@@ -3,7 +3,6 @@ import logging
 import os
 import signal
 import subprocess
-import sys
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -18,7 +17,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("s2s-endpoint")
 
-HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "7860"))
 
 INTERNAL_WS_HOST = os.getenv("INTERNAL_WS_HOST", "127.0.0.1")
@@ -27,29 +25,45 @@ INTERNAL_WS_URL = f"ws://{INTERNAL_WS_HOST}:{INTERNAL_WS_PORT}"
 
 S2S_REPO_DIR = os.getenv("S2S_REPO_DIR", "/opt/speech-to-speech")
 
-# Baseline model choices. Keep them simple for a first deployment.
-# You can override any of these in the endpoint env vars.
-LM_MODEL_NAME = os.getenv("LM_MODEL_NAME", "Qwen/Qwen2.5-3B-Instruct")
-TTS = os.getenv("TTS", "pocket")
-POCKET_TTS_VOICE = os.getenv("POCKET_TTS_VOICE", "jean")
-DEVICE = os.getenv("DEVICE", "cuda")
-LANGUAGE = os.getenv("LANGUAGE", "en")
-CHAT_SIZE = os.getenv("CHAT_SIZE", "10")
-STT_COMPILE_MODE = os.getenv("STT_COMPILE_MODE", "reduce-overhead")
+# Core pipeline selection
+DEVICE = os.getenv("DEVICE", "cuda").strip()
+LANGUAGE = os.getenv("LANGUAGE", "en").strip()
+CHAT_SIZE = os.getenv("CHAT_SIZE", "10").strip()
 
-# Optional extra CLI args for speech-to-speech, space-separated.
-# Example:
-#   EXTRA_S2S_ARGS="--stt_model_name large-v3 --temperature 0.7"
+STT = os.getenv("STT", "parakeet-tdt").strip()
+LLM = os.getenv("LLM", "open_api").strip()
+TTS = os.getenv("TTS", "qwen3").strip()
+
+# General module flags
+ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().lower() in {"1", "true", "yes"}
+LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
+
+# Whisper/faster-whisper only
+STT_COMPILE_MODE = os.getenv("STT_COMPILE_MODE", "").strip()
+
+# Open API / HF router
+OPEN_API_MODEL_NAME = os.getenv("OPEN_API_MODEL_NAME", "Qwen/Qwen3.5-9B:together").strip()
+OPEN_API_BASE_URL = os.getenv("OPEN_API_BASE_URL", "https://router.huggingface.co/v1").strip()
+OPEN_API_API_KEY = os.getenv("OPEN_API_API_KEY", "").strip() or os.getenv("HF_TOKEN", "").strip()
+OPEN_API_STREAM = os.getenv("OPEN_API_STREAM", "1").strip().lower() in {"1", "true", "yes"}
+OPEN_API_INIT_CHAT_PROMPT = os.getenv("OPEN_API_INIT_CHAT_PROMPT", "").strip()
+OPEN_API_IMAGE_PATHS = os.getenv("OPEN_API_IMAGE_PATHS", "").strip()
+
+# Optional generic extras for power users
 EXTRA_S2S_ARGS = os.getenv("EXTRA_S2S_ARGS", "").strip()
 
-# If you later want to use an OpenAI-compatible API-backed LLM instead of a local LM,
-# set USE_OPENAI_API_LLM=1 and configure the related env vars.
-USE_OPENAI_API_LLM = os.getenv("USE_OPENAI_API_LLM", "0") == "1"
-OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_API_MODEL = os.getenv("OPENAI_API_MODEL", "")
-
 pipeline_process: Optional[subprocess.Popen] = None
+
+
+def _add_bool_flag(cmd: list[str], enabled: bool, flag: str) -> None:
+    if enabled:
+        cmd.append(flag)
+
+
+def _add_str_flag(cmd: list[str], value: str, flag: str) -> None:
+    if value:
+        cmd.extend([flag, value])
+
 
 def build_s2s_command() -> list[str]:
     cmd = [
@@ -59,42 +73,52 @@ def build_s2s_command() -> list[str]:
         S2S_REPO_DIR,
         "python",
         "s2s_pipeline.py",
-        "--mode", "websocket",
-        "--ws_host", INTERNAL_WS_HOST,
-        "--ws_port", str(INTERNAL_WS_PORT),
-        "--device", DEVICE,
-        "--language", LANGUAGE,
-        "--chat_size", CHAT_SIZE,
-        "--tts", TTS,
+        "--mode",
+        "websocket",
+        "--ws_host",
+        INTERNAL_WS_HOST,
+        "--ws_port",
+        str(INTERNAL_WS_PORT),
+        "--device",
+        DEVICE,
+        "--language",
+        LANGUAGE,
+        "--chat_size",
+        CHAT_SIZE,
+        "--stt",
+        STT,
+        "--llm",
+        LLM,
+        "--tts",
+        TTS,
     ]
 
-    if STT_COMPILE_MODE:
-        cmd += ["--stt_compile_mode", STT_COMPILE_MODE]
+    # Live transcription is especially relevant for parakeet-tdt.
+    _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
+    _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
 
-    if TTS == "pocket" and POCKET_TTS_VOICE:
-        cmd += ["--pocket_tts_voice", POCKET_TTS_VOICE]
+    # Whisper compile path only makes sense for whisper-family backends.
+    if STT_COMPILE_MODE and STT in {"whisper", "faster-whisper"}:
+        cmd.extend(["--stt_compile_mode", STT_COMPILE_MODE])
 
-    if USE_OPENAI_API_LLM:
-        cmd += [
-            "--llm", "open-api",
-            "--open_api_base_url", OPENAI_API_BASE,
-            "--open_api_key", OPENAI_API_KEY,
-            "--open_api_model_name", OPENAI_API_MODEL,
-        ]
-    else:
-        cmd += ["--lm_model_name", LM_MODEL_NAME]
+    # Open API / HF router params
+    if LLM == "open_api":
+        _add_str_flag(cmd, OPEN_API_MODEL_NAME, "--open_api_model_name")
+        _add_str_flag(cmd, OPEN_API_BASE_URL, "--open_api_base_url")
+        _add_str_flag(cmd, OPEN_API_API_KEY, "--open_api_api_key")
+        _add_bool_flag(cmd, OPEN_API_STREAM, "--open_api_stream")
+        _add_str_flag(cmd, OPEN_API_INIT_CHAT_PROMPT, "--open_api_init_chat_prompt")
+
+        # Pass through exactly as a single argument string, matching your current usage.
+        _add_str_flag(cmd, OPEN_API_IMAGE_PATHS, "--open_api_image_paths")
 
     if EXTRA_S2S_ARGS:
-        cmd += EXTRA_S2S_ARGS.split()
+        cmd.extend(EXTRA_S2S_ARGS.split())
 
     return cmd
 
 
 async def wait_for_internal_ws(timeout_s: float = 900.0) -> None:
-    """
-    Wait until the internal speech-to-speech websocket server accepts connections.
-    First model load can take a while on endpoint startup.
-    """
     start = asyncio.get_event_loop().time()
     last_error = None
 
@@ -141,8 +165,8 @@ def start_pipeline() -> None:
         cmd,
         cwd=S2S_REPO_DIR,
         env=env,
-        stdout=sys.stdout,
-        stderr=sys.stderr,
+        stdout=None,
+        stderr=None,
         preexec_fn=os.setsid if os.name != "nt" else None,
     )
 
@@ -196,6 +220,14 @@ async def root():
         "message": "s2s endpoint is up",
         "health": "/health",
         "websocket": "/ws",
+        "internal_ws": INTERNAL_WS_URL,
+        "config": {
+            "stt": STT,
+            "llm": LLM,
+            "tts": TTS,
+            "device": DEVICE,
+            "language": LANGUAGE,
+        },
     }
 
 
@@ -215,7 +247,15 @@ async def health():
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"internal websocket not ready: {exc}") from exc
 
-    return JSONResponse({"status": "ok", "internal_ws": INTERNAL_WS_URL})
+    return JSONResponse(
+        {
+            "status": "ok",
+            "internal_ws": INTERNAL_WS_URL,
+            "stt": STT,
+            "llm": LLM,
+            "tts": TTS,
+        }
+    )
 
 
 @app.websocket("/ws")
