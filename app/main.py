@@ -3,7 +3,7 @@ import logging
 import os
 import signal
 import subprocess
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -16,6 +16,14 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("s2s-endpoint")
+
+
+class SuppressHealthcheckAccessFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "GET /health " not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(SuppressHealthcheckAccessFilter())
 
 PORT = int(os.getenv("PORT", "7860"))
 
@@ -53,6 +61,9 @@ OPEN_API_IMAGE_PATHS = os.getenv("OPEN_API_IMAGE_PATHS", "").strip()
 EXTRA_S2S_ARGS = os.getenv("EXTRA_S2S_ARGS", "").strip()
 
 pipeline_process: Optional[subprocess.Popen] = None
+internal_ws_ready = False
+internal_ws_error: Optional[str] = None
+internal_ws_monitor_task: Optional[asyncio.Task] = None
 
 
 def _add_bool_flag(cmd: list[str], enabled: bool, flag: str) -> None:
@@ -149,6 +160,21 @@ async def wait_for_internal_ws(timeout_s: float = 900.0) -> None:
         await asyncio.sleep(2.0)
 
 
+async def monitor_internal_ws_readiness() -> None:
+    global internal_ws_ready, internal_ws_error
+
+    try:
+        await wait_for_internal_ws(timeout_s=900.0)
+        internal_ws_ready = True
+        internal_ws_error = None
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        internal_ws_ready = False
+        internal_ws_error = str(exc)
+        logger.error("Internal websocket did not become ready: %s", exc)
+
+
 def start_pipeline() -> None:
     global pipeline_process
 
@@ -204,10 +230,22 @@ def stop_pipeline() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global internal_ws_ready, internal_ws_error, internal_ws_monitor_task
+
+    internal_ws_ready = False
+    internal_ws_error = None
     start_pipeline()
+    internal_ws_monitor_task = asyncio.create_task(monitor_internal_ws_readiness())
     try:
         yield
     finally:
+        if internal_ws_monitor_task is not None:
+            internal_ws_monitor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await internal_ws_monitor_task
+            internal_ws_monitor_task = None
+        internal_ws_ready = False
+        internal_ws_error = None
         stop_pipeline()
 
 
@@ -242,10 +280,9 @@ async def health():
             detail=f"speech-to-speech process exited with code {pipeline_process.returncode}",
         )
 
-    try:
-        await asyncio.wait_for(wait_for_internal_ws(timeout_s=5), timeout=6)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"internal websocket not ready: {exc}") from exc
+    if not internal_ws_ready:
+        detail = internal_ws_error or f"internal websocket not ready at {INTERNAL_WS_URL}"
+        raise HTTPException(status_code=503, detail=detail)
 
     return JSONResponse(
         {

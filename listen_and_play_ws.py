@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import signal
+import sys
+import threading
+import wave
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+try:
+    import websockets
+except ImportError:  # pragma: no cover - handled at runtime for local test environments
+    websockets = None
+
+try:
+    import sounddevice as sd
+except ImportError:  # pragma: no cover - handled at runtime for local test environments
+    sd = None
+
+
+SAMPLE_WIDTH = 2
+
+
+@dataclass
+class ListenAndPlayWSArguments:
+    ws_url: str = "ws://127.0.0.1:7860/ws"
+    send_rate: int = 16000
+    recv_rate: int = 16000
+    chunk_size: int = 1024
+    channels: int = 1
+    input_device: Optional[str] = None
+    output_device: Optional[str] = None
+    authorization: Optional[str] = None
+    save_output: Optional[str] = None
+    allow_barge_in: bool = False
+    list_devices: bool = False
+
+
+class PlaybackBuffer:
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+
+    def append(self, data: bytes) -> None:
+        with self._lock:
+            self._buffer.extend(data)
+
+    def has_data(self) -> bool:
+        with self._lock:
+            return bool(self._buffer)
+
+    def read(self, size: int) -> bytes:
+        with self._lock:
+            if not self._buffer:
+                return b"\x00" * size
+
+            data = bytes(self._buffer[:size])
+            del self._buffer[:size]
+
+        if len(data) < size:
+            data += b"\x00" * (size - len(data))
+        return data
+
+
+def parse_args() -> ListenAndPlayWSArguments:
+    parser = argparse.ArgumentParser(
+        description="Microphone/speaker websocket client for the s2s endpoint.",
+    )
+    parser.add_argument("--ws-url", default="ws://127.0.0.1:7860/ws")
+    parser.add_argument("--send-rate", type=int, default=16000)
+    parser.add_argument("--recv-rate", type=int, default=16000)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1024,
+        help="Audio block size in samples.",
+    )
+    parser.add_argument("--channels", type=int, default=1)
+    parser.add_argument("--input-device")
+    parser.add_argument("--output-device")
+    parser.add_argument(
+        "--authorization",
+        help="Optional Authorization header value, for example 'Bearer <token>'.",
+    )
+    parser.add_argument(
+        "--save-output",
+        help="Optional path to store received audio as a WAV file.",
+    )
+    parser.add_argument(
+        "--allow-barge-in",
+        action="store_true",
+        help="Keep streaming microphone audio while playback audio is buffered.",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="Print audio devices and exit.",
+    )
+    namespace = parser.parse_args()
+    return ListenAndPlayWSArguments(**vars(namespace))
+
+
+def require_runtime_dependencies() -> None:
+    if websockets is None:
+        raise SystemExit(
+            "websockets is required for listen_and_play_ws.py. "
+            "Install it locally with `pip install websockets`."
+        )
+    if sd is None:
+        raise SystemExit(
+            "sounddevice is required for listen_and_play_ws.py. "
+            "Install it locally with `pip install sounddevice`."
+        )
+
+
+def write_wav_pcm16(path: str, pcm_bytes: bytes, sample_rate: int, channels: int) -> None:
+    output_path = Path(path)
+    with wave.open(str(output_path), "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(SAMPLE_WIDTH)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+
+
+async def listen_and_play_ws(args: ListenAndPlayWSArguments) -> None:
+    require_runtime_dependencies()
+
+    if args.list_devices:
+        print(sd.query_devices())
+        return
+
+    playback = PlaybackBuffer()
+    received_audio = bytearray()
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    mic_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=8)
+
+    def queue_microphone_frame(frame: bytes) -> None:
+        if stop_event.is_set():
+            return
+        if mic_queue.full():
+            with suppress(asyncio.QueueEmpty):
+                mic_queue.get_nowait()
+        with suppress(asyncio.QueueFull):
+            mic_queue.put_nowait(frame)
+
+    def request_stop() -> None:
+        if stop_event.is_set():
+            return
+        stop_event.set()
+        with suppress(asyncio.QueueFull):
+            mic_queue.put_nowait(None)
+
+    def input_callback(indata, frames, time_info, status) -> None:
+        if status:
+            print(f"Input stream status: {status}", file=sys.stderr)
+        if stop_event.is_set():
+            return
+        if not args.allow_barge_in and playback.has_data():
+            return
+        loop.call_soon_threadsafe(queue_microphone_frame, bytes(indata))
+
+    def output_callback(outdata, frames, time_info, status) -> None:
+        if status:
+            print(f"Output stream status: {status}", file=sys.stderr)
+        outdata[:] = playback.read(len(outdata))
+
+    def install_signal_handlers() -> None:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with suppress(NotImplementedError):
+                loop.add_signal_handler(sig, request_stop)
+
+    async def send_audio(ws: websockets.ClientConnection) -> None:
+        try:
+            while not stop_event.is_set():
+                chunk = await mic_queue.get()
+                if chunk is None:
+                    break
+                await ws.send(chunk)
+        except websockets.ConnectionClosed:
+            request_stop()
+
+    async def receive_audio(ws: websockets.ClientConnection) -> None:
+        try:
+            while not stop_event.is_set():
+                msg = await ws.recv()
+                if isinstance(msg, bytes):
+                    playback.append(msg)
+                    received_audio.extend(msg)
+                else:
+                    print(f"TEXT EVENT: {msg}")
+        except websockets.ConnectionClosed:
+            request_stop()
+
+    async def wait_for_user_stop() -> None:
+        try:
+            await asyncio.to_thread(input, "Press Enter to stop...\n")
+        except EOFError:
+            pass
+        request_stop()
+
+    headers = {}
+    if args.authorization:
+        headers["Authorization"] = args.authorization
+
+    install_signal_handlers()
+
+    async with websockets.connect(
+        args.ws_url,
+        additional_headers=headers or None,
+        max_size=None,
+        ping_interval=20,
+        ping_timeout=20,
+    ) as ws:
+        print(f"Connected to {args.ws_url}")
+        print("Streaming microphone audio. Press Enter to stop.")
+
+        with sd.RawInputStream(
+            samplerate=args.send_rate,
+            channels=args.channels,
+            dtype="int16",
+            blocksize=args.chunk_size,
+            device=args.input_device,
+            callback=input_callback,
+        ), sd.RawOutputStream(
+            samplerate=args.recv_rate,
+            channels=args.channels,
+            dtype="int16",
+            blocksize=args.chunk_size,
+            device=args.output_device,
+            callback=output_callback,
+        ):
+            tasks = [
+                asyncio.create_task(send_audio(ws)),
+                asyncio.create_task(receive_audio(ws)),
+                asyncio.create_task(wait_for_user_stop()),
+            ]
+
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            request_stop()
+
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                with suppress(asyncio.CancelledError):
+                    await task
+            for task in done:
+                task.result()
+
+    if args.save_output:
+        write_wav_pcm16(args.save_output, bytes(received_audio), args.recv_rate, args.channels)
+        print(f"Wrote {args.save_output}")
+
+
+def main() -> None:
+    args = parse_args()
+    asyncio.run(listen_and_play_ws(args))
+
+
+if __name__ == "__main__":
+    main()
