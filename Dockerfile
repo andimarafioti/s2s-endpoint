@@ -24,8 +24,10 @@ RUN pip install --upgrade pip setuptools wheel && \
     pip install uv
 
 # Clone speech-to-speech and install its dependencies the way the repo expects
-RUN git clone https://github.com/huggingface/speech-to-speech.git ${S2S_REPO_DIR} && \
+RUN git clone --depth 1 https://github.com/huggingface/speech-to-speech.git ${S2S_REPO_DIR} && \
     cd ${S2S_REPO_DIR} && \
+    git fetch --depth 1 origin ${S2S_REF} && \
+    git checkout ${S2S_REF} && \
     uv sync --no-dev
 
 COPY app /app/app
