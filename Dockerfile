@@ -1,4 +1,5 @@
 FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+ARG S2S_REF=main
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
