@@ -140,14 +140,15 @@ async def wait_for_internal_ws(timeout_s: float = 900.0) -> None:
             )
 
         try:
-            _reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(INTERNAL_WS_HOST, INTERNAL_WS_PORT),
-                timeout=5,
-            )
-            writer.close()
-            with suppress(Exception):
-                await writer.wait_closed()
-            logger.info("Internal speech-to-speech listener is ready at %s", INTERNAL_WS_URL)
+            # Probe with a real websocket open / close sequence so the upstream
+            # listener doesn't log invalid HTTP handshake errors for readiness checks.
+            async with websockets.connect(
+                INTERNAL_WS_URL,
+                open_timeout=5,
+                ping_interval=None,
+                max_size=None,
+            ):
+                logger.info("Internal speech-to-speech listener is ready at %s", INTERNAL_WS_URL)
             return
         except Exception as exc:
             last_error = exc
