@@ -23,7 +23,6 @@ PIPELINE_MAX_INSTANCES = int(os.getenv("PIPELINE_MAX_INSTANCES", "1"))
 PIPELINE_MIN_IDLE_INSTANCES = int(os.getenv("PIPELINE_MIN_IDLE_INSTANCES", "1"))
 
 # Core pipeline selection
-DEVICE = os.getenv("DEVICE", "cuda").strip()
 LANGUAGE = os.getenv("LANGUAGE", "en").strip()
 CHAT_SIZE = os.getenv("CHAT_SIZE", "10").strip()
 
@@ -34,9 +33,6 @@ TTS = os.getenv("TTS", "qwen3").strip()
 # General module flags
 ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().lower() in {"1", "true", "yes"}
 LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
-
-# Whisper/faster-whisper only
-STT_COMPILE_MODE = os.getenv("STT_COMPILE_MODE", "").strip()
 
 # Open API / HF router
 OPEN_API_MODEL_NAME = os.getenv("OPEN_API_MODEL_NAME", "Qwen/Qwen3.5-9B:together").strip()
@@ -75,7 +71,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
         "--ws_port",
         str(port),
         "--device",
-        DEVICE,
+        "cuda",
         "--language",
         LANGUAGE,
         "--chat_size",
@@ -90,9 +86,6 @@ def build_s2s_command(host: str, port: int) -> list[str]:
 
     _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
-
-    if STT_COMPILE_MODE and STT in {"whisper", "faster-whisper"}:
-        cmd.extend(["--stt_compile_mode", STT_COMPILE_MODE])
 
     if LLM == "open_api":
         _add_str_flag(cmd, OPEN_API_MODEL_NAME, "--open_api_model_name")
@@ -170,7 +163,6 @@ async def root():
             "stt": STT,
             "llm": LLM,
             "tts": TTS,
-            "device": DEVICE,
             "language": LANGUAGE,
         },
     }
