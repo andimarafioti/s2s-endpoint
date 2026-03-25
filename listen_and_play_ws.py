@@ -44,6 +44,13 @@ class ListenAndPlayWSArguments:
     list_devices: bool = False
 
 
+@dataclass
+class AllocatedSession:
+    session_id: str
+    websocket_url: str
+    connect_url: str
+
+
 class PlaybackBuffer:
     def __init__(self) -> None:
         self._buffer = bytearray()
@@ -217,56 +224,64 @@ async def listen_and_play_ws(args: ListenAndPlayWSArguments) -> None:
     if args.authorization:
         headers["Authorization"] = args.authorization
 
+    allocated_session: Optional[AllocatedSession] = None
     if args.session_url:
         allocation = await asyncio.to_thread(allocate_session, args.session_url, args.authorization)
-        ws_url = allocation["connect_url"]
-        print(f"Allocated session {allocation['session_id']}")
-        print(f"Direct compute websocket: {allocation['websocket_url']}")
+        allocated_session = allocation
+        ws_url = allocation.connect_url
+        print(f"Allocated session {allocation.session_id}")
+        print(f"Direct compute websocket: {allocation.websocket_url}")
         headers = {}
 
     install_signal_handlers()
 
-    async with websockets.connect(
-        ws_url,
-        additional_headers=headers or None,
-        max_size=None,
-        ping_interval=20,
-        ping_timeout=20,
-    ) as ws:
-        print(f"Connected to {ws_url}")
-        print("Streaming microphone audio. Press Enter to stop.")
+    try:
+        websocket_cm = websockets.connect(
+            ws_url,
+            additional_headers=headers or None,
+            max_size=None,
+            ping_interval=20,
+            ping_timeout=20,
+        )
+        async with websocket_cm as ws:
+            print(f"Connected to {ws_url}")
+            print("Streaming microphone audio. Press Enter to stop.")
 
-        with sd.RawInputStream(
-            samplerate=args.send_rate,
-            channels=args.channels,
-            dtype="int16",
-            blocksize=args.chunk_size,
-            device=args.input_device,
-            callback=input_callback,
-        ), sd.RawOutputStream(
-            samplerate=args.recv_rate,
-            channels=args.channels,
-            dtype="int16",
-            blocksize=args.chunk_size,
-            device=args.output_device,
-            callback=output_callback,
-        ):
-            tasks = [
-                asyncio.create_task(send_audio(ws)),
-                asyncio.create_task(receive_audio(ws)),
-                asyncio.create_task(wait_for_user_stop()),
-            ]
+            with sd.RawInputStream(
+                samplerate=args.send_rate,
+                channels=args.channels,
+                dtype="int16",
+                blocksize=args.chunk_size,
+                device=args.input_device,
+                callback=input_callback,
+            ), sd.RawOutputStream(
+                samplerate=args.recv_rate,
+                channels=args.channels,
+                dtype="int16",
+                blocksize=args.chunk_size,
+                device=args.output_device,
+                callback=output_callback,
+            ):
+                tasks = [
+                    asyncio.create_task(send_audio(ws)),
+                    asyncio.create_task(receive_audio(ws)),
+                    asyncio.create_task(wait_for_user_stop()),
+                ]
 
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            request_stop()
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                request_stop()
 
-            for task in pending:
-                task.cancel()
-            for task in pending:
-                with suppress(asyncio.CancelledError):
-                    await task
-            for task in done:
-                task.result()
+                for task in pending:
+                    task.cancel()
+                for task in pending:
+                    with suppress(asyncio.CancelledError):
+                        await task
+                for task in done:
+                    task.result()
+    except websockets.InvalidStatus as exc:
+        raise SystemExit(_format_websocket_error(exc, allocated_session, ws_url)) from exc
+    except websockets.ConnectionClosedError as exc:
+        raise SystemExit(f"Websocket connection closed unexpectedly: {exc}") from exc
 
     if args.save_output:
         write_wav_pcm16(args.save_output, bytes(received_audio), args.recv_rate, args.channels)
@@ -278,7 +293,7 @@ def main() -> None:
     asyncio.run(listen_and_play_ws(args))
 
 
-def allocate_session(session_url: str, authorization: Optional[str]) -> dict[str, str]:
+def allocate_session(session_url: str, authorization: Optional[str]) -> AllocatedSession:
     headers = {"Content-Type": "application/json"}
     if authorization:
         headers["Authorization"] = authorization
@@ -305,11 +320,29 @@ def allocate_session(session_url: str, authorization: Optional[str]) -> dict[str
     if not connect_url or not session_id or not websocket_url:
         raise SystemExit(f"Invalid session allocation response: {payload}")
 
-    return {
-        "session_id": session_id,
-        "websocket_url": websocket_url,
-        "connect_url": connect_url,
-    }
+    return AllocatedSession(
+        session_id=session_id,
+        websocket_url=websocket_url,
+        connect_url=connect_url,
+    )
+
+
+def _format_websocket_error(
+    exc: Exception,
+    allocated_session: Optional[AllocatedSession],
+    ws_url: str,
+) -> str:
+    lines = [f"Failed to connect to websocket: {exc}"]
+    lines.append(f"Websocket URL: {ws_url}")
+
+    if allocated_session is not None:
+        lines.append(f"Allocated session id: {allocated_session.session_id}")
+        lines.append(f"Allocated compute websocket: {allocated_session.websocket_url}")
+        lines.append(
+            "A 403 here usually means the compute endpoint rejected the session token or is running an older image."
+        )
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
