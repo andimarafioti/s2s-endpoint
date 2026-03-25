@@ -70,29 +70,53 @@ The external websocket API remains `/ws` in both roles.
 
 ## Create Compute Endpoints
 
-The repo includes a helper script to create a batch of compute endpoints:
+The repo includes a helper script to create GPU compute endpoints for this app:
 
 ```bash
 uv run --with-requirements requirements.txt python scripts/create_compute_endpoints.py \
   --namespace your-org \
   --prefix reachy-s2s \
   --count 3 \
-  --repository andimarafioti/s2s-endpoint \
-  --framework custom \
-  --accelerator gpu \
+  --image-url your-registry/andito-s2s-endpoint:latest \
   --instance-size x1 \
   --instance-type nvidia-a10g \
   --vendor aws \
   --region us-east-1 \
-  --custom-image-file custom_image.json \
-  --env APP_ROLE=compute \
-  --env PIPELINE_MAX_INSTANCES=1 \
-  --env PIPELINE_MIN_IDLE_INSTANCES=1 \
+  --pipeline-max-instances 1 \
+  --pipeline-min-idle-instances 1 \
   --wait
 ```
 
 The script prints the created endpoint names and HTTPS URLs as JSON. Those names
 should then be passed to the LB with `COMPUTE_ENDPOINT_NAMES`.
+
+## Create Load Balancer Endpoint
+
+The repo also includes a helper script to create the CPU load-balancer endpoint:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/create_load_balancer_endpoint.py \
+  --name reachy-s2s-lb \
+  --namespace your-org \
+  --image-url your-registry/andito-s2s-endpoint:latest \
+  --instance-size x2 \
+  --instance-type intel-icl \
+  --vendor aws \
+  --region us-east-1 \
+  --compute-endpoint-names reachy-s2s-01,reachy-s2s-02,reachy-s2s-03 \
+  --compute-endpoint-slots 1 \
+  --compute-endpoint-min-warm 1 \
+  --compute-endpoint-wake-threshold-slots 1 \
+  --compute-endpoint-idle-park-timeout-s 300 \
+  --compute-endpoint-park-strategy pause \
+  --wait
+```
+
+Both scripts are specific to this repo and expect the same custom image to be
+used in two roles:
+
+- compute endpoints: `APP_ROLE=compute` on GPU instances
+- load balancer endpoint: `APP_ROLE=load_balancer` on a CPU instance
 
 ## Files
 - `app/`: application code
