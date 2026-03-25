@@ -7,6 +7,7 @@ from huggingface_hub import HfApi
 from _endpoint_helpers import (
     DEFAULT_FRAMEWORK,
     DEFAULT_HEALTH_ROUTE,
+    DEFAULT_IMAGE_PORT,
     DEFAULT_REPOSITORY,
     build_custom_image,
     build_names,
@@ -29,6 +30,7 @@ def main() -> None:
     parser.add_argument("--instance-type", required=True, help="GPU instance type, for example nvidia-a10g")
     parser.add_argument("--image-url", required=True, help="Custom compute image URL built from Dockerfile.compute")
     parser.add_argument("--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the compute image")
+    parser.add_argument("--image-port", type=int, default=DEFAULT_IMAGE_PORT, help="Container port exposed by the compute image")
     parser.add_argument("--session-shared-secret", required=True, help="Shared secret used to validate LB-issued session tokens")
     parser.add_argument("--lb-callback-auth-token", help="Optional bearer token used by compute endpoints when notifying the LB")
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY, help=argparse.SUPPRESS)
@@ -54,7 +56,7 @@ def main() -> None:
     env.update(parse_key_value_pairs(args.env))
     secrets.update(parse_key_value_pairs(args.secret))
 
-    custom_image = build_custom_image(args.image_url, args.image_health_route)
+    custom_image = build_custom_image(args.image_url, args.image_health_route, args.image_port)
 
     api = HfApi()
     created = []
@@ -76,6 +78,7 @@ def main() -> None:
             namespace=args.namespace,
             repository=args.repository,
             framework=DEFAULT_FRAMEWORK,
+            task="custom",
             accelerator="gpu",
             instance_size=args.instance_size,
             instance_type=args.instance_type,

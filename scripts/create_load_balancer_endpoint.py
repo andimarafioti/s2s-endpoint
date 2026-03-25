@@ -8,6 +8,7 @@ from _endpoint_helpers import (
     DEFAULT_ENDPOINT_TYPE,
     DEFAULT_FRAMEWORK,
     DEFAULT_HEALTH_ROUTE,
+    DEFAULT_IMAGE_PORT,
     DEFAULT_REPOSITORY,
     build_custom_image,
     load_json_file,
@@ -27,6 +28,7 @@ def main() -> None:
     parser.add_argument("--instance-type", required=True, help="CPU instance type, for example intel-icl")
     parser.add_argument("--image-url", required=True, help="Custom load-balancer image URL built from Dockerfile.load_balancer")
     parser.add_argument("--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the load-balancer image")
+    parser.add_argument("--image-port", type=int, default=DEFAULT_IMAGE_PORT, help="Container port exposed by the load-balancer image")
     parser.add_argument("--session-shared-secret", required=True, help="Shared secret used to mint and validate direct session tokens")
     parser.add_argument("--compute-endpoint-names", required=True, help="Comma-separated compute endpoint names")
     parser.add_argument("--compute-endpoint-slots", type=int, default=1, help="Concurrent sessions each compute endpoint can handle")
@@ -77,7 +79,7 @@ def main() -> None:
         }
     )
 
-    custom_image = build_custom_image(args.image_url, args.image_health_route)
+    custom_image = build_custom_image(args.image_url, args.image_health_route, args.image_port)
 
     api = HfApi()
     endpoint = api.create_inference_endpoint(
@@ -85,6 +87,7 @@ def main() -> None:
         namespace=args.namespace,
         repository=args.repository,
         framework=DEFAULT_FRAMEWORK,
+        task="custom",
         accelerator="cpu",
         instance_size=args.instance_size,
         instance_type=args.instance_type,

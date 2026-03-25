@@ -100,6 +100,7 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --prefix reachy-s2s \
   --count 3 \
   --image-url your-registry/s2s-endpoint-compute:latest \
+  --image-port 7860 \
   --session-shared-secret your-shared-secret \
   --instance-size x1 \
   --instance-type nvidia-a10g \
@@ -126,6 +127,7 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --name reachy-s2s-lb \
   --namespace your-org \
   --image-url your-registry/s2s-endpoint-lb:latest \
+  --image-port 7860 \
   --session-shared-secret your-shared-secret \
   --instance-size x2 \
   --instance-type intel-icl \
