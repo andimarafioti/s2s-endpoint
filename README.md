@@ -14,7 +14,7 @@ Speech-to-speech endpoint project.
 
 This repo now builds two different images with two different app entrypoints:
 
-- compute image: `Dockerfile`
+- compute image: `Dockerfile.compute`
   Starts `app.compute_main:app` on a GPU instance, runs local `speech-to-speech` subprocesses, and serves `/ws` directly.
 - load-balancer image: `Dockerfile.load_balancer`
   Starts `app.load_balancer_main:app` on a CPU instance, tracks a configured set of pre-created compute endpoints, keeps a warm pool, wakes parked endpoints when free session capacity gets tight, and allocates direct compute sessions for clients.
@@ -33,7 +33,7 @@ replica unless you add shared state outside this repo.
 Build the compute image:
 
 ```bash
-docker build --platform linux/amd64 -t your-registry/s2s-endpoint-compute:latest .
+docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
 Build the load-balancer image:
@@ -143,13 +143,13 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
 
 Both scripts are specific to this repo and expect the role-specific images:
 
-- compute endpoints: image built from `Dockerfile`
+- compute endpoints: image built from `Dockerfile.compute`
 - load balancer endpoint: image built from `Dockerfile.load_balancer`
 
 ## Files
 - `app/`: application code
 - `scripts/`: helper scripts
-- `Dockerfile`: compute container definition
+- `Dockerfile.compute`: compute container definition
 - `Dockerfile.load_balancer`: load-balancer container definition
 - `requirements.txt`: Python dependencies
 - `test_ws_file.py`: websocket test client

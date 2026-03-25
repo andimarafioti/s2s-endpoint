@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--region", required=True, help="Cloud region")
     parser.add_argument("--instance-size", required=True, help="Instance size, for example x1")
     parser.add_argument("--instance-type", required=True, help="GPU instance type, for example nvidia-a10g")
-    parser.add_argument("--image-url", required=True, help="Custom compute image URL built from Dockerfile")
+    parser.add_argument("--image-url", required=True, help="Custom compute image URL built from Dockerfile.compute")
     parser.add_argument("--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the compute image")
     parser.add_argument("--session-shared-secret", required=True, help="Shared secret used to validate LB-issued session tokens")
     parser.add_argument("--lb-callback-auth-token", help="Optional bearer token used by compute endpoints when notifying the LB")
