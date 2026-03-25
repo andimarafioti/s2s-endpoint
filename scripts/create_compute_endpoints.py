@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import json
 import sys
 
@@ -70,7 +71,7 @@ def main() -> None:
     custom_image = build_custom_image(args.image_url, args.image_health_route, args.image_port)
 
     api = HfApi()
-    created = []
+    endpoints = []
 
     for name in names:
         endpoint_env = dict(env)
@@ -105,18 +106,34 @@ def main() -> None:
             secrets=secrets or None,
             type=args.type,
         )
-        if args.wait:
-            endpoint.wait()
-            endpoint.fetch()
-        created.append(
-            {
-                "name": name,
-                "status": str(endpoint.status),
-                "url": getattr(endpoint, "url", None),
-            }
-        )
+        endpoints.append(endpoint)
 
-    print(json.dumps({"endpoints": created}, indent=2))
+    if args.wait:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoints) or 1) as executor:
+            futures = [executor.submit(_wait_and_fetch_endpoint, endpoint) for endpoint in endpoints]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+    print(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "name": endpoint.name,
+                        "status": str(endpoint.status),
+                        "url": getattr(endpoint, "url", None),
+                    }
+                    for endpoint in endpoints
+                ]
+            },
+            indent=2,
+        )
+    )
+
+
+def _wait_and_fetch_endpoint(endpoint) -> None:
+    endpoint.wait()
+    endpoint.fetch()
 
 
 if __name__ == "__main__":
