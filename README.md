@@ -102,6 +102,7 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --image-url your-registry/s2s-endpoint-compute:latest \
   --image-port 7860 \
   --session-shared-secret your-shared-secret \
+  --secret HF_TOKEN=$HF_TOKEN \
   --instance-size x1 \
   --instance-type nvidia-a10g \
   --vendor aws \
@@ -118,6 +119,10 @@ For the direct-session architecture, compute endpoints are usually created as
 `public` endpoints so clients can connect directly after the LB assigns them a
 session token.
 
+With the current defaults, compute endpoints also need an `HF_TOKEN` or
+`OPEN_API_API_KEY` secret at runtime because the speech-to-speech wrapper
+defaults to `LLM=open_api`.
+
 ## Create Load Balancer Endpoint
 
 The repo also includes a helper script to create the CPU load-balancer endpoint:
@@ -129,6 +134,7 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --image-url your-registry/s2s-endpoint-lb:latest \
   --image-port 7860 \
   --session-shared-secret your-shared-secret \
+  --secret HF_CONTROL_TOKEN=$HF_TOKEN \
   --instance-size x2 \
   --instance-type intel-icl \
   --vendor aws \

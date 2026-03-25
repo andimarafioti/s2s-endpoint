@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
 
 from huggingface_hub import HfApi
 
@@ -59,6 +60,14 @@ def main() -> None:
     secrets = load_json_file(args.secret_file) or {}
     env.update(parse_key_value_pairs(args.env))
     secrets.update(parse_key_value_pairs(args.secret))
+
+    if not (
+        secrets.get("HF_CONTROL_TOKEN") or secrets.get("HF_TOKEN") or env.get("HF_CONTROL_TOKEN") or env.get("HF_TOKEN")
+    ):
+        print(
+            "warning: the load balancer needs HF_CONTROL_TOKEN or HF_TOKEN to wake, park, and inspect compute endpoints.",
+            file=sys.stderr,
+        )
 
     compute_namespace = args.hf_endpoint_namespace or args.namespace or ""
     env.update(

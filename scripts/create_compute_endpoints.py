@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
 
 from huggingface_hub import HfApi
 
@@ -55,6 +56,16 @@ def main() -> None:
     secrets = load_json_file(args.secret_file) or {}
     env.update(parse_key_value_pairs(args.env))
     secrets.update(parse_key_value_pairs(args.secret))
+
+    llm_backend = str(env.get("LLM", "open_api")).strip() or "open_api"
+    if llm_backend == "open_api" and not (
+        secrets.get("OPEN_API_API_KEY") or secrets.get("HF_TOKEN") or env.get("OPEN_API_API_KEY") or env.get("HF_TOKEN")
+    ):
+        print(
+            "warning: compute endpoints default to LLM=open_api, but neither OPEN_API_API_KEY nor HF_TOKEN was provided. "
+            "The container will start, but runtime requests will fail when the speech-to-speech pipeline calls the OpenAI-compatible API.",
+            file=sys.stderr,
+        )
 
     custom_image = build_custom_image(args.image_url, args.image_health_route, args.image_port)
 
