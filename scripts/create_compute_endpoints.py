@@ -50,6 +50,9 @@ def main() -> None:
     parser.add_argument("--secret", action="append", default=[], help="Extra secret in KEY=VALUE form")
     parser.add_argument("--wait", action="store_true", help="Wait for each endpoint to finish provisioning")
     args = parser.parse_args()
+    args.session_shared_secret = args.session_shared_secret.strip()
+    if not args.session_shared_secret:
+        raise ValueError("--session-shared-secret must be a non-empty string")
 
     names = build_names(args.prefix, args.count, args.names)
 
