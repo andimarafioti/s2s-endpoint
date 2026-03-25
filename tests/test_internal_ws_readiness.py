@@ -20,7 +20,12 @@ class WaitForInternalWSTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.websockets, "connect", fake_connect), patch.object(
             main.asyncio, "open_connection", open_connection
         ):
-            await main.wait_for_internal_ws(timeout_s=0.01)
+            await main.wait_for_internal_ws(
+                main.INTERNAL_WS_HOST,
+                main.INTERNAL_WS_BASE_PORT,
+                None,
+                timeout_s=0.01,
+            )
 
         open_connection.assert_not_called()
         self.assertEqual(observed["args"], (main.INTERNAL_WS_URL,))

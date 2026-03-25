@@ -1,15 +1,17 @@
 import asyncio
 import logging
 import os
-import signal
 import subprocess
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+from app.endpoint_pool_router import EndpointPoolRouter, HuggingFaceEndpointController
+from app.session_router import SessionRouter
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -26,12 +28,31 @@ class SuppressHealthcheckAccessFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(SuppressHealthcheckAccessFilter())
 
 PORT = int(os.getenv("PORT", "7860"))
+APP_ROLE = os.getenv("APP_ROLE", "compute").strip().lower()
 
 INTERNAL_WS_HOST = os.getenv("INTERNAL_WS_HOST", "127.0.0.1")
-INTERNAL_WS_PORT = int(os.getenv("INTERNAL_WS_PORT", "9000"))
-INTERNAL_WS_URL = f"ws://{INTERNAL_WS_HOST}:{INTERNAL_WS_PORT}"
+INTERNAL_WS_BASE_PORT = int(os.getenv("INTERNAL_WS_PORT", "9000"))
+INTERNAL_WS_URL = f"ws://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}"
 
 S2S_REPO_DIR = os.getenv("S2S_REPO_DIR", "/opt/speech-to-speech")
+PIPELINE_MAX_INSTANCES = int(os.getenv("PIPELINE_MAX_INSTANCES", "1"))
+PIPELINE_MIN_IDLE_INSTANCES = int(os.getenv("PIPELINE_MIN_IDLE_INSTANCES", "1"))
+
+HF_ENDPOINT_NAMESPACE = os.getenv("HF_ENDPOINT_NAMESPACE", "").strip() or None
+COMPUTE_ENDPOINT_NAMES = [
+    name.strip() for name in os.getenv("COMPUTE_ENDPOINT_NAMES", "").split(",") if name.strip()
+]
+COMPUTE_ENDPOINT_SLOTS = int(os.getenv("COMPUTE_ENDPOINT_SLOTS", "1"))
+COMPUTE_ENDPOINT_MIN_WARM = int(os.getenv("COMPUTE_ENDPOINT_MIN_WARM", "1"))
+COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS = int(
+    os.getenv("COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS", str(COMPUTE_ENDPOINT_SLOTS))
+)
+COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "300"))
+COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S", "10"))
+COMPUTE_ENDPOINT_WAIT_TIMEOUT_S = int(os.getenv("COMPUTE_ENDPOINT_WAIT_TIMEOUT_S", "900"))
+COMPUTE_ENDPOINT_PARK_STRATEGY = os.getenv("COMPUTE_ENDPOINT_PARK_STRATEGY", "pause").strip().lower()
+HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TOKEN", "").strip() or None
+DOWNSTREAM_ENDPOINT_TOKEN = os.getenv("DOWNSTREAM_ENDPOINT_TOKEN", "").strip() or HF_CONTROL_TOKEN
 
 # Core pipeline selection
 DEVICE = os.getenv("DEVICE", "cuda").strip()
@@ -60,11 +81,6 @@ OPEN_API_IMAGE_PATHS = os.getenv("OPEN_API_IMAGE_PATHS", "").strip()
 # Optional generic extras for power users
 EXTRA_S2S_ARGS = os.getenv("EXTRA_S2S_ARGS", "").strip()
 
-pipeline_process: Optional[subprocess.Popen] = None
-internal_ws_ready = False
-internal_ws_error: Optional[str] = None
-internal_ws_monitor_task: Optional[asyncio.Task] = None
-
 
 def _add_bool_flag(cmd: list[str], enabled: bool, flag: str) -> None:
     if enabled:
@@ -76,7 +92,7 @@ def _add_str_flag(cmd: list[str], value: str, flag: str) -> None:
         cmd.extend([flag, value])
 
 
-def build_s2s_command() -> list[str]:
+def build_s2s_command(host: str, port: int) -> list[str]:
     cmd = [
         "uv",
         "run",
@@ -87,9 +103,9 @@ def build_s2s_command() -> list[str]:
         "--mode",
         "websocket",
         "--ws_host",
-        INTERNAL_WS_HOST,
+        host,
         "--ws_port",
-        str(INTERNAL_WS_PORT),
+        str(port),
         "--device",
         DEVICE,
         "--language",
@@ -129,126 +145,95 @@ def build_s2s_command() -> list[str]:
     return cmd
 
 
-async def wait_for_internal_ws(timeout_s: float = 900.0) -> None:
+async def wait_for_internal_ws(
+    host: str,
+    port: int,
+    process: Optional[subprocess.Popen],
+    timeout_s: float = 900.0,
+) -> None:
+    ws_url = f"ws://{host}:{port}"
     start = asyncio.get_event_loop().time()
     last_error = None
 
     while True:
-        if pipeline_process is not None and pipeline_process.poll() is not None:
+        if process is not None and process.poll() is not None:
             raise RuntimeError(
-                f"speech-to-speech process exited early with code {pipeline_process.returncode}"
+                f"speech-to-speech process exited early with code {process.returncode}"
             )
 
         try:
             # Probe with a real websocket open / close sequence so the upstream
             # listener doesn't log invalid HTTP handshake errors for readiness checks.
             async with websockets.connect(
-                INTERNAL_WS_URL,
+                ws_url,
                 open_timeout=5,
                 ping_interval=None,
                 max_size=None,
             ):
-                logger.info("Internal speech-to-speech listener is ready at %s", INTERNAL_WS_URL)
+                logger.info("Internal speech-to-speech listener is ready at %s", ws_url)
             return
         except Exception as exc:
             last_error = exc
 
         if asyncio.get_event_loop().time() - start > timeout_s:
             raise RuntimeError(
-                f"Timed out waiting for internal websocket server at {INTERNAL_WS_URL}. "
+                f"Timed out waiting for internal websocket server at {ws_url}. "
                 f"Last error: {last_error}"
             )
 
         await asyncio.sleep(2.0)
 
 
-async def monitor_internal_ws_readiness() -> None:
-    global internal_ws_ready, internal_ws_error
-
-    try:
-        await wait_for_internal_ws(timeout_s=900.0)
-        internal_ws_ready = True
-        internal_ws_error = None
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        internal_ws_ready = False
-        internal_ws_error = str(exc)
-        logger.error("Internal websocket did not become ready: %s", exc)
+session_router = SessionRouter(
+    host=INTERNAL_WS_HOST,
+    base_port=INTERNAL_WS_BASE_PORT,
+    repo_dir=S2S_REPO_DIR,
+    min_idle_instances=PIPELINE_MIN_IDLE_INSTANCES,
+    max_instances=PIPELINE_MAX_INSTANCES,
+    build_command=build_s2s_command,
+    wait_for_ready=wait_for_internal_ws,
+)
 
 
-def start_pipeline() -> None:
-    global pipeline_process
+def build_lb_router() -> EndpointPoolRouter:
+    if not COMPUTE_ENDPOINT_NAMES:
+        raise RuntimeError("COMPUTE_ENDPOINT_NAMES must be set when APP_ROLE=load_balancer")
 
-    if pipeline_process is not None and pipeline_process.poll() is None:
-        logger.info("speech-to-speech process already running")
-        return
+    controller = HuggingFaceEndpointController(
+        namespace=HF_ENDPOINT_NAMESPACE,
+        token=HF_CONTROL_TOKEN,
+        wait_timeout_s=COMPUTE_ENDPOINT_WAIT_TIMEOUT_S,
+        active_min_replica=1,
+        active_max_replica=1,
+        park_strategy=COMPUTE_ENDPOINT_PARK_STRATEGY,
+    )
 
-    cmd = build_s2s_command()
-    logger.info("Starting speech-to-speech subprocess:\n%s", " ".join(cmd))
-
-    env = os.environ.copy()
-
-    pipeline_process = subprocess.Popen(
-        cmd,
-        cwd=S2S_REPO_DIR,
-        env=env,
-        stdout=None,
-        stderr=None,
-        preexec_fn=os.setsid if os.name != "nt" else None,
+    return EndpointPoolRouter(
+        endpoint_names=COMPUTE_ENDPOINT_NAMES,
+        endpoint_slots=COMPUTE_ENDPOINT_SLOTS,
+        min_warm_endpoints=COMPUTE_ENDPOINT_MIN_WARM,
+        wake_threshold_slots=COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS,
+        idle_park_timeout_s=COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S,
+        reconcile_interval_s=COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S,
+        controller=controller,
     )
 
 
-def stop_pipeline() -> None:
-    global pipeline_process
-
-    if pipeline_process is None:
-        return
-
-    if pipeline_process.poll() is not None:
-        logger.info("speech-to-speech process already stopped")
-        return
-
-    logger.info("Stopping speech-to-speech subprocess")
-
-    try:
-        if os.name != "nt":
-            os.killpg(os.getpgid(pipeline_process.pid), signal.SIGTERM)
-        else:
-            pipeline_process.terminate()
-        pipeline_process.wait(timeout=20)
-    except Exception:
-        logger.exception("Graceful shutdown failed, killing subprocess")
-        try:
-            if os.name != "nt":
-                os.killpg(os.getpgid(pipeline_process.pid), signal.SIGKILL)
-            else:
-                pipeline_process.kill()
-        except Exception:
-            logger.exception("Failed to kill subprocess")
-    finally:
-        pipeline_process = None
+if APP_ROLE == "compute":
+    ws_router = session_router
+elif APP_ROLE == "load_balancer":
+    ws_router = build_lb_router()
+else:
+    raise RuntimeError("APP_ROLE must be either 'compute' or 'load_balancer'")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global internal_ws_ready, internal_ws_error, internal_ws_monitor_task
-
-    internal_ws_ready = False
-    internal_ws_error = None
-    start_pipeline()
-    internal_ws_monitor_task = asyncio.create_task(monitor_internal_ws_readiness())
+    await ws_router.start()
     try:
         yield
     finally:
-        if internal_ws_monitor_task is not None:
-            internal_ws_monitor_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await internal_ws_monitor_task
-            internal_ws_monitor_task = None
-        internal_ws_ready = False
-        internal_ws_error = None
-        stop_pipeline()
+        await ws_router.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -256,11 +241,11 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return {
+    payload = {
         "message": "s2s endpoint is up",
         "health": "/health",
         "websocket": "/ws",
-        "internal_ws": INTERNAL_WS_URL,
+        "role": APP_ROLE,
         "config": {
             "stt": STT,
             "llm": LLM,
@@ -269,42 +254,58 @@ async def root():
             "language": LANGUAGE,
         },
     }
+    if APP_ROLE == "compute":
+        payload["internal_ws"] = INTERNAL_WS_URL
+    else:
+        payload["compute_endpoints"] = COMPUTE_ENDPOINT_NAMES
+    return payload
 
 
 @app.get("/health")
 async def health():
-    if pipeline_process is None:
-        raise HTTPException(status_code=503, detail="speech-to-speech process not started")
+    healthy, detail, snapshot = await ws_router.healthcheck()
+    if not healthy:
+        raise HTTPException(status_code=503, detail=detail or "session router is not ready")
 
-    if pipeline_process.poll() is not None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"speech-to-speech process exited with code {pipeline_process.returncode}",
-        )
+    payload = {
+        "status": "ok",
+        "role": APP_ROLE,
+        "stt": STT,
+        "llm": LLM,
+        "tts": TTS,
+        "router": snapshot,
+    }
+    if APP_ROLE == "compute":
+        payload["internal_ws_base"] = INTERNAL_WS_URL
+    else:
+        payload["compute_endpoints"] = COMPUTE_ENDPOINT_NAMES
+    return JSONResponse(payload)
 
-    if not internal_ws_ready:
-        detail = internal_ws_error or f"internal websocket not ready at {INTERNAL_WS_URL}"
-        raise HTTPException(status_code=503, detail=detail)
 
-    return JSONResponse(
-        {
-            "status": "ok",
-            "internal_ws": INTERNAL_WS_URL,
-            "stt": STT,
-            "llm": LLM,
-            "tts": TTS,
-        }
-    )
+def build_upstream_headers() -> Optional[list[tuple[str, str]]]:
+    if APP_ROLE != "load_balancer" or not DOWNSTREAM_ENDPOINT_TOKEN:
+        return None
+    return [("Authorization", f"Bearer {DOWNSTREAM_ENDPOINT_TOKEN}")]
 
 
 @app.websocket("/ws")
 async def websocket_proxy(client_ws: WebSocket):
+    slot = None
+
+    try:
+        slot = await ws_router.acquire(timeout_s=900.0)
+    except Exception as exc:
+        await client_ws.close(code=1013, reason="No pipeline capacity available")
+        logger.warning("Failed to allocate speech-to-speech slot: %s", exc)
+        return
+
     await client_ws.accept()
-    logger.info("Client websocket connected")
+    logger.info("Client websocket connected to slot %s at %s", slot.slot_id, slot.ws_url)
 
     try:
         async with websockets.connect(
-            INTERNAL_WS_URL,
+            slot.ws_url,
+            additional_headers=build_upstream_headers(),
             open_timeout=30,
             ping_interval=20,
             ping_timeout=20,
@@ -347,3 +348,6 @@ async def websocket_proxy(client_ws: WebSocket):
             await client_ws.close(code=1011, reason="Proxy failure")
         except Exception:
             pass
+    finally:
+        if slot is not None:
+            await ws_router.release(slot.slot_id)
