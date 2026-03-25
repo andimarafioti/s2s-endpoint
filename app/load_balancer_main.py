@@ -4,7 +4,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
 
-from app.app_utils import build_lifespan, setup_logging
+from app.app_utils import build_lifespan, public_base_url, setup_logging
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointPoolRouter, HuggingFaceEndpointController
 
@@ -97,7 +97,7 @@ async def health():
 @app.post("/session")
 async def create_session(request: Request):
     try:
-        allocation = await session_manager.allocate(str(request.base_url))
+        allocation = await session_manager.allocate(public_base_url(request))
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
 

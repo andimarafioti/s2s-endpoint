@@ -252,7 +252,7 @@ def _get_session_payload(client_ws: WebSocket) -> Optional[dict[str, str]]:
         logger.warning("Rejected websocket with invalid session token")
         return None
 
-    request_host = client_ws.headers.get("host")
+    request_host = client_ws.headers.get("x-forwarded-host") or client_ws.headers.get("host")
     if not websocket_host_matches(str(payload["ws_url"]), request_host):
         logger.warning("Rejected websocket for mismatched compute endpoint host %s", request_host)
         return None

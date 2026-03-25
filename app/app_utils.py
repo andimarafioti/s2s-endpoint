@@ -2,6 +2,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Protocol
+from urllib.parse import urlunsplit
 
 
 class SuppressHealthcheckAccessFilter(logging.Filter):
@@ -40,3 +41,11 @@ def build_lifespan(manager: LifecycleManager):
             await manager.stop()
 
     return lifespan
+
+
+def public_base_url(request) -> str:
+    scheme = request.headers.get("x-forwarded-proto", "").strip() or request.url.scheme
+    host = request.headers.get("x-forwarded-host", "").strip() or request.headers.get("host", "").strip()
+    if not host:
+        host = request.url.netloc
+    return urlunsplit((scheme, host, "/", "", ""))

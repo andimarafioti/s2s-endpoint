@@ -60,7 +60,16 @@ def attach_session_token(websocket_url: str, session_token: str) -> str:
 def websocket_host_matches(expected_websocket_url: str, actual_host: str | None) -> bool:
     if not actual_host:
         return False
-    return urlparse(expected_websocket_url).netloc == actual_host.strip().lower()
+    expected = urlparse(expected_websocket_url)
+    expected_host = (expected.hostname or "").lower()
+    expected_port = expected.port or _default_port(expected.scheme)
+
+    raw_actual_host = actual_host.split(",", 1)[0].strip().lower()
+    actual = urlparse(f"{expected.scheme}://{raw_actual_host}")
+    actual_host_name = (actual.hostname or "").lower()
+    actual_port = actual.port or _default_port(expected.scheme)
+
+    return actual_host_name == expected_host and actual_port == expected_port
 
 
 def _sign(secret: str, encoded_payload: str) -> str:
@@ -75,3 +84,11 @@ def _b64encode(value: bytes) -> str:
 def _b64decode(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode(value + padding)
+
+
+def _default_port(scheme: str) -> int:
+    if scheme in {"https", "wss"}:
+        return 443
+    if scheme in {"http", "ws"}:
+        return 80
+    raise ValueError(f"Unsupported URL scheme: {scheme}")
