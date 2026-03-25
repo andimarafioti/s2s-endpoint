@@ -22,6 +22,9 @@ COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS = int(
 )
 COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "300"))
 COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S", "10"))
+COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S = float(
+    os.getenv("COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S", "300")
+)
 COMPUTE_ENDPOINT_WAIT_TIMEOUT_S = int(os.getenv("COMPUTE_ENDPOINT_WAIT_TIMEOUT_S", "900"))
 COMPUTE_ENDPOINT_PARK_STRATEGY = os.getenv("COMPUTE_ENDPOINT_PARK_STRATEGY", "pause").strip().lower()
 HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TOKEN", "").strip() or None
@@ -52,6 +55,7 @@ def build_endpoint_router() -> EndpointPoolRouter:
         wake_threshold_slots=COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS,
         idle_park_timeout_s=COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S,
         reconcile_interval_s=COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S,
+        waking_capacity_timeout_s=COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S,
         controller=controller,
     )
 

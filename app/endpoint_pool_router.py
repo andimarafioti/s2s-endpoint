@@ -150,6 +150,7 @@ class ManagedEndpoint:
     parking: bool = False
     last_error: Optional[str] = None
     last_used_at: float = field(default_factory=time.monotonic)
+    wake_capacity_until: Optional[float] = None
 
     @property
     def running(self) -> bool:
@@ -178,6 +179,7 @@ class EndpointPoolRouter:
         wake_threshold_slots: int,
         idle_park_timeout_s: float,
         reconcile_interval_s: float,
+        waking_capacity_timeout_s: float,
         controller: EndpointController,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
@@ -191,12 +193,15 @@ class EndpointPoolRouter:
             raise ValueError("min_warm_endpoints cannot exceed number of endpoints")
         if wake_threshold_slots < 0:
             raise ValueError("wake_threshold_slots must be >= 0")
+        if waking_capacity_timeout_s < 0:
+            raise ValueError("waking_capacity_timeout_s must be >= 0")
 
         self.endpoint_slots = endpoint_slots
         self.min_warm_endpoints = min_warm_endpoints
         self.wake_threshold_slots = wake_threshold_slots
         self.idle_park_timeout_s = idle_park_timeout_s
         self.reconcile_interval_s = reconcile_interval_s
+        self.waking_capacity_timeout_s = waking_capacity_timeout_s
         self.controller = controller
 
         self._endpoints = {name: ManagedEndpoint(name=name, slots=endpoint_slots) for name in names}
@@ -282,6 +287,11 @@ class EndpointPoolRouter:
         waking = sum(1 for endpoint in endpoints if endpoint.waking)
         parking = sum(1 for endpoint in endpoints if endpoint.parking)
         free_slots = sum(endpoint.free_slots for endpoint in endpoints)
+        warming_slots = 0
+        now = time.monotonic()
+        for endpoint in endpoints:
+            if self._counts_as_warming_capacity(endpoint, now):
+                warming_slots += endpoint.slots
         active_sessions = sum(endpoint.active_sessions for endpoint in endpoints)
         errors = [
             {"endpoint": endpoint.name, "error": endpoint.last_error}
@@ -295,11 +305,14 @@ class EndpointPoolRouter:
             "min_warm_endpoints": self.min_warm_endpoints,
             "wake_threshold_slots": self.wake_threshold_slots,
             "idle_park_timeout_s": self.idle_park_timeout_s,
+            "waking_capacity_timeout_s": self.waking_capacity_timeout_s,
             "running_endpoints": running,
             "waking_endpoints": waking,
             "parking_endpoints": parking,
             "active_sessions": active_sessions,
             "free_slots": free_slots,
+            "warming_slots": warming_slots,
+            "effective_free_slots": free_slots + warming_slots,
             "endpoints": [
                 {
                     "name": endpoint.name,
@@ -309,6 +322,7 @@ class EndpointPoolRouter:
                     "parking": endpoint.parking,
                     "active_sessions": endpoint.active_sessions,
                     "free_slots": endpoint.free_slots,
+                    "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
                     "url": endpoint.url,
                     "last_error": endpoint.last_error,
                 }
@@ -336,6 +350,7 @@ class EndpointPoolRouter:
                 endpoint.url = result.url
                 if endpoint.running:
                     endpoint.waking = False
+                    endpoint.wake_capacity_until = None
                 if _is_parked_status(endpoint.status):
                     endpoint.parking = False
                 endpoint.last_error = None
@@ -364,6 +379,7 @@ class EndpointPoolRouter:
             async with self._condition:
                 endpoint = self._endpoints[name]
                 endpoint.waking = False
+                endpoint.wake_capacity_until = None
                 endpoint.last_error = str(exc)
                 self._last_error = endpoint.last_error
                 self._condition.notify_all()
@@ -376,6 +392,7 @@ class EndpointPoolRouter:
             endpoint.raw_status = snapshot.raw_status
             endpoint.url = snapshot.url
             endpoint.waking = False
+            endpoint.wake_capacity_until = None
             endpoint.parking = False
             endpoint.last_error = None
             self._last_error = None
@@ -390,6 +407,7 @@ class EndpointPoolRouter:
             async with self._condition:
                 endpoint = self._endpoints[name]
                 endpoint.parking = False
+                endpoint.wake_capacity_until = None
                 endpoint.last_error = str(exc)
                 self._last_error = endpoint.last_error
                 self._condition.notify_all()
@@ -402,6 +420,7 @@ class EndpointPoolRouter:
             endpoint.raw_status = snapshot.raw_status
             endpoint.url = snapshot.url
             endpoint.parking = False
+            endpoint.wake_capacity_until = None
             endpoint.last_error = None
             self._last_error = None
             self._condition.notify_all()
@@ -433,15 +452,17 @@ class EndpointPoolRouter:
         force: bool = False,
         target_count: Optional[int] = None,
     ) -> list[str]:
-        free_slots = self._free_slots_unlocked()
+        effective_free_slots = self._effective_free_slots_unlocked()
         if not force and target_count is None:
             # Keep the warm floor, but don't spin up extra endpoints while the
             # system is idle. Proactive wakes should only happen once there is
             # actual allocated session pressure.
             if self._active_sessions_unlocked() == 0:
                 return []
-            if free_slots > self.wake_threshold_slots:
+            if effective_free_slots >= self.wake_threshold_slots:
                 return []
+        elif force and target_count is None and effective_free_slots > 0:
+            return []
 
         if target_count is None:
             target_count = 1
@@ -456,6 +477,7 @@ class EndpointPoolRouter:
         selected = []
         for endpoint in candidates[:target_count]:
             endpoint.waking = True
+            endpoint.wake_capacity_until = time.monotonic() + self.waking_capacity_timeout_s
             endpoint.last_error = None
             selected.append(endpoint.name)
         return selected
@@ -509,17 +531,35 @@ class EndpointPoolRouter:
         return sum(1 for endpoint in self._endpoints.values() if endpoint.running and not endpoint.parking)
 
     def _running_or_waking_count_unlocked(self) -> int:
+        now = time.monotonic()
         return sum(
             1
             for endpoint in self._endpoints.values()
-            if (endpoint.running and not endpoint.parking) or endpoint.waking
+            if (endpoint.running and not endpoint.parking) or self._counts_as_warming_capacity(endpoint, now)
         )
 
     def _free_slots_unlocked(self) -> int:
         return sum(endpoint.free_slots for endpoint in self._endpoints.values())
 
+    def _effective_free_slots_unlocked(self) -> int:
+        now = time.monotonic()
+        return sum(endpoint.free_slots for endpoint in self._endpoints.values()) + sum(
+            endpoint.slots
+            for endpoint in self._endpoints.values()
+            if self._counts_as_warming_capacity(endpoint, now)
+        )
+
     def _active_sessions_unlocked(self) -> int:
         return sum(endpoint.active_sessions for endpoint in self._endpoints.values())
+
+    def _counts_as_warming_capacity(self, endpoint: ManagedEndpoint, now: float) -> bool:
+        return (
+            endpoint.waking
+            and not endpoint.parking
+            and not endpoint.running
+            and endpoint.wake_capacity_until is not None
+            and now < endpoint.wake_capacity_until
+        )
 
     def _spawn_wake_tasks(self, names: list[str]) -> None:
         for name in names:

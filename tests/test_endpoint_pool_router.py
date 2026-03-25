@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 
 from app.endpoint_pool_router import EndpointPoolRouter, EndpointSnapshot, _to_ws_url
@@ -56,9 +57,10 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
-            wake_threshold_slots=0,
+            wake_threshold_slots=1,
             idle_park_timeout_s=60,
             reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
             controller=controller,
         )
 
@@ -79,9 +81,10 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
-            wake_threshold_slots=0,
+            wake_threshold_slots=1,
             idle_park_timeout_s=60,
             reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
             controller=controller,
         )
 
@@ -109,6 +112,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             wake_threshold_slots=0,
             idle_park_timeout_s=0,
             reconcile_interval_s=0.05,
+            waking_capacity_timeout_s=300,
             controller=controller,
         )
 
@@ -133,6 +137,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             wake_threshold_slots=1,
             idle_park_timeout_s=60,
             reconcile_interval_s=0.05,
+            waking_capacity_timeout_s=300,
             controller=controller,
         )
 
@@ -157,6 +162,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             wake_threshold_slots=1,
             idle_park_timeout_s=60,
             reconcile_interval_s=0.05,
+            waking_capacity_timeout_s=300,
             controller=controller,
         )
 
@@ -166,6 +172,48 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.router.snapshot()
         self.assertEqual(snapshot["running_endpoints"], 1)
         self.assertEqual(controller.wake_calls, [])
+
+    async def test_warming_endpoint_counts_as_capacity_until_timeout(self):
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+                ("endpoint-b", "paused", None),
+                ("endpoint-c", "paused", None),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a", "endpoint-b", "endpoint-c"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            controller=controller,
+        )
+
+        now = time.monotonic()
+        async with self.router._condition:
+            endpoint_a = self.router._endpoints["endpoint-a"]
+            endpoint_a.status = "running"
+            endpoint_a.raw_status = "running"
+            endpoint_a.url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+            endpoint_a.active_sessions = 1
+
+            endpoint_b = self.router._endpoints["endpoint-b"]
+            endpoint_b.status = "paused"
+            endpoint_b.raw_status = "paused"
+            endpoint_b.waking = True
+            endpoint_b.wake_capacity_until = now + 300
+
+            endpoint_c = self.router._endpoints["endpoint-c"]
+            endpoint_c.status = "paused"
+            endpoint_c.raw_status = "paused"
+
+            self.assertEqual(self.router._mark_endpoints_to_wake_unlocked(), [])
+
+            endpoint_b.wake_capacity_until = now - 1
+            self.assertEqual(self.router._mark_endpoints_to_wake_unlocked(), ["endpoint-c"])
 
 
 class EndpointUrlTests(unittest.TestCase):
