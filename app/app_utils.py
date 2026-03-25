@@ -24,6 +24,11 @@ def setup_logging() -> logging.Logger:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
+    # The load balancer polls HF Endpoints frequently; INFO-level request logs
+    # from httpx/httpcore drown out the app's own operational logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     access_logger = logging.getLogger("uvicorn.access")
     if not any(isinstance(existing, SuppressHealthcheckAccessFilter) for existing in access_logger.filters):
         access_logger.addFilter(SuppressHealthcheckAccessFilter())
