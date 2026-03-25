@@ -435,7 +435,10 @@ class EndpointPoolRouter:
     ) -> list[str]:
         free_slots = self._free_slots_unlocked()
         if not force and target_count is None:
-            if self._running_or_waking_count_unlocked() == 0 and self._active_sessions_unlocked() == 0:
+            # Keep the warm floor, but don't spin up extra endpoints while the
+            # system is idle. Proactive wakes should only happen once there is
+            # actual allocated session pressure.
+            if self._active_sessions_unlocked() == 0:
                 return []
             if free_slots > self.wake_threshold_slots:
                 return []

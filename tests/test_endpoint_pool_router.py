@@ -143,6 +143,30 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["running_endpoints"], 0)
         self.assertEqual(controller.wake_calls, [])
 
+    async def test_reconcile_does_not_wake_extra_endpoints_while_idle_at_warm_floor(self):
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+                ("endpoint-b", "paused", None),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a", "endpoint-b"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=0.05,
+            controller=controller,
+        )
+
+        await self.router.start()
+        await asyncio.sleep(0.15)
+
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["running_endpoints"], 1)
+        self.assertEqual(controller.wake_calls, [])
+
 
 class EndpointUrlTests(unittest.TestCase):
     def test_to_ws_url_uses_ws_route(self):
