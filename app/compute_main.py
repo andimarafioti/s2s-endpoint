@@ -1,32 +1,17 @@
 import asyncio
-import logging
 import os
 import subprocess
-from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.responses import JSONResponse
 import websockets
-from websockets.exceptions import ConnectionClosed
 
+from app.app_utils import build_lifespan, setup_logging
 from app.session_router import SessionRouter
+from app.ws_proxy import proxy_websocket
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("s2s-endpoint")
-
-
-class SuppressHealthcheckAccessFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return "GET /health " not in record.getMessage()
-
-
-logging.getLogger("uvicorn.access").addFilter(SuppressHealthcheckAccessFilter())
-
-PORT = int(os.getenv("PORT", "7860"))
+logger = setup_logging()
 APP_ROLE = "compute"
 
 INTERNAL_WS_HOST = os.getenv("INTERNAL_WS_HOST", "127.0.0.1")
@@ -170,17 +155,7 @@ session_router = SessionRouter(
     wait_for_ready=wait_for_internal_ws,
 )
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await session_router.start()
-    try:
-        yield
-    finally:
-        await session_router.stop()
-
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=build_lifespan(session_router))
 
 
 @app.get("/")
@@ -222,63 +197,11 @@ async def health():
 
 @app.websocket("/ws")
 async def websocket_proxy(client_ws: WebSocket):
-    slot = None
-
-    try:
-        slot = await session_router.acquire(timeout_s=900.0)
-    except Exception as exc:
-        await client_ws.close(code=1013, reason="No pipeline capacity available")
-        logger.warning("Failed to allocate speech-to-speech slot: %s", exc)
-        return
-
-    await client_ws.accept()
-    logger.info("Client websocket connected to slot %s at %s", slot.slot_id, slot.ws_url)
-
-    try:
-        async with websockets.connect(
-            slot.ws_url,
-            open_timeout=30,
-            ping_interval=20,
-            ping_timeout=20,
-            max_size=None,
-        ) as upstream_ws:
-
-            async def client_to_upstream():
-                while True:
-                    message = await client_ws.receive()
-
-                    if message["type"] == "websocket.disconnect":
-                        raise WebSocketDisconnect()
-
-                    if "bytes" in message and message["bytes"] is not None:
-                        await upstream_ws.send(message["bytes"])
-                    elif "text" in message and message["text"] is not None:
-                        await upstream_ws.send(message["text"])
-
-            async def upstream_to_client():
-                while True:
-                    msg = await upstream_ws.recv()
-                    if isinstance(msg, bytes):
-                        await client_ws.send_bytes(msg)
-                    else:
-                        await client_ws.send_text(msg)
-
-            await asyncio.gather(client_to_upstream(), upstream_to_client())
-
-    except WebSocketDisconnect:
-        logger.info("Client websocket disconnected")
-    except ConnectionClosed:
-        logger.info("Upstream websocket disconnected")
-        try:
-            await client_ws.close()
-        except Exception:
-            pass
-    except Exception:
-        logger.exception("Websocket proxy failed")
-        try:
-            await client_ws.close(code=1011, reason="Proxy failure")
-        except Exception:
-            pass
-    finally:
-        if slot is not None:
-            await session_router.release(slot.slot_id)
+    await proxy_websocket(
+        client_ws,
+        acquire_lease=lambda timeout_s: session_router.acquire(timeout_s=timeout_s),
+        release_lease=session_router.release,
+        describe_lease=lambda slot: f"slot {slot.slot_id} at {slot.ws_url}",
+        no_capacity_reason="No pipeline capacity available",
+        no_capacity_log="Failed to allocate speech-to-speech slot",
+    )

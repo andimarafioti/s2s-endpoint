@@ -226,8 +226,6 @@ class EndpointPoolRouter:
         deadline = asyncio.get_event_loop().time() + timeout_s
 
         while True:
-            wake_names: list[str] = []
-
             async with self._condition:
                 self._raise_if_closed()
 
@@ -249,11 +247,9 @@ class EndpointPoolRouter:
                     raise RuntimeError("timed out waiting for an available compute endpoint")
                 await asyncio.wait_for(self._condition.wait(), timeout=remaining)
 
-            for name in wake_names:
-                asyncio.create_task(self._wake_endpoint(name))
+            self._spawn_wake_tasks(wake_names)
 
-        for name in wake_names:
-            asyncio.create_task(self._wake_endpoint(name))
+        self._spawn_wake_tasks(wake_names)
         return lease
 
     async def release(self, slot_id: str) -> None:
@@ -416,28 +412,20 @@ class EndpointPoolRouter:
                 await asyncio.sleep(self.reconcile_interval_s)
                 await self.refresh()
                 await self.ensure_min_warm()
-                self._schedule_wakes_if_needed()
-                self._schedule_parks_if_needed()
+                await self._schedule_wakes_if_needed()
+                await self._schedule_parks_if_needed()
         except asyncio.CancelledError:
             raise
 
-    def _schedule_wakes_if_needed(self) -> None:
-        async def _inner() -> None:
-            async with self._condition:
-                wake_names = self._mark_endpoints_to_wake_unlocked()
-            for name in wake_names:
-                asyncio.create_task(self._wake_endpoint(name))
+    async def _schedule_wakes_if_needed(self) -> None:
+        async with self._condition:
+            wake_names = self._mark_endpoints_to_wake_unlocked()
+        self._spawn_wake_tasks(wake_names)
 
-        asyncio.create_task(_inner())
-
-    def _schedule_parks_if_needed(self) -> None:
-        async def _inner() -> None:
-            async with self._condition:
-                park_names = self._mark_endpoints_to_park_unlocked()
-            for name in park_names:
-                asyncio.create_task(self._park_endpoint(name))
-
-        asyncio.create_task(_inner())
+    async def _schedule_parks_if_needed(self) -> None:
+        async with self._condition:
+            park_names = self._mark_endpoints_to_park_unlocked()
+        self._spawn_park_tasks(park_names)
 
     def _mark_endpoints_to_wake_unlocked(
         self,
@@ -529,6 +517,14 @@ class EndpointPoolRouter:
 
     def _active_sessions_unlocked(self) -> int:
         return sum(endpoint.active_sessions for endpoint in self._endpoints.values())
+
+    def _spawn_wake_tasks(self, names: list[str]) -> None:
+        for name in names:
+            asyncio.create_task(self._wake_endpoint(name))
+
+    def _spawn_park_tasks(self, names: list[str]) -> None:
+        for name in names:
+            asyncio.create_task(self._park_endpoint(name))
 
     def _raise_if_closed(self) -> None:
         if self._closed:
