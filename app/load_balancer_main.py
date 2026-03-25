@@ -1,12 +1,12 @@
 import os
-from typing import Optional
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
 
 from app.app_utils import build_lifespan, setup_logging
+from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointPoolRouter, HuggingFaceEndpointController
-from app.ws_proxy import proxy_websocket
 
 setup_logging()
 APP_ROLE = "load_balancer"
@@ -25,10 +25,14 @@ COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_RECONC
 COMPUTE_ENDPOINT_WAIT_TIMEOUT_S = int(os.getenv("COMPUTE_ENDPOINT_WAIT_TIMEOUT_S", "900"))
 COMPUTE_ENDPOINT_PARK_STRATEGY = os.getenv("COMPUTE_ENDPOINT_PARK_STRATEGY", "pause").strip().lower()
 HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TOKEN", "").strip() or None
-DOWNSTREAM_ENDPOINT_TOKEN = os.getenv("DOWNSTREAM_ENDPOINT_TOKEN", "").strip() or HF_CONTROL_TOKEN
+
+SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
+SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
+SESSION_TOKEN_TTL_S = float(os.getenv("SESSION_TOKEN_TTL_S", "86400"))
+SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
 
 
-def build_lb_router() -> EndpointPoolRouter:
+def build_endpoint_router() -> EndpointPoolRouter:
     if not COMPUTE_ENDPOINT_NAMES:
         raise RuntimeError("COMPUTE_ENDPOINT_NAMES must be set for the load-balancer app")
 
@@ -52,9 +56,15 @@ def build_lb_router() -> EndpointPoolRouter:
     )
 
 
-endpoint_router = build_lb_router()
+session_manager = DirectSessionManager(
+    endpoint_router=build_endpoint_router(),
+    session_shared_secret=SESSION_SHARED_SECRET,
+    pending_timeout_s=SESSION_PENDING_TIMEOUT_S,
+    session_token_ttl_s=SESSION_TOKEN_TTL_S,
+    reap_interval_s=SESSION_REAP_INTERVAL_S,
+)
 
-app = FastAPI(lifespan=build_lifespan(endpoint_router))
+app = FastAPI(lifespan=build_lifespan(session_manager))
 
 
 @app.get("/")
@@ -63,14 +73,14 @@ async def root():
         "message": "s2s load balancer endpoint is up",
         "role": APP_ROLE,
         "health": "/health",
-        "websocket": "/ws",
+        "session": "/session",
         "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
     }
 
 
 @app.get("/health")
 async def health():
-    healthy, detail, snapshot = await endpoint_router.healthcheck()
+    healthy, detail, snapshot = await session_manager.healthcheck()
     if not healthy:
         raise HTTPException(status_code=503, detail=detail or "endpoint router is not ready")
 
@@ -79,25 +89,40 @@ async def health():
             "status": "ok",
             "role": APP_ROLE,
             "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
-            "router": snapshot,
+            "sessions": snapshot,
         }
     )
 
 
-def build_upstream_headers() -> Optional[list[tuple[str, str]]]:
-    if not DOWNSTREAM_ENDPOINT_TOKEN:
-        return None
-    return [("Authorization", f"Bearer {DOWNSTREAM_ENDPOINT_TOKEN}")]
+@app.post("/session")
+async def create_session(request: Request):
+    try:
+        allocation = await session_manager.allocate(str(request.base_url))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
+
+    return JSONResponse(allocation)
+
+
+@app.post("/internal/sessions/{session_id}/event")
+async def session_event(session_id: str, payload: dict[str, Any]):
+    session_token = str(payload.get("session_token", "")).strip()
+    event = str(payload.get("event", "")).strip()
+    if not session_token:
+        raise HTTPException(status_code=400, detail="session_token is required")
+    if not event:
+        raise HTTPException(status_code=400, detail="event is required")
+
+    try:
+        result = await session_manager.handle_event(session_id, session_token, event)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown session id") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    return JSONResponse(result)
 
 
 @app.websocket("/ws")
-async def websocket_proxy(client_ws: WebSocket):
-    await proxy_websocket(
-        client_ws,
-        acquire_lease=lambda timeout_s: endpoint_router.acquire(timeout_s=timeout_s),
-        release_lease=endpoint_router.release,
-        describe_lease=lambda slot: f"endpoint {slot.endpoint_name} at {slot.ws_url}",
-        no_capacity_reason="No compute endpoint capacity available",
-        no_capacity_log="Failed to allocate compute endpoint slot",
-        additional_headers=build_upstream_headers(),
-    )
+async def deprecated_websocket_route(client_ws: WebSocket):
+    await client_ws.close(code=1008, reason="Use POST /session and connect directly to the returned compute websocket URL")

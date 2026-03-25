@@ -17,7 +17,7 @@ This repo now builds two different images with two different app entrypoints:
 - compute image: `Dockerfile`
   Starts `app.compute_main:app` on a GPU instance, runs local `speech-to-speech` subprocesses, and serves `/ws` directly.
 - load-balancer image: `Dockerfile.load_balancer`
-  Starts `app.load_balancer_main:app` on a CPU instance, tracks a configured set of pre-created compute endpoints, keeps a warm pool, wakes parked endpoints when free session capacity gets tight, and proxies `/ws` to the selected compute endpoint.
+  Starts `app.load_balancer_main:app` on a CPU instance, tracks a configured set of pre-created compute endpoints, keeps a warm pool, wakes parked endpoints when free session capacity gets tight, and allocates direct compute sessions for clients.
 
 This is intended for a deployment with:
 
@@ -42,17 +42,26 @@ Build the load-balancer image:
 docker build --platform linux/amd64 -f Dockerfile.load_balancer -t your-registry/s2s-endpoint-lb:latest .
 ```
 
-## URL Selection
+## Direct Session Flow
+
+The LB is no longer in the media path for websocket traffic.
+
+The flow is:
+
+1. Client calls `POST /session` on the LB.
+2. The LB reserves a compute endpoint slot and returns:
+   - a direct compute websocket URL
+   - a signed session token
+   - a convenience `connect_url` with the session token embedded as a query parameter
+3. Client connects directly to the compute endpoint `/ws`.
+4. Compute validates the session token and notifies the LB when the session starts and ends.
+
+This removes the LB from the websocket data path. The LB only handles control-plane allocation and release.
 
 In load-balancer mode, the app does not guess endpoint hostnames. It asks the
-Hugging Face API for each compute endpoint's canonical HTTPS URL and then turns
-that into a websocket URL by replacing `https://` with `wss://` and appending
+Hugging Face API for each compute endpoint's canonical HTTPS URL and turns that
+into the direct websocket URL by replacing `https://` with `wss://` and appending
 `/ws`.
-
-For example:
-
-- endpoint URL from HF API: `https://my-endpoint.endpoints.huggingface.cloud`
-- websocket URL used by the LB: `wss://my-endpoint.endpoints.huggingface.cloud/ws`
 
 ## Load Balancer Env Vars
 
@@ -67,15 +76,19 @@ For example:
 - `COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S`: background refresh interval
 - `COMPUTE_ENDPOINT_PARK_STRATEGY`: `pause` or `scale_to_zero`
 - `HF_CONTROL_TOKEN`: token used to call the Inference Endpoints API
-- `DOWNSTREAM_ENDPOINT_TOKEN`: optional token used by the LB when opening websocket
-  connections to protected compute endpoints
+- `SESSION_SHARED_SECRET`: shared secret used to mint and validate direct session tokens
+- `SESSION_PENDING_TIMEOUT_S`: how long an unused reservation stays alive
+- `SESSION_TOKEN_TTL_S`: lifetime of the signed session token
+- `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations
 
 ## Compute Env Vars
 
 - `PIPELINE_MAX_INSTANCES`: local `speech-to-speech` pipelines per compute endpoint
 - `PIPELINE_MIN_IDLE_INSTANCES`: warm local pipeline slots to keep ready
+- `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
+- `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
 
-The external websocket API remains `/ws` in both roles.
+The compute endpoint still serves `/ws`. The LB now serves `POST /session` for allocation.
 
 ## Create Compute Endpoints
 
@@ -87,6 +100,7 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --prefix reachy-s2s \
   --count 3 \
   --image-url your-registry/s2s-endpoint-compute:latest \
+  --session-shared-secret your-shared-secret \
   --instance-size x1 \
   --instance-type nvidia-a10g \
   --vendor aws \
@@ -99,6 +113,10 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
 The script prints the created endpoint names and HTTPS URLs as JSON. Those names
 should then be passed to the LB with `COMPUTE_ENDPOINT_NAMES`.
 
+For the direct-session architecture, compute endpoints are usually created as
+`public` endpoints so clients can connect directly after the LB assigns them a
+session token.
+
 ## Create Load Balancer Endpoint
 
 The repo also includes a helper script to create the CPU load-balancer endpoint:
@@ -108,6 +126,7 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --name reachy-s2s-lb \
   --namespace your-org \
   --image-url your-registry/s2s-endpoint-lb:latest \
+  --session-shared-secret your-shared-secret \
   --instance-size x2 \
   --instance-type intel-icl \
   --vendor aws \
@@ -118,6 +137,7 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --compute-endpoint-wake-threshold-slots 1 \
   --compute-endpoint-idle-park-timeout-s 300 \
   --compute-endpoint-park-strategy pause \
+  --session-pending-timeout-s 60 \
   --wait
 ```
 

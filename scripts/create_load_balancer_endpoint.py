@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--instance-type", required=True, help="CPU instance type, for example intel-icl")
     parser.add_argument("--image-url", required=True, help="Custom load-balancer image URL built from Dockerfile.load_balancer")
     parser.add_argument("--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the load-balancer image")
+    parser.add_argument("--session-shared-secret", required=True, help="Shared secret used to mint and validate direct session tokens")
     parser.add_argument("--compute-endpoint-names", required=True, help="Comma-separated compute endpoint names")
     parser.add_argument("--compute-endpoint-slots", type=int, default=1, help="Concurrent sessions each compute endpoint can handle")
     parser.add_argument("--compute-endpoint-min-warm", type=int, default=1, help="Warm compute endpoints to keep ready")
@@ -35,8 +36,10 @@ def main() -> None:
     parser.add_argument("--compute-endpoint-reconcile-interval-s", type=float, default=10, help="Refresh interval for compute endpoint state")
     parser.add_argument("--compute-endpoint-wait-timeout-s", type=int, default=900, help="Timeout while waiting for resumed compute endpoints")
     parser.add_argument("--compute-endpoint-park-strategy", choices=["pause", "scale_to_zero"], default="pause")
+    parser.add_argument("--session-pending-timeout-s", type=float, default=60, help="How long a reserved session can remain unused before release")
+    parser.add_argument("--session-token-ttl-s", type=float, default=86400, help="Lifetime of the signed session token")
+    parser.add_argument("--session-reap-interval-s", type=float, default=5, help="Background interval for releasing unused session reservations")
     parser.add_argument("--hf-endpoint-namespace", help="Namespace that owns the compute endpoints; defaults to --namespace")
-    parser.add_argument("--downstream-endpoint-token", help="Optional bearer token used by the LB when connecting to protected compute endpoints")
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY, help=argparse.SUPPRESS)
     parser.add_argument("--account-id", help="Optional account id")
     parser.add_argument("--revision", help="Optional repo revision")
@@ -67,10 +70,12 @@ def main() -> None:
             "COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S": str(args.compute_endpoint_reconcile_interval_s),
             "COMPUTE_ENDPOINT_WAIT_TIMEOUT_S": str(args.compute_endpoint_wait_timeout_s),
             "COMPUTE_ENDPOINT_PARK_STRATEGY": args.compute_endpoint_park_strategy,
+            "SESSION_SHARED_SECRET": args.session_shared_secret,
+            "SESSION_PENDING_TIMEOUT_S": str(args.session_pending_timeout_s),
+            "SESSION_TOKEN_TTL_S": str(args.session_token_ttl_s),
+            "SESSION_REAP_INTERVAL_S": str(args.session_reap_interval_s),
         }
     )
-    if args.downstream_endpoint_token:
-        env["DOWNSTREAM_ENDPOINT_TOKEN"] = args.downstream_endpoint_token
 
     custom_image = build_custom_image(args.image_url, args.image_health_route)
 

@@ -1,6 +1,9 @@
 import asyncio
+import json
 import os
 import subprocess
+import urllib.error
+import urllib.request
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket
@@ -9,6 +12,7 @@ import websockets
 
 from app.app_utils import build_lifespan, setup_logging
 from app.session_router import SessionRouter
+from app.session_tokens import verify_session_token, websocket_host_matches
 from app.ws_proxy import proxy_websocket
 
 logger = setup_logging()
@@ -44,6 +48,9 @@ OPEN_API_IMAGE_PATHS = os.getenv("OPEN_API_IMAGE_PATHS", "").strip()
 
 # Optional generic extras for power users
 EXTRA_S2S_ARGS = os.getenv("EXTRA_S2S_ARGS", "").strip()
+
+SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
+LB_CALLBACK_AUTH_TOKEN = os.getenv("LB_CALLBACK_AUTH_TOKEN", "").strip()
 
 
 def _add_bool_flag(cmd: list[str], enabled: bool, flag: str) -> None:
@@ -189,11 +196,104 @@ async def health():
 
 @app.websocket("/ws")
 async def websocket_proxy(client_ws: WebSocket):
-    await proxy_websocket(
-        client_ws,
-        acquire_lease=lambda timeout_s: session_router.acquire(timeout_s=timeout_s),
-        release_lease=session_router.release,
-        describe_lease=lambda slot: f"slot {slot.slot_id} at {slot.ws_url}",
-        no_capacity_reason="No pipeline capacity available",
-        no_capacity_log="Failed to allocate speech-to-speech slot",
-    )
+    session_payload = _get_session_payload(client_ws)
+    connected_notified = False
+
+    if SESSION_SHARED_SECRET and session_payload is None:
+        await client_ws.close(code=1008, reason="Missing or invalid session token")
+        return
+
+    try:
+        if session_payload is not None:
+            await _notify_lb_session_event(
+                session_payload["callback_url"],
+                session_payload["session_token"],
+                "connected",
+            )
+            connected_notified = True
+
+        await proxy_websocket(
+            client_ws,
+            acquire_lease=lambda timeout_s: session_router.acquire(timeout_s=timeout_s),
+            release_lease=session_router.release,
+            describe_lease=lambda slot: f"slot {slot.slot_id} at {slot.ws_url}",
+            no_capacity_reason="No pipeline capacity available",
+            no_capacity_log="Failed to allocate speech-to-speech slot",
+        )
+    except Exception as exc:
+        logger.warning("Rejected websocket session: %s", exc)
+        try:
+            await client_ws.close(code=1013, reason="Failed to establish reserved session")
+        except Exception:
+            pass
+    finally:
+        if connected_notified and session_payload is not None:
+            try:
+                await _notify_lb_session_event(
+                    session_payload["callback_url"],
+                    session_payload["session_token"],
+                    "disconnected",
+                )
+            except Exception:
+                logger.exception("Failed to notify LB that session ended")
+
+
+def _get_session_payload(client_ws: WebSocket) -> Optional[dict[str, str]]:
+    if not SESSION_SHARED_SECRET:
+        return None
+
+    session_token = _extract_session_token(client_ws)
+    if not session_token:
+        return None
+
+    try:
+        payload = verify_session_token(session_token, SESSION_SHARED_SECRET)
+    except ValueError:
+        logger.warning("Rejected websocket with invalid session token")
+        return None
+
+    request_host = client_ws.headers.get("host")
+    if not websocket_host_matches(str(payload["ws_url"]), request_host):
+        logger.warning("Rejected websocket for mismatched compute endpoint host %s", request_host)
+        return None
+
+    payload["session_token"] = session_token
+    return payload
+
+
+def _extract_session_token(client_ws: WebSocket) -> Optional[str]:
+    query_token = client_ws.query_params.get("session_token", "").strip()
+    if query_token:
+        return query_token
+
+    auth_header = client_ws.headers.get("authorization", "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+
+    return None
+
+
+async def _notify_lb_session_event(callback_url: str, session_token: str, event: str) -> None:
+    payload = {
+        "session_token": session_token,
+        "event": event,
+    }
+    await asyncio.to_thread(_post_json, callback_url, payload)
+
+
+def _post_json(url: str, payload: dict[str, str]) -> None:
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if LB_CALLBACK_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {LB_CALLBACK_AUTH_TOKEN}"
+
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            status_code = getattr(response, "status", 200)
+            if status_code >= 400:
+                raise RuntimeError(f"LB callback failed with HTTP {status_code}")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"LB callback failed with HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"LB callback failed: {exc.reason}") from exc
