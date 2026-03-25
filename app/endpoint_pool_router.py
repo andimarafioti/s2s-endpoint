@@ -180,6 +180,7 @@ class EndpointPoolRouter:
         idle_park_timeout_s: float,
         reconcile_interval_s: float,
         waking_capacity_timeout_s: float,
+        park_cooldown_s: float,
         controller: EndpointController,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
@@ -195,6 +196,8 @@ class EndpointPoolRouter:
             raise ValueError("wake_threshold_slots must be >= 0")
         if waking_capacity_timeout_s < 0:
             raise ValueError("waking_capacity_timeout_s must be >= 0")
+        if park_cooldown_s < 0:
+            raise ValueError("park_cooldown_s must be >= 0")
 
         self.endpoint_slots = endpoint_slots
         self.min_warm_endpoints = min_warm_endpoints
@@ -202,6 +205,7 @@ class EndpointPoolRouter:
         self.idle_park_timeout_s = idle_park_timeout_s
         self.reconcile_interval_s = reconcile_interval_s
         self.waking_capacity_timeout_s = waking_capacity_timeout_s
+        self.park_cooldown_s = park_cooldown_s
         self.controller = controller
 
         self._endpoints = {name: ManagedEndpoint(name=name, slots=endpoint_slots) for name in names}
@@ -210,6 +214,7 @@ class EndpointPoolRouter:
         self._closed = False
         self._reconcile_task: Optional[asyncio.Task] = None
         self._last_error: Optional[str] = None
+        self._next_park_allowed_at = 0.0
 
     async def start(self) -> None:
         await self.refresh()
@@ -306,6 +311,8 @@ class EndpointPoolRouter:
             "wake_threshold_slots": self.wake_threshold_slots,
             "idle_park_timeout_s": self.idle_park_timeout_s,
             "waking_capacity_timeout_s": self.waking_capacity_timeout_s,
+            "park_cooldown_s": self.park_cooldown_s,
+            "park_cooldown_remaining_s": max(self._next_park_allowed_at - now, 0.0),
             "running_endpoints": running,
             "waking_endpoints": waking,
             "parking_endpoints": parking,
@@ -483,6 +490,10 @@ class EndpointPoolRouter:
         return selected
 
     def _mark_endpoints_to_park_unlocked(self) -> list[str]:
+        now = time.monotonic()
+        if now < self._next_park_allowed_at:
+            return []
+
         eligible = [
             endpoint
             for endpoint in self._endpoints.values()
@@ -490,14 +501,14 @@ class EndpointPoolRouter:
         ]
         eligible.sort(key=lambda item: item.last_used_at)
 
-        selected = []
         running_count = self._running_count_unlocked()
         for endpoint in eligible:
-            if running_count - len(selected) <= self.min_warm_endpoints:
-                break
+            if running_count - 1 < self.min_warm_endpoints:
+                return []
             endpoint.parking = True
-            selected.append(endpoint.name)
-        return selected
+            self._next_park_allowed_at = now + self.park_cooldown_s
+            return [endpoint.name]
+        return []
 
     def _should_park_endpoint_unlocked(self, endpoint: ManagedEndpoint) -> bool:
         if not endpoint.running or endpoint.waking or endpoint.parking:
