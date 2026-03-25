@@ -25,8 +25,8 @@ def main() -> None:
     parser.add_argument("--region", required=True, help="Cloud region")
     parser.add_argument("--instance-size", required=True, help="CPU instance size, for example x2")
     parser.add_argument("--instance-type", required=True, help="CPU instance type, for example intel-icl")
-    parser.add_argument("--image-url", required=True, help="Custom image URL for this app")
-    parser.add_argument("--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the image")
+    parser.add_argument("--image-url", required=True, help="Custom load-balancer image URL built from Dockerfile.load_balancer")
+    parser.add_argument("--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the load-balancer image")
     parser.add_argument("--compute-endpoint-names", required=True, help="Comma-separated compute endpoint names")
     parser.add_argument("--compute-endpoint-slots", type=int, default=1, help="Concurrent sessions each compute endpoint can handle")
     parser.add_argument("--compute-endpoint-min-warm", type=int, default=1, help="Warm compute endpoints to keep ready")
@@ -58,7 +58,6 @@ def main() -> None:
     compute_namespace = args.hf_endpoint_namespace or args.namespace or ""
     env.update(
         {
-            "APP_ROLE": "load_balancer",
             "HF_ENDPOINT_NAMESPACE": compute_namespace,
             "COMPUTE_ENDPOINT_NAMES": args.compute_endpoint_names,
             "COMPUTE_ENDPOINT_SLOTS": str(args.compute_endpoint_slots),

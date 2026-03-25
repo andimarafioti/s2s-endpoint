@@ -10,17 +10,14 @@ tags:
 
 Speech-to-speech endpoint project.
 
-## Roles
+## Deployment Split
 
-The same container can run in two different roles:
+This repo now builds two different images with two different app entrypoints:
 
-- `APP_ROLE=compute`
-  Runs local `speech-to-speech` subprocesses and serves `/ws` directly.
-- `APP_ROLE=load_balancer`
-  Does not start local `speech-to-speech`. Instead, it tracks a configured set of
-  pre-created Hugging Face Inference Endpoints, keeps a warm pool, wakes parked
-  endpoints when free session capacity gets tight, and proxies `/ws` to the selected
-  compute endpoint.
+- compute image: `Dockerfile`
+  Starts `app.compute_main:app` on a GPU instance, runs local `speech-to-speech` subprocesses, and serves `/ws` directly.
+- load-balancer image: `Dockerfile.load_balancer`
+  Starts `app.load_balancer_main:app` on a CPU instance, tracks a configured set of pre-created compute endpoints, keeps a warm pool, wakes parked endpoints when free session capacity gets tight, and proxies `/ws` to the selected compute endpoint.
 
 This is intended for a deployment with:
 
@@ -30,6 +27,20 @@ This is intended for a deployment with:
 
 The load balancer keeps session counts in memory, so it should run as a single
 replica unless you add shared state outside this repo.
+
+## Build Images
+
+Build the compute image:
+
+```bash
+docker build --platform linux/amd64 -t your-registry/s2s-endpoint-compute:latest .
+```
+
+Build the load-balancer image:
+
+```bash
+docker build --platform linux/amd64 -f Dockerfile.load_balancer -t your-registry/s2s-endpoint-lb:latest .
+```
 
 ## URL Selection
 
@@ -45,7 +56,6 @@ For example:
 
 ## Load Balancer Env Vars
 
-- `APP_ROLE=load_balancer`
 - `HF_ENDPOINT_NAMESPACE`: namespace that owns the compute endpoints
 - `COMPUTE_ENDPOINT_NAMES`: comma-separated endpoint names
 - `COMPUTE_ENDPOINT_SLOTS`: concurrent sessions each compute endpoint can handle
@@ -62,7 +72,6 @@ For example:
 
 ## Compute Env Vars
 
-- `APP_ROLE=compute`
 - `PIPELINE_MAX_INSTANCES`: local `speech-to-speech` pipelines per compute endpoint
 - `PIPELINE_MIN_IDLE_INSTANCES`: warm local pipeline slots to keep ready
 
@@ -77,7 +86,7 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --namespace your-org \
   --prefix reachy-s2s \
   --count 3 \
-  --image-url your-registry/andito-s2s-endpoint:latest \
+  --image-url your-registry/s2s-endpoint-compute:latest \
   --instance-size x1 \
   --instance-type nvidia-a10g \
   --vendor aws \
@@ -98,7 +107,7 @@ The repo also includes a helper script to create the CPU load-balancer endpoint:
 uv run --with-requirements requirements.txt python scripts/create_load_balancer_endpoint.py \
   --name reachy-s2s-lb \
   --namespace your-org \
-  --image-url your-registry/andito-s2s-endpoint:latest \
+  --image-url your-registry/s2s-endpoint-lb:latest \
   --instance-size x2 \
   --instance-type intel-icl \
   --vendor aws \
@@ -112,15 +121,15 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --wait
 ```
 
-Both scripts are specific to this repo and expect the same custom image to be
-used in two roles:
+Both scripts are specific to this repo and expect the role-specific images:
 
-- compute endpoints: `APP_ROLE=compute` on GPU instances
-- load balancer endpoint: `APP_ROLE=load_balancer` on a CPU instance
+- compute endpoints: image built from `Dockerfile`
+- load balancer endpoint: image built from `Dockerfile.load_balancer`
 
 ## Files
 - `app/`: application code
 - `scripts/`: helper scripts
-- `Dockerfile`: container definition
+- `Dockerfile`: compute container definition
+- `Dockerfile.load_balancer`: load-balancer container definition
 - `requirements.txt`: Python dependencies
 - `test_ws_file.py`: websocket test client

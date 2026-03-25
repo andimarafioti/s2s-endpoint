@@ -28,8 +28,8 @@ def main() -> None:
     parser.add_argument("--region", required=True, help="Cloud region")
     parser.add_argument("--instance-size", required=True, help="Instance size, for example x1")
     parser.add_argument("--instance-type", required=True, help="GPU instance type, for example nvidia-a10g")
-    parser.add_argument("--image-url", required=True, help="Custom image URL for this app")
-    parser.add_argument("--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the image")
+    parser.add_argument("--image-url", required=True, help="Custom compute image URL built from Dockerfile")
+    parser.add_argument("--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the compute image")
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY, help=argparse.SUPPRESS)
     parser.add_argument("--account-id", help="Optional account id")
     parser.add_argument("--revision", help="Optional repo revision")
@@ -55,7 +55,6 @@ def main() -> None:
 
     env.update(
         {
-            "APP_ROLE": "compute",
             "PIPELINE_MAX_INSTANCES": str(args.pipeline_max_instances),
             "PIPELINE_MIN_IDLE_INSTANCES": str(args.pipeline_min_idle_instances),
         }

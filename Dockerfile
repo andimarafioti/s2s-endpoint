@@ -1,3 +1,4 @@
+# Compute image: runs local speech-to-speech pipelines on a GPU instance.
 FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
 ARG S2S_REF=main
 
@@ -34,4 +35,4 @@ COPY app /app/app
 
 EXPOSE 7860
 
-CMD ["uv", "run", "--directory", "/app", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["uvicorn", "app.compute_main:app", "--host", "0.0.0.0", "--port", "7860"]
