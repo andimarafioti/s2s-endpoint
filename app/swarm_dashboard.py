@@ -920,9 +920,13 @@ def _dashboard_html() -> str:
     }
 
     function renderHealth(current) {
+      const warmingCount = Number(current.warming_endpoints || 0);
+      const transitioningCount = Number(current.transitioning_endpoints || 0);
+      const changingCount = Math.max(warmingCount, transitioningCount);
+      const changingLabel = transitioningCount > 0 ? 'transitioning' : 'warming';
       const badges = [
         `<span class="status-pill ${statusClass(current.healthy, current.errors_count)}">${current.healthy ? 'Healthy' : 'Degraded'}</span>`,
-        `<span class="status-pill ${current.warming_endpoints || current.transitioning_endpoints ? 'warm' : 'good'}">warming ${htmlEscape(prettyNumber(current.warming_endpoints + current.transitioning_endpoints))}</span>`,
+        `<span class="status-pill ${changingCount ? 'warm' : 'good'}">${htmlEscape(changingLabel)} ${htmlEscape(prettyNumber(changingCount))}</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(current.parked_endpoints))} parked</span>`,
       ];
       document.getElementById('health-badges').innerHTML = badges.join(' ');
