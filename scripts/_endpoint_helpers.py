@@ -48,3 +48,23 @@ def build_custom_image(url: str, health_route: str, port: int) -> dict[str, str 
         "health_route": health_route,
         "port": port,
     }
+
+
+def current_model_env(raw: dict[str, Any]) -> dict[str, str]:
+    model = raw.get("model") or {}
+    env = model.get("env") or {}
+    if not isinstance(env, dict):
+        raise ValueError("endpoint model env must be a dictionary")
+    return {str(key): str(value) for key, value in env.items()}
+
+
+def merge_env_updates(
+    current_env: dict[str, str] | None,
+    updates: dict[str, str],
+    unset_keys: list[str],
+) -> dict[str, str]:
+    merged = dict(current_env or {})
+    merged.update(updates)
+    for key in unset_keys:
+        merged.pop(key, None)
+    return merged

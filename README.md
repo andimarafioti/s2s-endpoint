@@ -123,6 +123,32 @@ With the current defaults, compute endpoints also need an `HF_TOKEN` or
 `OPEN_API_API_KEY` secret at runtime because the speech-to-speech wrapper
 defaults to `LLM=open_api`.
 
+## Update Compute Endpoint Env
+
+To update env vars across an existing compute pool, use the dedicated updater:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_compute_endpoints_env.py \
+  --namespace your-org \
+  --prefix reachy-s2s \
+  --count 8 \
+  --env OPEN_API_MODEL_NAME=Qwen/Qwen3.5-72B:together \
+  --wait
+```
+
+The script fetches each endpoint's current env, merges the requested changes,
+and sends the full updated env back to Hugging Face one endpoint at a time.
+That matters because the endpoint update API replaces the env payload instead of
+patching it.
+
+Useful options:
+
+- `--unset-env KEY`: remove an env var from every selected compute endpoint
+- `--env-file path.json`: load several env updates from JSON
+- `--dry-run`: print the planned changes without applying them
+- `--no-wait`: submit updates without waiting for each endpoint to return to
+  `running`
+
 ## Create Load Balancer Endpoint
 
 The repo also includes a helper script to create the CPU load-balancer endpoint:
