@@ -2,7 +2,7 @@ import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 
-from app import main
+from app import compute_main
 
 
 class WaitForInternalWSTests(unittest.IsolatedAsyncioTestCase):
@@ -17,13 +17,18 @@ class WaitForInternalWSTests(unittest.IsolatedAsyncioTestCase):
 
         open_connection = AsyncMock(side_effect=AssertionError("raw TCP probe should not be used"))
 
-        with patch.object(main.websockets, "connect", fake_connect), patch.object(
-            main.asyncio, "open_connection", open_connection
+        with patch.object(compute_main.websockets, "connect", fake_connect), patch.object(
+            compute_main.asyncio, "open_connection", open_connection
         ):
-            await main.wait_for_internal_ws(timeout_s=0.01)
+            await compute_main.wait_for_internal_ws(
+                compute_main.INTERNAL_WS_HOST,
+                compute_main.INTERNAL_WS_BASE_PORT,
+                None,
+                timeout_s=0.01,
+            )
 
         open_connection.assert_not_called()
-        self.assertEqual(observed["args"], (main.INTERNAL_WS_URL,))
+        self.assertEqual(observed["args"], (compute_main.INTERNAL_WS_URL,))
         self.assertEqual(
             observed["kwargs"],
             {
