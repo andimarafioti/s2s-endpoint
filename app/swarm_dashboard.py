@@ -743,6 +743,116 @@ def _dashboard_html() -> str:
     .status-pill.warm { color: var(--warm); background: rgba(217, 130, 43, 0.12); }
     .status-pill.bad { color: var(--danger); background: rgba(187, 45, 59, 0.10); }
 
+    .fleet-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 4px 0 14px;
+    }
+
+    .fleet-wall {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 14px;
+    }
+
+    .endpoint-tile {
+      position: relative;
+      border: 1px solid rgba(24, 33, 37, 0.10);
+      border-radius: 18px;
+      padding: 16px 16px 14px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.88), rgba(255,255,255,0.64));
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.4);
+    }
+
+    .endpoint-tile::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 6px;
+      border-radius: 18px 0 0 18px;
+      background: rgba(24, 33, 37, 0.12);
+    }
+
+    .endpoint-tile.state-running::before { background: var(--good); }
+    .endpoint-tile.state-warm::before { background: var(--warm); }
+    .endpoint-tile.state-parked::before { background: #8b969b; }
+    .endpoint-tile.state-error::before { background: var(--danger); }
+
+    .endpoint-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+    }
+
+    .endpoint-name {
+      font-family: "Menlo", "Consolas", monospace;
+      font-size: 13px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .endpoint-badges {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 6px;
+    }
+
+    .tiny-pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      background: rgba(24, 33, 37, 0.06);
+      color: var(--muted);
+    }
+
+    .endpoint-stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .endpoint-stat-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+
+    .endpoint-stat-value {
+      margin-top: 4px;
+      font-size: 24px;
+      line-height: 1;
+      letter-spacing: -0.05em;
+    }
+
+    .endpoint-meter {
+      margin-top: 14px;
+      height: 10px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(24, 33, 37, 0.08);
+    }
+
+    .endpoint-meter-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #0b5cab, #117a65);
+    }
+
+    .endpoint-flags {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      min-height: 16px;
+    }
+
     .muted { color: var(--muted); }
     .mono { font-family: "Menlo", "Consolas", monospace; }
     .footer-note { margin-top: 14px; color: var(--muted); font-size: 13px; }
@@ -831,21 +941,9 @@ def _dashboard_html() -> str:
 
       <div class="panel card span-12">
         <div class="label">Current Fleet</div>
-        <h2>Endpoint Table</h2>
-        <div style="overflow:auto;">
-          <table>
-            <thead>
-              <tr>
-                <th>Endpoint</th>
-                <th>Status</th>
-                <th>Active Sessions</th>
-                <th>Free Slots</th>
-                <th>Flags</th>
-              </tr>
-            </thead>
-            <tbody id="endpoint-table"></tbody>
-          </table>
-        </div>
+        <h2>Endpoint Wall</h2>
+        <div class="fleet-summary" id="fleet-summary"></div>
+        <div class="fleet-wall" id="endpoint-wall"></div>
       </div>
     </section>
   </div>
@@ -933,27 +1031,95 @@ def _dashboard_html() -> str:
       document.getElementById('health-detail').textContent = current.detail || 'Swarm snapshot is current.';
     }
 
-    function renderEndpointTable(endpoints) {
-      const rows = endpoints.map((endpoint) => {
-        const rawStatus = endpoint.status || 'unknown';
-        const normalized = String(rawStatus).toLowerCase();
-        const klass = normalized.includes('running') ? 'good' : (normalized.includes('init') || normalized.includes('updat') || endpoint.waking ? 'warm' : 'bad');
+    function endpointVisualState(endpoint) {
+      const rawStatus = String(endpoint.status || 'unknown').toLowerCase();
+      if (endpoint.last_error) return 'error';
+      if (endpoint.waking || rawStatus.includes('init') || rawStatus.includes('updat')) return 'warm';
+      if (rawStatus.includes('run')) return 'running';
+      if (rawStatus.includes('pause') || rawStatus.includes('scale')) return 'parked';
+      return 'error';
+    }
+
+    function endpointSortWeight(endpoint) {
+      const state = endpointVisualState(endpoint);
+      if (state === 'error') return 0;
+      if (Number(endpoint.active_sessions || 0) > 0) return 1;
+      if (state === 'warm') return 2;
+      if (state === 'running') return 3;
+      return 4;
+    }
+
+    function renderEndpointWall(endpoints) {
+      const sorted = [...endpoints].sort((left, right) => {
+        const weightDiff = endpointSortWeight(left) - endpointSortWeight(right);
+        if (weightDiff !== 0) return weightDiff;
+        const activeDiff = Number(right.active_sessions || 0) - Number(left.active_sessions || 0);
+        if (activeDiff !== 0) return activeDiff;
+        return String(left.name || '').localeCompare(String(right.name || ''));
+      });
+
+      const counts = { running: 0, warm: 0, parked: 0, error: 0 };
+      for (const endpoint of sorted) {
+        counts[endpointVisualState(endpoint)] += 1;
+      }
+
+      document.getElementById('fleet-summary').innerHTML = [
+        `<span class="status-pill good">${htmlEscape(prettyNumber(counts.running))} running</span>`,
+        `<span class="status-pill warm">${htmlEscape(prettyNumber(counts.warm))} changing</span>`,
+        `<span class="status-pill">${htmlEscape(prettyNumber(counts.parked))} parked</span>`,
+        `<span class="status-pill bad">${htmlEscape(prettyNumber(counts.error))} error</span>`,
+      ].join('');
+
+      const cards = sorted.map((endpoint) => {
+        const state = endpointVisualState(endpoint);
+        const activeSessions = Number(endpoint.active_sessions || 0);
+        const freeSlots = Number(endpoint.free_slots || 0);
+        const totalSlots = Math.max(activeSessions + freeSlots, 1);
+        const utilizationPct = Math.max(0, Math.min(100, (activeSessions / totalSlots) * 100));
+        const statusLabel =
+          state === 'running' ? 'good' :
+          state === 'warm' ? 'warm' :
+          state === 'parked' ? '' : 'bad';
         const flags = [
           endpoint.waking ? 'waking' : null,
           endpoint.parking ? 'parking' : null,
           endpoint.last_error ? 'error' : null,
-        ].filter(Boolean).join(', ') || '—';
+        ].filter(Boolean);
+
         return `
-          <tr>
-            <td class="mono">${htmlEscape(endpoint.name)}</td>
-            <td><span class="status-pill ${klass}">${htmlEscape(rawStatus)}</span></td>
-            <td>${htmlEscape(prettyNumber(endpoint.active_sessions || 0))}</td>
-            <td>${htmlEscape(prettyNumber(endpoint.free_slots || 0))}</td>
-            <td class="muted">${htmlEscape(flags)}</td>
-          </tr>
+          <article class="endpoint-tile state-${htmlEscape(state)}">
+            <div class="endpoint-top">
+              <div>
+                <div class="endpoint-name">${htmlEscape(endpoint.name || 'unknown')}</div>
+                <div class="muted" style="margin-top:6px;">${htmlEscape(endpoint.status || 'unknown')}</div>
+              </div>
+              <div class="endpoint-badges">
+                <span class="status-pill ${statusLabel}">${htmlEscape(state)}</span>
+              </div>
+            </div>
+            <div class="endpoint-stats">
+              <div>
+                <div class="endpoint-stat-label">Users</div>
+                <div class="endpoint-stat-value">${htmlEscape(prettyNumber(activeSessions))}</div>
+              </div>
+              <div>
+                <div class="endpoint-stat-label">Free</div>
+                <div class="endpoint-stat-value">${htmlEscape(prettyNumber(freeSlots))}</div>
+              </div>
+              <div>
+                <div class="endpoint-stat-label">Use</div>
+                <div class="endpoint-stat-value">${htmlEscape(prettyNumber(utilizationPct))}%</div>
+              </div>
+            </div>
+            <div class="endpoint-meter">
+              <div class="endpoint-meter-fill" style="width:${utilizationPct}%;"></div>
+            </div>
+            <div class="endpoint-flags">${htmlEscape(flags.join(' • ') || 'stable')}</div>
+          </article>
         `;
       }).join('');
-      document.getElementById('endpoint-table').innerHTML = rows;
+
+      document.getElementById('endpoint-wall').innerHTML = cards;
     }
 
     function drawChart(canvas, points, seriesConfig) {
@@ -1034,7 +1200,7 @@ def _dashboard_html() -> str:
       renderHeroStats(current, summary);
       renderKpis(current, summary);
       renderHealth(current);
-      renderEndpointTable(current.endpoints || []);
+      renderEndpointWall(current.endpoints || []);
 
       drawChart(document.getElementById('endpoints-chart'), series, [
         { key: 'running_endpoints', color: '#117a65' },
