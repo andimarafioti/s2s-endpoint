@@ -63,6 +63,22 @@ Hugging Face API for each compute endpoint's canonical HTTPS URL and turns that
 into the direct websocket URL by replacing `https://` with `wss://` and appending
 `/ws`.
 
+## Swarm Dashboard
+
+The load balancer now exposes a built-in dashboard:
+
+- `GET /dashboard`: HTML dashboard for the current swarm
+- `GET /dashboard/data`: JSON feed used by the dashboard UI
+
+The dashboard keeps an in-memory rolling history on the LB itself and shows:
+
+- running, warming, transitioning, and parked endpoint counts
+- connected and pending user sessions
+- free slots and effective free capacity
+- `POST /session` request counts, allocation successes/failures, and connect/disconnect events
+
+The timeline automatically switches between minute-level and hourly rollups depending on the selected window. Because the history is in memory, it resets when the LB endpoint restarts.
+
 ## Load Balancer Env Vars
 
 - `HF_ENDPOINT_NAMESPACE`: namespace that owns the compute endpoints
@@ -80,6 +96,8 @@ into the direct websocket URL by replacing `https://` with `wss://` and appendin
 - `SESSION_PENDING_TIMEOUT_S`: how long an unused reservation stays alive
 - `SESSION_TOKEN_TTL_S`: lifetime of the signed session token
 - `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations
+- `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
+- `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
 
 ## Compute Env Vars
 
