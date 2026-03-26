@@ -136,6 +136,21 @@ uv run --with-requirements requirements.txt python scripts/update_compute_endpoi
   --wait
 ```
 
+For the Qwen3 CustomVoice setup we used in production, the update command was:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_compute_endpoints_env.py \
+  --namespace HuggingFaceM4 \
+  --prefix reachy-s2s \
+  --count 8 \
+  --env 'EXTRA_S2S_ARGS=--qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --qwen3_tts_speaker Aiden --qwen3_tts_language English --qwen3_tts_ref_audio=' \
+  --no-wait
+```
+
+The trailing `--qwen3_tts_ref_audio=` is intentional. Without it, the upstream
+Qwen3 TTS handler keeps its default reference audio path and incorrectly takes
+the voice-cloning path even when you are using a `CustomVoice` model.
+
 The script fetches each endpoint's current env, merges the requested changes,
 and sends the full updated env back to Hugging Face one endpoint at a time.
 That matters because the endpoint update API replaces the env payload instead of
