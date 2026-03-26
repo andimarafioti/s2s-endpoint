@@ -853,6 +853,48 @@ def _dashboard_html() -> str:
       min-height: 16px;
     }
 
+    .mini-chart-shell {
+      margin-top: 16px;
+      display: grid;
+      grid-template-columns: minmax(0, 200px) 1fr;
+      gap: 14px;
+      align-items: center;
+    }
+
+    .mini-chart-shell canvas {
+      height: 200px;
+      background: transparent;
+      border: 0;
+    }
+
+    .mini-legend {
+      display: grid;
+      gap: 8px;
+      align-content: center;
+    }
+
+    .mini-legend-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 13px;
+    }
+
+    .mini-legend-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+    }
+
+    .mini-legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+
     .muted { color: var(--muted); }
     .mono { font-family: "Menlo", "Consolas", monospace; }
     .footer-note { margin-top: 14px; color: var(--muted); font-size: 13px; }
@@ -860,6 +902,12 @@ def _dashboard_html() -> str:
     @media (max-width: 1100px) {
       .hero, .kpis { grid-template-columns: 1fr; }
       .span-4, .span-6, .span-8 { grid-column: span 12; }
+    }
+
+    @media (max-width: 720px) {
+      .mini-chart-shell {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -936,6 +984,10 @@ def _dashboard_html() -> str:
         <div class="label">Now</div>
         <h2>Swarm Health</h2>
         <div id="health-badges"></div>
+        <div class="mini-chart-shell">
+          <canvas id="health-pie-chart" width="220" height="220"></canvas>
+          <div class="mini-legend" id="health-pie-legend"></div>
+        </div>
         <div class="footer-note" id="health-detail"></div>
       </div>
 
@@ -1017,18 +1069,27 @@ def _dashboard_html() -> str:
       ].join('');
     }
 
+    function countEndpointStates(endpoints) {
+      const counts = { running: 0, warm: 0, parked: 0, error: 0 };
+      for (const endpoint of endpoints) {
+        counts[endpointVisualState(endpoint)] += 1;
+      }
+      return counts;
+    }
+
     function renderHealth(current) {
-      const warmingCount = Number(current.warming_endpoints || 0);
-      const transitioningCount = Number(current.transitioning_endpoints || 0);
-      const changingCount = Math.max(warmingCount, transitioningCount);
-      const changingLabel = transitioningCount > 0 ? 'transitioning' : 'warming';
+      const counts = countEndpointStates(current.endpoints || []);
       const badges = [
-        `<span class="status-pill ${statusClass(current.healthy, current.errors_count)}">${current.healthy ? 'Healthy' : 'Degraded'}</span>`,
-        `<span class="status-pill ${changingCount ? 'warm' : 'good'}">${htmlEscape(changingLabel)} ${htmlEscape(prettyNumber(changingCount))}</span>`,
-        `<span class="status-pill">${htmlEscape(prettyNumber(current.parked_endpoints))} parked</span>`,
+        `<span class="status-pill good">healthy ${htmlEscape(prettyNumber(counts.running))}</span>`,
+        `<span class="status-pill ${counts.warm ? 'warm' : 'good'}">changing ${htmlEscape(prettyNumber(counts.warm))}</span>`,
+        `<span class="status-pill">${htmlEscape(prettyNumber(counts.parked))} parked</span>`,
+        `<span class="status-pill ${counts.error || !current.healthy ? 'bad' : 'good'}">error ${htmlEscape(prettyNumber(counts.error))}</span>`,
       ];
       document.getElementById('health-badges').innerHTML = badges.join(' ');
-      document.getElementById('health-detail').textContent = current.detail || 'Swarm snapshot is current.';
+      document.getElementById('health-detail').textContent =
+        current.detail || (current.healthy ? 'Swarm snapshot is current.' : 'The load balancer reports degraded routing health.');
+      drawStatePieChart(document.getElementById('health-pie-chart'), counts);
+      renderStateLegend(document.getElementById('health-pie-legend'), counts);
     }
 
     function endpointVisualState(endpoint) {
@@ -1058,10 +1119,7 @@ def _dashboard_html() -> str:
         return String(left.name || '').localeCompare(String(right.name || ''));
       });
 
-      const counts = { running: 0, warm: 0, parked: 0, error: 0 };
-      for (const endpoint of sorted) {
-        counts[endpointVisualState(endpoint)] += 1;
-      }
+      const counts = countEndpointStates(sorted);
 
       document.getElementById('fleet-summary').innerHTML = [
         `<span class="status-pill good">${htmlEscape(prettyNumber(counts.running))} running</span>`,
@@ -1120,6 +1178,76 @@ def _dashboard_html() -> str:
       }).join('');
 
       document.getElementById('endpoint-wall').innerHTML = cards;
+    }
+
+    function drawStatePieChart(canvas, counts) {
+      const ctx = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      const radius = Math.min(width, height) * 0.34;
+      const centerX = width / 2;
+      const centerY = height / 2;
+      const total = counts.running + counts.warm + counts.parked + counts.error;
+
+      ctx.clearRect(0, 0, width, height);
+
+      const segments = [
+        { value: counts.running, color: '#117a65', label: 'Healthy' },
+        { value: counts.warm, color: '#d9822b', label: 'Changing' },
+        { value: counts.parked, color: '#8b969b', label: 'Parked' },
+        { value: counts.error, color: '#bb2d3b', label: 'Error' },
+      ];
+
+      if (total <= 0) {
+        ctx.fillStyle = 'rgba(24, 33, 37, 0.08)';
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        let startAngle = -Math.PI / 2;
+        for (const segment of segments) {
+          if (!segment.value) continue;
+          const endAngle = startAngle + (segment.value / total) * Math.PI * 2;
+          ctx.beginPath();
+          ctx.moveTo(centerX, centerY);
+          ctx.arc(centerX, centerY, radius, startAngle, endAngle);
+          ctx.closePath();
+          ctx.fillStyle = segment.color;
+          ctx.fill();
+          startAngle = endAngle;
+        }
+      }
+
+      ctx.beginPath();
+      ctx.arc(centerX, centerY, radius * 0.54, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
+      ctx.fill();
+
+      ctx.fillStyle = '#182125';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = '12px Menlo, Consolas, monospace';
+      ctx.fillText('endpoints', centerX, centerY - 14);
+      ctx.font = 'bold 34px "Avenir Next", "Segoe UI", sans-serif';
+      ctx.fillText(String(total), centerX, centerY + 10);
+    }
+
+    function renderStateLegend(container, counts) {
+      const items = [
+        { key: 'running', label: 'Healthy', color: '#117a65' },
+        { key: 'warm', label: 'Changing', color: '#d9822b' },
+        { key: 'parked', label: 'Parked', color: '#8b969b' },
+        { key: 'error', label: 'Error', color: '#bb2d3b' },
+      ];
+      container.innerHTML = items.map((item) => `
+        <div class="mini-legend-row">
+          <span class="mini-legend-label">
+            <span class="mini-legend-dot" style="background:${item.color};"></span>
+            ${htmlEscape(item.label)}
+          </span>
+          <strong>${htmlEscape(prettyNumber(counts[item.key]))}</strong>
+        </div>
+      `).join('');
     }
 
     function drawChart(canvas, points, seriesConfig) {
