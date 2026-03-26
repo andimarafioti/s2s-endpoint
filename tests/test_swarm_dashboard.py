@@ -1,6 +1,6 @@
 import unittest
 
-from app.swarm_dashboard import SwarmDashboard, SwarmStateSample
+from app.swarm_dashboard import SwarmDashboard, SwarmHistoryBucket, SwarmStateSample
 
 
 class FakeClock:
@@ -20,6 +20,30 @@ class FakeSnapshotProvider:
 
     async def __call__(self):
         return self.payload
+
+
+class FakeHistoryStore:
+    def __init__(self, initial_buckets=None):
+        self.saved = {
+            bucket.bucket_start_s: bucket.to_dict()
+            for bucket in (initial_buckets or [])
+        }
+        self.write_calls = []
+        self.load_calls = 0
+
+    def load_recent(self, *, retention_minutes: int, now_epoch_s: float):
+        self.load_calls += 1
+        min_bucket = int(now_epoch_s // 60) * 60 - (retention_minutes - 1) * 60
+        return [
+            SwarmHistoryBucket.from_dict(payload)
+            for bucket_start_s, payload in sorted(self.saved.items())
+            if bucket_start_s >= min_bucket
+        ]
+
+    def write_buckets(self, buckets):
+        self.write_calls.append([bucket.bucket_start_s for bucket in buckets])
+        for bucket in buckets:
+            self.saved[bucket.bucket_start_s] = bucket.to_dict()
 
 
 def _health_snapshot(*, connected: int, pending: int, running: int, waking: int, free_slots: int, effective_free_slots: int):
@@ -253,6 +277,105 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(dashboard._history), 1)
+
+    async def test_persists_closed_buckets_to_history_store(self):
+        clock = FakeClock(2 * 3600)
+        store = FakeHistoryStore()
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=1,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            sample_interval_s=15,
+            retention_minutes=24 * 60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+
+        await dashboard.record_sample(
+            SwarmStateSample(
+                captured_at_s=clock.now(),
+                healthy=True,
+                detail=None,
+                total_endpoints=1,
+                running_endpoints=1,
+                warming_endpoints=0,
+                transitioning_endpoints=0,
+                parked_endpoints=0,
+                connected_sessions=1,
+                pending_sessions=0,
+                free_slots=1,
+                effective_free_slots=1,
+                router_active_sessions=1,
+                errors_count=0,
+                endpoints=[],
+            )
+        )
+        await dashboard.record_session_request()
+        clock.set(clock.now() + 60)
+        await dashboard.record_sample(
+            SwarmStateSample(
+                captured_at_s=clock.now(),
+                healthy=True,
+                detail=None,
+                total_endpoints=1,
+                running_endpoints=1,
+                warming_endpoints=0,
+                transitioning_endpoints=0,
+                parked_endpoints=0,
+                connected_sessions=0,
+                pending_sessions=0,
+                free_slots=1,
+                effective_free_slots=1,
+                router_active_sessions=0,
+                errors_count=0,
+                endpoints=[],
+            )
+        )
+        if dashboard._flush_task is not None:
+            await dashboard._flush_task
+
+        persisted = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
+        self.assertEqual(persisted.session_requests, 1)
+        self.assertEqual(persisted.connected_sessions_last, 1)
+
+    async def test_restores_persisted_history_from_store_on_start(self):
+        bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600)
+        bucket.running_endpoints_last = 2
+        bucket.running_endpoints_sum = 2
+        bucket.connected_sessions_last = 1
+        bucket.connected_sessions_sum = 1
+        bucket.sample_count = 1
+
+        clock = FakeClock(4 * 3600 + 60)
+        store = FakeHistoryStore(initial_buckets=[bucket])
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=2,
+                pending=0,
+                running=2,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            sample_interval_s=3600,
+            retention_minutes=24 * 60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+
+        await dashboard.start()
+        try:
+            series = await dashboard.series(window_minutes=2, resolution="minute")
+        finally:
+            await dashboard.stop()
+
+        self.assertEqual(store.load_calls, 1)
+        self.assertEqual(series[0]["running_endpoints"], 2)
 
 
 if __name__ == "__main__":

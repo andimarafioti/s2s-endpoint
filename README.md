@@ -79,6 +79,8 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 
 The timeline automatically switches between minute-level and hourly rollups depending on the selected window. Because the history is in memory, it resets when the LB endpoint restarts.
 
+If you want the dashboard history to survive LB restarts, you can configure it to persist completed minute buckets to a Hugging Face Storage Bucket. The live routing/session state still stays in memory; the bucket is only for historical dashboard data.
+
 ## Load Balancer Env Vars
 
 - `HF_ENDPOINT_NAMESPACE`: namespace that owns the compute endpoints
@@ -98,6 +100,9 @@ The timeline automatically switches between minute-level and hourly rollups depe
 - `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations
 - `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
 - `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
+- `DASHBOARD_BUCKET_ID`: optional HF storage bucket id used to persist dashboard history
+- `DASHBOARD_BUCKET_PREFIX`: path prefix inside the bucket for dashboard files
+- `DASHBOARD_BUCKET_TOKEN`: optional token override for bucket reads/writes
 
 ## Compute Env Vars
 

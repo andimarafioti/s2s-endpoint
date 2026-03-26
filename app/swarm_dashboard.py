@@ -1,13 +1,18 @@
 import asyncio
+import json
+import logging
 import re
+import tempfile
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Optional
+from pathlib import Path
+from typing import Awaitable, Callable, Optional, Protocol
 
 
 SnapshotProvider = Callable[[], Awaitable[tuple[bool, Optional[str], dict[str, object]]]]
+logger = logging.getLogger("s2s-endpoint")
 
 
 def _normalize_status(status: object) -> str:
@@ -39,6 +44,14 @@ def _parse_window_minutes(window: str | None) -> int:
     if unit == "h":
         return amount * 60
     return amount * 24 * 60
+
+
+class DashboardHistoryStore(Protocol):
+    def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list["SwarmHistoryBucket"]:
+        ...
+
+    def write_buckets(self, buckets: list["SwarmHistoryBucket"]) -> None:
+        ...
 
 
 @dataclass
@@ -195,6 +208,181 @@ class SwarmHistoryBucket:
             "session_disconnected_events": self.session_disconnected_events,
         }
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "bucket_start_s": self.bucket_start_s,
+            "sample_count": self.sample_count,
+            "running_endpoints_last": self.running_endpoints_last,
+            "running_endpoints_sum": self.running_endpoints_sum,
+            "warming_endpoints_last": self.warming_endpoints_last,
+            "warming_endpoints_sum": self.warming_endpoints_sum,
+            "transitioning_endpoints_last": self.transitioning_endpoints_last,
+            "transitioning_endpoints_sum": self.transitioning_endpoints_sum,
+            "parked_endpoints_last": self.parked_endpoints_last,
+            "parked_endpoints_sum": self.parked_endpoints_sum,
+            "connected_sessions_last": self.connected_sessions_last,
+            "connected_sessions_sum": self.connected_sessions_sum,
+            "pending_sessions_last": self.pending_sessions_last,
+            "pending_sessions_sum": self.pending_sessions_sum,
+            "free_slots_last": self.free_slots_last,
+            "free_slots_sum": self.free_slots_sum,
+            "effective_free_slots_last": self.effective_free_slots_last,
+            "effective_free_slots_sum": self.effective_free_slots_sum,
+            "router_active_sessions_last": self.router_active_sessions_last,
+            "router_active_sessions_sum": self.router_active_sessions_sum,
+            "healthy_last": self.healthy_last,
+            "healthy_samples": self.healthy_samples,
+            "errors_count_last": self.errors_count_last,
+            "errors_count_sum": self.errors_count_sum,
+            "session_requests": self.session_requests,
+            "session_allocation_successes": self.session_allocation_successes,
+            "session_allocation_failures": self.session_allocation_failures,
+            "session_connected_events": self.session_connected_events,
+            "session_disconnected_events": self.session_disconnected_events,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "SwarmHistoryBucket":
+        return cls(
+            bucket_start_s=int(payload.get("bucket_start_s", 0)),
+            sample_count=int(payload.get("sample_count", 0)),
+            running_endpoints_last=int(payload.get("running_endpoints_last", 0)),
+            running_endpoints_sum=float(payload.get("running_endpoints_sum", 0.0)),
+            warming_endpoints_last=int(payload.get("warming_endpoints_last", 0)),
+            warming_endpoints_sum=float(payload.get("warming_endpoints_sum", 0.0)),
+            transitioning_endpoints_last=int(payload.get("transitioning_endpoints_last", 0)),
+            transitioning_endpoints_sum=float(payload.get("transitioning_endpoints_sum", 0.0)),
+            parked_endpoints_last=int(payload.get("parked_endpoints_last", 0)),
+            parked_endpoints_sum=float(payload.get("parked_endpoints_sum", 0.0)),
+            connected_sessions_last=int(payload.get("connected_sessions_last", 0)),
+            connected_sessions_sum=float(payload.get("connected_sessions_sum", 0.0)),
+            pending_sessions_last=int(payload.get("pending_sessions_last", 0)),
+            pending_sessions_sum=float(payload.get("pending_sessions_sum", 0.0)),
+            free_slots_last=int(payload.get("free_slots_last", 0)),
+            free_slots_sum=float(payload.get("free_slots_sum", 0.0)),
+            effective_free_slots_last=int(payload.get("effective_free_slots_last", 0)),
+            effective_free_slots_sum=float(payload.get("effective_free_slots_sum", 0.0)),
+            router_active_sessions_last=int(payload.get("router_active_sessions_last", 0)),
+            router_active_sessions_sum=float(payload.get("router_active_sessions_sum", 0.0)),
+            healthy_last=bool(payload.get("healthy_last", False)),
+            healthy_samples=int(payload.get("healthy_samples", 0)),
+            errors_count_last=int(payload.get("errors_count_last", 0)),
+            errors_count_sum=float(payload.get("errors_count_sum", 0.0)),
+            session_requests=int(payload.get("session_requests", 0)),
+            session_allocation_successes=int(payload.get("session_allocation_successes", 0)),
+            session_allocation_failures=int(payload.get("session_allocation_failures", 0)),
+            session_connected_events=int(payload.get("session_connected_events", 0)),
+            session_disconnected_events=int(payload.get("session_disconnected_events", 0)),
+        )
+
+
+class HuggingFaceBucketHistoryStore:
+    def __init__(
+        self,
+        *,
+        bucket_id: str,
+        prefix: str = "s2s-endpoint/swarm-dashboard",
+        token: Optional[str] = None,
+    ) -> None:
+        from huggingface_hub import batch_bucket_files, download_bucket_files, list_bucket_tree
+
+        self.bucket_id = bucket_id.strip()
+        self.prefix = prefix.strip().strip("/")
+        self.token = token or None
+        self._batch_bucket_files = batch_bucket_files
+        self._download_bucket_files = download_bucket_files
+        self._list_bucket_tree = list_bucket_tree
+
+        if not self.bucket_id:
+            raise ValueError("bucket_id must be set")
+
+    def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list[SwarmHistoryBucket]:
+        min_bucket = _bucket_start_epoch_s(now_epoch_s, 1) - (retention_minutes - 1) * 60
+        candidates: list[tuple[int, str]] = []
+        prefix = self._minutes_prefix()
+
+        for item in self._list_bucket_tree(
+            self.bucket_id,
+            prefix=prefix or None,
+            recursive=True,
+            token=self.token,
+        ):
+            path = getattr(item, "path", None)
+            bucket_start_s = self._bucket_start_from_path(path)
+            if bucket_start_s is None or bucket_start_s < min_bucket:
+                continue
+            candidates.append((bucket_start_s, str(path)))
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda item: item[0])
+        loaded: list[SwarmHistoryBucket] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            downloads = [
+                (path, Path(tmpdir) / f"{bucket_start_s}.json")
+                for bucket_start_s, path in candidates
+            ]
+            self._download_bucket_files(
+                self.bucket_id,
+                files=downloads,
+                raise_on_missing_files=False,
+                token=self.token,
+            )
+
+            for bucket_start_s, local_path in downloads:
+                if not local_path.exists():
+                    continue
+                try:
+                    payload = json.loads(local_path.read_text())
+                    loaded.append(SwarmHistoryBucket.from_dict(payload["bucket"]))
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to load persisted dashboard bucket %s from %s: %s",
+                        bucket_start_s,
+                        self.bucket_id,
+                        exc,
+                    )
+
+        return loaded
+
+    def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
+        if not buckets:
+            return
+
+        add = []
+        for bucket in buckets:
+            payload = json.dumps(
+                {
+                    "version": 1,
+                    "bucket": bucket.to_dict(),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            add.append((payload, self._bucket_path(bucket.bucket_start_s)))
+
+        self._batch_bucket_files(
+            self.bucket_id,
+            add=add,
+            token=self.token,
+        )
+
+    def _minutes_prefix(self) -> str:
+        if self.prefix:
+            return f"{self.prefix}/minutes"
+        return "minutes"
+
+    def _bucket_path(self, bucket_start_s: int) -> str:
+        return f"{self._minutes_prefix()}/{bucket_start_s}.json"
+
+    def _bucket_start_from_path(self, path: object) -> Optional[int]:
+        if path is None:
+            return None
+        match = re.search(r"/(\d+)\.json$", f"/{path}".replace("\\", "/"))
+        if match is None:
+            return None
+        return int(match.group(1))
+
 
 class SwarmDashboard:
     def __init__(
@@ -203,6 +391,7 @@ class SwarmDashboard:
         snapshot_provider: SnapshotProvider,
         sample_interval_s: float = 15.0,
         retention_minutes: int = 7 * 24 * 60,
+        history_store: Optional[DashboardHistoryStore] = None,
         time_fn: Callable[[], float] = time.time,
     ) -> None:
         if sample_interval_s <= 0:
@@ -213,13 +402,17 @@ class SwarmDashboard:
         self.snapshot_provider = snapshot_provider
         self.sample_interval_s = sample_interval_s
         self.retention_minutes = retention_minutes
+        self.history_store = history_store
         self._time_fn = time_fn
         self._lock = asyncio.Lock()
         self._history: "OrderedDict[int, SwarmHistoryBucket]" = OrderedDict()
         self._latest_sample: Optional[SwarmStateSample] = None
         self._sample_task: Optional[asyncio.Task] = None
+        self._flush_task: Optional[asyncio.Task] = None
+        self._dirty_bucket_starts: set[int] = set()
 
     async def start(self) -> None:
+        await self._restore_history()
         await self.capture_sample()
         self._sample_task = asyncio.create_task(self._sample_loop())
 
@@ -231,6 +424,15 @@ class SwarmDashboard:
             except asyncio.CancelledError:
                 pass
             self._sample_task = None
+
+        if self._flush_task is not None:
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+            self._flush_task = None
+
+        await self._flush_dirty_buckets(include_open_bucket=True)
 
     async def capture_sample(self) -> SwarmStateSample:
         healthy, detail, snapshot = await self.snapshot_provider()
@@ -248,7 +450,9 @@ class SwarmDashboard:
             bucket = self._get_bucket_unlocked(sample.captured_at_s)
             bucket.record_sample(sample)
             self._latest_sample = sample
+            self._dirty_bucket_starts.add(bucket.bucket_start_s)
             self._prune_unlocked(sample.captured_at_s)
+            self._schedule_flush_unlocked(include_open_bucket=False)
 
     async def record_session_request(self) -> None:
         await self._increment_counter("session_requests")
@@ -373,7 +577,9 @@ class SwarmDashboard:
         async with self._lock:
             bucket = self._get_bucket_unlocked(now)
             setattr(bucket, field_name, getattr(bucket, field_name) + 1)
+            self._dirty_bucket_starts.add(bucket.bucket_start_s)
             self._prune_unlocked(now)
+            self._schedule_flush_unlocked(include_open_bucket=False)
 
     def _get_bucket_unlocked(self, epoch_s: float) -> SwarmHistoryBucket:
         bucket_start_s = _bucket_start_epoch_s(epoch_s, 1)
@@ -390,6 +596,7 @@ class SwarmDashboard:
             if oldest_key >= min_allowed_bucket:
                 break
             self._history.popitem(last=False)
+            self._dirty_bucket_starts.discard(oldest_key)
 
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, int]:
         now = self._time_fn()
@@ -498,6 +705,66 @@ class SwarmDashboard:
             current_hour_s += 3600
 
         return points
+
+    async def _restore_history(self) -> None:
+        if self.history_store is None:
+            return
+
+        try:
+            buckets = await asyncio.to_thread(
+                self.history_store.load_recent,
+                retention_minutes=self.retention_minutes,
+                now_epoch_s=self._time_fn(),
+            )
+        except Exception as exc:
+            logger.warning("Failed to restore dashboard history from bucket store: %s", exc)
+            return
+
+        if not buckets:
+            return
+
+        async with self._lock:
+            for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
+                self._history[bucket.bucket_start_s] = bucket
+            self._prune_unlocked(self._time_fn())
+
+        logger.info("Restored %s persisted dashboard minute buckets", len(buckets))
+
+    def _schedule_flush_unlocked(self, *, include_open_bucket: bool) -> None:
+        if self.history_store is None:
+            return
+        if self._flush_task is not None and not self._flush_task.done():
+            return
+        self._flush_task = asyncio.create_task(self._flush_dirty_buckets(include_open_bucket=include_open_bucket))
+
+    async def _flush_dirty_buckets(self, *, include_open_bucket: bool) -> None:
+        if self.history_store is None:
+            return
+
+        while True:
+            async with self._lock:
+                buckets = self._collect_dirty_buckets_unlocked(include_open_bucket=include_open_bucket)
+            if not buckets:
+                return
+
+            try:
+                await asyncio.to_thread(self.history_store.write_buckets, buckets)
+            except Exception as exc:
+                logger.warning("Failed to persist dashboard history to bucket store: %s", exc)
+                return
+
+            async with self._lock:
+                for bucket in buckets:
+                    self._dirty_bucket_starts.discard(bucket.bucket_start_s)
+
+    def _collect_dirty_buckets_unlocked(self, *, include_open_bucket: bool) -> list[SwarmHistoryBucket]:
+        current_bucket_start_s = _bucket_start_epoch_s(self._time_fn(), 1)
+        return [
+            self._history[bucket_start_s]
+            for bucket_start_s in sorted(self._dirty_bucket_starts)
+            if bucket_start_s in self._history
+            and (include_open_bucket or bucket_start_s < current_bucket_start_s)
+        ]
 
 
 def _dashboard_html() -> str:
