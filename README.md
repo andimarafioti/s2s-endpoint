@@ -77,7 +77,7 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - free slots and effective free capacity
 - `POST /session` request counts, allocation successes/failures, and connect/disconnect events
 
-The timeline automatically switches between minute-level and hourly rollups depending on the selected window. Because the history is in memory, it resets when the LB endpoint restarts.
+The timeline automatically switches between minute-level and hourly rollups depending on the selected window. By default the history is in memory and resets when the LB endpoint restarts.
 
 If you want the dashboard history to survive LB restarts, you can configure it to persist completed minute buckets to a Hugging Face Storage Bucket. The live routing/session state still stays in memory; the bucket is only for historical dashboard data.
 
@@ -217,6 +217,32 @@ Both scripts are specific to this repo and expect the role-specific images:
 
 - compute endpoints: image built from `Dockerfile.compute`
 - load balancer endpoint: image built from `Dockerfile.load_balancer`
+
+## Update Load Balancer Endpoint Env
+
+To update env vars on the existing load-balancer endpoint, use the dedicated updater:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_load_balancer_endpoint_env.py \
+  --namespace HuggingFaceM4 \
+  --name reachy-s2s-lb \
+  --env COMPUTE_ENDPOINT_MIN_WARM=2 \
+  --env COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS=2 \
+  --wait
+```
+
+To enable persisted dashboard history using a Hugging Face Storage Bucket, the command we used was:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_load_balancer_endpoint_env.py \
+  --namespace HuggingFaceM4 \
+  --name reachy-s2s-lb \
+  --env DASHBOARD_BUCKET_ID=HuggingFaceM4/reachy-s2s-dashboard \
+  --env DASHBOARD_BUCKET_PREFIX=reachy-s2s-lb \
+  --wait
+```
+
+Like the compute env updater, this script fetches the current env first, merges the requested changes, and sends the full updated env back to Hugging Face.
 
 ## Files
 - `app/`: application code
