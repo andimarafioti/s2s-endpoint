@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 import argparse
 import json
+from typing import Any
 
 from huggingface_hub import HfApi
+from huggingface_hub.errors import HfHubHTTPError
 
-from _endpoint_helpers import build_names, current_custom_image, current_model_env
+from _endpoint_helpers import build_names, current_custom_image
 
 
 DEFAULT_LOAD_BALANCER_NAME = "reachy-s2s-lb"
+DEFAULT_COMPUTE_INDEX_START = 1
+DEFAULT_COMPUTE_INDEX_WIDTH = 2
 
 
 def main() -> None:
@@ -50,7 +54,7 @@ def main() -> None:
     results: dict[str, object] = {}
 
     if args.compute:
-        compute_names = resolve_compute_names(
+        compute_names, selection = resolve_compute_names(
             api=api,
             namespace=args.namespace,
             load_balancer_name=args.load_balancer_name,
@@ -58,16 +62,20 @@ def main() -> None:
             prefix=args.compute_prefix,
             count=args.compute_count,
         )
-        results["compute"] = update_many(
-            api=api,
-            namespace=args.namespace,
-            names=compute_names,
-            image_url=args.compute,
-            wait=args.wait,
-            wait_timeout_s=args.wait_timeout_s,
-            wait_refresh_every_s=args.wait_refresh_every_s,
-            dry_run=args.dry_run,
-        )
+        results["compute"] = {
+            **selection,
+            "summary": build_compute_summary(compute_names, selection),
+            "updates": update_many(
+                api=api,
+                namespace=args.namespace,
+                names=compute_names,
+                image_url=args.compute,
+                wait=args.wait,
+                wait_timeout_s=args.wait_timeout_s,
+                wait_refresh_every_s=args.wait_refresh_every_s,
+                dry_run=args.dry_run,
+            ),
+        }
 
     if args.load_balancer:
         results["load_balancer"] = update_one(
@@ -92,19 +100,92 @@ def resolve_compute_names(
     explicit_names: list[str],
     prefix: str | None,
     count: int | None,
-) -> list[str]:
-    if explicit_names or prefix or count is not None:
-        return build_names(prefix, count, explicit_names)
+) -> tuple[list[str], dict[str, Any]]:
+    if explicit_names:
+        return explicit_names, {"discovery": "explicit_names"}
 
-    endpoint = api.get_inference_endpoint(load_balancer_name, namespace=namespace)
-    env = current_model_env(endpoint.raw)
-    names = [name.strip() for name in env.get("COMPUTE_ENDPOINT_NAMES", "").split(",") if name.strip()]
+    if prefix or count is not None:
+        names = build_names(prefix, count, explicit_names)
+        return names, {
+            "discovery": "prefix_count",
+            "prefix": prefix,
+            "start_index": DEFAULT_COMPUTE_INDEX_START,
+            "end_index": len(names),
+        }
+
+    inferred_prefix = default_compute_prefix(load_balancer_name)
+    return discover_sequential_compute_names(
+        api=api,
+        namespace=namespace,
+        prefix=inferred_prefix,
+    )
+
+
+def default_compute_prefix(load_balancer_name: str) -> str:
+    if load_balancer_name.endswith("-lb") and len(load_balancer_name) > len("-lb"):
+        return load_balancer_name[: -len("-lb")]
+    return load_balancer_name
+
+
+def discover_sequential_compute_names(
+    *,
+    api: HfApi,
+    namespace: str | None,
+    prefix: str,
+) -> tuple[list[str], dict[str, Any]]:
+    names: list[str] = []
+    index = DEFAULT_COMPUTE_INDEX_START
+
+    while True:
+        name = f"{prefix}-{index:0{DEFAULT_COMPUTE_INDEX_WIDTH}d}"
+        try:
+            api.get_inference_endpoint(name, namespace=namespace)
+        except HfHubHTTPError as exc:
+            if not is_not_found_error(exc):
+                raise
+            if index == DEFAULT_COMPUTE_INDEX_START:
+                raise ValueError(
+                    f"Could not discover compute endpoints with prefix {prefix!r}. "
+                    f"Expected to find {name!r} first."
+                ) from exc
+            break
+        names.append(name)
+        index += 1
+
+    return names, {
+        "discovery": "sequential_scan",
+        "prefix": prefix,
+        "start_index": DEFAULT_COMPUTE_INDEX_START,
+        "end_index": names_to_end_index(names),
+    }
+
+
+def names_to_end_index(names: list[str]) -> int:
+    return DEFAULT_COMPUTE_INDEX_START + len(names) - 1
+
+
+def build_compute_summary(names: list[str], selection: dict[str, Any]) -> str:
     if not names:
-        raise ValueError(
-            "Could not infer compute endpoint names from the load balancer. "
-            "Pass --compute-names or --compute-prefix/--compute-count."
-        )
-    return names
+        return "updated 0 compute endpoints"
+
+    start_index = selection.get("start_index")
+    end_index = selection.get("end_index")
+    if isinstance(start_index, int) and isinstance(end_index, int):
+        if start_index == end_index:
+            return f"updated endpoint {start_index}"
+        return f"updated endpoints {start_index} through {end_index}"
+
+    count = len(names)
+    noun = "endpoint" if count == 1 else "endpoints"
+    return f"updated {count} compute {noun}"
+
+
+def is_not_found_error(exc: HfHubHTTPError) -> bool:
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code == 404:
+        return True
+    message = str(exc).lower()
+    return "404" in message or "not found" in message
 
 
 def update_many(

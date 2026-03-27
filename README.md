@@ -288,7 +288,8 @@ Behavior:
 - if you pass `--compute`, the script updates the compute pool first
 - if you pass `--load_balancer`, it updates the load-balancer endpoint
 - if you omit either one, that side is skipped
-- if you do not provide compute names explicitly, the script reads `COMPUTE_ENDPOINT_NAMES` from the load balancer and updates that pool
+- if you do not provide compute names explicitly, the script derives the compute prefix from the load-balancer name and scans `-01`, `-02`, ... until the first missing endpoint
+- with the default LB name `reachy-s2s-lb`, that means it discovers `reachy-s2s-01`, `reachy-s2s-02`, and so on, then prints a summary like `updated endpoints 1 through 8`
 
 Useful options:
 
