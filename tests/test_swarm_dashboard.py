@@ -368,6 +368,52 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted.completed_conversations, 1)
         self.assertEqual(persisted.completed_conversation_duration_total_s, 90.0)
 
+    async def test_persists_open_bucket_to_history_store_without_waiting_for_rollover(self):
+        clock = FakeClock(5 * 3600 + 15)
+        store = FakeHistoryStore()
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=1,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            sample_interval_s=15,
+            retention_minutes=24 * 60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+
+        await dashboard.record_sample(
+            SwarmStateSample(
+                captured_at_s=clock.now(),
+                healthy=True,
+                detail=None,
+                total_endpoints=1,
+                running_endpoints=1,
+                warming_endpoints=0,
+                transitioning_endpoints=0,
+                parked_endpoints=0,
+                connected_sessions=1,
+                pending_sessions=0,
+                free_slots=1,
+                effective_free_slots=1,
+                router_active_sessions=1,
+                errors_count=0,
+                endpoints=[],
+            )
+        )
+        await dashboard.record_session_request()
+        if dashboard._flush_task is not None:
+            await dashboard._flush_task
+
+        current_bucket_start = int(clock.now() // 60) * 60
+        persisted = SwarmHistoryBucket.from_dict(store.saved[current_bucket_start])
+        self.assertEqual(persisted.connected_sessions_last, 1)
+        self.assertEqual(persisted.session_requests, 1)
+
     async def test_restores_persisted_history_from_store_on_start(self):
         bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600)
         bucket.running_endpoints_last = 2
