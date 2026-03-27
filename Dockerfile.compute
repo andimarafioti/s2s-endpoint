@@ -1,5 +1,6 @@
 # Compute image: runs local speech-to-speech pipelines on a GPU instance.
 FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
 ARG S2S_REF=openai_realtime_server_api
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -26,7 +27,7 @@ RUN pip install --upgrade pip setuptools wheel && \
     pip install uv
 
 # Clone speech-to-speech and install its dependencies the way the repo expects
-RUN git clone --filter=blob:none https://github.com/huggingface/speech-to-speech.git ${S2S_REPO_DIR} && \
+RUN git clone --filter=blob:none "${S2S_REPO_URL}" ${S2S_REPO_DIR} && \
     cd ${S2S_REPO_DIR} && \
     git checkout "${S2S_REF}" && \
     uv sync --no-dev

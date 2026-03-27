@@ -36,12 +36,22 @@ Build the compute image:
 docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
-Today `Dockerfile.compute` defaults `S2S_REF` to the upstream `openai_realtime_server_api` branch, because this repo now assumes the realtime server path. If you need to override that ref explicitly, use:
+Today `Dockerfile.compute` defaults `S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and `S2S_REF=openai_realtime_server_api`, because this repo now assumes the realtime server path. If you need to override that repo/ref explicitly, use:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
+  --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
   --build-arg S2S_REF=openai_realtime_server_api \
   -t your-registry/s2s-endpoint-compute:realtime .
+```
+
+To build against the temporary llama.cpp compatibility fix before it lands upstream, use:
+
+```bash
+docker build --platform linux/amd64 -f Dockerfile.compute \
+  --build-arg S2S_REPO_URL=https://github.com/andimarafioti/speech-to-speech.git \
+  --build-arg S2S_REF=fix/openai-responses-history-serialization \
+  -t your-registry/s2s-endpoint-compute:llamacpp-fix .
 ```
 
 Build the load-balancer image:
