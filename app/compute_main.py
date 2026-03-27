@@ -8,7 +8,6 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.responses import JSONResponse
-import websockets
 
 from app.app_utils import build_lifespan, setup_logging
 from app.session_router import SessionRouter
@@ -24,7 +23,6 @@ INTERNAL_WS_BASE_PORT = int(os.getenv("INTERNAL_WS_PORT", "9000"))
 S2S_REPO_DIR = os.getenv("S2S_REPO_DIR", "/opt/speech-to-speech")
 PIPELINE_MAX_INSTANCES = int(os.getenv("PIPELINE_MAX_INSTANCES", "1"))
 PIPELINE_MIN_IDLE_INSTANCES = int(os.getenv("PIPELINE_MIN_IDLE_INSTANCES", "1"))
-S2S_SERVER_MODE = os.getenv("S2S_SERVER_MODE", "websocket").strip().lower()
 
 # Core pipeline selection
 LANGUAGE = os.getenv("LANGUAGE", "en").strip()
@@ -52,11 +50,8 @@ EXTRA_S2S_ARGS = os.getenv("EXTRA_S2S_ARGS", "").strip()
 SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
 LB_CALLBACK_AUTH_TOKEN = os.getenv("LB_CALLBACK_AUTH_TOKEN", "").strip()
 
-if S2S_SERVER_MODE not in {"websocket", "realtime"}:
-    raise ValueError("S2S_SERVER_MODE must be either 'websocket' or 'realtime'")
-
-INTERNAL_SLOT_WS_PATH = "/v1/realtime" if S2S_SERVER_MODE == "realtime" else ""
-PUBLIC_WS_PATH = "/v1/realtime" if S2S_SERVER_MODE == "realtime" else "/ws"
+INTERNAL_SLOT_WS_PATH = "/v1/realtime"
+PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_WS_URL = f"ws://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_SLOT_WS_PATH}"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_USAGE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_USAGE_PATH}"
@@ -81,7 +76,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
         "python",
         "s2s_pipeline.py",
         "--mode",
-        S2S_SERVER_MODE,
+        "realtime",
         "--ws_host",
         host,
         "--ws_port",
@@ -117,44 +112,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     return cmd
 
 
-async def wait_for_internal_ws(
-    host: str,
-    port: int,
-    process: Optional[subprocess.Popen],
-    timeout_s: float = 900.0,
-) -> None:
-    ws_url = f"ws://{host}:{port}"
-    start = asyncio.get_running_loop().time()
-    last_error = None
-
-    while True:
-        if process is not None and process.poll() is not None:
-            raise RuntimeError(
-                f"speech-to-speech process exited early with code {process.returncode}"
-            )
-
-        try:
-            async with websockets.connect(
-                ws_url,
-                open_timeout=5,
-                ping_interval=None,
-                max_size=None,
-            ):
-                logger.info("Internal speech-to-speech listener is ready at %s", ws_url)
-            return
-        except Exception as exc:
-            last_error = exc
-
-        if asyncio.get_running_loop().time() - start > timeout_s:
-            raise RuntimeError(
-                f"Timed out waiting for internal websocket server at {ws_url}. "
-                f"Last error: {last_error}"
-            )
-
-        await asyncio.sleep(2.0)
-
-
-async def wait_for_internal_realtime_http(
+async def wait_for_internal_server(
     host: str,
     port: int,
     process: Optional[subprocess.Popen],
@@ -186,18 +144,6 @@ async def wait_for_internal_realtime_http(
         await asyncio.sleep(2.0)
 
 
-async def wait_for_internal_server(
-    host: str,
-    port: int,
-    process: Optional[subprocess.Popen],
-    timeout_s: float = 900.0,
-) -> None:
-    if S2S_SERVER_MODE == "realtime":
-        await wait_for_internal_realtime_http(host, port, process, timeout_s)
-        return
-    await wait_for_internal_ws(host, port, process, timeout_s)
-
-
 session_router = SessionRouter(
     host=INTERNAL_WS_HOST,
     base_port=INTERNAL_WS_BASE_PORT,
@@ -220,9 +166,8 @@ async def root():
         "health": "/health",
         "websocket": PUBLIC_WS_PATH,
         "internal_ws": INTERNAL_WS_URL,
-        "internal_usage": INTERNAL_USAGE_URL if S2S_SERVER_MODE == "realtime" else None,
+        "internal_usage": INTERNAL_USAGE_URL,
         "config": {
-            "s2s_server_mode": S2S_SERVER_MODE,
             "stt": STT,
             "llm": LLM,
             "tts": TTS,
@@ -242,9 +187,8 @@ async def health():
             "status": "ok",
             "role": APP_ROLE,
             "internal_ws_base": INTERNAL_WS_URL,
-            "internal_usage_url": INTERNAL_USAGE_URL if S2S_SERVER_MODE == "realtime" else None,
+            "internal_usage_url": INTERNAL_USAGE_URL,
             "public_websocket": PUBLIC_WS_PATH,
-            "s2s_server_mode": S2S_SERVER_MODE,
             "stt": STT,
             "llm": LLM,
             "tts": TTS,
@@ -253,14 +197,8 @@ async def health():
     )
 
 
-@app.websocket("/ws")
 @app.websocket("/v1/realtime")
 async def websocket_proxy(client_ws: WebSocket):
-    if client_ws.url.path != PUBLIC_WS_PATH:
-        await client_ws.accept()
-        await client_ws.close(code=1008, reason=f"Use {PUBLIC_WS_PATH}")
-        return
-
     session_payload = _get_session_payload(client_ws)
     connected_notified = False
 

@@ -33,7 +33,6 @@ def main() -> None:
     parser.add_argument("--session-shared-secret", required=True, help="Shared secret used to mint and validate direct session tokens")
     parser.add_argument("--compute-endpoint-names", required=True, help="Comma-separated compute endpoint names")
     parser.add_argument("--compute-endpoint-slots", type=int, default=1, help="Concurrent sessions each compute endpoint can handle")
-    parser.add_argument("--compute-endpoint-ws-path", default="/ws", help="Websocket path exposed by each compute endpoint")
     parser.add_argument("--compute-endpoint-min-warm", type=int, default=1, help="Warm compute endpoints to keep ready")
     parser.add_argument("--compute-endpoint-wake-threshold-slots", type=int, default=1, help="Wake another compute endpoint when total free slots drop to this value")
     parser.add_argument("--compute-endpoint-idle-park-timeout-s", type=float, default=300, help="Idle timeout before parking a compute endpoint")
@@ -79,7 +78,6 @@ def main() -> None:
             "HF_ENDPOINT_NAMESPACE": compute_namespace,
             "COMPUTE_ENDPOINT_NAMES": args.compute_endpoint_names,
             "COMPUTE_ENDPOINT_SLOTS": str(args.compute_endpoint_slots),
-            "COMPUTE_ENDPOINT_WS_PATH": args.compute_endpoint_ws_path,
             "COMPUTE_ENDPOINT_MIN_WARM": str(args.compute_endpoint_min_warm),
             "COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS": str(args.compute_endpoint_wake_threshold_slots),
             "COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S": str(args.compute_endpoint_idle_park_timeout_s),

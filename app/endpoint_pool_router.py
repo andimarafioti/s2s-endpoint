@@ -15,7 +15,7 @@ def _normalize_status(status: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(status).lower())
 
 
-def _to_ws_url(base_url: str, path: str = "/ws") -> str:
+def _to_ws_url(base_url: str, path: str = "/v1/realtime") -> str:
     parsed = urlparse(base_url)
     scheme = "wss" if parsed.scheme == "https" else "ws"
     route_path = (parsed.path.rstrip("/") + path) if parsed.path else path
@@ -142,7 +142,7 @@ class HuggingFaceEndpointController:
 class ManagedEndpoint:
     name: str
     slots: int
-    ws_path: str = "/ws"
+    ws_path: str = "/v1/realtime"
     status: str = "unknown"
     raw_status: str = "unknown"
     url: Optional[str] = None
@@ -183,7 +183,7 @@ class EndpointPoolRouter:
         waking_capacity_timeout_s: float,
         park_cooldown_s: float,
         controller: EndpointController,
-        endpoint_ws_path: str = "/ws",
+        endpoint_ws_path: str = "/v1/realtime",
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
         if not names:

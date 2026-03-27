@@ -257,20 +257,20 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EndpointUrlTests(unittest.TestCase):
-    def test_to_ws_url_uses_ws_route(self):
+    def test_to_ws_url_uses_realtime_route(self):
         self.assertEqual(
             _to_ws_url("https://abc.endpoints.huggingface.cloud"),
-            "wss://abc.endpoints.huggingface.cloud/ws",
+            "wss://abc.endpoints.huggingface.cloud/v1/realtime",
         )
         self.assertEqual(
             _to_ws_url("https://abc.endpoints.huggingface.cloud/base"),
-            "wss://abc.endpoints.huggingface.cloud/base/ws",
+            "wss://abc.endpoints.huggingface.cloud/base/v1/realtime",
         )
 
     def test_to_ws_url_supports_custom_route(self):
         self.assertEqual(
-            _to_ws_url("https://abc.endpoints.huggingface.cloud", "/v1/realtime"),
-            "wss://abc.endpoints.huggingface.cloud/v1/realtime",
+            _to_ws_url("https://abc.endpoints.huggingface.cloud", "/custom"),
+            "wss://abc.endpoints.huggingface.cloud/custom",
         )
 
 

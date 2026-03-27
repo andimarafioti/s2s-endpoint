@@ -44,7 +44,6 @@ def main() -> None:
     parser.add_argument("--scale-to-zero-timeout", type=int, help="Optional scale-to-zero timeout")
     parser.add_argument("--pipeline-max-instances", type=int, default=1, help="Local pipeline slots per compute endpoint")
     parser.add_argument("--pipeline-min-idle-instances", type=int, default=1, help="Warm local pipeline slots per compute endpoint")
-    parser.add_argument("--s2s-server-mode", choices=["websocket", "realtime"], default="websocket", help="speech-to-speech server mode to run inside each compute endpoint")
     parser.add_argument("--env-file", help="JSON file with extra env vars")
     parser.add_argument("--secret-file", help="JSON file with secrets")
     parser.add_argument("--env", action="append", default=[], help="Extra env var in KEY=VALUE form")
@@ -84,7 +83,6 @@ def main() -> None:
                 "SESSION_SHARED_SECRET": args.session_shared_secret,
                 "PIPELINE_MAX_INSTANCES": str(args.pipeline_max_instances),
                 "PIPELINE_MIN_IDLE_INSTANCES": str(args.pipeline_min_idle_instances),
-                "S2S_SERVER_MODE": args.s2s_server_mode,
             }
         )
         if args.lb_callback_auth_token:
