@@ -161,6 +161,9 @@ class SwarmHistoryBucket:
     session_allocation_failures: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
+    completed_conversations: int = 0
+    completed_conversation_duration_total_s: float = 0.0
+    completed_conversation_duration_max_s: float = 0.0
 
     def record_sample(self, sample: SwarmStateSample) -> None:
         self.sample_count += 1
@@ -206,6 +209,19 @@ class SwarmHistoryBucket:
             "session_allocation_failures": self.session_allocation_failures,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
+            "completed_conversations": self.completed_conversations,
+            "avg_conversation_duration_s": (
+                round(self.completed_conversation_duration_total_s / self.completed_conversations, 2)
+                if self.completed_conversations
+                else 0.0
+            ),
+            "avg_conversation_duration_min": (
+                round((self.completed_conversation_duration_total_s / self.completed_conversations) / 60.0, 2)
+                if self.completed_conversations
+                else 0.0
+            ),
+            "max_conversation_duration_s": round(self.completed_conversation_duration_max_s, 2),
+            "max_conversation_duration_min": round(self.completed_conversation_duration_max_s / 60.0, 2),
         }
 
     def to_dict(self) -> dict[str, object]:
@@ -239,6 +255,9 @@ class SwarmHistoryBucket:
             "session_allocation_failures": self.session_allocation_failures,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
+            "completed_conversations": self.completed_conversations,
+            "completed_conversation_duration_total_s": self.completed_conversation_duration_total_s,
+            "completed_conversation_duration_max_s": self.completed_conversation_duration_max_s,
         }
 
     @classmethod
@@ -273,6 +292,13 @@ class SwarmHistoryBucket:
             session_allocation_failures=int(payload.get("session_allocation_failures", 0)),
             session_connected_events=int(payload.get("session_connected_events", 0)),
             session_disconnected_events=int(payload.get("session_disconnected_events", 0)),
+            completed_conversations=int(payload.get("completed_conversations", 0)),
+            completed_conversation_duration_total_s=float(
+                payload.get("completed_conversation_duration_total_s", 0.0)
+            ),
+            completed_conversation_duration_max_s=float(
+                payload.get("completed_conversation_duration_max_s", 0.0)
+            ),
         )
 
 
@@ -463,11 +489,19 @@ class SwarmDashboard:
     async def record_session_allocation_failure(self) -> None:
         await self._increment_counter("session_allocation_failures")
 
-    async def record_session_event(self, event: str) -> None:
+    async def record_session_event(
+        self,
+        event: str,
+        *,
+        conversation_duration_s: Optional[float] = None,
+        conversation_counted: bool = False,
+    ) -> None:
         if event == "connected":
             await self._increment_counter("session_connected_events")
         elif event == "disconnected":
             await self._increment_counter("session_disconnected_events")
+            if conversation_counted:
+                await self._record_completed_conversation(max(float(conversation_duration_s or 0.0), 0.0))
 
     async def live_sample(self) -> SwarmStateSample:
         return await self.capture_sample()
@@ -512,6 +546,16 @@ class SwarmDashboard:
             "session_successes_last_hour": one_hour["session_allocation_successes"],
             "session_connects_last_hour": one_hour["session_connected_events"],
             "session_disconnects_last_hour": one_hour["session_disconnected_events"],
+            "conversations_started_last_hour": one_hour["session_connected_events"],
+            "conversations_completed_last_hour": one_hour["completed_conversations"],
+            "avg_conversation_duration_last_hour_s": one_hour["avg_conversation_duration_s"],
+            "avg_conversation_duration_last_hour_min": round(one_hour["avg_conversation_duration_s"] / 60.0, 2),
+            "conversations_started_24h": one_day["session_connected_events"],
+            "conversations_completed_24h": one_day["completed_conversations"],
+            "avg_conversation_duration_24h_s": one_day["avg_conversation_duration_s"],
+            "avg_conversation_duration_24h_min": round(one_day["avg_conversation_duration_s"] / 60.0, 2),
+            "max_conversation_duration_24h_s": one_day["max_conversation_duration_s"],
+            "max_conversation_duration_24h_min": round(one_day["max_conversation_duration_s"] / 60.0, 2),
             "peak_connected_sessions_24h": one_day["peak_connected_sessions"],
             "peak_running_endpoints_24h": one_day["peak_running_endpoints"],
         }
@@ -553,6 +597,11 @@ class SwarmDashboard:
                             "session_allocation_failures": 0,
                             "session_connected_events": 0,
                             "session_disconnected_events": 0,
+                            "completed_conversations": 0,
+                            "avg_conversation_duration_s": 0.0,
+                            "avg_conversation_duration_min": 0.0,
+                            "max_conversation_duration_s": 0.0,
+                            "max_conversation_duration_min": 0.0,
                         }
                     )
                 else:
@@ -562,7 +611,7 @@ class SwarmDashboard:
         return self._aggregate_hourly(minute_map, start_bucket, end_bucket)
 
     def html(self) -> str:
-        return _dashboard_html()
+        return _dashboard_html(history_persisted=self.history_store is not None)
 
     async def _sample_loop(self) -> None:
         try:
@@ -577,6 +626,20 @@ class SwarmDashboard:
         async with self._lock:
             bucket = self._get_bucket_unlocked(now)
             setattr(bucket, field_name, getattr(bucket, field_name) + 1)
+            self._dirty_bucket_starts.add(bucket.bucket_start_s)
+            self._prune_unlocked(now)
+            self._schedule_flush_unlocked(include_open_bucket=False)
+
+    async def _record_completed_conversation(self, duration_s: float) -> None:
+        now = self._time_fn()
+        async with self._lock:
+            bucket = self._get_bucket_unlocked(now)
+            bucket.completed_conversations += 1
+            bucket.completed_conversation_duration_total_s += duration_s
+            bucket.completed_conversation_duration_max_s = max(
+                bucket.completed_conversation_duration_max_s,
+                duration_s,
+            )
             self._dirty_bucket_starts.add(bucket.bucket_start_s)
             self._prune_unlocked(now)
             self._schedule_flush_unlocked(include_open_bucket=False)
@@ -598,16 +661,30 @@ class SwarmDashboard:
             self._history.popitem(last=False)
             self._dirty_bucket_starts.discard(oldest_key)
 
-    def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, int]:
+    def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()
         min_bucket = _bucket_start_epoch_s(now, 1) - (window_minutes - 1) * 60
         selected = [bucket for bucket in minute_buckets if bucket.bucket_start_s >= min_bucket]
+        completed_conversations = sum(bucket.completed_conversations for bucket in selected)
+        completed_conversation_duration_total_s = sum(
+            bucket.completed_conversation_duration_total_s for bucket in selected
+        )
         return {
             "session_requests": sum(bucket.session_requests for bucket in selected),
             "session_allocation_successes": sum(bucket.session_allocation_successes for bucket in selected),
             "session_allocation_failures": sum(bucket.session_allocation_failures for bucket in selected),
             "session_connected_events": sum(bucket.session_connected_events for bucket in selected),
             "session_disconnected_events": sum(bucket.session_disconnected_events for bucket in selected),
+            "completed_conversations": completed_conversations,
+            "avg_conversation_duration_s": (
+                round(completed_conversation_duration_total_s / completed_conversations, 2)
+                if completed_conversations
+                else 0.0
+            ),
+            "max_conversation_duration_s": round(
+                max((bucket.completed_conversation_duration_max_s for bucket in selected), default=0.0),
+                2,
+            ),
             "peak_connected_sessions": max((bucket.connected_sessions_last for bucket in selected), default=0),
             "peak_running_endpoints": max((bucket.running_endpoints_last for bucket in selected), default=0),
         }
@@ -650,8 +727,17 @@ class SwarmDashboard:
                     "session_allocation_failures": 0,
                     "session_connected_events": 0,
                     "session_disconnected_events": 0,
+                    "completed_conversations": 0,
+                    "avg_conversation_duration_s": 0.0,
+                    "avg_conversation_duration_min": 0.0,
+                    "max_conversation_duration_s": 0.0,
+                    "max_conversation_duration_min": 0.0,
                 }
             else:
+                completed_conversations = sum(bucket.completed_conversations for bucket in minute_buckets)
+                completed_conversation_duration_total_s = sum(
+                    bucket.completed_conversation_duration_total_s for bucket in minute_buckets
+                )
                 point = {
                     "timestamp": _isoformat(current_hour_s),
                     "running_endpoints": round(
@@ -699,6 +785,24 @@ class SwarmDashboard:
                     "session_connected_events": sum(bucket.session_connected_events for bucket in minute_buckets),
                     "session_disconnected_events": sum(
                         bucket.session_disconnected_events for bucket in minute_buckets
+                    ),
+                    "completed_conversations": completed_conversations,
+                    "avg_conversation_duration_s": round(
+                        completed_conversation_duration_total_s / completed_conversations,
+                        2,
+                    ) if completed_conversations else 0.0,
+                    "avg_conversation_duration_min": round(
+                        (completed_conversation_duration_total_s / completed_conversations) / 60.0,
+                        2,
+                    ) if completed_conversations else 0.0,
+                    "max_conversation_duration_s": round(
+                        max((bucket.completed_conversation_duration_max_s for bucket in minute_buckets), default=0.0),
+                        2,
+                    ),
+                    "max_conversation_duration_min": round(
+                        max((bucket.completed_conversation_duration_max_s for bucket in minute_buckets), default=0.0)
+                        / 60.0,
+                        2,
                     ),
                 }
             points.append(point)
@@ -767,7 +871,12 @@ class SwarmDashboard:
         ]
 
 
-def _dashboard_html() -> str:
+def _dashboard_html(*, history_persisted: bool = False) -> str:
+    history_note = (
+        "Minute history persists to bucket storage across restarts."
+        if history_persisted
+        else "Single-replica LB in-memory history; resets on restart."
+    )
     return """<!doctype html>
 <html lang="en">
 <head>
@@ -1192,7 +1301,7 @@ def _dashboard_html() -> str:
         </div>
         <div class="hero-meta">
           <span class="mono">/dashboard</span>
-          <span>Single-replica LB in-memory history; resets on restart.</span>
+          <span>__HISTORY_NOTE__</span>
         </div>
       </div>
       <div class="panel hero-stat-grid" id="hero-stats"></div>
@@ -1259,6 +1368,18 @@ def _dashboard_html() -> str:
       </div>
 
       <div class="panel card span-12">
+        <div class="label">Chart / Conversations</div>
+        <h2>Conversation Volume And Duration</h2>
+        <div class="legend">
+          <span style="color: #0b5cab">Starts</span>
+          <span style="color: #117a65">Completed</span>
+          <span style="color: #d9822b">Avg Duration (min)</span>
+          <span style="color: #bb2d3b">Max Duration (min)</span>
+        </div>
+        <div class="chart-shell"><canvas id="conversations-chart" width="1200" height="260"></canvas></div>
+      </div>
+
+      <div class="panel card span-12">
         <div class="label">Current Fleet</div>
         <h2>Endpoint Wall</h2>
         <div class="fleet-summary" id="fleet-summary"></div>
@@ -1280,6 +1401,20 @@ def _dashboard_html() -> str:
         return String(Math.round(numeric));
       }
       return numeric.toFixed(1);
+    }
+
+    function formatDuration(seconds) {
+      const totalSeconds = Math.max(0, Math.round(Number(seconds || 0)));
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const secs = totalSeconds % 60;
+      if (hours > 0) {
+        return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+      }
+      if (minutes > 0) {
+        return `${minutes}m ${String(secs).padStart(2, '0')}s`;
+      }
+      return `${secs}s`;
     }
 
     function statusClass(healthy, errors) {
@@ -1312,8 +1447,8 @@ def _dashboard_html() -> str:
       const stats = [
         ['Running', current.running_endpoints],
         ['Connected', current.connected_sessions],
-        ['Spare Slots', current.effective_free_slots],
-        ['Req / Last Hour', summary.session_requests_last_hour],
+        ['Conversations / 24h', summary.conversations_completed_24h],
+        ['Avg Duration / 24h', formatDuration(summary.avg_conversation_duration_24h_s)],
       ];
       document.getElementById('hero-stats').innerHTML = stats.map(([label, value]) => `
         <div class="hero-stat">
@@ -1325,10 +1460,16 @@ def _dashboard_html() -> str:
 
     function renderKpis(current, summary) {
       document.getElementById('kpis').innerHTML = [
-        kpiCard('Connected users', prettyNumber(current.connected_sessions), 'Current live websocket sessions'),
+        kpiCard('Live conversations', prettyNumber(current.connected_sessions), 'Current live websocket sessions'),
         kpiCard('Pending joins', prettyNumber(current.pending_sessions), 'Reserved sessions waiting to connect'),
         kpiCard('Requests / 60m', prettyNumber(summary.session_requests_last_hour), 'POST /session requests in the last hour'),
         kpiCard('Failures / 60m', prettyNumber(summary.session_failures_last_hour), 'Allocation failures in the last hour'),
+        kpiCard('Started / 60m', prettyNumber(summary.conversations_started_last_hour), 'Conversation starts recorded in the last hour'),
+        kpiCard('Completed / 60m', prettyNumber(summary.conversations_completed_last_hour), 'Conversation ends recorded in the last hour'),
+        kpiCard('Avg duration / 60m', formatDuration(summary.avg_conversation_duration_last_hour_s), 'Average completed conversation duration in the last hour'),
+        kpiCard('Completed / 24h', prettyNumber(summary.conversations_completed_24h), 'Conversations completed in the last 24 hours'),
+        kpiCard('Avg duration / 24h', formatDuration(summary.avg_conversation_duration_24h_s), 'Average completed conversation duration in the last 24 hours'),
+        kpiCard('Max duration / 24h', formatDuration(summary.max_conversation_duration_24h_s), 'Longest completed conversation in the last 24 hours'),
         kpiCard('Peak users / 24h', prettyNumber(summary.peak_connected_sessions_24h), 'Highest concurrent connected sessions'),
         kpiCard('Peak running / 24h', prettyNumber(summary.peak_running_endpoints_24h), 'Highest active compute endpoint count'),
         kpiCard('Free slots', prettyNumber(current.free_slots), 'Currently running free slots'),
@@ -1618,6 +1759,13 @@ def _dashboard_html() -> str:
         { key: 'session_connected_events', color: '#0b5cab' },
         { key: 'session_disconnected_events', color: '#d9822b' },
       ]);
+
+      drawChart(document.getElementById('conversations-chart'), series, [
+        { key: 'session_connected_events', color: '#0b5cab' },
+        { key: 'completed_conversations', color: '#117a65' },
+        { key: 'avg_conversation_duration_min', color: '#d9822b' },
+        { key: 'max_conversation_duration_min', color: '#bb2d3b' },
+      ]);
     }
 
     function scheduleRefresh() {
@@ -1654,4 +1802,4 @@ def _dashboard_html() -> str:
   </script>
 </body>
 </html>
-"""
+""".replace("__HISTORY_NOTE__", history_note)

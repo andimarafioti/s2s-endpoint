@@ -19,7 +19,9 @@ class DirectSession:
     lease: EndpointLease
     session_token: str
     pending_expires_at: Optional[float]
+    allocated_at_monotonic: float
     connected: bool = False
+    connected_at_monotonic: Optional[float] = None
 
 
 class DirectSessionManager:
@@ -85,6 +87,7 @@ class DirectSessionManager:
             lease=lease,
             session_token=session_token,
             pending_expires_at=pending_expires_at,
+            allocated_at_monotonic=time.monotonic(),
         )
 
         async with self._lock:
@@ -118,6 +121,8 @@ class DirectSessionManager:
             if event == "connected":
                 session.connected = True
                 session.pending_expires_at = None
+                if session.connected_at_monotonic is None:
+                    session.connected_at_monotonic = time.monotonic()
                 return {
                     "status": "ok",
                     "session_id": session_id,
@@ -127,10 +132,18 @@ class DirectSessionManager:
             session_to_release = self._sessions.pop(session_id)
 
         await self.endpoint_router.release(session_to_release.lease.slot_id)
+        conversation_duration_s = 0.0
+        if session_to_release.connected_at_monotonic is not None:
+            conversation_duration_s = max(
+                time.monotonic() - session_to_release.connected_at_monotonic,
+                0.0,
+            )
         return {
             "status": "ok",
             "session_id": session_id,
             "state": "released",
+            "conversation_counted": session_to_release.connected_at_monotonic is not None,
+            "conversation_duration_s": conversation_duration_s,
         }
 
     async def snapshot(self) -> dict[str, object]:
@@ -149,6 +162,12 @@ class DirectSessionManager:
                     "endpoint_name": session.lease.endpoint_name,
                     "connected": session.connected,
                     "pending_expires_at_monotonic": session.pending_expires_at,
+                    "connected_at_monotonic": session.connected_at_monotonic,
+                    "connected_duration_s": (
+                        max(time.monotonic() - session.connected_at_monotonic, 0.0)
+                        if session.connected_at_monotonic is not None
+                        else None
+                    ),
                 }
                 for session in sorted(sessions, key=lambda item: item.session_id)
             ],

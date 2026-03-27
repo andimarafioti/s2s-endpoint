@@ -132,6 +132,11 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         await dashboard.record_session_request()
         await dashboard.record_session_allocation_success()
         await dashboard.record_session_event("connected")
+        await dashboard.record_session_event(
+            "disconnected",
+            conversation_duration_s=150.0,
+            conversation_counted=True,
+        )
 
         payload = await dashboard.data(window="60m", resolution="minute")
         point = payload["series"][-1]
@@ -143,7 +148,12 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["session_requests"], 1)
         self.assertEqual(point["session_allocation_successes"], 1)
         self.assertEqual(point["session_connected_events"], 1)
+        self.assertEqual(point["completed_conversations"], 1)
+        self.assertEqual(point["avg_conversation_duration_s"], 150.0)
+        self.assertEqual(point["max_conversation_duration_min"], 2.5)
         self.assertEqual(payload["summary"]["session_requests_last_hour"], 1)
+        self.assertEqual(payload["summary"]["conversations_completed_last_hour"], 1)
+        self.assertEqual(payload["summary"]["avg_conversation_duration_last_hour_s"], 150.0)
 
     async def test_hourly_series_averages_state_metrics_and_sums_events(self):
         clock = FakeClock(3 * 3600)
@@ -206,7 +216,11 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock.set(3 * 3600 + 40 * 60)
         await dashboard.record_session_request()
         await dashboard.record_session_allocation_failure()
-        await dashboard.record_session_event("disconnected")
+        await dashboard.record_session_event(
+            "disconnected",
+            conversation_duration_s=600.0,
+            conversation_counted=True,
+        )
         clock.set(3 * 3600 + 59 * 60)
 
         points = await dashboard.series(window_minutes=60, resolution="hour")
@@ -218,6 +232,9 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["session_allocation_successes"], 1)
         self.assertEqual(point["session_allocation_failures"], 1)
         self.assertEqual(point["session_disconnected_events"], 1)
+        self.assertEqual(point["completed_conversations"], 1)
+        self.assertEqual(point["avg_conversation_duration_s"], 600.0)
+        self.assertEqual(point["max_conversation_duration_min"], 10.0)
 
     async def test_prunes_buckets_older_than_retention_window(self):
         clock = FakeClock(10 * 3600)
@@ -316,6 +333,11 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         await dashboard.record_session_request()
+        await dashboard.record_session_event(
+            "disconnected",
+            conversation_duration_s=90.0,
+            conversation_counted=True,
+        )
         clock.set(clock.now() + 60)
         await dashboard.record_sample(
             SwarmStateSample(
@@ -342,6 +364,8 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         persisted = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
         self.assertEqual(persisted.session_requests, 1)
         self.assertEqual(persisted.connected_sessions_last, 1)
+        self.assertEqual(persisted.completed_conversations, 1)
+        self.assertEqual(persisted.completed_conversation_duration_total_s, 90.0)
 
     async def test_restores_persisted_history_from_store_on_start(self):
         bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600)

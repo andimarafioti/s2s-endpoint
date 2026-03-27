@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointLease
@@ -62,23 +63,28 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
             websocket_host_matches(payload["ws_url"], "endpoint-1.example.endpoints.huggingface.cloud")
         )
 
-        connected = await self.manager.handle_event(
-            allocation["session_id"],
-            allocation["session_token"],
-            "connected",
-        )
-        self.assertEqual(connected["state"], "connected")
+        with patch("app.direct_session_manager.time.monotonic", side_effect=[100.0, 105.0, 112.5]):
+            connected = await self.manager.handle_event(
+                allocation["session_id"],
+                allocation["session_token"],
+                "connected",
+            )
+            self.assertEqual(connected["state"], "connected")
 
-        snapshot = await self.manager.snapshot()
-        self.assertEqual(snapshot["pending_sessions"], 0)
-        self.assertEqual(snapshot["connected_sessions"], 1)
+            snapshot = await self.manager.snapshot()
+            self.assertEqual(snapshot["pending_sessions"], 0)
+            self.assertEqual(snapshot["connected_sessions"], 1)
+            self.assertAlmostEqual(snapshot["sessions"][0]["connected_duration_s"], 5.0, places=3)
 
-        released = await self.manager.handle_event(
-            allocation["session_id"],
-            allocation["session_token"],
-            "disconnected",
-        )
+            released = await self.manager.handle_event(
+                allocation["session_id"],
+                allocation["session_token"],
+                "disconnected",
+            )
+
         self.assertEqual(released["state"], "released")
+        self.assertTrue(released["conversation_counted"])
+        self.assertAlmostEqual(released["conversation_duration_s"], 12.5, places=3)
         self.assertEqual(router.release_calls, ["endpoint-1"])
 
     async def test_pending_session_is_released_if_client_never_connects(self):

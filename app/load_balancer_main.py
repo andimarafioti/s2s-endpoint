@@ -163,7 +163,11 @@ async def session_event(session_id: str, payload: dict[str, Any]):
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    await dashboard.record_session_event(event)
+    await dashboard.record_session_event(
+        event,
+        conversation_duration_s=result.get("conversation_duration_s"),
+        conversation_counted=bool(result.get("conversation_counted")),
+    )
     return JSONResponse(result)
 
 

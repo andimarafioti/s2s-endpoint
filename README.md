@@ -76,6 +76,7 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - connected and pending user sessions
 - free slots and effective free capacity
 - `POST /session` request counts, allocation successes/failures, and connect/disconnect events
+- conversation starts/completions plus average and max completed conversation duration
 
 The timeline automatically switches between minute-level and hourly rollups depending on the selected window. By default the history is in memory and resets when the LB endpoint restarts.
 
