@@ -1451,7 +1451,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       document.getElementById('hero-stats').innerHTML = stats.map(([label, value]) => `
         <div class="hero-stat">
           <div class="label">${htmlEscape(label)}</div>
-          <strong>${htmlEscape(prettyNumber(value))}</strong>
+          <strong>${htmlEscape(typeof value === 'number' ? prettyNumber(value) : value)}</strong>
         </div>
       `).join('');
     }
