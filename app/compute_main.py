@@ -20,11 +20,11 @@ APP_ROLE = "compute"
 
 INTERNAL_WS_HOST = os.getenv("INTERNAL_WS_HOST", "127.0.0.1")
 INTERNAL_WS_BASE_PORT = int(os.getenv("INTERNAL_WS_PORT", "9000"))
-INTERNAL_WS_URL = f"ws://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}"
 
 S2S_REPO_DIR = os.getenv("S2S_REPO_DIR", "/opt/speech-to-speech")
 PIPELINE_MAX_INSTANCES = int(os.getenv("PIPELINE_MAX_INSTANCES", "1"))
 PIPELINE_MIN_IDLE_INSTANCES = int(os.getenv("PIPELINE_MIN_IDLE_INSTANCES", "1"))
+S2S_SERVER_MODE = os.getenv("S2S_SERVER_MODE", "websocket").strip().lower()
 
 # Core pipeline selection
 LANGUAGE = os.getenv("LANGUAGE", "en").strip()
@@ -52,6 +52,15 @@ EXTRA_S2S_ARGS = os.getenv("EXTRA_S2S_ARGS", "").strip()
 SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
 LB_CALLBACK_AUTH_TOKEN = os.getenv("LB_CALLBACK_AUTH_TOKEN", "").strip()
 
+if S2S_SERVER_MODE not in {"websocket", "realtime"}:
+    raise ValueError("S2S_SERVER_MODE must be either 'websocket' or 'realtime'")
+
+INTERNAL_SLOT_WS_PATH = "/v1/realtime" if S2S_SERVER_MODE == "realtime" else ""
+PUBLIC_WS_PATH = "/v1/realtime" if S2S_SERVER_MODE == "realtime" else "/ws"
+INTERNAL_WS_URL = f"ws://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_SLOT_WS_PATH}"
+INTERNAL_USAGE_PATH = "/v1/usage"
+INTERNAL_USAGE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_USAGE_PATH}"
+
 
 def _add_bool_flag(cmd: list[str], enabled: bool, flag: str) -> None:
     if enabled:
@@ -72,7 +81,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
         "python",
         "s2s_pipeline.py",
         "--mode",
-        "websocket",
+        S2S_SERVER_MODE,
         "--ws_host",
         host,
         "--ws_port",
@@ -115,7 +124,7 @@ async def wait_for_internal_ws(
     timeout_s: float = 900.0,
 ) -> None:
     ws_url = f"ws://{host}:{port}"
-    start = asyncio.get_event_loop().time()
+    start = asyncio.get_running_loop().time()
     last_error = None
 
     while True:
@@ -136,7 +145,7 @@ async def wait_for_internal_ws(
         except Exception as exc:
             last_error = exc
 
-        if asyncio.get_event_loop().time() - start > timeout_s:
+        if asyncio.get_running_loop().time() - start > timeout_s:
             raise RuntimeError(
                 f"Timed out waiting for internal websocket server at {ws_url}. "
                 f"Last error: {last_error}"
@@ -145,14 +154,59 @@ async def wait_for_internal_ws(
         await asyncio.sleep(2.0)
 
 
+async def wait_for_internal_realtime_http(
+    host: str,
+    port: int,
+    process: Optional[subprocess.Popen],
+    timeout_s: float = 900.0,
+) -> None:
+    http_url = f"http://{host}:{port}{INTERNAL_USAGE_PATH}"
+    start = asyncio.get_running_loop().time()
+    last_error = None
+
+    while True:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"speech-to-speech process exited early with code {process.returncode}"
+            )
+
+        try:
+            await asyncio.to_thread(_http_get_json, http_url)
+            logger.info("Internal speech-to-speech listener is ready at %s", http_url)
+            return
+        except Exception as exc:
+            last_error = exc
+
+        if asyncio.get_running_loop().time() - start > timeout_s:
+            raise RuntimeError(
+                f"Timed out waiting for internal realtime server at {http_url}. "
+                f"Last error: {last_error}"
+            )
+
+        await asyncio.sleep(2.0)
+
+
+async def wait_for_internal_server(
+    host: str,
+    port: int,
+    process: Optional[subprocess.Popen],
+    timeout_s: float = 900.0,
+) -> None:
+    if S2S_SERVER_MODE == "realtime":
+        await wait_for_internal_realtime_http(host, port, process, timeout_s)
+        return
+    await wait_for_internal_ws(host, port, process, timeout_s)
+
+
 session_router = SessionRouter(
     host=INTERNAL_WS_HOST,
     base_port=INTERNAL_WS_BASE_PORT,
+    ws_path=INTERNAL_SLOT_WS_PATH,
     repo_dir=S2S_REPO_DIR,
     min_idle_instances=PIPELINE_MIN_IDLE_INSTANCES,
     max_instances=PIPELINE_MAX_INSTANCES,
     build_command=build_s2s_command,
-    wait_for_ready=wait_for_internal_ws,
+    wait_for_ready=wait_for_internal_server,
 )
 
 app = FastAPI(lifespan=build_lifespan(session_router))
@@ -164,9 +218,11 @@ async def root():
         "message": "s2s compute endpoint is up",
         "role": APP_ROLE,
         "health": "/health",
-        "websocket": "/ws",
+        "websocket": PUBLIC_WS_PATH,
         "internal_ws": INTERNAL_WS_URL,
+        "internal_usage": INTERNAL_USAGE_URL if S2S_SERVER_MODE == "realtime" else None,
         "config": {
+            "s2s_server_mode": S2S_SERVER_MODE,
             "stt": STT,
             "llm": LLM,
             "tts": TTS,
@@ -186,6 +242,9 @@ async def health():
             "status": "ok",
             "role": APP_ROLE,
             "internal_ws_base": INTERNAL_WS_URL,
+            "internal_usage_url": INTERNAL_USAGE_URL if S2S_SERVER_MODE == "realtime" else None,
+            "public_websocket": PUBLIC_WS_PATH,
+            "s2s_server_mode": S2S_SERVER_MODE,
             "stt": STT,
             "llm": LLM,
             "tts": TTS,
@@ -195,7 +254,13 @@ async def health():
 
 
 @app.websocket("/ws")
+@app.websocket("/v1/realtime")
 async def websocket_proxy(client_ws: WebSocket):
+    if client_ws.url.path != PUBLIC_WS_PATH:
+        await client_ws.accept()
+        await client_ws.close(code=1008, reason=f"Use {PUBLIC_WS_PATH}")
+        return
+
     session_payload = _get_session_payload(client_ws)
     connected_notified = False
 
@@ -279,6 +344,25 @@ async def _notify_lb_session_event(callback_url: str, session_token: str, event:
         "event": event,
     }
     await asyncio.to_thread(_post_json, callback_url, payload)
+
+
+def _http_get_json(url: str) -> dict[str, object]:
+    request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            status_code = getattr(response, "status", 200)
+            if status_code >= 400:
+                raise RuntimeError(f"HTTP GET failed with status {status_code}")
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP GET failed with HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"HTTP GET failed: {exc.reason}") from exc
+
+    try:
+        return json.loads(body.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("HTTP GET returned invalid JSON") from exc
 
 
 def _post_json(url: str, payload: dict[str, str]) -> None:

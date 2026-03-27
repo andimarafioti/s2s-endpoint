@@ -267,6 +267,12 @@ class EndpointUrlTests(unittest.TestCase):
             "wss://abc.endpoints.huggingface.cloud/base/ws",
         )
 
+    def test_to_ws_url_supports_custom_route(self):
+        self.assertEqual(
+            _to_ws_url("https://abc.endpoints.huggingface.cloud", "/v1/realtime"),
+            "wss://abc.endpoints.huggingface.cloud/v1/realtime",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

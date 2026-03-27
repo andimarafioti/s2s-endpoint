@@ -15,7 +15,7 @@ Speech-to-speech endpoint project.
 This repo now builds two different images with two different app entrypoints:
 
 - compute image: `Dockerfile.compute`
-  Starts `app.compute_main:app` on a GPU instance, runs local `speech-to-speech` subprocesses, and serves `/ws` directly.
+  Starts `app.compute_main:app` on a GPU instance, runs local `speech-to-speech` subprocesses, and serves `/ws` directly by default. When `S2S_SERVER_MODE=realtime`, it serves `/v1/realtime`.
 - load-balancer image: `Dockerfile.load_balancer`
   Starts `app.load_balancer_main:app` on a CPU instance, tracks a configured set of pre-created compute endpoints, keeps a warm pool, wakes parked endpoints when free session capacity gets tight, and allocates direct compute sessions for clients.
 
@@ -36,6 +36,14 @@ Build the compute image:
 docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
+To test the upstream OpenAI Realtime API branch from `speech-to-speech`, build the compute image against that ref:
+
+```bash
+docker build --platform linux/amd64 -f Dockerfile.compute \
+  --build-arg S2S_REF=openai_realtime_server_api \
+  -t your-registry/s2s-endpoint-compute:realtime .
+```
+
 Build the load-balancer image:
 
 ```bash
@@ -53,7 +61,7 @@ The flow is:
    - a direct compute websocket URL
    - a signed session token
    - a convenience `connect_url` with the session token embedded as a query parameter
-3. Client connects directly to the compute endpoint `/ws`.
+3. Client connects directly to the compute endpoint websocket route returned by the LB, `/ws` by default or `/v1/realtime` when the compute fleet is running in realtime mode.
 4. Compute validates the session token and notifies the LB when the session starts and ends.
 
 This removes the LB from the websocket data path. The LB only handles control-plane allocation and release.
@@ -61,7 +69,7 @@ This removes the LB from the websocket data path. The LB only handles control-pl
 In load-balancer mode, the app does not guess endpoint hostnames. It asks the
 Hugging Face API for each compute endpoint's canonical HTTPS URL and turns that
 into the direct websocket URL by replacing `https://` with `wss://` and appending
-`/ws`.
+that websocket route.
 
 ## Swarm Dashboard
 
@@ -87,6 +95,7 @@ If you want the dashboard history to survive LB restarts, you can configure it t
 - `HF_ENDPOINT_NAMESPACE`: namespace that owns the compute endpoints
 - `COMPUTE_ENDPOINT_NAMES`: comma-separated endpoint names
 - `COMPUTE_ENDPOINT_SLOTS`: concurrent sessions each compute endpoint can handle
+- `COMPUTE_ENDPOINT_WS_PATH`: websocket path exposed by each compute endpoint, `/ws` by default or `/v1/realtime` for the upstream OpenAI Realtime API mode
 - `COMPUTE_ENDPOINT_MIN_WARM`: number of compute endpoints that should stay warm
 - `COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS`: when total free slots drop to this level,
   the LB starts waking another parked endpoint
@@ -109,10 +118,11 @@ If you want the dashboard history to survive LB restarts, you can configure it t
 
 - `PIPELINE_MAX_INSTANCES`: local `speech-to-speech` pipelines per compute endpoint
 - `PIPELINE_MIN_IDLE_INSTANCES`: warm local pipeline slots to keep ready
+- `S2S_SERVER_MODE`: `websocket` by default, or `realtime` to run the upstream OpenAI Realtime API server internally
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
 
-The compute endpoint still serves `/ws`. The LB now serves `POST /session` for allocation.
+The compute endpoint serves `/ws` by default. When `S2S_SERVER_MODE=realtime`, it serves `/v1/realtime`. The LB now serves `POST /session` for allocation.
 
 ## Create Compute Endpoints
 
@@ -133,6 +143,26 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --region us-east-1 \
   --pipeline-max-instances 1 \
   --pipeline-min-idle-instances 1 \
+  --wait
+```
+
+To create compute endpoints backed by the upstream OpenAI Realtime API branch, use the realtime image and set the server mode:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/create_compute_endpoints.py \
+  --namespace your-org \
+  --prefix reachy-s2s \
+  --count 3 \
+  --image-url your-registry/s2s-endpoint-compute:realtime \
+  --session-shared-secret your-shared-secret \
+  --secret HF_TOKEN=$HF_TOKEN \
+  --instance-size x1 \
+  --instance-type nvidia-a10g \
+  --vendor aws \
+  --region us-east-1 \
+  --pipeline-max-instances 1 \
+  --pipeline-min-idle-instances 1 \
+  --s2s-server-mode realtime \
   --wait
 ```
 
@@ -206,11 +236,31 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --region us-east-1 \
   --compute-endpoint-names reachy-s2s-01,reachy-s2s-02,reachy-s2s-03 \
   --compute-endpoint-slots 1 \
+  --compute-endpoint-ws-path /ws \
   --compute-endpoint-min-warm 1 \
   --compute-endpoint-wake-threshold-slots 1 \
   --compute-endpoint-idle-park-timeout-s 300 \
   --compute-endpoint-park-strategy pause \
   --session-pending-timeout-s 60 \
+  --wait
+```
+
+For compute endpoints running the upstream OpenAI Realtime API mode, change the load balancer path to `/v1/realtime`:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/create_load_balancer_endpoint.py \
+  --name reachy-s2s-lb \
+  --namespace your-org \
+  --image-url your-registry/s2s-endpoint-lb:latest \
+  --session-shared-secret your-shared-secret \
+  --secret HF_CONTROL_TOKEN=$HF_TOKEN \
+  --instance-size x1 \
+  --instance-type intel-spr \
+  --vendor aws \
+  --region us-east-1 \
+  --compute-endpoint-names reachy-s2s-01,reachy-s2s-02,reachy-s2s-03 \
+  --compute-endpoint-slots 1 \
+  --compute-endpoint-ws-path /v1/realtime \
   --wait
 ```
 

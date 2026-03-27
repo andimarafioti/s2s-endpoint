@@ -19,6 +19,7 @@ class PipelineSlot:
     slot_id: int
     host: str
     port: int
+    ws_path: str = ""
     process: Optional[subprocess.Popen] = None
     ready: bool = False
     busy: bool = False
@@ -27,7 +28,7 @@ class PipelineSlot:
     ws_url: str = field(init=False)
 
     def __post_init__(self) -> None:
-        self.ws_url = f"ws://{self.host}:{self.port}"
+        self.ws_url = f"ws://{self.host}:{self.port}{self.ws_path}"
 
 
 class SessionRouter:
@@ -41,6 +42,7 @@ class SessionRouter:
         max_instances: int,
         build_command: BuildCommand,
         wait_for_ready: WaitForReady,
+        ws_path: str = "",
     ) -> None:
         if max_instances < 1:
             raise ValueError("max_instances must be >= 1")
@@ -51,6 +53,7 @@ class SessionRouter:
 
         self.host = host
         self.base_port = base_port
+        self.ws_path = ws_path
         self.repo_dir = repo_dir
         self.min_idle_instances = min_idle_instances
         self.max_instances = max_instances
@@ -200,6 +203,7 @@ class SessionRouter:
             slot_id=slot_id,
             host=self.host,
             port=self.base_port + slot_id,
+            ws_path=self.ws_path,
             busy=busy,
             starting=True,
         )

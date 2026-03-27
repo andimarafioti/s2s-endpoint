@@ -17,6 +17,7 @@ COMPUTE_ENDPOINT_NAMES = [
     name.strip() for name in os.getenv("COMPUTE_ENDPOINT_NAMES", "").split(",") if name.strip()
 ]
 COMPUTE_ENDPOINT_SLOTS = int(os.getenv("COMPUTE_ENDPOINT_SLOTS", "1"))
+COMPUTE_ENDPOINT_WS_PATH = os.getenv("COMPUTE_ENDPOINT_WS_PATH", "/ws").strip() or "/ws"
 COMPUTE_ENDPOINT_MIN_WARM = int(os.getenv("COMPUTE_ENDPOINT_MIN_WARM", "1"))
 COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS = int(
     os.getenv("COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS", str(COMPUTE_ENDPOINT_SLOTS))
@@ -58,6 +59,7 @@ def build_endpoint_router() -> EndpointPoolRouter:
     return EndpointPoolRouter(
         endpoint_names=COMPUTE_ENDPOINT_NAMES,
         endpoint_slots=COMPUTE_ENDPOINT_SLOTS,
+        endpoint_ws_path=COMPUTE_ENDPOINT_WS_PATH,
         min_warm_endpoints=COMPUTE_ENDPOINT_MIN_WARM,
         wake_threshold_slots=COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS,
         idle_park_timeout_s=COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S,
