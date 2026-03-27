@@ -213,8 +213,9 @@ Qwen3 TTS handler keeps its default reference audio path and incorrectly takes
 the voice-cloning path even when you are using a `CustomVoice` model.
 
 The script fetches each endpoint's current env, merges the requested changes,
-and sends the full updated env back to Hugging Face one endpoint at a time.
-That matters because the endpoint update API replaces the env payload instead of
+and sends the full updated env back to Hugging Face. By default, it updates the
+selected compute endpoints in parallel and waits for them in parallel too. That
+matters because the endpoint update API replaces the env payload instead of
 patching it.
 
 Useful options:
@@ -223,7 +224,9 @@ Useful options:
 - `--env-file path.json`: load several env updates from JSON
 - `--dry-run`: print the planned changes without applying them
 - `--no-wait`: submit updates without waiting for each endpoint to return to
-  `running`
+  its target state
+- `--parallelism 1`: force sequential updates instead of the default parallel
+  rollout
 
 ## Create Load Balancer Endpoint
 
