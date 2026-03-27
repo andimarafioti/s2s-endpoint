@@ -3,10 +3,11 @@ import argparse
 from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait as wait_futures
 import json
 import sys
+import time
 from typing import Any
 
 from huggingface_hub import HfApi
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import HfHubHTTPError, InferenceEndpointError, InferenceEndpointTimeoutError
 
 from _endpoint_helpers import build_names, current_custom_image
 
@@ -14,6 +15,8 @@ from _endpoint_helpers import build_names, current_custom_image
 DEFAULT_LOAD_BALANCER_NAME = "reachy-s2s-lb"
 DEFAULT_COMPUTE_INDEX_START = 1
 DEFAULT_COMPUTE_INDEX_WIDTH = 2
+FAILED_UPDATE_STATUSES = {"failed", "updateFailed"}
+PARKED_STATUSES = {"paused", "scaledToZero"}
 
 
 def log_progress(message: str) -> None:
@@ -206,6 +209,10 @@ def is_not_found_error(exc: HfHubHTTPError) -> bool:
     return "404" in message or "not found" in message
 
 
+def expected_target_status(status_before: str) -> str:
+    return status_before if status_before in PARKED_STATUSES else "running"
+
+
 def update_many(
     *,
     api: HfApi,
@@ -321,18 +328,21 @@ def update_one(
     dry_run: bool,
 ) -> dict[str, object]:
     endpoint = api.get_inference_endpoint(name, namespace=namespace)
+    status_before = str(endpoint.status)
     current_image = current_custom_image(endpoint.raw)
     updated_image = dict(current_image)
     updated_image["url"] = image_url
+    target_status = expected_target_status(status_before)
 
     result = {
         "name": name,
-        "status_before": str(endpoint.status),
+        "status_before": status_before,
         "url": getattr(endpoint, "url", None),
         "image_before": current_image["url"],
         "image_after": image_url,
         "health_route": current_image["health_route"],
         "port": current_image["port"],
+        "expected_status_after": target_status,
         "skipped": False,
     }
 
@@ -348,7 +358,7 @@ def update_one(
     if wait:
         log_progress(
             f"Waiting for {name} to finish updating "
-            f"(timeout {wait_timeout_s}s, poll every {wait_refresh_every_s}s)"
+            f"and return to {target_status} (timeout {wait_timeout_s}s, poll every {wait_refresh_every_s}s)"
         )
     endpoint = api.update_inference_endpoint(
         name,
@@ -356,10 +366,44 @@ def update_one(
         custom_image=updated_image,
     )
     if wait:
-        endpoint.wait(timeout=wait_timeout_s, refresh_every=wait_refresh_every_s)
-        endpoint.fetch()
+        wait_for_endpoint_update(
+            endpoint,
+            target_status=target_status,
+            timeout=wait_timeout_s,
+            refresh_every=wait_refresh_every_s,
+        )
     result["status_after"] = str(endpoint.status)
     return result
+
+
+def wait_for_endpoint_update(
+    endpoint,
+    *,
+    target_status: str,
+    timeout: int,
+    refresh_every: int,
+):
+    if target_status == "running":
+        endpoint.wait(timeout=timeout, refresh_every=refresh_every)
+        endpoint.fetch()
+        return endpoint
+
+    start = time.time()
+    while True:
+        current_status = str(endpoint.status)
+        if current_status in FAILED_UPDATE_STATUSES:
+            raise InferenceEndpointError(
+                f"Inference Endpoint {endpoint.name} failed to update. Please check the logs for more information."
+            )
+        if current_status == target_status:
+            endpoint.fetch()
+            return endpoint
+        if timeout is not None and time.time() - start > timeout:
+            raise InferenceEndpointTimeoutError(
+                f"Timeout while waiting for Inference Endpoint {endpoint.name} to return to {target_status}."
+            )
+        time.sleep(refresh_every)
+        endpoint.fetch()
 
 
 if __name__ == "__main__":

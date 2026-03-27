@@ -292,6 +292,7 @@ Behavior:
 - with the default LB name `reachy-s2s-lb`, that means it discovers `reachy-s2s-01`, `reachy-s2s-02`, and so on, then prints a summary like `updated endpoints 1 through 8`
 - compute endpoint updates now run in parallel by default; use `--compute-parallelism 1` if you want the old sequential rollout behavior
 - with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately
+- paused or scale-to-zero compute endpoints keep their parked state after the image update, and the script now waits for them to return to that original parked state instead of incorrectly waiting for `running`
 
 Useful options:
 

@@ -16,6 +16,7 @@ from update_endpoints_images import (  # noqa: E402
     build_compute_summary,
     default_compute_prefix,
     discover_sequential_compute_names,
+    update_one,
     update_many,
 )
 
@@ -84,6 +85,25 @@ class FakeManagedEndpoint:
         return self
 
 
+class FakeTransitionEndpoint(FakeManagedEndpoint):
+    def __init__(self, name: str, image_url: str, tracker: ParallelTracker, status: str, fetch_statuses: list[str]):
+        super().__init__(name, image_url, tracker)
+        self.status = status
+        self.fetch_statuses = list(fetch_statuses)
+        self.wait_called = False
+        self.fetch_count = 0
+
+    def wait(self, timeout=None, refresh_every=None):
+        self.wait_called = True
+        super().wait(timeout=timeout, refresh_every=refresh_every)
+
+    def fetch(self):
+        self.fetch_count += 1
+        if self.fetch_statuses:
+            self.status = self.fetch_statuses.pop(0)
+        return self
+
+
 class FakeParallelUpdateApi:
     def __init__(self, names: list[str]):
         self.tracker = ParallelTracker()
@@ -99,6 +119,19 @@ class FakeParallelUpdateApi:
         endpoint.status = "updating"
         endpoint._image_url = custom_image["url"]
         return endpoint
+
+
+class FakeTransitionUpdateApi:
+    def __init__(self, endpoint: FakeTransitionEndpoint):
+        self.endpoint = endpoint
+
+    def get_inference_endpoint(self, name: str, namespace: str | None = None):
+        return self.endpoint
+
+    def update_inference_endpoint(self, name: str, namespace: str | None = None, custom_image=None):
+        self.endpoint.status = "updating"
+        self.endpoint._image_url = custom_image["url"]
+        return self.endpoint
 
 
 class UpdateEndpointImagesTests(unittest.TestCase):
@@ -159,6 +192,34 @@ class UpdateEndpointImagesTests(unittest.TestCase):
 
         self.assertEqual([result["name"] for result in results], names)
         self.assertGreaterEqual(api.tracker.max_active_waiters, 2)
+
+    def test_update_one_waits_for_paused_endpoint_to_return_to_paused(self):
+        tracker = ParallelTracker()
+        endpoint = FakeTransitionEndpoint(
+            "reachy-s2s-01",
+            "andito/s2s-compute:old",
+            tracker,
+            status="paused",
+            fetch_statuses=["paused"],
+        )
+        api = FakeTransitionUpdateApi(endpoint)
+
+        result = update_one(
+            api=api,
+            namespace="HuggingFaceM4",
+            name="reachy-s2s-01",
+            image_url="andito/s2s-compute:new",
+            wait=True,
+            wait_timeout_s=1,
+            wait_refresh_every_s=0.001,
+            dry_run=False,
+        )
+
+        self.assertEqual(result["status_before"], "paused")
+        self.assertEqual(result["expected_status_after"], "paused")
+        self.assertEqual(result["status_after"], "paused")
+        self.assertFalse(endpoint.wait_called)
+        self.assertGreaterEqual(endpoint.fetch_count, 1)
 
 
 if __name__ == "__main__":
