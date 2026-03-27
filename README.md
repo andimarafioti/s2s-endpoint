@@ -272,6 +272,32 @@ uv run --with-requirements requirements.txt python scripts/update_load_balancer_
 
 Like the compute env updater, this script fetches the current env first, merges the requested changes, and sends the full updated env back to Hugging Face.
 
+## Update Endpoint Images
+
+To roll out a new compute image, a new load-balancer image, or both, use:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_endpoints_images.py \
+  --namespace HuggingFaceM4 \
+  --compute andito/s2s-compute:v0.3 \
+  --load_balancer andito/s2s-load_balancer:v0.11
+```
+
+Behavior:
+
+- if you pass `--compute`, the script updates the compute pool first
+- if you pass `--load_balancer`, it updates the load-balancer endpoint
+- if you omit either one, that side is skipped
+- if you do not provide compute names explicitly, the script reads `COMPUTE_ENDPOINT_NAMES` from the load balancer and updates that pool
+
+Useful options:
+
+- `--load-balancer-name`: defaults to `reachy-s2s-lb`
+- `--compute-names reachy-s2s-01 reachy-s2s-02`
+- `--compute-prefix reachy-s2s --compute-count 8`
+- `--no-wait`
+- `--dry-run`
+
 ## Files
 - `app/`: application code
 - `scripts/`: helper scripts
