@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait as wait_futures
 import json
+import sys
+import time
 
 from huggingface_hub import HfApi
+from huggingface_hub.errors import InferenceEndpointError, InferenceEndpointTimeoutError
 
 from _endpoint_helpers import (
     build_names,
@@ -11,6 +15,50 @@ from _endpoint_helpers import (
     merge_env_updates,
     parse_key_value_pairs,
 )
+
+FAILED_UPDATE_STATUSES = {"failed", "updateFailed"}
+PARKED_STATUSES = {"paused", "scaledToZero"}
+
+
+def log_progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def expected_target_status(status_before: str) -> str:
+    return "parked" if status_before in PARKED_STATUSES else "running"
+
+
+def wait_for_endpoint_update(
+    endpoint,
+    *,
+    target_status: str,
+    timeout: int,
+    refresh_every: int,
+):
+    if target_status == "running":
+        endpoint.wait(timeout=timeout, refresh_every=refresh_every)
+        endpoint.fetch()
+        return endpoint
+
+    start = time.time()
+    while True:
+        current_status = str(endpoint.status)
+        if current_status in FAILED_UPDATE_STATUSES:
+            raise InferenceEndpointError(
+                f"Inference Endpoint {endpoint.name} failed to update. Please check the logs for more information."
+            )
+        if target_status == "parked" and current_status in PARKED_STATUSES:
+            endpoint.fetch()
+            return endpoint
+        if current_status == target_status:
+            endpoint.fetch()
+            return endpoint
+        if timeout is not None and time.time() - start > timeout:
+            raise InferenceEndpointTimeoutError(
+                f"Timeout while waiting for Inference Endpoint {endpoint.name} to return to {target_status}."
+            )
+        time.sleep(refresh_every)
+        endpoint.fetch()
 
 
 def main() -> None:
@@ -25,11 +73,17 @@ def main() -> None:
     parser.add_argument("--env", action="append", default=[], help="Env var to set in KEY=VALUE form")
     parser.add_argument("--unset-env", action="append", default=[], help="Env var key to remove")
     parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=0,
+        help="Number of compute endpoint env updates to run in parallel. Default: all selected endpoints. Use 1 for sequential updates.",
+    )
+    parser.add_argument(
         "--wait",
         dest="wait",
         action="store_true",
         default=True,
-        help="Wait for each endpoint update to finish before moving to the next one (default).",
+        help="Wait for each endpoint update to finish before returning (default).",
     )
     parser.add_argument(
         "--no-wait",
@@ -51,51 +105,189 @@ def main() -> None:
         raise ValueError("Provide at least one --env/--env-file entry or one --unset-env key")
 
     api = HfApi()
-    results = []
-
-    for name in names:
-        endpoint = api.get_inference_endpoint(name, namespace=args.namespace)
-        current_env = current_model_env(endpoint.raw)
-        updated_env = merge_env_updates(current_env, env_updates, unset_env)
-
-        changed = {
-            key: updated_env[key]
-            for key in sorted(updated_env)
-            if current_env.get(key) != updated_env[key]
-        }
-        removed = sorted(key for key in current_env if key not in updated_env)
-
-        result = {
-            "name": name,
-            "status_before": str(endpoint.status),
-            "url": getattr(endpoint, "url", None),
-            "changed": changed,
-            "removed": removed,
-            "skipped": False,
-        }
-
-        if current_env == updated_env:
-            result["skipped"] = True
-            result["status_after"] = str(endpoint.status)
-            results.append(result)
-            continue
-
-        if not args.dry_run:
-            endpoint = api.update_inference_endpoint(
-                name,
-                namespace=args.namespace,
-                env=updated_env,
-            )
-            if args.wait:
-                endpoint.wait(timeout=args.wait_timeout_s, refresh_every=args.wait_refresh_every_s)
-                endpoint.fetch()
-            result["status_after"] = str(endpoint.status)
-        else:
-            result["status_after"] = "dry_run"
-
-        results.append(result)
+    results = update_many(
+        api=api,
+        namespace=args.namespace,
+        names=names,
+        env_updates=env_updates,
+        unset_env=unset_env,
+        wait=args.wait,
+        wait_timeout_s=args.wait_timeout_s,
+        wait_refresh_every_s=args.wait_refresh_every_s,
+        dry_run=args.dry_run,
+        parallelism=args.parallelism,
+    )
 
     print(json.dumps({"endpoints": results}, indent=2, sort_keys=True))
+
+
+def update_many(
+    *,
+    api: HfApi,
+    namespace: str | None,
+    names: list[str],
+    env_updates: dict[str, str],
+    unset_env: list[str],
+    wait: bool,
+    wait_timeout_s: int,
+    wait_refresh_every_s: int,
+    dry_run: bool,
+    parallelism: int,
+) -> list[dict[str, object]]:
+    total = len(names)
+    if total == 0:
+        return []
+
+    max_workers = total if parallelism <= 0 else min(total, parallelism)
+    if max_workers == 1:
+        return update_many_sequential(
+            api=api,
+            namespace=namespace,
+            names=names,
+            env_updates=env_updates,
+            unset_env=unset_env,
+            wait=wait,
+            wait_timeout_s=wait_timeout_s,
+            wait_refresh_every_s=wait_refresh_every_s,
+            dry_run=dry_run,
+        )
+
+    log_progress(f"Updating {total} compute endpoint envs in parallel with {max_workers} workers")
+    results: list[dict[str, object] | None] = [None] * total
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[Future[dict[str, object]], tuple[int, str]] = {}
+        for index, name in enumerate(names, start=1):
+            log_progress(f"[{index}/{total}] Submitting compute env update for {name}")
+            future = executor.submit(
+                update_one,
+                api=api,
+                namespace=namespace,
+                name=name,
+                env_updates=env_updates,
+                unset_env=unset_env,
+                wait=wait,
+                wait_timeout_s=wait_timeout_s,
+                wait_refresh_every_s=wait_refresh_every_s,
+                dry_run=dry_run,
+            )
+            futures[future] = (index, name)
+
+        done, not_done = wait_futures(futures, return_when=FIRST_EXCEPTION)
+        first_error: BaseException | None = None
+        for future in done:
+            exc = future.exception()
+            if exc is not None:
+                first_error = exc
+                break
+
+        if first_error is not None:
+            for future in not_done:
+                future.cancel()
+            raise first_error
+
+        for future, (index, name) in futures.items():
+            result = future.result()
+            log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
+            results[index - 1] = result
+
+    return [result for result in results if result is not None]
+
+
+def update_many_sequential(
+    *,
+    api: HfApi,
+    namespace: str | None,
+    names: list[str],
+    env_updates: dict[str, str],
+    unset_env: list[str],
+    wait: bool,
+    wait_timeout_s: int,
+    wait_refresh_every_s: int,
+    dry_run: bool,
+) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    total = len(names)
+    for index, name in enumerate(names, start=1):
+        log_progress(f"[{index}/{total}] Updating env on compute endpoint {name}")
+        result = update_one(
+            api=api,
+            namespace=namespace,
+            name=name,
+            env_updates=env_updates,
+            unset_env=unset_env,
+            wait=wait,
+            wait_timeout_s=wait_timeout_s,
+            wait_refresh_every_s=wait_refresh_every_s,
+            dry_run=dry_run,
+        )
+        log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
+        results.append(result)
+    return results
+
+
+def update_one(
+    *,
+    api: HfApi,
+    namespace: str | None,
+    name: str,
+    env_updates: dict[str, str],
+    unset_env: list[str],
+    wait: bool,
+    wait_timeout_s: int,
+    wait_refresh_every_s: int,
+    dry_run: bool,
+) -> dict[str, object]:
+    endpoint = api.get_inference_endpoint(name, namespace=namespace)
+    status_before = str(endpoint.status)
+    target_status = expected_target_status(status_before)
+    current_env = current_model_env(endpoint.raw)
+    updated_env = merge_env_updates(current_env, env_updates, unset_env)
+
+    changed = {
+        key: updated_env[key]
+        for key in sorted(updated_env)
+        if current_env.get(key) != updated_env[key]
+    }
+    removed = sorted(key for key in current_env if key not in updated_env)
+
+    result = {
+        "name": name,
+        "status_before": status_before,
+        "expected_status_after": target_status,
+        "url": getattr(endpoint, "url", None),
+        "changed": changed,
+        "removed": removed,
+        "skipped": False,
+    }
+
+    if current_env == updated_env:
+        result["skipped"] = True
+        result["status_after"] = str(endpoint.status)
+        return result
+
+    if dry_run:
+        result["status_after"] = "dry_run"
+        return result
+
+    if wait:
+        log_progress(
+            f"Waiting for {name} to finish updating and return to "
+            f"{target_status} (timeout {wait_timeout_s}s, poll every {wait_refresh_every_s}s)"
+        )
+    endpoint = api.update_inference_endpoint(
+        name,
+        namespace=namespace,
+        env=updated_env,
+    )
+    if wait:
+        wait_for_endpoint_update(
+            endpoint,
+            target_status=target_status,
+            timeout=wait_timeout_s,
+            refresh_every=wait_refresh_every_s,
+        )
+    result["status_after"] = str(endpoint.status)
+    return result
 
 
 if __name__ == "__main__":

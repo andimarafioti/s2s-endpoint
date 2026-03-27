@@ -7,7 +7,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from _endpoint_helpers import current_model_env, merge_env_updates
+from _endpoint_helpers import current_custom_image, current_model_env, merge_env_updates
 
 
 class EndpointHelpersTests(unittest.TestCase):
@@ -41,6 +41,27 @@ class EndpointHelpersTests(unittest.TestCase):
             {
                 "OPEN_API_MODEL_NAME": "Qwen/Qwen3.5-72B:together",
                 "SESSION_SHARED_SECRET": "secret",
+            },
+        )
+
+    def test_current_custom_image_preserves_url_health_route_and_port(self):
+        raw = {
+            "model": {
+                "image": {
+                    "custom": {
+                        "url": "andito/s2s-compute:v0.3",
+                        "healthRoute": "/healthz",
+                        "port": 9000,
+                    }
+                }
+            }
+        }
+        self.assertEqual(
+            current_custom_image(raw),
+            {
+                "url": "andito/s2s-compute:v0.3",
+                "health_route": "/healthz",
+                "port": 9000,
             },
         )
 

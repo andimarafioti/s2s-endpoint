@@ -15,7 +15,7 @@ def _normalize_status(status: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(status).lower())
 
 
-def _to_ws_url(base_url: str, path: str = "/ws") -> str:
+def _to_ws_url(base_url: str, path: str = "/v1/realtime") -> str:
     parsed = urlparse(base_url)
     scheme = "wss" if parsed.scheme == "https" else "ws"
     route_path = (parsed.path.rstrip("/") + path) if parsed.path else path
@@ -142,6 +142,7 @@ class HuggingFaceEndpointController:
 class ManagedEndpoint:
     name: str
     slots: int
+    ws_path: str = "/v1/realtime"
     status: str = "unknown"
     raw_status: str = "unknown"
     url: Optional[str] = None
@@ -166,7 +167,7 @@ class ManagedEndpoint:
     def ws_url(self) -> Optional[str]:
         if self.url is None:
             return None
-        return _to_ws_url(self.url)
+        return _to_ws_url(self.url, self.ws_path)
 
 
 class EndpointPoolRouter:
@@ -182,6 +183,7 @@ class EndpointPoolRouter:
         waking_capacity_timeout_s: float,
         park_cooldown_s: float,
         controller: EndpointController,
+        endpoint_ws_path: str = "/v1/realtime",
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
         if not names:
@@ -198,8 +200,11 @@ class EndpointPoolRouter:
             raise ValueError("waking_capacity_timeout_s must be >= 0")
         if park_cooldown_s < 0:
             raise ValueError("park_cooldown_s must be >= 0")
+        if not endpoint_ws_path.startswith("/"):
+            raise ValueError("endpoint_ws_path must start with '/'")
 
         self.endpoint_slots = endpoint_slots
+        self.endpoint_ws_path = endpoint_ws_path
         self.min_warm_endpoints = min_warm_endpoints
         self.wake_threshold_slots = wake_threshold_slots
         self.idle_park_timeout_s = idle_park_timeout_s
@@ -208,7 +213,10 @@ class EndpointPoolRouter:
         self.park_cooldown_s = park_cooldown_s
         self.controller = controller
 
-        self._endpoints = {name: ManagedEndpoint(name=name, slots=endpoint_slots) for name in names}
+        self._endpoints = {
+            name: ManagedEndpoint(name=name, slots=endpoint_slots, ws_path=endpoint_ws_path)
+            for name in names
+        }
         self._lock = asyncio.Lock()
         self._condition = asyncio.Condition(self._lock)
         self._closed = False

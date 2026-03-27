@@ -58,6 +58,36 @@ def current_model_env(raw: dict[str, Any]) -> dict[str, str]:
     return {str(key): str(value) for key, value in env.items()}
 
 
+def current_custom_image(raw: dict[str, Any]) -> dict[str, str | int]:
+    model = raw.get("model") or {}
+    image = model.get("image") or {}
+    custom = image.get("custom") or {}
+    if not isinstance(custom, dict):
+        raise ValueError("endpoint custom image must be a dictionary")
+
+    url = str(custom.get("url") or "").strip()
+    if not url:
+        raise ValueError("endpoint does not have a custom image url")
+
+    health_route = str(
+        custom.get("health_route")
+        or custom.get("healthRoute")
+        or DEFAULT_HEALTH_ROUTE
+    ).strip() or DEFAULT_HEALTH_ROUTE
+
+    port_value = custom.get("port", DEFAULT_IMAGE_PORT)
+    try:
+        port = int(port_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid endpoint custom image port: {port_value!r}") from exc
+
+    return {
+        "url": url,
+        "health_route": health_route,
+        "port": port,
+    }
+
+
 def merge_env_updates(
     current_env: dict[str, str] | None,
     updates: dict[str, str],

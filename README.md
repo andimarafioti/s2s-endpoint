@@ -15,7 +15,7 @@ Speech-to-speech endpoint project.
 This repo now builds two different images with two different app entrypoints:
 
 - compute image: `Dockerfile.compute`
-  Starts `app.compute_main:app` on a GPU instance, runs local `speech-to-speech` subprocesses, and serves `/ws` directly.
+  Starts `app.compute_main:app` on a GPU instance, runs local `speech-to-speech` subprocesses in upstream `--mode realtime`, and serves `/v1/realtime` directly.
 - load-balancer image: `Dockerfile.load_balancer`
   Starts `app.load_balancer_main:app` on a CPU instance, tracks a configured set of pre-created compute endpoints, keeps a warm pool, wakes parked endpoints when free session capacity gets tight, and allocates direct compute sessions for clients.
 
@@ -36,6 +36,24 @@ Build the compute image:
 docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
+Today `Dockerfile.compute` defaults `S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and `S2S_REF=openai_realtime_server_api`, because this repo now assumes the realtime server path. If you need to override that repo/ref explicitly, use:
+
+```bash
+docker build --platform linux/amd64 -f Dockerfile.compute \
+  --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
+  --build-arg S2S_REF=openai_realtime_server_api \
+  -t your-registry/s2s-endpoint-compute:realtime .
+```
+
+To build against the temporary llama.cpp compatibility fix before it lands upstream, use:
+
+```bash
+docker build --platform linux/amd64 -f Dockerfile.compute \
+  --build-arg S2S_REPO_URL=https://github.com/andimarafioti/speech-to-speech.git \
+  --build-arg S2S_REF=fix/openai-responses-history-serialization \
+  -t your-registry/s2s-endpoint-compute:llamacpp-fix .
+```
+
 Build the load-balancer image:
 
 ```bash
@@ -53,7 +71,7 @@ The flow is:
    - a direct compute websocket URL
    - a signed session token
    - a convenience `connect_url` with the session token embedded as a query parameter
-3. Client connects directly to the compute endpoint `/ws`.
+3. Client connects directly to the compute endpoint websocket route returned by the LB, `/v1/realtime`.
 4. Compute validates the session token and notifies the LB when the session starts and ends.
 
 This removes the LB from the websocket data path. The LB only handles control-plane allocation and release.
@@ -61,7 +79,7 @@ This removes the LB from the websocket data path. The LB only handles control-pl
 In load-balancer mode, the app does not guess endpoint hostnames. It asks the
 Hugging Face API for each compute endpoint's canonical HTTPS URL and turns that
 into the direct websocket URL by replacing `https://` with `wss://` and appending
-`/ws`.
+that websocket route.
 
 ## Swarm Dashboard
 
@@ -112,7 +130,7 @@ If you want the dashboard history to survive LB restarts, you can configure it t
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
 
-The compute endpoint still serves `/ws`. The LB now serves `POST /session` for allocation.
+The compute endpoint serves `/v1/realtime`. The LB now serves `POST /session` for allocation.
 
 ## Create Compute Endpoints
 
@@ -125,6 +143,25 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --count 3 \
   --image-url your-registry/s2s-endpoint-compute:latest \
   --image-port 7860 \
+  --session-shared-secret your-shared-secret \
+  --secret HF_TOKEN=$HF_TOKEN \
+  --instance-size x1 \
+  --instance-type nvidia-a10g \
+  --vendor aws \
+  --region us-east-1 \
+  --pipeline-max-instances 1 \
+  --pipeline-min-idle-instances 1 \
+  --wait
+```
+
+To create compute endpoints backed by the upstream OpenAI Realtime API branch, use the realtime image:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/create_compute_endpoints.py \
+  --namespace your-org \
+  --prefix reachy-s2s \
+  --count 3 \
+  --image-url your-registry/s2s-endpoint-compute:realtime \
   --session-shared-secret your-shared-secret \
   --secret HF_TOKEN=$HF_TOKEN \
   --instance-size x1 \
@@ -176,8 +213,9 @@ Qwen3 TTS handler keeps its default reference audio path and incorrectly takes
 the voice-cloning path even when you are using a `CustomVoice` model.
 
 The script fetches each endpoint's current env, merges the requested changes,
-and sends the full updated env back to Hugging Face one endpoint at a time.
-That matters because the endpoint update API replaces the env payload instead of
+and sends the full updated env back to Hugging Face. By default, it updates the
+selected compute endpoints in parallel and waits for them in parallel too. That
+matters because the endpoint update API replaces the env payload instead of
 patching it.
 
 Useful options:
@@ -186,7 +224,9 @@ Useful options:
 - `--env-file path.json`: load several env updates from JSON
 - `--dry-run`: print the planned changes without applying them
 - `--no-wait`: submit updates without waiting for each endpoint to return to
-  `running`
+  its target state
+- `--parallelism 1`: force sequential updates instead of the default parallel
+  rollout
 
 ## Create Load Balancer Endpoint
 
@@ -244,6 +284,37 @@ uv run --with-requirements requirements.txt python scripts/update_load_balancer_
 ```
 
 Like the compute env updater, this script fetches the current env first, merges the requested changes, and sends the full updated env back to Hugging Face.
+
+## Update Endpoint Images
+
+To roll out a new compute image, a new load-balancer image, or both, use:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_endpoints_images.py \
+  --namespace HuggingFaceM4 \
+  --compute andito/s2s-compute:v0.3 \
+  --load_balancer andito/s2s-load_balancer:v0.11
+```
+
+Behavior:
+
+- if you pass `--compute`, the script updates the compute pool first
+- if you pass `--load_balancer`, it updates the load-balancer endpoint
+- if you omit either one, that side is skipped
+- if you do not provide compute names explicitly, the script derives the compute prefix from the load-balancer name and scans `-01`, `-02`, ... until the first missing endpoint
+- with the default LB name `reachy-s2s-lb`, that means it discovers `reachy-s2s-01`, `reachy-s2s-02`, and so on, then prints a summary like `updated endpoints 1 through 8`
+- compute endpoint updates now run in parallel by default; use `--compute-parallelism 1` if you want the old sequential rollout behavior
+- with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately
+- paused or scale-to-zero compute endpoints keep their parked state after the image update, and the script now waits for them to return to that original parked state instead of incorrectly waiting for `running`
+
+Useful options:
+
+- `--load-balancer-name`: defaults to `reachy-s2s-lb`
+- `--compute-names reachy-s2s-01 reachy-s2s-02`
+- `--compute-prefix reachy-s2s --compute-count 8`
+- `--compute-parallelism 1`
+- `--no-wait`
+- `--dry-run`
 
 ## Files
 - `app/`: application code
