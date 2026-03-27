@@ -210,7 +210,7 @@ def is_not_found_error(exc: HfHubHTTPError) -> bool:
 
 
 def expected_target_status(status_before: str) -> str:
-    return status_before if status_before in PARKED_STATUSES else "running"
+    return "parked" if status_before in PARKED_STATUSES else "running"
 
 
 def update_many(
@@ -395,6 +395,9 @@ def wait_for_endpoint_update(
             raise InferenceEndpointError(
                 f"Inference Endpoint {endpoint.name} failed to update. Please check the logs for more information."
             )
+        if target_status == "parked" and current_status in PARKED_STATUSES:
+            endpoint.fetch()
+            return endpoint
         if current_status == target_status:
             endpoint.fetch()
             return endpoint

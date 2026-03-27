@@ -193,14 +193,14 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual([result["name"] for result in results], names)
         self.assertGreaterEqual(api.tracker.max_active_waiters, 2)
 
-    def test_update_one_waits_for_paused_endpoint_to_return_to_paused(self):
+    def test_update_one_waits_for_paused_endpoint_to_return_to_any_parked_state(self):
         tracker = ParallelTracker()
         endpoint = FakeTransitionEndpoint(
             "reachy-s2s-01",
             "andito/s2s-compute:old",
             tracker,
             status="paused",
-            fetch_statuses=["paused"],
+            fetch_statuses=["scaledToZero"],
         )
         api = FakeTransitionUpdateApi(endpoint)
 
@@ -216,8 +216,8 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status_before"], "paused")
-        self.assertEqual(result["expected_status_after"], "paused")
-        self.assertEqual(result["status_after"], "paused")
+        self.assertEqual(result["expected_status_after"], "parked")
+        self.assertEqual(result["status_after"], "scaledToZero")
         self.assertFalse(endpoint.wait_called)
         self.assertGreaterEqual(endpoint.fetch_count, 1)
 
