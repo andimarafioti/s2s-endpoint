@@ -290,13 +290,15 @@ Behavior:
 - if you omit either one, that side is skipped
 - if you do not provide compute names explicitly, the script derives the compute prefix from the load-balancer name and scans `-01`, `-02`, ... until the first missing endpoint
 - with the default LB name `reachy-s2s-lb`, that means it discovers `reachy-s2s-01`, `reachy-s2s-02`, and so on, then prints a summary like `updated endpoints 1 through 8`
-- by default it waits sequentially for each selected endpoint to return to `running`, so large compute-pool rollouts can take a while; use `--no-wait` if you want to submit the updates and return immediately
+- compute endpoint updates now run in parallel by default; use `--compute-parallelism 1` if you want the old sequential rollout behavior
+- with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately
 
 Useful options:
 
 - `--load-balancer-name`: defaults to `reachy-s2s-lb`
 - `--compute-names reachy-s2s-01 reachy-s2s-02`
 - `--compute-prefix reachy-s2s --compute-count 8`
+- `--compute-parallelism 1`
 - `--no-wait`
 - `--dry-run`
 

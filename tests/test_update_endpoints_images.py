@@ -1,4 +1,6 @@
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from update_endpoints_images import (  # noqa: E402
     build_compute_summary,
     default_compute_prefix,
     discover_sequential_compute_names,
+    update_many,
 )
 
 
@@ -29,6 +32,73 @@ class FakeApi:
         request = httpx.Request("GET", f"https://example.test/{namespace or 'default'}/{name}")
         response = httpx.Response(404, request=request)
         raise HfHubHTTPError("not found", response=response)
+
+
+class ParallelTracker:
+    def __init__(self):
+        self.active_waiters = 0
+        self.max_active_waiters = 0
+        self.lock = threading.Lock()
+
+    def wait_started(self):
+        with self.lock:
+            self.active_waiters += 1
+            self.max_active_waiters = max(self.max_active_waiters, self.active_waiters)
+
+    def wait_finished(self):
+        with self.lock:
+            self.active_waiters -= 1
+
+
+class FakeManagedEndpoint:
+    def __init__(self, name: str, image_url: str, tracker: ParallelTracker):
+        self.name = name
+        self.status = "running"
+        self.url = f"https://example.test/{name}"
+        self._image_url = image_url
+        self._tracker = tracker
+
+    @property
+    def raw(self):
+        return {
+            "model": {
+                "image": {
+                    "custom": {
+                        "url": self._image_url,
+                        "healthRoute": "/health",
+                        "port": 7860,
+                    }
+                }
+            }
+        }
+
+    def wait(self, timeout=None, refresh_every=None):
+        self._tracker.wait_started()
+        try:
+            time.sleep(0.05)
+            self.status = "running"
+        finally:
+            self._tracker.wait_finished()
+
+    def fetch(self):
+        return self
+
+
+class FakeParallelUpdateApi:
+    def __init__(self, names: list[str]):
+        self.tracker = ParallelTracker()
+        self.endpoints = {
+            name: FakeManagedEndpoint(name, "andito/s2s-compute:old", self.tracker) for name in names
+        }
+
+    def get_inference_endpoint(self, name: str, namespace: str | None = None):
+        return self.endpoints[name]
+
+    def update_inference_endpoint(self, name: str, namespace: str | None = None, custom_image=None):
+        endpoint = self.endpoints[name]
+        endpoint.status = "updating"
+        endpoint._image_url = custom_image["url"]
+        return endpoint
 
 
 class UpdateEndpointImagesTests(unittest.TestCase):
@@ -70,6 +140,25 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 namespace="HuggingFaceM4",
                 prefix="reachy-s2s",
             )
+
+    def test_update_many_runs_compute_updates_in_parallel(self):
+        names = ["reachy-s2s-01", "reachy-s2s-02", "reachy-s2s-03"]
+        api = FakeParallelUpdateApi(names)
+
+        results = update_many(
+            api=api,
+            namespace="HuggingFaceM4",
+            names=names,
+            image_url="andito/s2s-compute:new",
+            wait=True,
+            wait_timeout_s=60,
+            wait_refresh_every_s=1,
+            dry_run=False,
+            parallelism=0,
+        )
+
+        self.assertEqual([result["name"] for result in results], names)
+        self.assertGreaterEqual(api.tracker.max_active_waiters, 2)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait as wait_futures
 import json
 import sys
 from typing import Any
@@ -35,11 +36,17 @@ def main() -> None:
     parser.add_argument("--compute-count", type=int, help="Number of compute endpoints, used with --compute-prefix")
     parser.add_argument("--compute-names", nargs="*", default=[], help="Explicit compute endpoint names")
     parser.add_argument(
+        "--compute-parallelism",
+        type=int,
+        default=0,
+        help="Number of compute endpoint updates to run in parallel. Default: all selected compute endpoints. Use 1 for sequential updates.",
+    )
+    parser.add_argument(
         "--wait",
         dest="wait",
         action="store_true",
         default=True,
-        help="Wait for each endpoint update to finish before moving to the next one (default).",
+        help="Wait for each endpoint update to finish before returning (default).",
     )
     parser.add_argument(
         "--no-wait",
@@ -83,6 +90,7 @@ def main() -> None:
                 wait_timeout_s=args.wait_timeout_s,
                 wait_refresh_every_s=args.wait_refresh_every_s,
                 dry_run=args.dry_run,
+                parallelism=args.compute_parallelism,
             ),
         }
 
@@ -199,6 +207,77 @@ def is_not_found_error(exc: HfHubHTTPError) -> bool:
 
 
 def update_many(
+    *,
+    api: HfApi,
+    namespace: str | None,
+    names: list[str],
+    image_url: str,
+    wait: bool,
+    wait_timeout_s: int,
+    wait_refresh_every_s: int,
+    dry_run: bool,
+    parallelism: int,
+) -> list[dict[str, object]]:
+    total = len(names)
+    if total == 0:
+        return []
+
+    max_workers = total if parallelism <= 0 else min(total, parallelism)
+    if max_workers == 1:
+        return update_many_sequential(
+            api=api,
+            namespace=namespace,
+            names=names,
+            image_url=image_url,
+            wait=wait,
+            wait_timeout_s=wait_timeout_s,
+            wait_refresh_every_s=wait_refresh_every_s,
+            dry_run=dry_run,
+        )
+
+    log_progress(f"Updating {total} compute endpoints in parallel with {max_workers} workers")
+    results: list[dict[str, object] | None] = [None] * total
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[Future[dict[str, object]], tuple[int, str]] = {}
+        for index, name in enumerate(names, start=1):
+            log_progress(f"[{index}/{total}] Submitting compute endpoint update for {name}")
+            future = executor.submit(
+                update_one,
+                api=api,
+                namespace=namespace,
+                name=name,
+                image_url=image_url,
+                wait=wait,
+                wait_timeout_s=wait_timeout_s,
+                wait_refresh_every_s=wait_refresh_every_s,
+                dry_run=dry_run,
+            )
+            futures[future] = (index, name)
+
+        done, not_done = wait_futures(futures, return_when=FIRST_EXCEPTION)
+        first_error: BaseException | None = None
+        for future in done:
+            exc = future.exception()
+            if exc is not None:
+                first_error = exc
+                break
+
+        if first_error is not None:
+            for future in not_done:
+                future.cancel()
+            raise first_error
+
+        for future, (index, name) in futures.items():
+            result = future.result()
+            log_progress(
+                f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
+            )
+            results[index - 1] = result
+
+    return [result for result in results if result is not None]
+
+
+def update_many_sequential(
     *,
     api: HfApi,
     namespace: str | None,
