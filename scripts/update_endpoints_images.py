@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
 from typing import Any
 
 from huggingface_hub import HfApi
@@ -12,6 +13,10 @@ from _endpoint_helpers import build_names, current_custom_image
 DEFAULT_LOAD_BALANCER_NAME = "reachy-s2s-lb"
 DEFAULT_COMPUTE_INDEX_START = 1
 DEFAULT_COMPUTE_INDEX_WIDTH = 2
+
+
+def log_progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 def main() -> None:
@@ -62,6 +67,10 @@ def main() -> None:
             prefix=args.compute_prefix,
             count=args.compute_count,
         )
+        log_progress(
+            f"Discovered {len(compute_names)} compute endpoints via {selection['discovery']}: "
+            f"{build_compute_summary(compute_names, selection)}"
+        )
         results["compute"] = {
             **selection,
             "summary": build_compute_summary(compute_names, selection),
@@ -78,6 +87,7 @@ def main() -> None:
         }
 
     if args.load_balancer:
+        log_progress(f"Updating load balancer endpoint {args.load_balancer_name}")
         results["load_balancer"] = update_one(
             api=api,
             namespace=args.namespace,
@@ -199,8 +209,11 @@ def update_many(
     wait_refresh_every_s: int,
     dry_run: bool,
 ) -> list[dict[str, object]]:
-    return [
-        update_one(
+    results: list[dict[str, object]] = []
+    total = len(names)
+    for index, name in enumerate(names, start=1):
+        log_progress(f"[{index}/{total}] Updating compute endpoint {name}")
+        result = update_one(
             api=api,
             namespace=namespace,
             name=name,
@@ -210,8 +223,11 @@ def update_many(
             wait_refresh_every_s=wait_refresh_every_s,
             dry_run=dry_run,
         )
-        for name in names
-    ]
+        log_progress(
+            f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
+        )
+        results.append(result)
+    return results
 
 
 def update_one(
@@ -250,6 +266,11 @@ def update_one(
         result["status_after"] = "dry_run"
         return result
 
+    if wait:
+        log_progress(
+            f"Waiting for {name} to finish updating "
+            f"(timeout {wait_timeout_s}s, poll every {wait_refresh_every_s}s)"
+        )
     endpoint = api.update_inference_endpoint(
         name,
         namespace=namespace,
