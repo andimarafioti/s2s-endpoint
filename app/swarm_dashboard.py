@@ -436,7 +436,6 @@ class SwarmDashboard:
         self._sample_task: Optional[asyncio.Task] = None
         self._flush_task: Optional[asyncio.Task] = None
         self._dirty_bucket_starts: set[int] = set()
-        self._bucket_versions: dict[int, int] = {}
 
     async def start(self) -> None:
         await self._restore_history()
@@ -477,9 +476,9 @@ class SwarmDashboard:
             bucket = self._get_bucket_unlocked(sample.captured_at_s)
             bucket.record_sample(sample)
             self._latest_sample = sample
-            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
+            self._dirty_bucket_starts.add(bucket.bucket_start_s)
             self._prune_unlocked(sample.captured_at_s)
-            self._schedule_flush_unlocked(include_open_bucket=True)
+            self._schedule_flush_unlocked(include_open_bucket=False)
 
     async def record_session_request(self) -> None:
         await self._increment_counter("session_requests")
@@ -624,9 +623,9 @@ class SwarmDashboard:
         async with self._lock:
             bucket = self._get_bucket_unlocked(now)
             setattr(bucket, field_name, getattr(bucket, field_name) + 1)
-            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
+            self._dirty_bucket_starts.add(bucket.bucket_start_s)
             self._prune_unlocked(now)
-            self._schedule_flush_unlocked(include_open_bucket=True)
+            self._schedule_flush_unlocked(include_open_bucket=False)
 
     async def _record_completed_conversation(self, duration_s: float) -> None:
         now = self._time_fn()
@@ -638,9 +637,9 @@ class SwarmDashboard:
                 bucket.completed_conversation_duration_max_s,
                 duration_s,
             )
-            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
+            self._dirty_bucket_starts.add(bucket.bucket_start_s)
             self._prune_unlocked(now)
-            self._schedule_flush_unlocked(include_open_bucket=True)
+            self._schedule_flush_unlocked(include_open_bucket=False)
 
     def _get_bucket_unlocked(self, epoch_s: float) -> SwarmHistoryBucket:
         bucket_start_s = _bucket_start_epoch_s(epoch_s, 1)
@@ -658,11 +657,6 @@ class SwarmDashboard:
                 break
             self._history.popitem(last=False)
             self._dirty_bucket_starts.discard(oldest_key)
-            self._bucket_versions.pop(oldest_key, None)
-
-    def _mark_bucket_dirty_unlocked(self, bucket_start_s: int) -> None:
-        self._bucket_versions[bucket_start_s] = self._bucket_versions.get(bucket_start_s, 0) + 1
-        self._dirty_bucket_starts.add(bucket_start_s)
 
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()
@@ -833,7 +827,6 @@ class SwarmDashboard:
         async with self._lock:
             for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
                 self._history[bucket.bucket_start_s] = bucket
-                self._bucket_versions.setdefault(bucket.bucket_start_s, 0)
             self._prune_unlocked(self._time_fn())
 
         logger.info("Restored %s persisted dashboard minute buckets", len(buckets))
@@ -851,12 +844,9 @@ class SwarmDashboard:
 
         while True:
             async with self._lock:
-                buckets_with_versions = self._collect_dirty_buckets_unlocked(
-                    include_open_bucket=include_open_bucket
-                )
-            if not buckets_with_versions:
+                buckets = self._collect_dirty_buckets_unlocked(include_open_bucket=include_open_bucket)
+            if not buckets:
                 return
-            buckets = [bucket for bucket, _version in buckets_with_versions]
 
             try:
                 await asyncio.to_thread(self.history_store.write_buckets, buckets)
@@ -865,22 +855,13 @@ class SwarmDashboard:
                 return
 
             async with self._lock:
-                for bucket, flushed_version in buckets_with_versions:
-                    current_version = self._bucket_versions.get(bucket.bucket_start_s)
-                    if current_version == flushed_version:
-                        self._dirty_bucket_starts.discard(bucket.bucket_start_s)
+                for bucket in buckets:
+                    self._dirty_bucket_starts.discard(bucket.bucket_start_s)
 
-    def _collect_dirty_buckets_unlocked(
-        self,
-        *,
-        include_open_bucket: bool,
-    ) -> list[tuple[SwarmHistoryBucket, int]]:
+    def _collect_dirty_buckets_unlocked(self, *, include_open_bucket: bool) -> list[SwarmHistoryBucket]:
         current_bucket_start_s = _bucket_start_epoch_s(self._time_fn(), 1)
         return [
-            (
-                self._history[bucket_start_s],
-                self._bucket_versions.get(bucket_start_s, 0),
-            )
+            self._history[bucket_start_s]
             for bucket_start_s in sorted(self._dirty_bucket_starts)
             if bucket_start_s in self._history
             and (include_open_bucket or bucket_start_s < current_bucket_start_s)
