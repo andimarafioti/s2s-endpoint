@@ -63,6 +63,25 @@ Hugging Face API for each compute endpoint's canonical HTTPS URL and turns that
 into the direct websocket URL by replacing `https://` with `wss://` and appending
 `/ws`.
 
+## Swarm Dashboard
+
+The load balancer now exposes a built-in dashboard:
+
+- `GET /dashboard`: HTML dashboard for the current swarm
+- `GET /dashboard/data`: JSON feed used by the dashboard UI
+
+The dashboard keeps an in-memory rolling history on the LB itself and shows:
+
+- running, warming, transitioning, and parked endpoint counts
+- connected and pending user sessions
+- free slots and effective free capacity
+- `POST /session` request counts, allocation successes/failures, and connect/disconnect events
+- conversation starts/completions plus average and max completed conversation duration
+
+The timeline automatically switches between minute-level and hourly rollups depending on the selected window. By default the history is in memory and resets when the LB endpoint restarts.
+
+If you want the dashboard history to survive LB restarts, you can configure it to persist completed minute buckets to a Hugging Face Storage Bucket. The live routing/session state still stays in memory; the bucket is only for historical dashboard data.
+
 ## Load Balancer Env Vars
 
 - `HF_ENDPOINT_NAMESPACE`: namespace that owns the compute endpoints
@@ -80,6 +99,11 @@ into the direct websocket URL by replacing `https://` with `wss://` and appendin
 - `SESSION_PENDING_TIMEOUT_S`: how long an unused reservation stays alive
 - `SESSION_TOKEN_TTL_S`: lifetime of the signed session token
 - `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations
+- `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
+- `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
+- `DASHBOARD_BUCKET_ID`: optional HF storage bucket id used to persist dashboard history
+- `DASHBOARD_BUCKET_PREFIX`: path prefix inside the bucket for dashboard files
+- `DASHBOARD_BUCKET_TOKEN`: optional token override for bucket reads/writes
 
 ## Compute Env Vars
 
@@ -194,6 +218,32 @@ Both scripts are specific to this repo and expect the role-specific images:
 
 - compute endpoints: image built from `Dockerfile.compute`
 - load balancer endpoint: image built from `Dockerfile.load_balancer`
+
+## Update Load Balancer Endpoint Env
+
+To update env vars on the existing load-balancer endpoint, use the dedicated updater:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_load_balancer_endpoint_env.py \
+  --namespace HuggingFaceM4 \
+  --name reachy-s2s-lb \
+  --env COMPUTE_ENDPOINT_MIN_WARM=2 \
+  --env COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS=2 \
+  --wait
+```
+
+To enable persisted dashboard history using a Hugging Face Storage Bucket, the command we used was:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_load_balancer_endpoint_env.py \
+  --namespace HuggingFaceM4 \
+  --name reachy-s2s-lb \
+  --env DASHBOARD_BUCKET_ID=HuggingFaceM4/reachy-s2s-dashboard \
+  --env DASHBOARD_BUCKET_PREFIX=reachy-s2s-lb \
+  --wait
+```
+
+Like the compute env updater, this script fetches the current env first, merges the requested changes, and sends the full updated env back to Hugging Face.
 
 ## Files
 - `app/`: application code

@@ -2,11 +2,12 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.app_utils import build_lifespan, public_base_url, setup_logging
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointPoolRouter, HuggingFaceEndpointController
+from app.swarm_dashboard import HuggingFaceBucketHistoryStore, SwarmDashboard
 
 setup_logging()
 APP_ROLE = "load_balancer"
@@ -34,6 +35,11 @@ SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
 SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
 SESSION_TOKEN_TTL_S = float(os.getenv("SESSION_TOKEN_TTL_S", "86400"))
 SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
+DASHBOARD_SAMPLE_INTERVAL_S = float(os.getenv("DASHBOARD_SAMPLE_INTERVAL_S", "15"))
+DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(7 * 24 * 60)))
+DASHBOARD_BUCKET_ID = os.getenv("DASHBOARD_BUCKET_ID", "").strip() or None
+DASHBOARD_BUCKET_PREFIX = os.getenv("DASHBOARD_BUCKET_PREFIX", "s2s-endpoint/swarm-dashboard").strip()
+DASHBOARD_BUCKET_TOKEN = os.getenv("DASHBOARD_BUCKET_TOKEN", "").strip() or HF_CONTROL_TOKEN
 
 
 def build_endpoint_router() -> EndpointPoolRouter:
@@ -70,7 +76,33 @@ session_manager = DirectSessionManager(
     reap_interval_s=SESSION_REAP_INTERVAL_S,
 )
 
-app = FastAPI(lifespan=build_lifespan(session_manager))
+dashboard_history_store = None
+if DASHBOARD_BUCKET_ID:
+    dashboard_history_store = HuggingFaceBucketHistoryStore(
+        bucket_id=DASHBOARD_BUCKET_ID,
+        prefix=DASHBOARD_BUCKET_PREFIX,
+        token=DASHBOARD_BUCKET_TOKEN,
+    )
+
+dashboard = SwarmDashboard(
+    snapshot_provider=session_manager.healthcheck,
+    sample_interval_s=DASHBOARD_SAMPLE_INTERVAL_S,
+    retention_minutes=DASHBOARD_RETENTION_MINUTES,
+    history_store=dashboard_history_store,
+)
+
+
+class LoadBalancerRuntime:
+    async def start(self) -> None:
+        await session_manager.start()
+        await dashboard.start()
+
+    async def stop(self) -> None:
+        await dashboard.stop()
+        await session_manager.stop()
+
+
+app = FastAPI(lifespan=build_lifespan(LoadBalancerRuntime()))
 
 
 @app.get("/")
@@ -80,6 +112,8 @@ async def root():
         "role": APP_ROLE,
         "health": "/health",
         "session": "/session",
+        "dashboard": "/dashboard",
+        "dashboard_data": "/dashboard/data",
         "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
     }
 
@@ -102,11 +136,14 @@ async def health():
 
 @app.post("/session")
 async def create_session(request: Request):
+    await dashboard.record_session_request()
     try:
         allocation = await session_manager.allocate(public_base_url(request))
     except Exception as exc:
+        await dashboard.record_session_allocation_failure()
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
 
+    await dashboard.record_session_allocation_success()
     return JSONResponse(allocation)
 
 
@@ -126,9 +163,29 @@ async def session_event(session_id: str, payload: dict[str, Any]):
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
+    await dashboard.record_session_event(
+        event,
+        conversation_duration_s=result.get("conversation_duration_s"),
+        conversation_counted=bool(result.get("conversation_counted")),
+    )
     return JSONResponse(result)
 
 
 @app.websocket("/ws")
 async def deprecated_websocket_route(client_ws: WebSocket):
     await client_ws.close(code=1008, reason="Use POST /session and connect directly to the returned compute websocket URL")
+
+
+@app.get("/dashboard")
+async def dashboard_page():
+    return HTMLResponse(dashboard.html())
+
+
+@app.get("/dashboard/data")
+async def dashboard_data(window: str = "6h", resolution: str = ""):
+    try:
+        payload = await dashboard.data(window=window, resolution=resolution or None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return JSONResponse(payload)
