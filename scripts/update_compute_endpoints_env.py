@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
+import time
 
 from huggingface_hub import HfApi
+from huggingface_hub.errors import InferenceEndpointError, InferenceEndpointTimeoutError
 
 from _endpoint_helpers import (
     build_names,
@@ -11,6 +14,50 @@ from _endpoint_helpers import (
     merge_env_updates,
     parse_key_value_pairs,
 )
+
+FAILED_UPDATE_STATUSES = {"failed", "updateFailed"}
+PARKED_STATUSES = {"paused", "scaledToZero"}
+
+
+def log_progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def expected_target_status(status_before: str) -> str:
+    return "parked" if status_before in PARKED_STATUSES else "running"
+
+
+def wait_for_endpoint_update(
+    endpoint,
+    *,
+    target_status: str,
+    timeout: int,
+    refresh_every: int,
+):
+    if target_status == "running":
+        endpoint.wait(timeout=timeout, refresh_every=refresh_every)
+        endpoint.fetch()
+        return endpoint
+
+    start = time.time()
+    while True:
+        current_status = str(endpoint.status)
+        if current_status in FAILED_UPDATE_STATUSES:
+            raise InferenceEndpointError(
+                f"Inference Endpoint {endpoint.name} failed to update. Please check the logs for more information."
+            )
+        if target_status == "parked" and current_status in PARKED_STATUSES:
+            endpoint.fetch()
+            return endpoint
+        if current_status == target_status:
+            endpoint.fetch()
+            return endpoint
+        if timeout is not None and time.time() - start > timeout:
+            raise InferenceEndpointTimeoutError(
+                f"Timeout while waiting for Inference Endpoint {endpoint.name} to return to {target_status}."
+            )
+        time.sleep(refresh_every)
+        endpoint.fetch()
 
 
 def main() -> None:
@@ -52,9 +99,13 @@ def main() -> None:
 
     api = HfApi()
     results = []
+    total = len(names)
 
-    for name in names:
+    for index, name in enumerate(names, start=1):
+        log_progress(f"[{index}/{total}] Updating env on compute endpoint {name}")
         endpoint = api.get_inference_endpoint(name, namespace=args.namespace)
+        status_before = str(endpoint.status)
+        target_status = expected_target_status(status_before)
         current_env = current_model_env(endpoint.raw)
         updated_env = merge_env_updates(current_env, env_updates, unset_env)
 
@@ -67,7 +118,8 @@ def main() -> None:
 
         result = {
             "name": name,
-            "status_before": str(endpoint.status),
+            "status_before": status_before,
+            "expected_status_after": target_status,
             "url": getattr(endpoint, "url", None),
             "changed": changed,
             "removed": removed,
@@ -81,18 +133,28 @@ def main() -> None:
             continue
 
         if not args.dry_run:
+            if args.wait:
+                log_progress(
+                    f"[{index}/{total}] Waiting for {name} to finish updating and return to "
+                    f"{target_status} (timeout {args.wait_timeout_s}s, poll every {args.wait_refresh_every_s}s)"
+                )
             endpoint = api.update_inference_endpoint(
                 name,
                 namespace=args.namespace,
                 env=updated_env,
             )
             if args.wait:
-                endpoint.wait(timeout=args.wait_timeout_s, refresh_every=args.wait_refresh_every_s)
-                endpoint.fetch()
+                wait_for_endpoint_update(
+                    endpoint,
+                    target_status=target_status,
+                    timeout=args.wait_timeout_s,
+                    refresh_every=args.wait_refresh_every_s,
+                )
             result["status_after"] = str(endpoint.status)
         else:
             result["status_after"] = "dry_run"
 
+        log_progress(f"[{index}/{total}] {name}: {status_before} -> {result['status_after']}")
         results.append(result)
 
     print(json.dumps({"endpoints": results}, indent=2, sort_keys=True))
