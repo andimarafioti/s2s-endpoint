@@ -516,7 +516,7 @@ class SwarmDashboard:
 
         current = await self.live_sample()
         series = await self.series(window_minutes=window_minutes, resolution=resolved_resolution)
-        summary = await self.summary()
+        summary = await self.summary(window_minutes=window_minutes, requested_window=window or "6h")
 
         return {
             "generated_at": _isoformat(self._time_fn()),
@@ -531,33 +531,30 @@ class SwarmDashboard:
             "retention_minutes": self.retention_minutes,
         }
 
-    async def summary(self) -> dict[str, object]:
+    async def summary(self, *, window_minutes: int, requested_window: str) -> dict[str, object]:
         async with self._lock:
             latest = self._latest_sample
             minute_buckets = list(self._history.values())
 
-        one_hour = self._aggregate_recent(minute_buckets, window_minutes=60)
-        one_day = self._aggregate_recent(minute_buckets, window_minutes=24 * 60)
+        selected = self._aggregate_recent(minute_buckets, window_minutes=window_minutes)
 
         return {
             "current": latest.to_dict() if latest is not None else None,
-            "session_requests_last_hour": one_hour["session_requests"],
-            "session_failures_last_hour": one_hour["session_allocation_failures"],
-            "session_successes_last_hour": one_hour["session_allocation_successes"],
-            "session_connects_last_hour": one_hour["session_connected_events"],
-            "session_disconnects_last_hour": one_hour["session_disconnected_events"],
-            "conversations_started_last_hour": one_hour["session_connected_events"],
-            "conversations_completed_last_hour": one_hour["completed_conversations"],
-            "avg_conversation_duration_last_hour_s": one_hour["avg_conversation_duration_s"],
-            "avg_conversation_duration_last_hour_min": round(one_hour["avg_conversation_duration_s"] / 60.0, 2),
-            "conversations_started_24h": one_day["session_connected_events"],
-            "conversations_completed_24h": one_day["completed_conversations"],
-            "avg_conversation_duration_24h_s": one_day["avg_conversation_duration_s"],
-            "avg_conversation_duration_24h_min": round(one_day["avg_conversation_duration_s"] / 60.0, 2),
-            "max_conversation_duration_24h_s": one_day["max_conversation_duration_s"],
-            "max_conversation_duration_24h_min": round(one_day["max_conversation_duration_s"] / 60.0, 2),
-            "peak_connected_sessions_24h": one_day["peak_connected_sessions"],
-            "peak_running_endpoints_24h": one_day["peak_running_endpoints"],
+            "window_label": requested_window,
+            "window_minutes": window_minutes,
+            "session_requests_window": selected["session_requests"],
+            "session_failures_window": selected["session_allocation_failures"],
+            "session_successes_window": selected["session_allocation_successes"],
+            "session_connects_window": selected["session_connected_events"],
+            "session_disconnects_window": selected["session_disconnected_events"],
+            "conversations_started_window": selected["session_connected_events"],
+            "conversations_completed_window": selected["completed_conversations"],
+            "avg_conversation_duration_window_s": selected["avg_conversation_duration_s"],
+            "avg_conversation_duration_window_min": round(selected["avg_conversation_duration_s"] / 60.0, 2),
+            "max_conversation_duration_window_s": selected["max_conversation_duration_s"],
+            "max_conversation_duration_window_min": round(selected["max_conversation_duration_s"] / 60.0, 2),
+            "peak_connected_sessions_window": selected["peak_connected_sessions"],
+            "peak_running_endpoints_window": selected["peak_running_endpoints"],
         }
 
     async def series(self, *, window_minutes: int, resolution: str) -> list[dict[str, object]]:
@@ -1444,11 +1441,12 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     }
 
     function renderHeroStats(current, summary) {
+      const windowLabel = summary.window_label || '6h';
       const stats = [
         ['Running', current.running_endpoints],
         ['Connected', current.connected_sessions],
-        ['Conversations / 24h', summary.conversations_completed_24h],
-        ['Avg Duration / 24h', formatDuration(summary.avg_conversation_duration_24h_s)],
+        [`Conversations / ${windowLabel}`, summary.conversations_completed_window],
+        [`Avg Duration / ${windowLabel}`, formatDuration(summary.avg_conversation_duration_window_s)],
       ];
       document.getElementById('hero-stats').innerHTML = stats.map(([label, value]) => `
         <div class="hero-stat">
@@ -1459,19 +1457,18 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     }
 
     function renderKpis(current, summary) {
+      const windowLabel = summary.window_label || '6h';
       document.getElementById('kpis').innerHTML = [
         kpiCard('Live conversations', prettyNumber(current.connected_sessions), 'Current live websocket sessions'),
         kpiCard('Pending joins', prettyNumber(current.pending_sessions), 'Reserved sessions waiting to connect'),
-        kpiCard('Requests / 60m', prettyNumber(summary.session_requests_last_hour), 'POST /session requests in the last hour'),
-        kpiCard('Failures / 60m', prettyNumber(summary.session_failures_last_hour), 'Allocation failures in the last hour'),
-        kpiCard('Started / 60m', prettyNumber(summary.conversations_started_last_hour), 'Conversation starts recorded in the last hour'),
-        kpiCard('Completed / 60m', prettyNumber(summary.conversations_completed_last_hour), 'Conversation ends recorded in the last hour'),
-        kpiCard('Avg duration / 60m', formatDuration(summary.avg_conversation_duration_last_hour_s), 'Average completed conversation duration in the last hour'),
-        kpiCard('Completed / 24h', prettyNumber(summary.conversations_completed_24h), 'Conversations completed in the last 24 hours'),
-        kpiCard('Avg duration / 24h', formatDuration(summary.avg_conversation_duration_24h_s), 'Average completed conversation duration in the last 24 hours'),
-        kpiCard('Max duration / 24h', formatDuration(summary.max_conversation_duration_24h_s), 'Longest completed conversation in the last 24 hours'),
-        kpiCard('Peak users / 24h', prettyNumber(summary.peak_connected_sessions_24h), 'Highest concurrent connected sessions'),
-        kpiCard('Peak running / 24h', prettyNumber(summary.peak_running_endpoints_24h), 'Highest active compute endpoint count'),
+        kpiCard(`Requests / ${windowLabel}`, prettyNumber(summary.session_requests_window), `POST /session requests in the last ${windowLabel}`),
+        kpiCard(`Failures / ${windowLabel}`, prettyNumber(summary.session_failures_window), `Allocation failures in the last ${windowLabel}`),
+        kpiCard(`Started / ${windowLabel}`, prettyNumber(summary.conversations_started_window), `Conversation starts recorded in the last ${windowLabel}`),
+        kpiCard(`Completed / ${windowLabel}`, prettyNumber(summary.conversations_completed_window), `Conversation ends recorded in the last ${windowLabel}`),
+        kpiCard(`Avg duration / ${windowLabel}`, formatDuration(summary.avg_conversation_duration_window_s), `Average completed conversation duration in the last ${windowLabel}`),
+        kpiCard(`Max duration / ${windowLabel}`, formatDuration(summary.max_conversation_duration_window_s), `Longest completed conversation in the last ${windowLabel}`),
+        kpiCard(`Peak users / ${windowLabel}`, prettyNumber(summary.peak_connected_sessions_window), `Highest concurrent connected sessions in the last ${windowLabel}`),
+        kpiCard(`Peak running / ${windowLabel}`, prettyNumber(summary.peak_running_endpoints_window), `Highest active compute endpoint count in the last ${windowLabel}`),
         kpiCard('Free slots', prettyNumber(current.free_slots), 'Currently running free slots'),
         kpiCard('Errors', prettyNumber(current.errors_count), current.healthy ? 'No active router errors' : (current.detail || 'Swarm is degraded')),
       ].join('');

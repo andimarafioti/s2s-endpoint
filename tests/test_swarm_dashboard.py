@@ -151,9 +151,10 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["completed_conversations"], 1)
         self.assertEqual(point["avg_conversation_duration_s"], 150.0)
         self.assertEqual(point["max_conversation_duration_min"], 2.5)
-        self.assertEqual(payload["summary"]["session_requests_last_hour"], 1)
-        self.assertEqual(payload["summary"]["conversations_completed_last_hour"], 1)
-        self.assertEqual(payload["summary"]["avg_conversation_duration_last_hour_s"], 150.0)
+        self.assertEqual(payload["summary"]["window_label"], "60m")
+        self.assertEqual(payload["summary"]["session_requests_window"], 1)
+        self.assertEqual(payload["summary"]["conversations_completed_window"], 1)
+        self.assertEqual(payload["summary"]["avg_conversation_duration_window_s"], 150.0)
 
     async def test_hourly_series_averages_state_metrics_and_sums_events(self):
         clock = FakeClock(3 * 3600)
