@@ -8,7 +8,7 @@ from huggingface_hub import HfApi
 from _endpoint_helpers import (
     DEFAULT_ENDPOINT_TYPE,
     DEFAULT_FRAMEWORK,
-    DEFAULT_HEALTH_ROUTE,
+    DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
     DEFAULT_IMAGE_PORT,
     DEFAULT_REPOSITORY,
     build_custom_image,
@@ -28,7 +28,7 @@ def main() -> None:
     parser.add_argument("--instance-size", required=True, help="CPU instance size, for example x2")
     parser.add_argument("--instance-type", required=True, help="CPU instance type, for example intel-icl")
     parser.add_argument("--image-url", required=True, help="Custom load-balancer image URL built from Dockerfile.load_balancer")
-    parser.add_argument("--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the load-balancer image")
+    parser.add_argument("--image-health-route", default=DEFAULT_LOAD_BALANCER_HEALTH_ROUTE, help="Health route exposed by the load-balancer image")
     parser.add_argument("--image-port", type=int, default=DEFAULT_IMAGE_PORT, help="Container port exposed by the load-balancer image")
     parser.add_argument("--session-shared-secret", required=True, help="Shared secret used to mint and validate direct session tokens")
     parser.add_argument("--compute-endpoint-names", required=True, help="Comma-separated compute endpoint names")

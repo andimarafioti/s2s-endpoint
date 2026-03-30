@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait as wait_futures
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import json
 import sys
 import time
@@ -172,23 +172,17 @@ def update_many(
             )
             futures[future] = (index, name)
 
-        done, not_done = wait_futures(futures, return_when=FIRST_EXCEPTION)
-        first_error: BaseException | None = None
-        for future in done:
-            exc = future.exception()
-            if exc is not None:
-                first_error = exc
-                break
-
-        if first_error is not None:
-            for future in not_done:
-                future.cancel()
-            raise first_error
-
-        for future, (index, name) in futures.items():
-            result = future.result()
-            log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
-            results[index - 1] = result
+        try:
+            for future in as_completed(futures):
+                index, name = futures[future]
+                result = future.result()
+                log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
+                results[index - 1] = result
+        except BaseException:
+            for pending_future in futures:
+                if pending_future is not future:
+                    pending_future.cancel()
+            raise
 
     return [result for result in results if result is not None]
 

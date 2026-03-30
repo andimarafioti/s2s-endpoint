@@ -254,6 +254,13 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --wait
 ```
 
+The load balancer exposes two different health-style routes:
+
+- `/ready`: lightweight process readiness for the Hugging Face platform health check
+- `/health`: swarm health, which can return `503` when the compute pool is cold or still warming
+
+For the load balancer image, the endpoint health route should therefore be `/ready`, not `/health`.
+
 Both scripts are specific to this repo and expect the role-specific images:
 
 - compute endpoints: image built from `Dockerfile.compute`
@@ -305,7 +312,9 @@ Behavior:
 - with the default LB name `reachy-s2s-lb`, that means it discovers `reachy-s2s-01`, `reachy-s2s-02`, and so on, then prints a summary like `updated endpoints 1 through 8`
 - compute endpoint updates now run in parallel by default; use `--compute-parallelism 1` if you want the old sequential rollout behavior
 - with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately
+- completion lines are printed as each endpoint finishes, so parked endpoints are reported immediately even if a few running endpoints are still becoming healthy
 - paused or scale-to-zero compute endpoints keep their parked state after the image update, and the script now waits for them to return to that original parked state instead of incorrectly waiting for `running`
+- load-balancer updates automatically force the custom-image health route to `/ready`, even if the image URL itself is unchanged
 
 Useful options:
 

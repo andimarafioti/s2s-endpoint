@@ -66,10 +66,46 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await self.router.start()
+        await asyncio.sleep(0.05)
 
         snapshot = await self.router.snapshot()
         self.assertEqual(snapshot["running_endpoints"], 1)
         self.assertEqual(len(controller.wake_calls), 1)
+
+    async def test_start_does_not_block_on_initial_warmup(self):
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "paused", None),
+            ]
+        )
+
+        original_wake = controller.wake
+
+        def delayed_wake(name: str):
+            time.sleep(0.1)
+            return original_wake(name)
+
+        controller.wake = delayed_wake
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+
+        started = time.monotonic()
+        await self.router.start()
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.1)
+        await asyncio.sleep(0.15)
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["running_endpoints"], 1)
 
     async def test_acquire_wakes_another_endpoint_when_free_slots_are_critical(self):
         controller = FakeEndpointController(
