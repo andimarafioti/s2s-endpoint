@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait as wait_futures
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import json
 import sys
 import time
@@ -9,7 +9,7 @@ from typing import Any
 from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError, InferenceEndpointError, InferenceEndpointTimeoutError
 
-from _endpoint_helpers import build_names, current_custom_image
+from _endpoint_helpers import DEFAULT_LOAD_BALANCER_HEALTH_ROUTE, build_names, current_custom_image
 
 
 DEFAULT_LOAD_BALANCER_NAME = "reachy-s2s-lb"
@@ -104,6 +104,7 @@ def main() -> None:
             namespace=args.namespace,
             name=args.load_balancer_name,
             image_url=args.load_balancer,
+            health_route_override=DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
             wait=args.wait,
             wait_timeout_s=args.wait_timeout_s,
             wait_refresh_every_s=args.wait_refresh_every_s,
@@ -261,25 +262,19 @@ def update_many(
             )
             futures[future] = (index, name)
 
-        done, not_done = wait_futures(futures, return_when=FIRST_EXCEPTION)
-        first_error: BaseException | None = None
-        for future in done:
-            exc = future.exception()
-            if exc is not None:
-                first_error = exc
-                break
-
-        if first_error is not None:
-            for future in not_done:
-                future.cancel()
-            raise first_error
-
-        for future, (index, name) in futures.items():
-            result = future.result()
-            log_progress(
-                f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
-            )
-            results[index - 1] = result
+        try:
+            for future in as_completed(futures):
+                index, name = futures[future]
+                result = future.result()
+                log_progress(
+                    f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
+                )
+                results[index - 1] = result
+        except BaseException:
+            for pending_future in futures:
+                if pending_future is not future:
+                    pending_future.cancel()
+            raise
 
     return [result for result in results if result is not None]
 
@@ -322,6 +317,7 @@ def update_one(
     namespace: str | None,
     name: str,
     image_url: str,
+    health_route_override: str | None = None,
     wait: bool,
     wait_timeout_s: int,
     wait_refresh_every_s: int,
@@ -332,6 +328,8 @@ def update_one(
     current_image = current_custom_image(endpoint.raw)
     updated_image = dict(current_image)
     updated_image["url"] = image_url
+    if health_route_override:
+        updated_image["health_route"] = health_route_override
     target_status = expected_target_status(status_before)
 
     result = {
@@ -340,13 +338,16 @@ def update_one(
         "url": getattr(endpoint, "url", None),
         "image_before": current_image["url"],
         "image_after": image_url,
-        "health_route": current_image["health_route"],
+        "health_route": updated_image["health_route"],
         "port": current_image["port"],
         "expected_status_after": target_status,
         "skipped": False,
     }
 
-    if current_image["url"] == image_url:
+    if (
+        current_image["url"] == image_url
+        and current_image["health_route"] == updated_image["health_route"]
+    ):
         result["skipped"] = True
         result["status_after"] = str(endpoint.status)
         return result

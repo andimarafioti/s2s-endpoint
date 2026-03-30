@@ -221,18 +221,25 @@ class EndpointPoolRouter:
         self._condition = asyncio.Condition(self._lock)
         self._closed = False
         self._reconcile_task: Optional[asyncio.Task] = None
+        self._initial_warm_task: Optional[asyncio.Task] = None
         self._last_error: Optional[str] = None
         self._next_park_allowed_at = 0.0
 
     async def start(self) -> None:
         await self.refresh()
-        await self.ensure_min_warm()
+        self._initial_warm_task = asyncio.create_task(self.ensure_min_warm())
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
 
     async def stop(self) -> None:
         async with self._condition:
             self._closed = True
             self._condition.notify_all()
+
+        if self._initial_warm_task is not None:
+            self._initial_warm_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._initial_warm_task
+            self._initial_warm_task = None
 
         if self._reconcile_task is not None:
             self._reconcile_task.cancel()

@@ -134,6 +134,20 @@ class FakeTransitionUpdateApi:
         return self.endpoint
 
 
+class FakeHealthRouteUpdateApi:
+    def __init__(self):
+        self.endpoint = FakeManagedEndpoint("reachy-s2s-lb", "andito/s2s-load_balancer:v1", ParallelTracker())
+        self.last_custom_image = None
+
+    def get_inference_endpoint(self, name: str, namespace: str | None = None):
+        return self.endpoint
+
+    def update_inference_endpoint(self, name: str, namespace: str | None = None, custom_image=None):
+        self.last_custom_image = dict(custom_image or {})
+        self.endpoint.status = "running"
+        return self.endpoint
+
+
 class UpdateEndpointImagesTests(unittest.TestCase):
     def test_default_compute_prefix_strips_lb_suffix(self):
         self.assertEqual(default_compute_prefix("reachy-s2s-lb"), "reachy-s2s")
@@ -220,6 +234,25 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual(result["status_after"], "scaledToZero")
         self.assertFalse(endpoint.wait_called)
         self.assertGreaterEqual(endpoint.fetch_count, 1)
+
+    def test_update_one_applies_load_balancer_ready_health_route_even_when_image_matches(self):
+        api = FakeHealthRouteUpdateApi()
+
+        result = update_one(
+            api=api,
+            namespace="HuggingFaceM4",
+            name="reachy-s2s-lb",
+            image_url="andito/s2s-load_balancer:v1",
+            health_route_override="/ready",
+            wait=False,
+            wait_timeout_s=1,
+            wait_refresh_every_s=0.001,
+            dry_run=False,
+        )
+
+        self.assertFalse(result["skipped"])
+        self.assertEqual(result["health_route"], "/ready")
+        self.assertEqual(api.last_custom_image["health_route"], "/ready")
 
 
 if __name__ == "__main__":

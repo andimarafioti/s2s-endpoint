@@ -7,10 +7,18 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from _endpoint_helpers import current_custom_image, current_model_env, merge_env_updates
+from _endpoint_helpers import (
+    DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
+    current_custom_image,
+    current_model_env,
+    merge_env_updates,
+)
 
 
 class EndpointHelpersTests(unittest.TestCase):
+    def test_default_load_balancer_health_route_is_ready(self):
+        self.assertEqual(DEFAULT_LOAD_BALANCER_HEALTH_ROUTE, "/ready")
+
     def test_current_model_env_returns_empty_dict_when_missing(self):
         self.assertEqual(current_model_env({}), {})
         self.assertEqual(current_model_env({"model": {}}), {})

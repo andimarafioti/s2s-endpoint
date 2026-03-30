@@ -110,12 +110,23 @@ async def root():
     return {
         "message": "s2s load balancer endpoint is up",
         "role": APP_ROLE,
+        "ready": "/ready",
         "health": "/health",
         "session": "/session",
         "dashboard": "/dashboard",
         "dashboard_data": "/dashboard/data",
         "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
     }
+
+
+@app.get("/ready")
+async def ready():
+    return JSONResponse(
+        {
+            "status": "ok",
+            "role": APP_ROLE,
+        }
+    )
 
 
 @app.get("/health")
