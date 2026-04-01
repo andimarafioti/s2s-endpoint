@@ -60,6 +60,18 @@ Build the load-balancer image:
 docker build --platform linux/amd64 -f Dockerfile.load_balancer -t your-registry/s2s-endpoint-lb:latest .
 ```
 
+Build the custom vLLM image that embeds a Qwen non-thinking chat template:
+
+```bash
+docker build --platform linux/amd64 -f Dockerfile.vllm -t your-registry/s2s-endpoint-vllm:latest .
+```
+
+When deploying that image on a Hugging Face vLLM endpoint, use container arguments like:
+
+```text
+--max-model-len 32768 --reasoning-parser qwen3 --chat-template /app/qwen3_nonthinking.jinja
+```
+
 ## Direct Session Flow
 
 The LB is no longer in the media path for websocket traffic.
