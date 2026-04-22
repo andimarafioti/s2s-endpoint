@@ -72,6 +72,8 @@ def main() -> None:
     parser.add_argument("--env-file", help="JSON file with env vars to set or overwrite")
     parser.add_argument("--env", action="append", default=[], help="Env var to set in KEY=VALUE form")
     parser.add_argument("--unset-env", action="append", default=[], help="Env var key to remove")
+    parser.add_argument("--secret-file", help="JSON file with secrets to set or overwrite")
+    parser.add_argument("--secret", action="append", default=[], help="Secret to set in KEY=VALUE form")
     parser.add_argument(
         "--parallelism",
         type=int,
@@ -100,9 +102,11 @@ def main() -> None:
     env_updates = load_json_file(args.env_file) or {}
     env_updates.update(parse_key_value_pairs(args.env))
     unset_env = [key.strip() for key in args.unset_env if key.strip()]
+    secret_updates = load_json_file(args.secret_file) or {}
+    secret_updates.update(parse_key_value_pairs(args.secret))
 
-    if not env_updates and not unset_env:
-        raise ValueError("Provide at least one --env/--env-file entry or one --unset-env key")
+    if not env_updates and not unset_env and not secret_updates:
+        raise ValueError("Provide at least one --env/--env-file entry, one --unset-env key, or one --secret/--secret-file entry")
 
     api = HfApi()
     results = update_many(
@@ -111,6 +115,7 @@ def main() -> None:
         names=names,
         env_updates=env_updates,
         unset_env=unset_env,
+        secret_updates=secret_updates,
         wait=args.wait,
         wait_timeout_s=args.wait_timeout_s,
         wait_refresh_every_s=args.wait_refresh_every_s,
@@ -128,6 +133,7 @@ def update_many(
     names: list[str],
     env_updates: dict[str, str],
     unset_env: list[str],
+    secret_updates: dict[str, str],
     wait: bool,
     wait_timeout_s: int,
     wait_refresh_every_s: int,
@@ -146,6 +152,7 @@ def update_many(
             names=names,
             env_updates=env_updates,
             unset_env=unset_env,
+            secret_updates=secret_updates,
             wait=wait,
             wait_timeout_s=wait_timeout_s,
             wait_refresh_every_s=wait_refresh_every_s,
@@ -165,6 +172,7 @@ def update_many(
                 name=name,
                 env_updates=env_updates,
                 unset_env=unset_env,
+                secret_updates=secret_updates,
                 wait=wait,
                 wait_timeout_s=wait_timeout_s,
                 wait_refresh_every_s=wait_refresh_every_s,
@@ -194,6 +202,7 @@ def update_many_sequential(
     names: list[str],
     env_updates: dict[str, str],
     unset_env: list[str],
+    secret_updates: dict[str, str],
     wait: bool,
     wait_timeout_s: int,
     wait_refresh_every_s: int,
@@ -209,6 +218,7 @@ def update_many_sequential(
             name=name,
             env_updates=env_updates,
             unset_env=unset_env,
+            secret_updates=secret_updates,
             wait=wait,
             wait_timeout_s=wait_timeout_s,
             wait_refresh_every_s=wait_refresh_every_s,
@@ -226,6 +236,7 @@ def update_one(
     name: str,
     env_updates: dict[str, str],
     unset_env: list[str],
+    secret_updates: dict[str, str],
     wait: bool,
     wait_timeout_s: int,
     wait_refresh_every_s: int,
@@ -243,6 +254,7 @@ def update_one(
         if current_env.get(key) != updated_env[key]
     }
     removed = sorted(key for key in current_env if key not in updated_env)
+    secrets_set = sorted(secret_updates.keys())
 
     result = {
         "name": name,
@@ -251,10 +263,12 @@ def update_one(
         "url": getattr(endpoint, "url", None),
         "changed": changed,
         "removed": removed,
+        "secrets_set": secrets_set,
         "skipped": False,
     }
 
-    if current_env == updated_env:
+    env_unchanged = current_env == updated_env
+    if env_unchanged and not secret_updates:
         result["skipped"] = True
         result["status_after"] = str(endpoint.status)
         return result
@@ -272,6 +286,7 @@ def update_one(
         name,
         namespace=namespace,
         env=updated_env,
+        secrets=secret_updates or None,
     )
     if wait:
         wait_for_endpoint_update(
