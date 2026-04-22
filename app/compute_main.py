@@ -26,7 +26,7 @@ PIPELINE_MIN_IDLE_INSTANCES = int(os.getenv("PIPELINE_MIN_IDLE_INSTANCES", "1"))
 
 # Core pipeline selection
 LANGUAGE = os.getenv("LANGUAGE", "en").strip()
-CHAT_SIZE = os.getenv("CHAT_SIZE", "10").strip()
+CHAT_SIZE = os.getenv("LM_CHAT_SIZE", "10").strip()
 
 STT = os.getenv("STT", "parakeet-tdt").strip()
 LLM = os.getenv("LLM", "open_api").strip()
