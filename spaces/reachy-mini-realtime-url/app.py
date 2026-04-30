@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse, Response
 
 
 SERVICE_NAME = "reachy-mini-realtime-url"
-UPSTREAM_ENV_NAMES = ("UPSTREAM_SESSION_URL", "REALTIME_SESSION_URL", "HF_REALTIME_SESSION_URL")
+UPSTREAM_ENV_NAME = "UPSTREAM_SESSION_URL"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
@@ -39,11 +39,7 @@ def _timeout_seconds() -> float:
 
 
 def _configured_session_url() -> str | None:
-    for env_name in UPSTREAM_ENV_NAMES:
-        value = os.getenv(env_name, "").strip()
-        if value:
-            return value
-    return None
+    return os.getenv(UPSTREAM_ENV_NAME, "").strip() or None
 
 
 def _validate_session_url(session_url: str) -> str:
@@ -69,7 +65,7 @@ def _not_configured_response() -> JSONResponse:
         {
             "ok": False,
             "error": "upstream_session_url_not_configured",
-            "expected_env": list(UPSTREAM_ENV_NAMES),
+            "expected_env": UPSTREAM_ENV_NAME,
         },
         status_code=503,
         headers=_no_store_headers(),

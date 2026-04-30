@@ -12,14 +12,12 @@ session endpoint.
 
 ## Configuration
 
-Set one of these Space variables/secrets to the current session allocator URL:
+Set this Space variable/secret to the current session allocator URL:
 
 - `UPSTREAM_SESSION_URL`
-- `REALTIME_SESSION_URL`
-- `HF_REALTIME_SESSION_URL`
 
-`UPSTREAM_SESSION_URL` is preferred. The service validates that the configured
-value is an absolute `http` or `https` URL.
+The service validates that the configured value is an absolute `http` or
+`https` URL.
 
 Optional:
 

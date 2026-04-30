@@ -24,8 +24,7 @@ def _load_space_app_module() -> Any:
 
 def test_health_does_not_require_upstream_url(monkeypatch: Any) -> None:
     module = _load_space_app_module()
-    for env_name in module.UPSTREAM_ENV_NAMES:
-        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.delenv(module.UPSTREAM_ENV_NAME, raising=False)
 
     client = TestClient(module.app)
 
@@ -38,8 +37,7 @@ def test_health_does_not_require_upstream_url(monkeypatch: Any) -> None:
 
 def test_ready_requires_upstream_url(monkeypatch: Any) -> None:
     module = _load_space_app_module()
-    for env_name in module.UPSTREAM_ENV_NAMES:
-        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.delenv(module.UPSTREAM_ENV_NAME, raising=False)
 
     client = TestClient(module.app)
 
@@ -47,6 +45,7 @@ def test_ready_requires_upstream_url(monkeypatch: Any) -> None:
 
     assert response.status_code == 503
     assert response.json()["error"] == "upstream_session_url_not_configured"
+    assert response.json()["expected_env"] == "UPSTREAM_SESSION_URL"
 
 
 def test_session_url_returns_configured_upstream(monkeypatch: Any) -> None:
