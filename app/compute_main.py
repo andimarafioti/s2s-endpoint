@@ -29,7 +29,7 @@ LANGUAGE = os.getenv("LANGUAGE", "en").strip()
 CHAT_SIZE = os.getenv("LM_CHAT_SIZE", "10").strip()
 
 STT = os.getenv("STT", "parakeet-tdt").strip()
-LLM = os.getenv("LLM", "open_api").strip()
+LLM = os.getenv("LLM", "openai-api").strip()
 TTS = os.getenv("TTS", "qwen3").strip()
 
 # General module flags
@@ -88,7 +88,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
         CHAT_SIZE,
         "--stt",
         STT,
-        "--llm",
+        "--llm_backend",
         LLM,
         "--tts",
         TTS,
@@ -97,12 +97,12 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
 
-    if LLM == "open_api":
-        _add_str_flag(cmd, OPEN_API_MODEL_NAME, "--open_api_model_name")
+    if LLM == "openai-api":
+        _add_str_flag(cmd, OPEN_API_MODEL_NAME, "--model_name")
         _add_str_flag(cmd, OPEN_API_BASE_URL, "--open_api_base_url")
         _add_str_flag(cmd, OPEN_API_API_KEY, "--open_api_api_key")
         _add_bool_flag(cmd, OPEN_API_STREAM, "--open_api_stream")
-        _add_str_flag(cmd, OPEN_API_INIT_CHAT_PROMPT, "--open_api_init_chat_prompt")
+        _add_str_flag(cmd, OPEN_API_INIT_CHAT_PROMPT, "--init_chat_prompt")
         _add_str_flag(cmd, OPEN_API_IMAGE_PATHS, "--open_api_image_paths")
 
     if EXTRA_S2S_ARGS:

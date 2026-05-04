@@ -61,8 +61,8 @@ def main() -> None:
     env.update(parse_key_value_pairs(args.env))
     secrets.update(parse_key_value_pairs(args.secret))
 
-    llm_backend = str(env.get("LLM", "open_api")).strip() or "open_api"
-    if llm_backend == "open_api" and not (
+    llm_backend = str(env.get("LLM", "openai-api")).strip() or "openai-api"
+    if llm_backend == "openai-api" and not (
         secrets.get("OPEN_API_API_KEY") or secrets.get("HF_TOKEN") or env.get("OPEN_API_API_KEY") or env.get("HF_TOKEN")
     ):
         print(
