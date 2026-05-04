@@ -4,7 +4,28 @@ import json
 
 from huggingface_hub import HfApi
 
-from _endpoint_helpers import current_model_env, load_json_file, merge_env_updates, parse_key_value_pairs
+from _endpoint_helpers import build_names, current_model_env, load_json_file, merge_env_updates, parse_key_value_pairs
+
+
+def add_compute_pool_updates(
+    env_updates: dict[str, str],
+    *,
+    prefix: str | None,
+    count: int | None,
+    min_warm: int | None,
+    wake_threshold_slots: int | None,
+) -> None:
+    if prefix or count is not None:
+        names = build_names(prefix, count, [])
+        env_updates["COMPUTE_ENDPOINT_NAMES"] = ",".join(names)
+    if min_warm is not None:
+        if min_warm < 0:
+            raise ValueError("--compute-endpoint-min-warm must be >= 0")
+        env_updates["COMPUTE_ENDPOINT_MIN_WARM"] = str(min_warm)
+    if wake_threshold_slots is not None:
+        if wake_threshold_slots < 0:
+            raise ValueError("--compute-endpoint-wake-threshold-slots must be >= 0")
+        env_updates["COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS"] = str(wake_threshold_slots)
 
 
 def main() -> None:
@@ -16,6 +37,10 @@ def main() -> None:
     parser.add_argument("--env-file", help="JSON file with env vars to set or overwrite")
     parser.add_argument("--env", action="append", default=[], help="Env var to set in KEY=VALUE form")
     parser.add_argument("--unset-env", action="append", default=[], help="Env var key to remove")
+    parser.add_argument("--compute-endpoint-prefix", help="Compute endpoint name prefix, used with --compute-endpoint-count")
+    parser.add_argument("--compute-endpoint-count", type=int, help="Number of compute endpoints, used with --compute-endpoint-prefix")
+    parser.add_argument("--compute-endpoint-min-warm", type=int, help="Set COMPUTE_ENDPOINT_MIN_WARM")
+    parser.add_argument("--compute-endpoint-wake-threshold-slots", type=int, help="Set COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS")
     parser.add_argument(
         "--wait",
         dest="wait",
@@ -36,6 +61,13 @@ def main() -> None:
 
     env_updates = load_json_file(args.env_file) or {}
     env_updates.update(parse_key_value_pairs(args.env))
+    add_compute_pool_updates(
+        env_updates,
+        prefix=args.compute_endpoint_prefix,
+        count=args.compute_endpoint_count,
+        min_warm=args.compute_endpoint_min_warm,
+        wake_threshold_slots=args.compute_endpoint_wake_threshold_slots,
+    )
     unset_env = [key.strip() for key in args.unset_env if key.strip()]
 
     if not env_updates and not unset_env:

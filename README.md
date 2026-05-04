@@ -185,8 +185,34 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --wait
 ```
 
-The script prints the created endpoint names and HTTPS URLs as JSON. Those names
-should then be passed to the LB with `COMPUTE_ENDPOINT_NAMES`.
+To add endpoints without touching existing lower-numbered endpoints, use
+`--target-total`. For example, to grow a `reachy-s2s-01` through
+`reachy-s2s-08` pool to 64 endpoints, the script checks the existing
+sequential pool and creates only `reachy-s2s-09` through `reachy-s2s-64`:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/create_compute_endpoints.py \
+  --namespace your-org \
+  --prefix reachy-s2s \
+  --target-total 64 \
+  --copy-env-from reachy-s2s-01 \
+  --image-url your-registry/s2s-endpoint-compute:latest \
+  --image-port 7860 \
+  --secret-file production-compute-secrets.json \
+  --instance-size x1 \
+  --instance-type nvidia-a10g \
+  --vendor aws \
+  --region us-east-1 \
+  --wait
+```
+
+`--copy-env-from` copies readable env vars from an existing endpoint. Secret
+values are not readable from existing endpoints, so pass the same secrets again
+with `--secret-file` or `--secret`.
+
+The script prints the created endpoint names and HTTPS URLs as JSON. The LB can
+receive that pool either as explicit `COMPUTE_ENDPOINT_NAMES` or through the
+helper scripts' prefix/count arguments.
 
 For the direct-session architecture, compute endpoints are usually created as
 `public` endpoints so clients can connect directly after the LB assigns them a
@@ -230,10 +256,26 @@ selected compute endpoints in parallel and waits for them in parallel too. That
 matters because the endpoint update API replaces the env payload instead of
 patching it.
 
+To repair a newly added tail so it matches an existing endpoint's readable env
+without touching lower-numbered endpoints, select the tail explicitly and copy
+from a known-good endpoint. Re-supply the production secrets because existing
+secret values cannot be copied back from the API:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_compute_endpoints_env.py \
+  --namespace HuggingFaceM4 \
+  --names $(printf 'reachy-s2s-%02d ' {9..64}) \
+  --copy-env-from reachy-s2s-01 \
+  --secret-file production-compute-secrets.json \
+  --wait
+```
+
 Useful options:
 
 - `--unset-env KEY`: remove an env var from every selected compute endpoint
 - `--env-file path.json`: load several env updates from JSON
+- `--copy-env-from NAME`: replace selected endpoint envs with readable env vars
+  from an existing endpoint before applying overrides
 - `--dry-run`: print the planned changes without applying them
 - `--no-wait`: submit updates without waiting for each endpoint to return to
   its target state
@@ -256,7 +298,8 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --instance-type intel-icl \
   --vendor aws \
   --region us-east-1 \
-  --compute-endpoint-names reachy-s2s-01,reachy-s2s-02,reachy-s2s-03 \
+  --compute-endpoint-prefix reachy-s2s \
+  --compute-endpoint-count 3 \
   --compute-endpoint-slots 1 \
   --compute-endpoint-min-warm 1 \
   --compute-endpoint-wake-threshold-slots 1 \
@@ -286,10 +329,16 @@ To update env vars on the existing load-balancer endpoint, use the dedicated upd
 uv run --with-requirements requirements.txt python scripts/update_load_balancer_endpoint_env.py \
   --namespace HuggingFaceM4 \
   --name reachy-s2s-lb \
-  --env COMPUTE_ENDPOINT_MIN_WARM=2 \
-  --env COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS=2 \
+  --compute-endpoint-prefix reachy-s2s \
+  --compute-endpoint-count 64 \
+  --compute-endpoint-min-warm 3 \
+  --compute-endpoint-wake-threshold-slots 3 \
   --wait
 ```
+
+The prefix/count form expands to the existing `COMPUTE_ENDPOINT_NAMES` env var,
+so it works with the current load-balancer image while avoiding a long manual
+comma-separated list.
 
 To enable persisted dashboard history using a Hugging Face Storage Bucket, the command we used was:
 

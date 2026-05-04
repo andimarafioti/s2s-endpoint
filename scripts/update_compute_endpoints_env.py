@@ -69,6 +69,7 @@ def main() -> None:
     parser.add_argument("--prefix", help="Endpoint name prefix, used with --count")
     parser.add_argument("--count", type=int, help="Number of endpoints to update, used with --prefix")
     parser.add_argument("--names", nargs="*", default=[], help="Explicit endpoint names")
+    parser.add_argument("--copy-env-from", help="Replace selected endpoint envs with readable env vars from this existing compute endpoint")
     parser.add_argument("--env-file", help="JSON file with env vars to set or overwrite")
     parser.add_argument("--env", action="append", default=[], help="Env var to set in KEY=VALUE form")
     parser.add_argument("--unset-env", action="append", default=[], help="Env var key to remove")
@@ -99,7 +100,13 @@ def main() -> None:
     args = parser.parse_args()
 
     names = build_names(args.prefix, args.count, args.names)
-    env_updates = load_json_file(args.env_file) or {}
+    api = HfApi()
+    env_updates = {}
+    replace_env = args.copy_env_from is not None
+    if args.copy_env_from:
+        template_endpoint = api.get_inference_endpoint(args.copy_env_from, namespace=args.namespace)
+        env_updates.update(current_model_env(template_endpoint.raw))
+    env_updates.update(load_json_file(args.env_file) or {})
     env_updates.update(parse_key_value_pairs(args.env))
     unset_env = [key.strip() for key in args.unset_env if key.strip()]
     secret_updates = load_json_file(args.secret_file) or {}
@@ -108,7 +115,6 @@ def main() -> None:
     if not env_updates and not unset_env and not secret_updates:
         raise ValueError("Provide at least one --env/--env-file entry, one --unset-env key, or one --secret/--secret-file entry")
 
-    api = HfApi()
     results = update_many(
         api=api,
         namespace=args.namespace,
@@ -121,6 +127,7 @@ def main() -> None:
         wait_refresh_every_s=args.wait_refresh_every_s,
         dry_run=args.dry_run,
         parallelism=args.parallelism,
+        replace_env=replace_env,
     )
 
     print(json.dumps({"endpoints": results}, indent=2, sort_keys=True))
@@ -139,6 +146,7 @@ def update_many(
     wait_refresh_every_s: int,
     dry_run: bool,
     parallelism: int,
+    replace_env: bool = False,
 ) -> list[dict[str, object]]:
     total = len(names)
     if total == 0:
@@ -157,6 +165,7 @@ def update_many(
             wait_timeout_s=wait_timeout_s,
             wait_refresh_every_s=wait_refresh_every_s,
             dry_run=dry_run,
+            replace_env=replace_env,
         )
 
     log_progress(f"Updating {total} compute endpoint envs in parallel with {max_workers} workers")
@@ -177,6 +186,7 @@ def update_many(
                 wait_timeout_s=wait_timeout_s,
                 wait_refresh_every_s=wait_refresh_every_s,
                 dry_run=dry_run,
+                replace_env=replace_env,
             )
             futures[future] = (index, name)
 
@@ -207,6 +217,7 @@ def update_many_sequential(
     wait_timeout_s: int,
     wait_refresh_every_s: int,
     dry_run: bool,
+    replace_env: bool = False,
 ) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     total = len(names)
@@ -223,6 +234,7 @@ def update_many_sequential(
             wait_timeout_s=wait_timeout_s,
             wait_refresh_every_s=wait_refresh_every_s,
             dry_run=dry_run,
+            replace_env=replace_env,
         )
         log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
         results.append(result)
@@ -241,12 +253,13 @@ def update_one(
     wait_timeout_s: int,
     wait_refresh_every_s: int,
     dry_run: bool,
+    replace_env: bool = False,
 ) -> dict[str, object]:
     endpoint = api.get_inference_endpoint(name, namespace=namespace)
     status_before = str(endpoint.status)
     target_status = expected_target_status(status_before)
     current_env = current_model_env(endpoint.raw)
-    updated_env = merge_env_updates(current_env, env_updates, unset_env)
+    updated_env = merge_env_updates({} if replace_env else current_env, env_updates, unset_env)
 
     changed = {
         key: updated_env[key]
