@@ -9,7 +9,12 @@ from typing import Any
 from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError, InferenceEndpointError, InferenceEndpointTimeoutError
 
-from _endpoint_helpers import DEFAULT_LOAD_BALANCER_HEALTH_ROUTE, build_names, current_custom_image
+from _endpoint_helpers import (
+    DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
+    build_names,
+    current_custom_image,
+    current_model_env,
+)
 
 
 DEFAULT_LOAD_BALANCER_NAME = "reachy-s2s-lb"
@@ -81,12 +86,13 @@ def main() -> None:
             f"Discovered {len(compute_names)} compute endpoints via {selection['discovery']}: "
             f"{build_compute_summary(compute_names, selection)}"
         )
+        compute_namespace = selection.get("namespace", args.namespace)
         results["compute"] = {
             **selection,
             "summary": build_compute_summary(compute_names, selection),
             "updates": update_many(
                 api=api,
-                namespace=args.namespace,
+                namespace=compute_namespace if isinstance(compute_namespace, str) else args.namespace,
                 names=compute_names,
                 image_url=args.compute,
                 wait=args.wait,
@@ -131,9 +137,18 @@ def resolve_compute_names(
         return names, {
             "discovery": "prefix_count",
             "prefix": prefix,
+            "namespace": namespace,
             "start_index": DEFAULT_COMPUTE_INDEX_START,
             "end_index": len(names),
         }
+
+    load_balancer_names = discover_load_balancer_compute_names(
+        api=api,
+        namespace=namespace,
+        load_balancer_name=load_balancer_name,
+    )
+    if load_balancer_names is not None:
+        return load_balancer_names
 
     inferred_prefix = default_compute_prefix(load_balancer_name)
     return discover_sequential_compute_names(
@@ -141,6 +156,35 @@ def resolve_compute_names(
         namespace=namespace,
         prefix=inferred_prefix,
     )
+
+
+def discover_load_balancer_compute_names(
+    *,
+    api: HfApi,
+    namespace: str | None,
+    load_balancer_name: str,
+) -> tuple[list[str], dict[str, Any]] | None:
+    try:
+        endpoint = api.get_inference_endpoint(load_balancer_name, namespace=namespace)
+    except HfHubHTTPError as exc:
+        if is_not_found_error(exc):
+            return None
+        raise
+    env = current_model_env(endpoint.raw)
+    names = parse_compute_endpoint_names(env.get("COMPUTE_ENDPOINT_NAMES", ""))
+    if not names:
+        return None
+
+    compute_namespace = env.get("HF_ENDPOINT_NAMESPACE", "").strip() or namespace
+    return names, {
+        "discovery": "load_balancer_env",
+        "load_balancer_name": load_balancer_name,
+        "namespace": compute_namespace,
+    }
+
+
+def parse_compute_endpoint_names(value: str) -> list[str]:
+    return [name.strip() for name in value.split(",") if name.strip()]
 
 
 def default_compute_prefix(load_balancer_name: str) -> str:
@@ -177,6 +221,7 @@ def discover_sequential_compute_names(
     return names, {
         "discovery": "sequential_scan",
         "prefix": prefix,
+        "namespace": namespace,
         "start_index": DEFAULT_COMPUTE_INDEX_START,
         "end_index": names_to_end_index(names),
     }

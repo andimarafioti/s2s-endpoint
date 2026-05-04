@@ -9,6 +9,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from _endpoint_helpers import (
     DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
+    build_names,
     current_custom_image,
     current_model_env,
     merge_env_updates,
@@ -18,6 +19,12 @@ from _endpoint_helpers import (
 class EndpointHelpersTests(unittest.TestCase):
     def test_default_load_balancer_health_route_is_ready(self):
         self.assertEqual(DEFAULT_LOAD_BALANCER_HEALTH_ROUTE, "/ready")
+
+    def test_build_names_expands_prefix_count(self):
+        self.assertEqual(
+            build_names("reachy-s2s", 3, []),
+            ["reachy-s2s-01", "reachy-s2s-02", "reachy-s2s-03"],
+        )
 
     def test_current_model_env_returns_empty_dict_when_missing(self):
         self.assertEqual(current_model_env({}), {})
