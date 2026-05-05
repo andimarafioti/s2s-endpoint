@@ -80,7 +80,7 @@ class FakeParallelUpdateApi:
     def __init__(self, names: list[str]):
         self.tracker = ParallelTracker()
         self.endpoints = {
-            name: FakeManagedEndpoint(name, {"OPEN_API_MODEL_NAME": "old-model"}, self.tracker) for name in names
+            name: FakeManagedEndpoint(name, {"RESPONSES_API_MODEL_NAME": "old-model"}, self.tracker) for name in names
         }
 
     def get_inference_endpoint(self, name: str, namespace: str | None = None):
@@ -121,7 +121,7 @@ class UpdateComputeEndpointsEnvTests(unittest.TestCase):
             api=api,
             namespace="HuggingFaceM4",
             names=names,
-            env_updates={"OPEN_API_MODEL_NAME": "new-model"},
+            env_updates={"RESPONSES_API_MODEL_NAME": "new-model"},
             unset_env=[],
             secret_updates={},
             wait=True,
