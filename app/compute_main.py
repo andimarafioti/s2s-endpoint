@@ -38,7 +38,7 @@ LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERV
 
 # Responses API / HF router
 RESPONSES_API_MODEL_NAME = os.getenv("RESPONSES_API_MODEL_NAME", "Qwen/Qwen3.5-9B:together").strip()
-RESPONSES_API_BASE_URL = os.getenv("RESPONSES_API_BASE_URL", "https://api.openai.com/v1").strip()
+RESPONSES_API_BASE_URL = os.getenv("RESPONSES_API_BASE_URL", "").strip()
 RESPONSES_API_API_KEY = os.getenv("RESPONSES_API_API_KEY", "").strip() or os.getenv("HF_TOKEN", "").strip()
 RESPONSES_API_STREAM = os.getenv("RESPONSES_API_STREAM", "1").strip().lower() in {"1", "true", "yes"}
 RESPONSES_API_INIT_CHAT_PROMPT = os.getenv("RESPONSES_API_INIT_CHAT_PROMPT", "").strip()
@@ -99,7 +99,8 @@ def build_s2s_command(host: str, port: int) -> list[str]:
 
     if LLM == "responses-api":
         _add_str_flag(cmd, RESPONSES_API_MODEL_NAME, "--model_name")
-        _add_str_flag(cmd, RESPONSES_API_BASE_URL, "--responses_api_base_url")
+        if RESPONSES_API_BASE_URL:
+            _add_str_flag(cmd, RESPONSES_API_BASE_URL, "--responses_api_base_url")
         _add_str_flag(cmd, RESPONSES_API_API_KEY, "--responses_api_api_key")
         _add_bool_flag(cmd, RESPONSES_API_STREAM, "--responses_api_stream")
         _add_str_flag(cmd, RESPONSES_API_INIT_CHAT_PROMPT, "--init_chat_prompt")
