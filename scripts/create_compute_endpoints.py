@@ -61,13 +61,13 @@ def main() -> None:
     env.update(parse_key_value_pairs(args.env))
     secrets.update(parse_key_value_pairs(args.secret))
 
-    llm_backend = str(env.get("LLM", "openai-api")).strip() or "openai-api"
-    if llm_backend == "openai-api" and not (
-        secrets.get("OPEN_API_API_KEY") or secrets.get("HF_TOKEN") or env.get("OPEN_API_API_KEY") or env.get("HF_TOKEN")
+    llm_backend = str(env.get("LLM", "responses-api")).strip() or "responses-api"
+    if llm_backend == "responses-api" and not (
+        secrets.get("RESPONSES_API_API_KEY") or secrets.get("HF_TOKEN") or env.get("RESPONSES_API_API_KEY") or env.get("HF_TOKEN")
     ):
         print(
-            "warning: compute endpoints default to LLM=open_api, but neither OPEN_API_API_KEY nor HF_TOKEN was provided. "
-            "The container will start, but runtime requests will fail when the speech-to-speech pipeline calls the OpenAI-compatible API.",
+            "warning: compute endpoints default to LLM=responses-api, but neither RESPONSES_API_API_KEY nor HF_TOKEN was provided. "
+            "The container will start, but runtime requests will fail when the speech-to-speech pipeline calls the Responses API.",
             file=sys.stderr,
         )
 

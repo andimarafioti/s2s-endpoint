@@ -29,20 +29,20 @@ LANGUAGE = os.getenv("LANGUAGE", "en").strip()
 CHAT_SIZE = os.getenv("LM_CHAT_SIZE", "10").strip()
 
 STT = os.getenv("STT", "parakeet-tdt").strip()
-LLM = os.getenv("LLM", "openai-api").strip()
+LLM = os.getenv("LLM", "responses-api").strip()
 TTS = os.getenv("TTS", "qwen3").strip()
 
 # General module flags
 ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().lower() in {"1", "true", "yes"}
 LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
 
-# Open API / HF router
-OPEN_API_MODEL_NAME = os.getenv("OPEN_API_MODEL_NAME", "Qwen/Qwen3.5-9B:together").strip()
-OPEN_API_BASE_URL = os.getenv("OPEN_API_BASE_URL", "https://router.huggingface.co/v1").strip()
-OPEN_API_API_KEY = os.getenv("OPEN_API_API_KEY", "").strip() or os.getenv("HF_TOKEN", "").strip()
-OPEN_API_STREAM = os.getenv("OPEN_API_STREAM", "1").strip().lower() in {"1", "true", "yes"}
-OPEN_API_INIT_CHAT_PROMPT = os.getenv("OPEN_API_INIT_CHAT_PROMPT", "").strip()
-OPEN_API_IMAGE_PATHS = os.getenv("OPEN_API_IMAGE_PATHS", "").strip()
+# Responses API / HF router
+RESPONSES_API_MODEL_NAME = os.getenv("RESPONSES_API_MODEL_NAME", "Qwen/Qwen3.5-9B:together").strip()
+RESPONSES_API_BASE_URL = os.getenv("RESPONSES_API_BASE_URL", "https://router.huggingface.co/v1").strip()
+RESPONSES_API_API_KEY = os.getenv("RESPONSES_API_API_KEY", "").strip() or os.getenv("HF_TOKEN", "").strip()
+RESPONSES_API_STREAM = os.getenv("RESPONSES_API_STREAM", "1").strip().lower() in {"1", "true", "yes"}
+RESPONSES_API_INIT_CHAT_PROMPT = os.getenv("RESPONSES_API_INIT_CHAT_PROMPT", "").strip()
+RESPONSES_API_IMAGE_PATHS = os.getenv("RESPONSES_API_IMAGE_PATHS", "").strip()
 
 # Optional generic extras for power users
 EXTRA_S2S_ARGS = os.getenv("EXTRA_S2S_ARGS", "").strip()
@@ -97,13 +97,13 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
 
-    if LLM == "openai-api":
-        _add_str_flag(cmd, OPEN_API_MODEL_NAME, "--model_name")
-        _add_str_flag(cmd, OPEN_API_BASE_URL, "--open_api_base_url")
-        _add_str_flag(cmd, OPEN_API_API_KEY, "--open_api_api_key")
-        _add_bool_flag(cmd, OPEN_API_STREAM, "--open_api_stream")
-        _add_str_flag(cmd, OPEN_API_INIT_CHAT_PROMPT, "--init_chat_prompt")
-        _add_str_flag(cmd, OPEN_API_IMAGE_PATHS, "--open_api_image_paths")
+    if LLM == "responses-api":
+        _add_str_flag(cmd, RESPONSES_API_MODEL_NAME, "--model_name")
+        _add_str_flag(cmd, RESPONSES_API_BASE_URL, "--responses_api_base_url")
+        _add_str_flag(cmd, RESPONSES_API_API_KEY, "--responses_api_api_key")
+        _add_bool_flag(cmd, RESPONSES_API_STREAM, "--responses_api_stream")
+        _add_str_flag(cmd, RESPONSES_API_INIT_CHAT_PROMPT, "--init_chat_prompt")
+        _add_str_flag(cmd, RESPONSES_API_IMAGE_PATHS, "--responses_api_image_paths")
 
     if EXTRA_S2S_ARGS:
         cmd.extend(EXTRA_S2S_ARGS.split())

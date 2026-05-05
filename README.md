@@ -193,8 +193,8 @@ For the direct-session architecture, compute endpoints are usually created as
 session token.
 
 With the current defaults, compute endpoints also need an `HF_TOKEN` or
-`OPEN_API_API_KEY` secret at runtime because the speech-to-speech wrapper
-defaults to `LLM=open_api`.
+`RESPONSES_API_API_KEY` secret at runtime because the speech-to-speech wrapper
+defaults to `LLM=responses-api`.
 
 ## Update Compute Endpoint Env
 
@@ -205,7 +205,7 @@ uv run --with-requirements requirements.txt python scripts/update_compute_endpoi
   --namespace your-org \
   --prefix reachy-s2s \
   --count 8 \
-  --env OPEN_API_MODEL_NAME=Qwen/Qwen3.5-72B:together \
+  --env RESPONSES_API_MODEL_NAME=Qwen/Qwen3.5-72B:together \
   --wait
 ```
 

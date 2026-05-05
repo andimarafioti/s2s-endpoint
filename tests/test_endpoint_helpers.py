@@ -35,19 +35,19 @@ class EndpointHelpersTests(unittest.TestCase):
 
     def test_merge_env_updates_overwrites_and_unsets_keys(self):
         current_env = {
-            "OPEN_API_MODEL_NAME": "Qwen/Qwen3.5-9B:together",
+            "RESPONSES_API_MODEL_NAME": "Qwen/Qwen3.5-9B:together",
             "SESSION_SHARED_SECRET": "secret",
             "OLD_FLAG": "1",
         }
         updated = merge_env_updates(
             current_env,
-            updates={"OPEN_API_MODEL_NAME": "Qwen/Qwen3.5-72B:together"},
+            updates={"RESPONSES_API_MODEL_NAME": "Qwen/Qwen3.5-72B:together"},
             unset_keys=["OLD_FLAG"],
         )
         self.assertEqual(
             updated,
             {
-                "OPEN_API_MODEL_NAME": "Qwen/Qwen3.5-72B:together",
+                "RESPONSES_API_MODEL_NAME": "Qwen/Qwen3.5-72B:together",
                 "SESSION_SHARED_SECRET": "secret",
             },
         )
