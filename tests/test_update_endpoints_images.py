@@ -15,7 +15,9 @@ if str(SCRIPTS_DIR) not in sys.path:
 from update_endpoints_images import (  # noqa: E402
     build_compute_summary,
     default_compute_prefix,
+    discover_load_balancer_compute_names,
     discover_sequential_compute_names,
+    resolve_compute_names,
     update_one,
     update_many,
 )
@@ -83,6 +85,25 @@ class FakeManagedEndpoint:
 
     def fetch(self):
         return self
+
+
+class FakeLoadBalancerEndpoint:
+    def __init__(self, env: dict[str, str]):
+        self.raw = {"model": {"env": env}}
+
+
+class FakeLoadBalancerApi:
+    def __init__(self, env: dict[str, str]):
+        self.endpoint = FakeLoadBalancerEndpoint(env)
+        self.calls: list[tuple[str, str | None]] = []
+
+    def get_inference_endpoint(self, name: str, namespace: str | None = None):
+        self.calls.append((name, namespace))
+        if name == "reachy-s2s-lb":
+            return self.endpoint
+        request = httpx.Request("GET", f"https://example.test/{namespace or 'default'}/{name}")
+        response = httpx.Response(404, request=request)
+        raise HfHubHTTPError("not found", response=response)
 
 
 class FakeTransitionEndpoint(FakeManagedEndpoint):
@@ -172,11 +193,59 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             {
                 "discovery": "sequential_scan",
                 "prefix": "reachy-s2s",
+                "namespace": "HuggingFaceM4",
                 "start_index": 1,
                 "end_index": 3,
             },
         )
         self.assertEqual(build_compute_summary(names, selection), "updated endpoints 1 through 3")
+
+    def test_discover_load_balancer_compute_names_reads_lb_env(self):
+        api = FakeLoadBalancerApi(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "reachy-s2s-01, reachy-s2s-02,reachy-s2s-03",
+                "HF_ENDPOINT_NAMESPACE": "ComputeOrg",
+            }
+        )
+
+        result = discover_load_balancer_compute_names(
+            api=api,
+            namespace="RouterOrg",
+            load_balancer_name="reachy-s2s-lb",
+        )
+
+        self.assertIsNotNone(result)
+        names, selection = result
+        self.assertEqual(names, ["reachy-s2s-01", "reachy-s2s-02", "reachy-s2s-03"])
+        self.assertEqual(
+            selection,
+            {
+                "discovery": "load_balancer_env",
+                "load_balancer_name": "reachy-s2s-lb",
+                "namespace": "ComputeOrg",
+            },
+        )
+
+    def test_resolve_compute_names_uses_load_balancer_env_by_default(self):
+        api = FakeLoadBalancerApi(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "reachy-s2s-01,reachy-s2s-02",
+            }
+        )
+
+        names, selection = resolve_compute_names(
+            api=api,
+            namespace="HuggingFaceM4",
+            load_balancer_name="reachy-s2s-lb",
+            explicit_names=[],
+            prefix=None,
+            count=None,
+        )
+
+        self.assertEqual(names, ["reachy-s2s-01", "reachy-s2s-02"])
+        self.assertEqual(selection["discovery"], "load_balancer_env")
+        self.assertEqual(selection["namespace"], "HuggingFaceM4")
+        self.assertEqual(api.calls, [("reachy-s2s-lb", "HuggingFaceM4")])
 
     def test_discover_sequential_compute_names_raises_when_first_index_is_missing(self):
         api = FakeApi([])
