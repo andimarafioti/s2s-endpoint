@@ -12,6 +12,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 from update_compute_endpoints_env import (  # noqa: E402
     expected_target_status,
     update_many,
+    update_one,
     wait_for_endpoint_update,
 )
 
@@ -85,7 +86,7 @@ class FakeParallelUpdateApi:
     def get_inference_endpoint(self, name: str, namespace: str | None = None):
         return self.endpoints[name]
 
-    def update_inference_endpoint(self, name: str, namespace: str | None = None, env=None):
+    def update_inference_endpoint(self, name: str, namespace: str | None = None, env=None, secrets=None):
         endpoint = self.endpoints[name]
         endpoint.status = "updating"
         endpoint._env = dict(env or {})
@@ -122,6 +123,7 @@ class UpdateComputeEndpointsEnvTests(unittest.TestCase):
             names=names,
             env_updates={"OPEN_API_MODEL_NAME": "new-model"},
             unset_env=[],
+            secret_updates={},
             wait=True,
             wait_timeout_s=60,
             wait_refresh_every_s=1,
@@ -131,6 +133,39 @@ class UpdateComputeEndpointsEnvTests(unittest.TestCase):
 
         self.assertEqual([result["name"] for result in results], names)
         self.assertGreaterEqual(api.tracker.max_active_waiters, 2)
+
+    def test_update_one_can_replace_env_with_template_env(self):
+        api = FakeParallelUpdateApi(["reachy-s2s-09"])
+        api.endpoints["reachy-s2s-09"]._env = {
+            "OPEN_API_MODEL_NAME": "wrong-model",
+            "EXTRA_FLAG": "remove-me",
+        }
+
+        result = update_one(
+            api=api,
+            namespace="HuggingFaceM4",
+            name="reachy-s2s-09",
+            env_updates={
+                "OPEN_API_MODEL_NAME": "template-model",
+                "SESSION_SHARED_SECRET": "shared",
+            },
+            unset_env=[],
+            secret_updates={},
+            wait=False,
+            wait_timeout_s=60,
+            wait_refresh_every_s=1,
+            dry_run=False,
+            replace_env=True,
+        )
+
+        self.assertEqual(
+            api.endpoints["reachy-s2s-09"]._env,
+            {
+                "OPEN_API_MODEL_NAME": "template-model",
+                "SESSION_SHARED_SECRET": "shared",
+            },
+        )
+        self.assertEqual(result["removed"], ["EXTRA_FLAG"])
 
 
 if __name__ == "__main__":

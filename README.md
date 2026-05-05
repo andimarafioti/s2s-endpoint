@@ -185,8 +185,34 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --wait
 ```
 
-The script prints the created endpoint names and HTTPS URLs as JSON. Those names
-should then be passed to the LB with `COMPUTE_ENDPOINT_NAMES`.
+To add endpoints without touching existing lower-numbered endpoints, use
+`--target-total`. For example, to grow a `reachy-s2s-01` through
+`reachy-s2s-08` pool to 64 endpoints, the script checks the existing
+sequential pool and creates only `reachy-s2s-09` through `reachy-s2s-64`:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/create_compute_endpoints.py \
+  --namespace your-org \
+  --prefix reachy-s2s \
+  --target-total 64 \
+  --copy-env-from reachy-s2s-01 \
+  --image-url your-registry/s2s-endpoint-compute:latest \
+  --image-port 7860 \
+  --secret-file production-compute-secrets.json \
+  --instance-size x1 \
+  --instance-type nvidia-a10g \
+  --vendor aws \
+  --region us-east-1 \
+  --wait
+```
+
+`--copy-env-from` copies readable env vars from an existing endpoint. Secret
+values are not readable from existing endpoints, so pass the same secrets again
+with `--secret-file` or `--secret`.
+
+The script prints the created endpoint names and HTTPS URLs as JSON. The LB can
+receive that pool either as explicit `COMPUTE_ENDPOINT_NAMES` or through the
+helper scripts' prefix/count arguments.
 
 For the direct-session architecture, compute endpoints are usually created as
 `public` endpoints so clients can connect directly after the LB assigns them a
@@ -194,7 +220,7 @@ session token.
 
 With the current defaults, compute endpoints also need an `HF_TOKEN` or
 `OPEN_API_API_KEY` secret at runtime because the speech-to-speech wrapper
-defaults to `LLM=open_api`.
+defaults to `LLM=openai-api`.
 
 ## Update Compute Endpoint Env
 
@@ -230,10 +256,26 @@ selected compute endpoints in parallel and waits for them in parallel too. That
 matters because the endpoint update API replaces the env payload instead of
 patching it.
 
+To repair a newly added tail so it matches an existing endpoint's readable env
+without touching lower-numbered endpoints, select the tail explicitly and copy
+from a known-good endpoint. Re-supply the production secrets because existing
+secret values cannot be copied back from the API:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_compute_endpoints_env.py \
+  --namespace HuggingFaceM4 \
+  --names $(printf 'reachy-s2s-%02d ' {9..64}) \
+  --copy-env-from reachy-s2s-01 \
+  --secret-file production-compute-secrets.json \
+  --wait
+```
+
 Useful options:
 
 - `--unset-env KEY`: remove an env var from every selected compute endpoint
 - `--env-file path.json`: load several env updates from JSON
+- `--copy-env-from NAME`: replace selected endpoint envs with readable env vars
+  from an existing endpoint before applying overrides
 - `--dry-run`: print the planned changes without applying them
 - `--no-wait`: submit updates without waiting for each endpoint to return to
   its target state
@@ -256,7 +298,8 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --instance-type intel-icl \
   --vendor aws \
   --region us-east-1 \
-  --compute-endpoint-names reachy-s2s-01,reachy-s2s-02,reachy-s2s-03 \
+  --compute-endpoint-prefix reachy-s2s \
+  --compute-endpoint-count 3 \
   --compute-endpoint-slots 1 \
   --compute-endpoint-min-warm 1 \
   --compute-endpoint-wake-threshold-slots 1 \
@@ -286,10 +329,16 @@ To update env vars on the existing load-balancer endpoint, use the dedicated upd
 uv run --with-requirements requirements.txt python scripts/update_load_balancer_endpoint_env.py \
   --namespace HuggingFaceM4 \
   --name reachy-s2s-lb \
-  --env COMPUTE_ENDPOINT_MIN_WARM=2 \
-  --env COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS=2 \
+  --compute-endpoint-prefix reachy-s2s \
+  --compute-endpoint-count 64 \
+  --compute-endpoint-min-warm 3 \
+  --compute-endpoint-wake-threshold-slots 3 \
   --wait
 ```
+
+The prefix/count form expands to the existing `COMPUTE_ENDPOINT_NAMES` env var,
+so it works with the current load-balancer image while avoiding a long manual
+comma-separated list.
 
 To enable persisted dashboard history using a Hugging Face Storage Bucket, the command we used was:
 
@@ -311,6 +360,16 @@ To roll out a new compute image, a new load-balancer image, or both, use:
 ```bash
 uv run --with-requirements requirements.txt python scripts/update_endpoints_images.py \
   --namespace HuggingFaceM4 \
+  --compute andito/s2s-compute:v0.4
+```
+
+That compute-only command updates the current pool configured on the load
+balancer. To update both compute and load-balancer images in one run, pass both
+image arguments:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_endpoints_images.py \
+  --namespace HuggingFaceM4 \
   --compute andito/s2s-compute:v0.3 \
   --load_balancer andito/s2s-load_balancer:v0.11
 ```
@@ -320,8 +379,11 @@ Behavior:
 - if you pass `--compute`, the script updates the compute pool first
 - if you pass `--load_balancer`, it updates the load-balancer endpoint
 - if you omit either one, that side is skipped
-- if you do not provide compute names explicitly, the script derives the compute prefix from the load-balancer name and scans `-01`, `-02`, ... until the first missing endpoint
-- with the default LB name `reachy-s2s-lb`, that means it discovers `reachy-s2s-01`, `reachy-s2s-02`, and so on, then prints a summary like `updated endpoints 1 through 8`
+- if you do not provide compute names explicitly, the script reads the current
+  compute pool from the load balancer's `COMPUTE_ENDPOINT_NAMES` env var
+- if the load balancer does not have `COMPUTE_ENDPOINT_NAMES`, the script falls
+  back to deriving the compute prefix from the load-balancer name and scanning
+  `-01`, `-02`, ... until the first missing endpoint
 - compute endpoint updates now run in parallel by default; use `--compute-parallelism 1` if you want the old sequential rollout behavior
 - with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately
 - completion lines are printed as each endpoint finishes, so parked endpoints are reported immediately even if a few running endpoints are still becoming healthy
@@ -331,8 +393,10 @@ Behavior:
 Useful options:
 
 - `--load-balancer-name`: defaults to `reachy-s2s-lb`
-- `--compute-names reachy-s2s-01 reachy-s2s-02`
-- `--compute-prefix reachy-s2s --compute-count 8`
+- `--compute-names reachy-s2s-01 reachy-s2s-02`: override the LB env and update
+  only these compute endpoints
+- `--compute-prefix reachy-s2s --compute-count 8`: override the LB env and
+  update a generated prefix/count set
 - `--compute-parallelism 1`
 - `--no-wait`
 - `--dry-run`

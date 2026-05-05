@@ -11,10 +11,21 @@ from _endpoint_helpers import (
     DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
     DEFAULT_IMAGE_PORT,
     DEFAULT_REPOSITORY,
+    build_names,
     build_custom_image,
     load_json_file,
     parse_key_value_pairs,
 )
+
+
+def resolve_compute_endpoint_names(
+    *,
+    names_csv: str | None,
+    prefix: str | None,
+    count: int | None,
+) -> list[str]:
+    names = [name.strip() for name in (names_csv or "").split(",") if name.strip()]
+    return build_names(prefix, count, names)
 
 
 def main() -> None:
@@ -31,7 +42,9 @@ def main() -> None:
     parser.add_argument("--image-health-route", default=DEFAULT_LOAD_BALANCER_HEALTH_ROUTE, help="Health route exposed by the load-balancer image")
     parser.add_argument("--image-port", type=int, default=DEFAULT_IMAGE_PORT, help="Container port exposed by the load-balancer image")
     parser.add_argument("--session-shared-secret", required=True, help="Shared secret used to mint and validate direct session tokens")
-    parser.add_argument("--compute-endpoint-names", required=True, help="Comma-separated compute endpoint names")
+    parser.add_argument("--compute-endpoint-names", help="Comma-separated compute endpoint names")
+    parser.add_argument("--compute-endpoint-prefix", help="Compute endpoint name prefix, used with --compute-endpoint-count")
+    parser.add_argument("--compute-endpoint-count", type=int, help="Number of compute endpoints, used with --compute-endpoint-prefix")
     parser.add_argument("--compute-endpoint-slots", type=int, default=1, help="Concurrent sessions each compute endpoint can handle")
     parser.add_argument("--compute-endpoint-min-warm", type=int, default=1, help="Warm compute endpoints to keep ready")
     parser.add_argument("--compute-endpoint-wake-threshold-slots", type=int, default=1, help="Wake another compute endpoint when total free slots drop to this value")
@@ -72,11 +85,16 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    compute_endpoint_names = resolve_compute_endpoint_names(
+        names_csv=args.compute_endpoint_names,
+        prefix=args.compute_endpoint_prefix,
+        count=args.compute_endpoint_count,
+    )
     compute_namespace = args.hf_endpoint_namespace or args.namespace or ""
     env.update(
         {
             "HF_ENDPOINT_NAMESPACE": compute_namespace,
-            "COMPUTE_ENDPOINT_NAMES": args.compute_endpoint_names,
+            "COMPUTE_ENDPOINT_NAMES": ",".join(compute_endpoint_names),
             "COMPUTE_ENDPOINT_SLOTS": str(args.compute_endpoint_slots),
             "COMPUTE_ENDPOINT_MIN_WARM": str(args.compute_endpoint_min_warm),
             "COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS": str(args.compute_endpoint_wake_threshold_slots),
