@@ -26,7 +26,7 @@ PIPELINE_MIN_IDLE_INSTANCES = int(os.getenv("PIPELINE_MIN_IDLE_INSTANCES", "1"))
 
 # Core pipeline selection
 LANGUAGE = os.getenv("LANGUAGE", "en").strip()
-CHAT_SIZE = os.getenv("LM_CHAT_SIZE", "10").strip()
+CHAT_SIZE = os.getenv("CHAT_SIZE", "30").strip()
 
 STT = os.getenv("STT", "parakeet-tdt").strip()
 LLM = os.getenv("LLM", "responses-api").strip()
@@ -37,12 +37,11 @@ ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().
 LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
 
 # Responses API / HF router
-RESPONSES_API_MODEL_NAME = os.getenv("RESPONSES_API_MODEL_NAME", "Qwen/Qwen3.5-9B:together").strip()
-RESPONSES_API_BASE_URL = os.getenv("RESPONSES_API_BASE_URL", "https://router.huggingface.co/v1").strip()
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5.4").strip()
+INIT_CHAT_PROMPT = os.getenv("INIT_CHAT_PROMPT", "").strip()
+RESPONSES_API_BASE_URL = os.getenv("RESPONSES_API_BASE_URL", "").strip()
 RESPONSES_API_API_KEY = os.getenv("RESPONSES_API_API_KEY", "").strip() or os.getenv("HF_TOKEN", "").strip()
 RESPONSES_API_STREAM = os.getenv("RESPONSES_API_STREAM", "1").strip().lower() in {"1", "true", "yes"}
-RESPONSES_API_INIT_CHAT_PROMPT = os.getenv("RESPONSES_API_INIT_CHAT_PROMPT", "").strip()
-RESPONSES_API_IMAGE_PATHS = os.getenv("RESPONSES_API_IMAGE_PATHS", "").strip()
 
 # Optional generic extras for power users
 EXTRA_S2S_ARGS = os.getenv("EXTRA_S2S_ARGS", "").strip()
@@ -96,14 +95,15 @@ def build_s2s_command(host: str, port: int) -> list[str]:
 
     _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
+    _add_str_flag(cmd, MODEL_NAME, "--model_name")
+    _add_str_flag(cmd, INIT_CHAT_PROMPT, "--init_chat_prompt")
 
     if LLM == "responses-api":
-        _add_str_flag(cmd, RESPONSES_API_MODEL_NAME, "--model_name")
-        _add_str_flag(cmd, RESPONSES_API_BASE_URL, "--responses_api_base_url")
-        _add_str_flag(cmd, RESPONSES_API_API_KEY, "--responses_api_api_key")
+        if RESPONSES_API_BASE_URL:
+            _add_str_flag(cmd, RESPONSES_API_BASE_URL, "--responses_api_base_url")
+        if RESPONSES_API_API_KEY:
+            _add_str_flag(cmd, RESPONSES_API_API_KEY, "--responses_api_api_key")
         _add_bool_flag(cmd, RESPONSES_API_STREAM, "--responses_api_stream")
-        _add_str_flag(cmd, RESPONSES_API_INIT_CHAT_PROMPT, "--init_chat_prompt")
-        _add_str_flag(cmd, RESPONSES_API_IMAGE_PATHS, "--responses_api_image_paths")
 
     if EXTRA_S2S_ARGS:
         cmd.extend(EXTRA_S2S_ARGS.split())
