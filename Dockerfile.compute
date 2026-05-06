@@ -2,6 +2,7 @@
 FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
 ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
 ARG S2S_REF=main
+ARG MODEL_CONFIG=""
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -30,7 +31,18 @@ RUN pip install --upgrade pip setuptools wheel && \
 RUN git clone --filter=blob:none "${S2S_REPO_URL}" ${S2S_REPO_DIR} && \
     cd ${S2S_REPO_DIR} && \
     git checkout "${S2S_REF}" && \
+<<<<<<< Updated upstream
     uv sync --no-dev
+=======
+    uv sync --no-dev && \
+    uv run --no-dev python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')"
+
+COPY model_configs/ /app/model_configs/
+RUN if [ -n "${MODEL_CONFIG}" ]; then \
+      cd ${S2S_REPO_DIR} && \
+      uv run --no-dev python /app/model_configs/${MODEL_CONFIG}; \
+    fi
+>>>>>>> Stashed changes
 
 COPY app /app/app
 
