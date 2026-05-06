@@ -70,6 +70,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     cmd = [
         "uv",
         "run",
+        "--no-dev",
         "--directory",
         S2S_REPO_DIR,
         "speech-to-speech",
