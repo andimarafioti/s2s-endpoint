@@ -221,7 +221,7 @@ def main() -> None:
             scale_to_zero_timeout=args.scale_to_zero_timeout,
             revision=args.revision,
             custom_image=custom_image,
-            env=dict(endpoint_env) or None,
+            env=dict(env) or None,
             secrets=secrets or None,
             type=args.type,
         )
