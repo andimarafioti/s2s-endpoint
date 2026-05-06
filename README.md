@@ -36,15 +36,26 @@ Build the compute image:
 docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
-To bake model weights into the image (faster cold starts, no runtime downloads), pass a `MODEL_CONFIG` build-arg pointing to a script in `model_configs/`:
+To bake model weights into the image (faster cold starts, no runtime downloads), pass a `MODEL_CONFIG` build-arg:
 
 ```bash
+# Use the latest model config automatically
+docker build --platform linux/amd64 -f Dockerfile.compute \
+  --build-arg MODEL_CONFIG=1 \
+  -t your-registry/s2s-endpoint-compute:latest .
+
+# Target a specific config file
 docker build --platform linux/amd64 -f Dockerfile.compute \
   --build-arg MODEL_CONFIG=model_config_20260506.py \
   -t your-registry/s2s-endpoint-compute:latest .
 ```
 
-Without `MODEL_CONFIG`, the image is lighter but models are fetched at first startup.
+`MODEL_CONFIG` values:
+- `1`: automatically picks the latest `model_config_*.py` by filename sort
+- `<filename>`: uses the specified file from `model_configs/`
+- `0`: skips model pre-download (lighter image, models fetched at runtime)
+
+The default is `1`, so a plain `docker build` bakes in the latest models.
 
 Today `Dockerfile.compute` defaults `S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and `S2S_REF=main`, because the realtime server path now lives on upstream `main`. If you need to override that repo/ref explicitly, use:
 
