@@ -353,6 +353,48 @@ uv run --with-requirements requirements.txt python scripts/update_load_balancer_
 
 Like the compute env updater, this script fetches the current env first, merges the requested changes, and sends the full updated env back to Hugging Face.
 
+## Download Endpoint Logs
+
+To download the current Hugging Face Inference Endpoint log tails into local files:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/download_endpoint_logs.py \
+  --namespace HuggingFaceM4 \
+  --output-dir logs/endpoints \
+  --tail 10000
+```
+
+By default the script downloads the load-balancer logs and discovers the compute
+pool from the load balancer's `COMPUTE_ENDPOINT_NAMES` env var. You can override
+the compute selection with `--compute-names` or `--compute-prefix` /
+`--compute-count`, and use `--skip-load-balancer` or `--no-compute` to narrow the
+download. `--tail` means the maximum number of most-recent log lines to request
+per endpoint. If some endpoint log requests do not return, reduce
+`--timeout-s` to fail those endpoints quickly and report the error in the JSON
+summary.
+
+For large replica downloads, the final JSON is concise by default. Add
+`--verbose` to print every endpoint/replica as it starts and finishes, or
+`--include-results` to include one JSON result object per downloaded file.
+
+To retrieve logs per historical replica for a specific time window, use the
+paginated v3 logs API mode:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/download_endpoint_logs.py \
+  --namespace HuggingFaceM4 \
+  --output-dir logs/endpoints-replicas \
+  --skip-load-balancer \
+  --all-replicas \
+  --since 2026-05-05T00:00:00Z \
+  --until 2026-05-06T12:00:00Z \
+  --parallelism 4 \
+  --timeout-s 30
+```
+
+This first asks the metrics API which replica ids existed in the window, then
+writes one log file per endpoint/replica.
+
 ## Update Endpoint Images
 
 To roll out a new compute image, a new load-balancer image, or both, use:

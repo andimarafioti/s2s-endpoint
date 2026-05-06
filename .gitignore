@@ -6,5 +6,6 @@ __pycache__/
 venv/
 .env
 *.log
+logs/
 response.wav
 input.wav
