@@ -6,8 +6,8 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import JSONResponse, Response
 
 from app.app_utils import build_lifespan, setup_logging
 from app.session_router import SessionRouter
@@ -241,6 +241,59 @@ async def websocket_proxy(client_ws: WebSocket):
                 logger.exception("Failed to notify LB that session ended")
 
 
+@app.post("/v1/realtime")
+async def webrtc_offer_proxy(request: Request):
+    """Reverse-proxy a WebRTC SDP offer to the internal speech-to-speech server."""
+    session_payload = _get_http_session_payload(request)
+    if SESSION_SHARED_SECRET and session_payload is None:
+        raise HTTPException(status_code=401, detail="Missing or invalid session token")
+
+    try:
+        slot = await session_router.acquire(timeout_s=30.0)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail=f"No pipeline capacity: {exc}"
+        )
+
+    internal_url = f"http://{slot.host}:{slot.port}/v1/realtime"
+    body = await request.body()
+    content_type = request.headers.get("content-type", "application/sdp")
+
+    try:
+        resp_status, resp_body, resp_ct = await asyncio.to_thread(
+            _http_post_raw, internal_url, body, content_type
+        )
+    except Exception as exc:
+        await session_router.release(slot.slot_id)
+        raise HTTPException(
+            status_code=502, detail=f"Internal SDP proxy failed: {exc}"
+        )
+
+    if resp_status >= 400:
+        await session_router.release(slot.slot_id)
+        return Response(content=resp_body, status_code=resp_status, media_type=resp_ct)
+
+    connected_notified = False
+    if session_payload is not None:
+        try:
+            await _notify_lb_session_event(
+                session_payload["callback_url"],
+                session_payload["session_token"],
+                "connected",
+            )
+            connected_notified = True
+        except Exception:
+            logger.exception("Failed to notify LB of WebRTC connected event")
+
+    asyncio.create_task(
+        _monitor_webrtc_session(
+            slot, internal_url, session_payload if connected_notified else None
+        )
+    )
+
+    return Response(content=resp_body, status_code=resp_status, media_type=resp_ct)
+
+
 def _get_session_payload(client_ws: WebSocket) -> Optional[dict[str, str]]:
     if not SESSION_SHARED_SECRET:
         return None
@@ -276,6 +329,36 @@ def _extract_session_token(client_ws: WebSocket) -> Optional[str]:
     return None
 
 
+def _get_http_session_payload(request: Request) -> Optional[dict[str, str]]:
+    if not SESSION_SHARED_SECRET:
+        return None
+
+    session_token = request.query_params.get("session_token", "").strip()
+    if not session_token:
+        auth_header = request.headers.get("authorization", "").strip()
+        if auth_header.lower().startswith("bearer "):
+            session_token = auth_header[7:].strip()
+    if not session_token:
+        return None
+
+    try:
+        payload = verify_session_token(session_token, SESSION_SHARED_SECRET)
+    except ValueError:
+        logger.warning("Rejected WebRTC offer with invalid session token")
+        return None
+
+    request_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if not websocket_host_matches(str(payload["ws_url"]), request_host):
+        logger.warning(
+            "Rejected WebRTC offer for mismatched compute endpoint host %s",
+            request_host,
+        )
+        return None
+
+    payload["session_token"] = session_token
+    return payload
+
+
 async def _notify_lb_session_event(callback_url: str, session_token: str, event: str) -> None:
     payload = {
         "session_token": session_token,
@@ -301,6 +384,74 @@ def _http_get_json(url: str) -> dict[str, object]:
         return json.loads(body.decode("utf-8"))
     except Exception as exc:
         raise RuntimeError("HTTP GET returned invalid JSON") from exc
+
+
+def _http_post_raw(url: str, body: bytes, content_type: str) -> tuple[int, bytes, str]:
+    """Forward a raw POST and return (status, body, content_type)."""
+    headers = {"Content-Type": content_type}
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.read(), resp.headers.get("Content-Type", "application/sdp")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), exc.headers.get("Content-Type", "text/plain")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Failed to reach internal server: {exc.reason}") from exc
+
+
+def _probe_webrtc_active(url: str) -> int:
+    """Probe whether the internal server still has an active session.
+
+    The internal speech-to-speech server returns 503 when a WebRTC (or WebSocket)
+    session is already active.  Any other status means no session is active.
+    """
+    req = urllib.request.Request(
+        url, data=b"", headers={"Content-Type": "text/plain"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except urllib.error.URLError:
+        return 0
+
+
+async def _monitor_webrtc_session(
+    slot: object,
+    internal_url: str,
+    session_payload: Optional[dict[str, str]],
+) -> None:
+    """Poll until the internal WebRTC session ends, then release the slot."""
+    try:
+        while True:
+            await asyncio.sleep(5.0)
+            status = await asyncio.to_thread(_probe_webrtc_active, internal_url)
+            if status != 503:
+                logger.info(
+                    "WebRTC session on slot %s ended (probe status %s)",
+                    getattr(slot, "slot_id", slot),
+                    status,
+                )
+                break
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception(
+            "WebRTC session monitor error for slot %s",
+            getattr(slot, "slot_id", slot),
+        )
+    finally:
+        await session_router.release(slot.slot_id)
+        if session_payload is not None:
+            try:
+                await _notify_lb_session_event(
+                    session_payload["callback_url"],
+                    session_payload["session_token"],
+                    "disconnected",
+                )
+            except Exception:
+                logger.exception("Failed to notify LB that WebRTC session ended")
 
 
 def _post_json(url: str, payload: dict[str, str]) -> None:
