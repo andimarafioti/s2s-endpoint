@@ -36,6 +36,27 @@ Build the compute image:
 docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
+To bake model weights into the image (faster cold starts, no runtime downloads), pass a `MODEL_CONFIG` build-arg:
+
+```bash
+# Use the latest model config automatically
+docker build --platform linux/amd64 -f Dockerfile.compute \
+  --build-arg MODEL_CONFIG=1 \
+  -t your-registry/s2s-endpoint-compute:latest .
+
+# Target a specific config file
+docker build --platform linux/amd64 -f Dockerfile.compute \
+  --build-arg MODEL_CONFIG=model_config_20260506.py \
+  -t your-registry/s2s-endpoint-compute:latest .
+```
+
+`MODEL_CONFIG` values:
+- `1`: automatically picks the latest `model_config_*.py` by filename sort
+- `<filename>`: uses the specified file from `model_configs/`
+- `0`: skips model pre-download (lighter image, models fetched at runtime)
+
+The default is `1`, so a plain `docker build` bakes in the latest models.
+
 Today `Dockerfile.compute` defaults `S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and `S2S_REF=main`, because the realtime server path now lives on upstream `main`. If you need to override that repo/ref explicitly, use:
 
 ```bash
@@ -443,9 +464,23 @@ Useful options:
 - `--no-wait`
 - `--dry-run`
 
+## Model Configs
+
+The `model_configs/` folder contains Python scripts that pre-download model
+weights at Docker build time. Each script is a standalone entry point run inside
+the speech-to-speech venv during `docker build` when `MODEL_CONFIG` is set.
+
+Current configs:
+
+- `model_config_20260506.py`: silero-vad, Qwen3-TTS-12Hz-1.7B-CustomVoice, nvidia/parakeet-tdt-0.6b-v3
+
+To create a new config for a different model combination, add a new file (e.g.
+`model_config_20260601.py`) and pass it as `--build-arg MODEL_CONFIG=model_config_20260601.py`.
+
 ## Files
 - `app/`: application code
 - `scripts/`: helper scripts
+- `model_configs/`: model pre-download scripts for Docker build
 - `Dockerfile.compute`: compute container definition
 - `Dockerfile.load_balancer`: load-balancer container definition
 - `requirements.txt`: Python dependencies

@@ -2,6 +2,7 @@
 FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
 ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
 ARG S2S_REF=main
+ARG MODEL_CONFIG="1"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -31,11 +32,29 @@ RUN git clone --filter=blob:none "${S2S_REPO_URL}" ${S2S_REPO_DIR} && \
     cd ${S2S_REPO_DIR} && \
     git checkout "${S2S_REF}" && \
     uv sync --no-dev && \
-    uv run --no-dev python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')" && \
-    uv run --no-dev python -c "import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)"
+    uv run --no-dev python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')"
+
+ENV HF_HOME=/repository/cache
+
+COPY model_configs/ /app/model_configs/
+RUN if [ "${MODEL_CONFIG}" = "0" ] || [ -z "${MODEL_CONFIG}" ]; then \
+      echo "MODEL_CONFIG=0, skipping model pre-download"; \
+    elif [ "${MODEL_CONFIG}" = "1" ]; then \
+      LATEST=$(ls /app/model_configs/model_config_*.py | sort | tail -n1) && \
+      echo "MODEL_CONFIG=1, using latest: ${LATEST}" && \
+      cd ${S2S_REPO_DIR} && \
+      uv run --no-dev python "${LATEST}" && \
+      touch /app/.models_preloaded; \
+    else \
+      echo "MODEL_CONFIG=${MODEL_CONFIG}" && \
+      cd ${S2S_REPO_DIR} && \
+      uv run --no-dev python /app/model_configs/${MODEL_CONFIG} && \
+      touch /app/.models_preloaded; \
+    fi
 
 COPY app /app/app
 
 EXPOSE 7860
 
-CMD ["uvicorn", "app.compute_main:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD if [ -f /app/.models_preloaded ]; then export HF_HUB_OFFLINE=1; fi && \
+    exec uvicorn app.compute_main:app --host 0.0.0.0 --port 7860
