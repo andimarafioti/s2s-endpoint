@@ -31,7 +31,7 @@ RUN pip install --upgrade pip setuptools wheel && \
 RUN git clone --filter=blob:none "${S2S_REPO_URL}" ${S2S_REPO_DIR} && \
     cd ${S2S_REPO_DIR} && \
     git checkout "${S2S_REF}" && \
-    uv sync --no-dev && \
+    uv sync --no-dev --extra webrtc && \
     uv run --no-dev python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')"
 
 ENV HF_HOME=/repository/cache
