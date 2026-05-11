@@ -6,7 +6,7 @@ WORKDIR /app
 
 COPY tests/crash_app.py /app/crash_app.py
 
-ENV CRASH_AFTER_S=60
+ENV CRASH_AFTER_S=300
 EXPOSE 7860
 
 CMD ["uvicorn", "crash_app:app", "--host", "0.0.0.0", "--port", "7860"]
