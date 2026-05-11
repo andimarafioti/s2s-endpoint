@@ -137,16 +137,10 @@ class HuggingFaceEndpointController:
             return self._snapshot(name, endpoint)
 
         try:
-            endpoint.update(
-                min_replica=self.active_min_replica,
-                max_replica=self.active_max_replica,
-            )
+            endpoint.pause()
         except Exception:
-            try:
-                endpoint.pause()
-            except Exception:
-                pass
-            endpoint.resume(running_ok=True)
+            pass
+        endpoint.resume(running_ok=True)
 
         endpoint.fetch()
         return self._snapshot(name, endpoint)
