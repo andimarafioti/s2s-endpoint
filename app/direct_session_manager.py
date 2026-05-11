@@ -39,6 +39,7 @@ class DirectSessionManager:
             raise ValueError("session_shared_secret must be set")
 
         self.endpoint_router = endpoint_router
+        self.endpoint_router._on_endpoint_down = self._release_sessions_for_endpoint
         self.session_shared_secret = session_shared_secret
         self.pending_timeout_s = pending_timeout_s
         self.session_token_ttl_s = session_token_ttl_s
@@ -205,6 +206,23 @@ class DirectSessionManager:
                 "Released expired pending session %s for endpoint %s",
                 session.session_id,
                 session.lease.endpoint_name,
+            )
+
+    async def _release_sessions_for_endpoint(self, endpoint_name: str) -> None:
+        to_release: list[DirectSession] = []
+
+        async with self._lock:
+            for session_id, session in list(self._sessions.items()):
+                if session.lease.endpoint_name == endpoint_name:
+                    to_release.append(self._sessions.pop(session_id))
+
+        for session in to_release:
+            await self.endpoint_router.release(session.lease.slot_id)
+            logger.info(
+                "Released session %s for downed endpoint %s (connected=%s)",
+                session.session_id,
+                endpoint_name,
+                session.connected,
             )
 
 
