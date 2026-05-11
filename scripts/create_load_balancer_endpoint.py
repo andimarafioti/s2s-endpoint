@@ -52,6 +52,11 @@ def main() -> None:
     parser.add_argument("--compute-endpoint-reconcile-interval-s", type=float, default=10, help="Refresh interval for compute endpoint state")
     parser.add_argument("--compute-endpoint-wait-timeout-s", type=int, default=900, help="Timeout while waiting for resumed compute endpoints")
     parser.add_argument("--compute-endpoint-park-strategy", choices=["pause", "scale_to_zero"], default="pause")
+    parser.add_argument("--compute-endpoint-auto-restart", type=str, choices=["true", "false"], default="true", help="Auto-restart failed compute endpoints")
+    parser.add_argument("--compute-endpoint-max-restart-attempts", type=int, default=3, help="Max consecutive restart attempts before giving up")
+    parser.add_argument("--compute-endpoint-restart-backoff-s", type=float, default=30, help="Initial backoff between restart attempts")
+    parser.add_argument("--compute-endpoint-restart-backoff-max-s", type=float, default=300, help="Max backoff cap between restart attempts")
+    parser.add_argument("--compute-endpoint-restart-stable-running-s", type=float, default=120, help="How long an endpoint must run before restart counter resets")
     parser.add_argument("--session-pending-timeout-s", type=float, default=60, help="How long a reserved session can remain unused before release")
     parser.add_argument("--session-token-ttl-s", type=float, default=86400, help="Lifetime of the signed session token")
     parser.add_argument("--session-reap-interval-s", type=float, default=5, help="Background interval for releasing unused session reservations")
@@ -102,6 +107,11 @@ def main() -> None:
             "COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S": str(args.compute_endpoint_reconcile_interval_s),
             "COMPUTE_ENDPOINT_WAIT_TIMEOUT_S": str(args.compute_endpoint_wait_timeout_s),
             "COMPUTE_ENDPOINT_PARK_STRATEGY": args.compute_endpoint_park_strategy,
+            "COMPUTE_ENDPOINT_AUTO_RESTART": args.compute_endpoint_auto_restart,
+            "COMPUTE_ENDPOINT_MAX_RESTART_ATTEMPTS": str(args.compute_endpoint_max_restart_attempts),
+            "COMPUTE_ENDPOINT_RESTART_BACKOFF_S": str(args.compute_endpoint_restart_backoff_s),
+            "COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S": str(args.compute_endpoint_restart_backoff_max_s),
+            "COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S": str(args.compute_endpoint_restart_stable_running_s),
             "SESSION_SHARED_SECRET": args.session_shared_secret,
             "SESSION_PENDING_TIMEOUT_S": str(args.session_pending_timeout_s),
             "SESSION_TOKEN_TTL_S": str(args.session_token_ttl_s),

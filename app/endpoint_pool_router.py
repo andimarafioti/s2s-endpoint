@@ -4,7 +4,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Protocol
+from typing import Awaitable, Callable, Optional, Protocol
 from urllib.parse import urlparse, urlunparse
 
 
@@ -30,6 +30,10 @@ def _is_parked_status(status: str) -> bool:
     return status in {"paused", "scaledtozero", "scaledto0"}
 
 
+def _is_failed_status(status: str) -> bool:
+    return status in {"failed", "updatefailed"}
+
+
 @dataclass
 class EndpointLease:
     slot_id: str
@@ -53,6 +57,9 @@ class EndpointController(Protocol):
         ...
 
     def park(self, name: str) -> EndpointSnapshot:
+        ...
+
+    def restart(self, name: str) -> EndpointSnapshot:
         ...
 
 
@@ -121,6 +128,23 @@ class HuggingFaceEndpointController:
         endpoint.fetch()
         return self._snapshot(name, endpoint)
 
+    def restart(self, name: str) -> EndpointSnapshot:
+        endpoint = self._get(name)
+        status = _normalize_status(getattr(endpoint, "status", ""))
+
+        if _is_running_status(status):
+            endpoint.fetch()
+            return self._snapshot(name, endpoint)
+
+        try:
+            endpoint.pause()
+        except Exception:
+            pass
+        endpoint.resume(running_ok=True)
+
+        endpoint.fetch()
+        return self._snapshot(name, endpoint)
+
     def _get(self, name: str):
         return self._get_inference_endpoint(
             name,
@@ -149,9 +173,13 @@ class ManagedEndpoint:
     active_sessions: int = 0
     waking: bool = False
     parking: bool = False
+    restarting: bool = False
     last_error: Optional[str] = None
     last_used_at: float = field(default_factory=time.monotonic)
     wake_capacity_until: Optional[float] = None
+    restart_attempts: int = 0
+    last_restart_at: Optional[float] = None
+    running_since: Optional[float] = None
 
     @property
     def running(self) -> bool:
@@ -184,6 +212,11 @@ class EndpointPoolRouter:
         park_cooldown_s: float,
         controller: EndpointController,
         endpoint_ws_path: str = "/v1/realtime",
+        auto_restart: bool = True,
+        max_restart_attempts: int = 3,
+        restart_backoff_s: float = 30.0,
+        restart_backoff_max_s: float = 300.0,
+        restart_stable_running_s: float = 120.0,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
         if not names:
@@ -212,7 +245,13 @@ class EndpointPoolRouter:
         self.waking_capacity_timeout_s = waking_capacity_timeout_s
         self.park_cooldown_s = park_cooldown_s
         self.controller = controller
+        self.auto_restart = auto_restart
+        self.max_restart_attempts = max_restart_attempts
+        self.restart_backoff_s = restart_backoff_s
+        self.restart_backoff_max_s = restart_backoff_max_s
+        self.restart_stable_running_s = restart_stable_running_s
 
+        self._on_endpoint_down: Optional[Callable[[str], Awaitable[None]]] = None
         self._endpoints = {
             name: ManagedEndpoint(name=name, slots=endpoint_slots, ws_path=endpoint_ws_path)
             for name in names
@@ -294,6 +333,8 @@ class EndpointPoolRouter:
             return True, None, snapshot
         if snapshot["waking_endpoints"]:
             return False, "compute endpoints are still waking", snapshot
+        if snapshot["restarting_endpoints"]:
+            return False, "compute endpoints are restarting after failure", snapshot
         errors = snapshot["errors"]
         if errors:
             return False, str(errors[0]["error"]), snapshot
@@ -306,6 +347,7 @@ class EndpointPoolRouter:
         running = sum(1 for endpoint in endpoints if endpoint.running)
         waking = sum(1 for endpoint in endpoints if endpoint.waking)
         parking = sum(1 for endpoint in endpoints if endpoint.parking)
+        restarting = sum(1 for endpoint in endpoints if endpoint.restarting)
         free_slots = sum(endpoint.free_slots for endpoint in endpoints)
         warming_slots = 0
         now = time.monotonic()
@@ -328,9 +370,12 @@ class EndpointPoolRouter:
             "waking_capacity_timeout_s": self.waking_capacity_timeout_s,
             "park_cooldown_s": self.park_cooldown_s,
             "park_cooldown_remaining_s": max(self._next_park_allowed_at - now, 0.0),
+            "auto_restart": self.auto_restart,
+            "max_restart_attempts": self.max_restart_attempts,
             "running_endpoints": running,
             "waking_endpoints": waking,
             "parking_endpoints": parking,
+            "restarting_endpoints": restarting,
             "active_sessions": active_sessions,
             "free_slots": free_slots,
             "warming_slots": warming_slots,
@@ -342,6 +387,8 @@ class EndpointPoolRouter:
                     "running": endpoint.running,
                     "waking": endpoint.waking,
                     "parking": endpoint.parking,
+                    "restarting": endpoint.restarting,
+                    "restart_attempts": endpoint.restart_attempts,
                     "active_sessions": endpoint.active_sessions,
                     "free_slots": endpoint.free_slots,
                     "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
@@ -360,6 +407,9 @@ class EndpointPoolRouter:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        now = time.monotonic()
+        downed_endpoints: list[str] = []
+
         async with self._condition:
             for endpoint, result in zip(self._endpoints.values(), results):
                 if isinstance(result, Exception):
@@ -367,18 +417,53 @@ class EndpointPoolRouter:
                     self._last_error = endpoint.last_error
                     continue
 
+                was_running = endpoint.running
+
                 endpoint.status = result.status
                 endpoint.raw_status = result.raw_status
                 endpoint.url = result.url
                 if endpoint.running:
                     endpoint.waking = False
                     endpoint.wake_capacity_until = None
+                    if not was_running:
+                        endpoint.running_since = now
+                    if (
+                        endpoint.restart_attempts > 0
+                        and endpoint.running_since is not None
+                        and now - endpoint.running_since >= self.restart_stable_running_s
+                    ):
+                        endpoint.restart_attempts = 0
+                        endpoint.last_restart_at = None
+                else:
+                    endpoint.running_since = None
+
                 if _is_parked_status(endpoint.status):
                     endpoint.parking = False
-                endpoint.last_error = None
+
+                if was_running and not endpoint.running and not _is_parked_status(endpoint.status):
+                    endpoint.active_sessions = 0
+                    downed_endpoints.append(endpoint.name)
+
+                if (
+                    _is_failed_status(endpoint.status)
+                    and self.auto_restart
+                    and endpoint.restart_attempts >= self.max_restart_attempts
+                ):
+                    endpoint.last_error = (
+                        f"endpoint failed, {endpoint.restart_attempts} restart attempt(s) exhausted"
+                    )
+                else:
+                    endpoint.last_error = None
                 self._last_error = None
 
             self._condition.notify_all()
+
+        if self._on_endpoint_down is not None:
+            for name in downed_endpoints:
+                try:
+                    await self._on_endpoint_down(name)
+                except Exception:
+                    logger.exception("on_endpoint_down callback failed for %s", name)
 
     async def ensure_min_warm(self) -> None:
         while True:
@@ -452,11 +537,80 @@ class EndpointPoolRouter:
             while True:
                 await asyncio.sleep(self.reconcile_interval_s)
                 await self.refresh()
+                await self._schedule_restarts_if_needed()
                 await self.ensure_min_warm()
                 await self._schedule_wakes_if_needed()
                 await self._schedule_parks_if_needed()
         except asyncio.CancelledError:
             raise
+
+    async def _schedule_restarts_if_needed(self) -> None:
+        if not self.auto_restart:
+            return
+
+        now = time.monotonic()
+        restart_names: list[str] = []
+
+        async with self._condition:
+            for endpoint in self._endpoints.values():
+                if not _is_failed_status(endpoint.status):
+                    continue
+                if endpoint.restarting or endpoint.waking or endpoint.parking:
+                    continue
+                if endpoint.restart_attempts >= self.max_restart_attempts:
+                    continue
+                if endpoint.last_restart_at is not None:
+                    backoff = min(
+                        self.restart_backoff_s * (2 ** (endpoint.restart_attempts - 1)),
+                        self.restart_backoff_max_s,
+                    )
+                    if now - endpoint.last_restart_at < backoff:
+                        continue
+
+                endpoint.restarting = True
+                endpoint.restart_attempts += 1
+                endpoint.last_restart_at = now
+                restart_names.append(endpoint.name)
+
+        for name in restart_names:
+            logger.info(
+                "Scheduling restart for failed endpoint %s (attempt %d/%d)",
+                name,
+                self._endpoints[name].restart_attempts,
+                self.max_restart_attempts,
+            )
+            asyncio.create_task(self._restart_endpoint(name))
+
+    async def _restart_endpoint(self, name: str) -> None:
+        try:
+            snapshot = await asyncio.to_thread(self.controller.restart, name)
+        except Exception as exc:
+            async with self._condition:
+                endpoint = self._endpoints[name]
+                endpoint.restarting = False
+                endpoint.last_error = str(exc)
+                self._last_error = endpoint.last_error
+                self._condition.notify_all()
+            logger.error("Failed to restart endpoint %s: %s", name, exc)
+            return
+
+        async with self._condition:
+            endpoint = self._endpoints[name]
+            endpoint.status = snapshot.status
+            endpoint.raw_status = snapshot.raw_status
+            endpoint.url = snapshot.url
+            endpoint.restarting = False
+            endpoint.last_error = None
+            self._last_error = None
+            if endpoint.running:
+                endpoint.running_since = time.monotonic()
+            self._condition.notify_all()
+
+        logger.info(
+            "Restart action completed for endpoint %s (status: %s)",
+            name,
+            snapshot.raw_status,
+        )
 
     async def _schedule_wakes_if_needed(self) -> None:
         async with self._condition:
@@ -492,7 +646,10 @@ class EndpointPoolRouter:
         candidates = [
             endpoint
             for endpoint in self._endpoints.values()
-            if _is_parked_status(endpoint.status) and not endpoint.waking and not endpoint.parking
+            if _is_parked_status(endpoint.status)
+            and not endpoint.waking
+            and not endpoint.parking
+            and not endpoint.restarting
         ]
         candidates.sort(key=lambda item: (item.active_sessions, item.name))
 
@@ -526,7 +683,7 @@ class EndpointPoolRouter:
         return []
 
     def _should_park_endpoint_unlocked(self, endpoint: ManagedEndpoint) -> bool:
-        if not endpoint.running or endpoint.waking or endpoint.parking:
+        if not endpoint.running or endpoint.waking or endpoint.parking or endpoint.restarting:
             return False
         if endpoint.active_sessions != 0:
             return False
