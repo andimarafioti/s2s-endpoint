@@ -112,6 +112,11 @@ The timeline automatically switches between minute-level and hourly rollups depe
 
 If you want the dashboard history to survive LB restarts, you can configure it to persist completed minute buckets to a Hugging Face Storage Bucket. The live routing/session state still stays in memory; the bucket is only for historical dashboard data.
 
+Persisted history is restored in the background during load-balancer startup, so
+the endpoint can become ready before older dashboard buckets finish loading. The
+`/dashboard/data` response includes a `history_restore` object with the restore
+status, elapsed time, and restored bucket count.
+
 ## Load Balancer Env Vars
 
 - `HF_ENDPOINT_NAMESPACE`: namespace that owns the compute endpoints
@@ -131,6 +136,11 @@ If you want the dashboard history to survive LB restarts, you can configure it t
 - `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations
 - `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
 - `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
+- `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
+  endpoint/session data instead of connecting to real compute endpoints. You can
+  also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.
+  If `DASHBOARD_BUCKET_ID` is set, preview mode loads existing dashboard history
+  from the bucket read-only and never writes preview data back to the bucket.
 - `DASHBOARD_BUCKET_ID`: optional HF storage bucket id used to persist dashboard history
 - `DASHBOARD_BUCKET_PREFIX`: path prefix inside the bucket for dashboard files
 - `DASHBOARD_BUCKET_TOKEN`: optional token override for bucket reads/writes
