@@ -117,6 +117,25 @@ the endpoint can become ready before older dashboard buckets finish loading. The
 `/dashboard/data` response includes a `history_restore` object with the restore
 status, elapsed time, and restored bucket count.
 
+The dashboard store keeps the original minute files under `minutes/` and also
+uses `days/YYYY-MM-DD.json` files as a compact cache for complete UTC days. On
+restore it checks `days/` first, falls back to `minutes/` for missing days, and
+backfills a `days/` file once it has all 1,440 minute buckets for a completed
+day. Existing minute files are left in place.
+
+You can precompute day files without running the load balancer:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/backfill_dashboard_day_history.py \
+  --bucket-id HuggingFaceM4/reachy-s2s-dashboard \
+  --prefix reachy-s2s-lb \
+  --days 30
+```
+
+Use `--dry-run` to inspect which days would be created without writing files.
+The script processes and uploads one day at a time, so interrupted runs are
+resumable: the next run skips any day files that were already created.
+
 ## Load Balancer Env Vars
 
 - `HF_ENDPOINT_NAMESPACE`: namespace that owns the compute endpoints

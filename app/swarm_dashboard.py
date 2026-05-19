@@ -1,13 +1,10 @@
 import asyncio
-import json
 import logging
 import re
-import tempfile
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Awaitable, Callable, Optional, Protocol
 
 
@@ -301,140 +298,6 @@ class SwarmHistoryBucket:
             ),
         )
 
-
-class HuggingFaceBucketHistoryStore:
-    def __init__(
-        self,
-        *,
-        bucket_id: str,
-        prefix: str = "s2s-endpoint/swarm-dashboard",
-        token: Optional[str] = None,
-    ) -> None:
-        from huggingface_hub import batch_bucket_files, download_bucket_files, list_bucket_tree
-
-        self.bucket_id = bucket_id.strip()
-        self.prefix = prefix.strip().strip("/")
-        self.token = token or None
-        self._batch_bucket_files = batch_bucket_files
-        self._download_bucket_files = download_bucket_files
-        self._list_bucket_tree = list_bucket_tree
-
-        if not self.bucket_id:
-            raise ValueError("bucket_id must be set")
-        if self.prefix == self.bucket_id:
-            logger.warning(
-                "DASHBOARD_BUCKET_PREFIX is set to the bucket id %s; it should be a path inside the bucket, "
-                "for example reachy-s2s-lb",
-                self.bucket_id,
-            )
-
-    def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list[SwarmHistoryBucket]:
-        min_bucket = _bucket_start_epoch_s(now_epoch_s, 1) - (retention_minutes - 1) * 60
-        candidates: list[tuple[int, str]] = []
-        prefix = self._minutes_prefix()
-        logger.info(
-            "Loading dashboard history from bucket %s prefix %s for the last %s minutes",
-            self.bucket_id,
-            prefix,
-            retention_minutes,
-        )
-
-        for item in self._list_bucket_tree(
-            self.bucket_id,
-            prefix=prefix or None,
-            recursive=True,
-            token=self.token,
-        ):
-            path = getattr(item, "path", None)
-            bucket_start_s = self._bucket_start_from_path(path)
-            if bucket_start_s is None or bucket_start_s < min_bucket:
-                continue
-            candidates.append((bucket_start_s, str(path)))
-
-        if not candidates:
-            logger.info("No dashboard history bucket files found at %s/%s", self.bucket_id, prefix)
-            return []
-
-        candidates.sort(key=lambda item: item[0])
-        logger.info("Found %s dashboard history bucket files; downloading them", len(candidates))
-        loaded: list[SwarmHistoryBucket] = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            downloads = [
-                (path, Path(tmpdir) / f"{bucket_start_s}.json")
-                for bucket_start_s, path in candidates
-            ]
-            self._download_bucket_files(
-                self.bucket_id,
-                files=downloads,
-                raise_on_missing_files=False,
-                token=self.token,
-            )
-
-            for bucket_start_s, local_path in downloads:
-                if not local_path.exists():
-                    continue
-                try:
-                    payload = json.loads(local_path.read_text())
-                    loaded.append(SwarmHistoryBucket.from_dict(payload["bucket"]))
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to load persisted dashboard bucket %s from %s: %s",
-                        bucket_start_s,
-                        self.bucket_id,
-                        exc,
-                    )
-
-        logger.info("Loaded %s dashboard history buckets from %s/%s", len(loaded), self.bucket_id, prefix)
-        return loaded
-
-    def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
-        if not buckets:
-            return
-
-        add = []
-        for bucket in buckets:
-            payload = json.dumps(
-                {
-                    "version": 1,
-                    "bucket": bucket.to_dict(),
-                },
-                sort_keys=True,
-            ).encode("utf-8")
-            add.append((payload, self._bucket_path(bucket.bucket_start_s)))
-
-        self._batch_bucket_files(
-            self.bucket_id,
-            add=add,
-            token=self.token,
-        )
-
-    def _minutes_prefix(self) -> str:
-        if self.prefix:
-            return f"{self.prefix}/minutes"
-        return "minutes"
-
-    def _bucket_path(self, bucket_start_s: int) -> str:
-        return f"{self._minutes_prefix()}/{bucket_start_s}.json"
-
-    def _bucket_start_from_path(self, path: object) -> Optional[int]:
-        if path is None:
-            return None
-        match = re.search(r"/(\d+)\.json$", f"/{path}".replace("\\", "/"))
-        if match is None:
-            return None
-        return int(match.group(1))
-
-
-class ReadOnlyDashboardHistoryStore:
-    def __init__(self, wrapped: DashboardHistoryStore) -> None:
-        self.wrapped = wrapped
-
-    def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list[SwarmHistoryBucket]:
-        return self.wrapped.load_recent(retention_minutes=retention_minutes, now_epoch_s=now_epoch_s)
-
-    def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
-        if buckets:
-            logger.debug("Skipping dashboard history write because history store is read-only")
 
 
 class SwarmDashboard:

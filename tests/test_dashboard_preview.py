@@ -3,8 +3,9 @@ import sys
 import unittest
 from unittest.mock import patch
 
+from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
-from app.swarm_dashboard import ReadOnlyDashboardHistoryStore, SwarmHistoryBucket
+from app.swarm_dashboard import SwarmHistoryBucket
 
 
 class FakeClock:
@@ -77,7 +78,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertIsInstance(module.session_manager, DashboardPreviewSessionManager)
         self.assertEqual(module.COMPUTE_ENDPOINT_NAMES[0], "preview-compute-01")
 
-    @patch("app.swarm_dashboard.HuggingFaceBucketHistoryStore.__init__", return_value=None)
+    @patch("app.dashboard_history_store.HuggingFaceBucketHistoryStore.__init__", return_value=None)
     def test_preview_mode_uses_dashboard_bucket_persistence_read_only(self, init_store):
         module = self._import_load_balancer(
             {
