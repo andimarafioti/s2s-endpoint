@@ -3,9 +3,8 @@ import time
 import unittest
 from datetime import datetime, timezone
 
+from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.swarm_dashboard import (
-    HuggingFaceBucketHistoryStore,
-    ReadOnlyDashboardHistoryStore,
     SwarmDashboard,
     SwarmHistoryBucket,
     SwarmStateSample,

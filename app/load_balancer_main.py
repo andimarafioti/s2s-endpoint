@@ -5,10 +5,11 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.app_utils import build_lifespan, public_base_url, setup_logging
+from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointPoolRouter, HuggingFaceEndpointController
-from app.swarm_dashboard import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore, SwarmDashboard
+from app.swarm_dashboard import SwarmDashboard
 
 setup_logging()
 APP_ROLE = "load_balancer"

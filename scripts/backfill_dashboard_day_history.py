@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.swarm_dashboard import HuggingFaceBucketHistoryStore  # noqa: E402
+from app.dashboard_history_store import HuggingFaceBucketHistoryStore  # noqa: E402
 
 
 def parse_day(value: str) -> datetime:
