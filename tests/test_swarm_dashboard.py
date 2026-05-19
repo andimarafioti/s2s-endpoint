@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from app.swarm_dashboard import SwarmDashboard, SwarmHistoryBucket, SwarmStateSample
@@ -44,6 +45,16 @@ class FakeHistoryStore:
         self.write_calls.append([bucket.bucket_start_s for bucket in buckets])
         for bucket in buckets:
             self.saved[bucket.bucket_start_s] = bucket.to_dict()
+
+
+class SlowHistoryStore(FakeHistoryStore):
+    def __init__(self, *, delay_s: float, initial_buckets=None):
+        super().__init__(initial_buckets=initial_buckets)
+        self.delay_s = delay_s
+
+    def load_recent(self, *, retention_minutes: int, now_epoch_s: float):
+        time.sleep(self.delay_s)
+        return super().load_recent(retention_minutes=retention_minutes, now_epoch_s=now_epoch_s)
 
 
 def _health_snapshot(*, connected: int, pending: int, running: int, waking: int, free_slots: int, effective_free_slots: int):
@@ -401,6 +412,43 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(store.load_calls, 1)
         self.assertEqual(series[0]["running_endpoints"], 2)
+
+    async def test_background_restore_does_not_block_start(self):
+        bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600)
+        bucket.running_endpoints_last = 2
+        bucket.running_endpoints_sum = 2
+        bucket.sample_count = 1
+
+        clock = FakeClock(4 * 3600 + 60)
+        store = SlowHistoryStore(delay_s=0.15, initial_buckets=[bucket])
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            sample_interval_s=3600,
+            retention_minutes=24 * 60,
+            history_store=store,
+            restore_history_in_background=True,
+            time_fn=clock.now,
+        )
+
+        started = time.monotonic()
+        await dashboard.start()
+        elapsed = time.monotonic() - started
+        try:
+            self.assertLess(elapsed, 0.1)
+            self.assertEqual(dashboard.history_restore_status()["status"], "running")
+            await dashboard._restore_task
+            self.assertEqual(dashboard.history_restore_status()["status"], "complete")
+            series = await dashboard.series(window_minutes=2, resolution="minute")
+            self.assertEqual(series[0]["running_endpoints"], 2)
+        finally:
+            await dashboard.stop()
 
 
 if __name__ == "__main__":

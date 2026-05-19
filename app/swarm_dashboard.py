@@ -321,11 +321,23 @@ class HuggingFaceBucketHistoryStore:
 
         if not self.bucket_id:
             raise ValueError("bucket_id must be set")
+        if self.prefix == self.bucket_id:
+            logger.warning(
+                "DASHBOARD_BUCKET_PREFIX is set to the bucket id %s; it should be a path inside the bucket, "
+                "for example reachy-s2s-lb",
+                self.bucket_id,
+            )
 
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list[SwarmHistoryBucket]:
         min_bucket = _bucket_start_epoch_s(now_epoch_s, 1) - (retention_minutes - 1) * 60
         candidates: list[tuple[int, str]] = []
         prefix = self._minutes_prefix()
+        logger.info(
+            "Loading dashboard history from bucket %s prefix %s for the last %s minutes",
+            self.bucket_id,
+            prefix,
+            retention_minutes,
+        )
 
         for item in self._list_bucket_tree(
             self.bucket_id,
@@ -340,9 +352,11 @@ class HuggingFaceBucketHistoryStore:
             candidates.append((bucket_start_s, str(path)))
 
         if not candidates:
+            logger.info("No dashboard history bucket files found at %s/%s", self.bucket_id, prefix)
             return []
 
         candidates.sort(key=lambda item: item[0])
+        logger.info("Found %s dashboard history bucket files; downloading them", len(candidates))
         loaded: list[SwarmHistoryBucket] = []
         with tempfile.TemporaryDirectory() as tmpdir:
             downloads = [
@@ -370,6 +384,7 @@ class HuggingFaceBucketHistoryStore:
                         exc,
                     )
 
+        logger.info("Loaded %s dashboard history buckets from %s/%s", len(loaded), self.bucket_id, prefix)
         return loaded
 
     def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
@@ -410,6 +425,18 @@ class HuggingFaceBucketHistoryStore:
         return int(match.group(1))
 
 
+class ReadOnlyDashboardHistoryStore:
+    def __init__(self, wrapped: DashboardHistoryStore) -> None:
+        self.wrapped = wrapped
+
+    def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list[SwarmHistoryBucket]:
+        return self.wrapped.load_recent(retention_minutes=retention_minutes, now_epoch_s=now_epoch_s)
+
+    def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
+        if buckets:
+            logger.debug("Skipping dashboard history write because history store is read-only")
+
+
 class SwarmDashboard:
     def __init__(
         self,
@@ -418,6 +445,7 @@ class SwarmDashboard:
         sample_interval_s: float = 15.0,
         retention_minutes: int = 7 * 24 * 60,
         history_store: Optional[DashboardHistoryStore] = None,
+        restore_history_in_background: bool = False,
         time_fn: Callable[[], float] = time.time,
     ) -> None:
         if sample_interval_s <= 0:
@@ -429,20 +457,42 @@ class SwarmDashboard:
         self.sample_interval_s = sample_interval_s
         self.retention_minutes = retention_minutes
         self.history_store = history_store
+        self.restore_history_in_background = restore_history_in_background
         self._time_fn = time_fn
         self._lock = asyncio.Lock()
         self._history: "OrderedDict[int, SwarmHistoryBucket]" = OrderedDict()
         self._latest_sample: Optional[SwarmStateSample] = None
         self._sample_task: Optional[asyncio.Task] = None
+        self._restore_task: Optional[asyncio.Task] = None
         self._flush_task: Optional[asyncio.Task] = None
         self._dirty_bucket_starts: set[int] = set()
+        self._history_restore_status = "disabled" if history_store is None else "pending"
+        self._history_restore_detail: Optional[str] = None
+        self._history_restore_started_at_s: Optional[float] = None
+        self._history_restore_finished_at_s: Optional[float] = None
+        self._history_restore_bucket_count = 0
 
     async def start(self) -> None:
-        await self._restore_history()
         await self.capture_sample()
+        if self.history_store is not None:
+            if self.restore_history_in_background:
+                logger.info("Restoring dashboard history in the background")
+                self._history_restore_status = "running"
+                self._history_restore_detail = "Loading persisted dashboard history"
+                self._restore_task = asyncio.create_task(self._restore_history())
+            else:
+                await self._restore_history()
         self._sample_task = asyncio.create_task(self._sample_loop())
 
     async def stop(self) -> None:
+        if self._restore_task is not None and not self._restore_task.done():
+            self._restore_task.cancel()
+            try:
+                await self._restore_task
+            except asyncio.CancelledError:
+                pass
+            self._restore_task = None
+
         if self._sample_task is not None:
             self._sample_task.cancel()
             try:
@@ -529,6 +579,7 @@ class SwarmDashboard:
             "summary": summary,
             "series": series,
             "retention_minutes": self.retention_minutes,
+            "history_restore": self.history_restore_status(),
         }
 
     async def summary(self, *, window_minutes: int, requested_window: str) -> dict[str, object]:
@@ -609,6 +660,22 @@ class SwarmDashboard:
 
     def html(self) -> str:
         return _dashboard_html(history_persisted=self.history_store is not None)
+
+    def history_restore_status(self) -> dict[str, object]:
+        now_s = time.monotonic()
+        started_at_s = self._history_restore_started_at_s
+        finished_at_s = self._history_restore_finished_at_s
+        return {
+            "status": self._history_restore_status,
+            "detail": self._history_restore_detail,
+            "bucket_count": self._history_restore_bucket_count,
+            "background": self.restore_history_in_background,
+            "elapsed_s": (
+                round((finished_at_s or now_s) - started_at_s, 2)
+                if started_at_s is not None
+                else None
+            ),
+        }
 
     async def _sample_loop(self) -> None:
         try:
@@ -809,27 +876,58 @@ class SwarmDashboard:
 
     async def _restore_history(self) -> None:
         if self.history_store is None:
+            self._history_restore_status = "disabled"
             return
 
+        started_s = time.monotonic()
+        self._history_restore_started_at_s = started_s
+        self._history_restore_finished_at_s = None
+        self._history_restore_bucket_count = 0
+        self._history_restore_status = "running"
+        self._history_restore_detail = "Loading persisted dashboard history"
         try:
             buckets = await asyncio.to_thread(
                 self.history_store.load_recent,
                 retention_minutes=self.retention_minutes,
                 now_epoch_s=self._time_fn(),
             )
+        except asyncio.CancelledError:
+            self._history_restore_status = "cancelled"
+            self._history_restore_detail = "Dashboard history restore was cancelled"
+            self._history_restore_finished_at_s = time.monotonic()
+            raise
         except Exception as exc:
+            self._history_restore_status = "failed"
+            self._history_restore_detail = str(exc)
+            self._history_restore_finished_at_s = time.monotonic()
             logger.warning("Failed to restore dashboard history from bucket store: %s", exc)
             return
 
         if not buckets:
+            self._history_restore_status = "empty"
+            self._history_restore_detail = "No persisted dashboard history found"
+            self._history_restore_finished_at_s = time.monotonic()
+            logger.info(
+                "No persisted dashboard history restored after %.2fs",
+                time.monotonic() - started_s,
+            )
             return
 
         async with self._lock:
             for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
-                self._history[bucket.bucket_start_s] = bucket
+                if bucket.bucket_start_s not in self._dirty_bucket_starts:
+                    self._history[bucket.bucket_start_s] = bucket
             self._prune_unlocked(self._time_fn())
 
-        logger.info("Restored %s persisted dashboard minute buckets", len(buckets))
+        self._history_restore_status = "complete"
+        self._history_restore_detail = "Persisted dashboard history restored"
+        self._history_restore_bucket_count = len(buckets)
+        self._history_restore_finished_at_s = time.monotonic()
+        logger.info(
+            "Restored %s persisted dashboard minute buckets in %.2fs",
+            len(buckets),
+            time.monotonic() - started_s,
+        )
 
     def _schedule_flush_unlocked(self, *, include_open_bucket: bool) -> None:
         if self.history_store is None:
@@ -1305,8 +1403,8 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     </section>
 
     <div class="controls">
-      <button class="toggle active" data-window="1h">1h</button>
-      <button class="toggle" data-window="6h">6h</button>
+      <button class="toggle" data-window="1h">1h</button>
+      <button class="toggle active" data-window="6h">6h</button>
       <button class="toggle" data-window="24h">24h</button>
       <button class="toggle" data-window="7d">7d</button>
       <button class="toggle" data-resolution="minute">Minute</button>
