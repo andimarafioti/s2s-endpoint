@@ -8,7 +8,11 @@ from app.app_utils import build_lifespan, public_base_url, setup_logging
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
 from app.direct_session_manager import DirectSessionManager
-from app.endpoint_pool_router import EndpointPoolRouter, HuggingFaceEndpointController
+from app.endpoint_pool_router import (
+    EndpointPoolRouter,
+    HuggingFaceEndpointController,
+    fetch_compute_active_sessions,
+)
 from app.swarm_dashboard import SwarmDashboard
 
 setup_logging()
@@ -83,6 +87,7 @@ def build_endpoint_router() -> EndpointPoolRouter:
         restart_backoff_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_S,
         restart_backoff_max_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S,
         restart_stable_running_s=COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S,
+        compute_usage_fetcher=fetch_compute_active_sessions,
     )
 
 

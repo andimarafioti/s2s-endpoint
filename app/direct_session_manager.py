@@ -177,6 +177,13 @@ class DirectSessionManager:
     async def healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
         healthy, detail, router_snapshot = await self.endpoint_router.healthcheck()
         snapshot = await self.snapshot()
+        router_active_sessions = int(router_snapshot.get("active_sessions", 0))
+        pending_sessions = int(snapshot.get("pending_sessions", 0))
+        observed_connected_sessions = max(router_active_sessions - pending_sessions, 0)
+        snapshot["connected_sessions"] = max(
+            int(snapshot.get("connected_sessions", 0)),
+            observed_connected_sessions,
+        )
         snapshot["router"] = router_snapshot
         return healthy, detail, snapshot
 

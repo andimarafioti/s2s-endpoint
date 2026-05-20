@@ -1,14 +1,18 @@
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional, Protocol
 from urllib.parse import urlparse, urlunparse
 
 
 logger = logging.getLogger("s2s-endpoint")
+ComputeUsageFetcher = Callable[[str], int]
 
 
 def _normalize_status(status: object) -> str:
@@ -20,6 +24,32 @@ def _to_ws_url(base_url: str, path: str = "/v1/realtime") -> str:
     scheme = "wss" if parsed.scheme == "https" else "ws"
     route_path = (parsed.path.rstrip("/") + path) if parsed.path else path
     return urlunparse(parsed._replace(scheme=scheme, path=route_path))
+
+
+def _to_health_url(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    route_path = (parsed.path.rstrip("/") + "/health") if parsed.path else "/health"
+    return urlunparse(parsed._replace(path=route_path))
+
+
+def fetch_compute_active_sessions(base_url: str) -> int:
+    request = urllib.request.Request(
+        _to_health_url(base_url),
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"compute health returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"compute health request failed: {exc.reason}") from exc
+
+    router = payload.get("router") if isinstance(payload, dict) else None
+    if not isinstance(router, dict):
+        raise RuntimeError("compute health response did not include router usage")
+    return max(int(router.get("ready_busy", 0)), 0)
 
 
 def _is_running_status(status: str) -> bool:
@@ -171,6 +201,7 @@ class ManagedEndpoint:
     raw_status: str = "unknown"
     url: Optional[str] = None
     active_sessions: int = 0
+    observed_active_sessions: int = 0
     waking: bool = False
     parking: bool = False
     restarting: bool = False
@@ -189,7 +220,11 @@ class ManagedEndpoint:
     def free_slots(self) -> int:
         if not self.running or self.parking:
             return 0
-        return max(self.slots - self.active_sessions, 0)
+        return max(self.slots - self.busy_sessions, 0)
+
+    @property
+    def busy_sessions(self) -> int:
+        return max(self.active_sessions, self.observed_active_sessions)
 
     @property
     def ws_url(self) -> Optional[str]:
@@ -217,6 +252,7 @@ class EndpointPoolRouter:
         restart_backoff_s: float = 30.0,
         restart_backoff_max_s: float = 300.0,
         restart_stable_running_s: float = 120.0,
+        compute_usage_fetcher: Optional[ComputeUsageFetcher] = None,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
         if not names:
@@ -250,6 +286,7 @@ class EndpointPoolRouter:
         self.restart_backoff_s = restart_backoff_s
         self.restart_backoff_max_s = restart_backoff_max_s
         self.restart_stable_running_s = restart_stable_running_s
+        self.compute_usage_fetcher = compute_usage_fetcher
 
         self._on_endpoint_down: Optional[Callable[[str], Awaitable[None]]] = None
         self._endpoints = {
@@ -355,6 +392,8 @@ class EndpointPoolRouter:
             if self._counts_as_warming_capacity(endpoint, now):
                 warming_slots += endpoint.slots
         active_sessions = sum(endpoint.active_sessions for endpoint in endpoints)
+        observed_active_sessions = sum(endpoint.observed_active_sessions for endpoint in endpoints)
+        busy_sessions = sum(endpoint.busy_sessions for endpoint in endpoints)
         errors = [
             {"endpoint": endpoint.name, "error": endpoint.last_error}
             for endpoint in endpoints
@@ -376,7 +415,9 @@ class EndpointPoolRouter:
             "waking_endpoints": waking,
             "parking_endpoints": parking,
             "restarting_endpoints": restarting,
-            "active_sessions": active_sessions,
+            "active_sessions": busy_sessions,
+            "local_active_sessions": active_sessions,
+            "observed_active_sessions": observed_active_sessions,
             "free_slots": free_slots,
             "warming_slots": warming_slots,
             "effective_free_slots": free_slots + warming_slots,
@@ -389,7 +430,9 @@ class EndpointPoolRouter:
                     "parking": endpoint.parking,
                     "restarting": endpoint.restarting,
                     "restart_attempts": endpoint.restart_attempts,
-                    "active_sessions": endpoint.active_sessions,
+                    "active_sessions": endpoint.busy_sessions,
+                    "local_active_sessions": endpoint.active_sessions,
+                    "observed_active_sessions": endpoint.observed_active_sessions,
                     "free_slots": endpoint.free_slots,
                     "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
                     "url": endpoint.url,
@@ -442,7 +485,10 @@ class EndpointPoolRouter:
 
                 if was_running and not endpoint.running and not _is_parked_status(endpoint.status):
                     endpoint.active_sessions = 0
+                    endpoint.observed_active_sessions = 0
                     downed_endpoints.append(endpoint.name)
+                elif not endpoint.running:
+                    endpoint.observed_active_sessions = 0
 
                 if (
                     _is_failed_status(endpoint.status)
@@ -465,6 +511,8 @@ class EndpointPoolRouter:
                 except Exception:
                     logger.exception("on_endpoint_down callback failed for %s", name)
 
+        await self._sync_compute_usage()
+
     async def ensure_min_warm(self) -> None:
         while True:
             async with self._condition:
@@ -478,6 +526,52 @@ class EndpointPoolRouter:
                     return
 
             await asyncio.gather(*(self._wake_endpoint(name) for name in wake_names))
+
+    async def _sync_compute_usage(self) -> None:
+        if self.compute_usage_fetcher is None:
+            return
+
+        async with self._condition:
+            targets = [
+                (endpoint.name, endpoint.url)
+                for endpoint in self._endpoints.values()
+                if endpoint.running and endpoint.url is not None
+            ]
+
+        if not targets:
+            return
+
+        results = await asyncio.gather(
+            *(
+                asyncio.to_thread(self.compute_usage_fetcher, url)
+                for _, url in targets
+            ),
+            return_exceptions=True,
+        )
+
+        now = time.monotonic()
+        async with self._condition:
+            for (name, url), result in zip(targets, results):
+                endpoint = self._endpoints.get(name)
+                if endpoint is None or endpoint.url != url or not endpoint.running:
+                    continue
+                if isinstance(result, Exception):
+                    logger.warning("Failed to sync compute usage for %s: %s", name, result)
+                    continue
+
+                observed_active_sessions = min(max(int(result), 0), endpoint.slots)
+                if observed_active_sessions != endpoint.observed_active_sessions:
+                    logger.info(
+                        "Synced compute usage for %s: observed active sessions %s -> %s",
+                        name,
+                        endpoint.observed_active_sessions,
+                        observed_active_sessions,
+                    )
+                endpoint.observed_active_sessions = observed_active_sessions
+                if observed_active_sessions:
+                    endpoint.last_used_at = now
+
+            self._condition.notify_all()
 
     async def _wake_endpoint(self, name: str) -> None:
         try:
@@ -651,7 +745,7 @@ class EndpointPoolRouter:
             and not endpoint.parking
             and not endpoint.restarting
         ]
-        candidates.sort(key=lambda item: (item.active_sessions, item.name))
+        candidates.sort(key=lambda item: (item.busy_sessions, item.name))
 
         selected = []
         for endpoint in candidates[:target_count]:
@@ -685,7 +779,7 @@ class EndpointPoolRouter:
     def _should_park_endpoint_unlocked(self, endpoint: ManagedEndpoint) -> bool:
         if not endpoint.running or endpoint.waking or endpoint.parking or endpoint.restarting:
             return False
-        if endpoint.active_sessions != 0:
+        if endpoint.busy_sessions != 0:
             return False
         if self._running_count_unlocked() <= self.min_warm_endpoints:
             return False
@@ -704,8 +798,8 @@ class EndpointPoolRouter:
         return min(
             candidates,
             key=lambda item: (
-                item.active_sessions / item.slots,
-                item.active_sessions,
+                item.busy_sessions / item.slots,
+                item.busy_sessions,
                 item.name,
             ),
         )
@@ -733,7 +827,7 @@ class EndpointPoolRouter:
         )
 
     def _active_sessions_unlocked(self) -> int:
-        return sum(endpoint.active_sessions for endpoint in self._endpoints.values())
+        return sum(endpoint.busy_sessions for endpoint in self._endpoints.values())
 
     def _counts_as_warming_capacity(self, endpoint: ManagedEndpoint, now: float) -> bool:
         return (

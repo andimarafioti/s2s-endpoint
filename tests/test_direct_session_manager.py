@@ -8,11 +8,12 @@ from app.session_tokens import verify_session_token, websocket_host_matches
 
 
 class FakeLeaseRouter:
-    def __init__(self):
+    def __init__(self, health_snapshot: dict[str, object] | None = None):
         self.acquire_calls = 0
         self.release_calls = []
         self.started = False
         self.stopped = False
+        self.health_snapshot = health_snapshot or {"running_endpoints": 1}
 
     async def start(self) -> None:
         self.started = True
@@ -33,7 +34,7 @@ class FakeLeaseRouter:
         self.release_calls.append(slot_id)
 
     async def healthcheck(self):
-        return True, None, {"running_endpoints": 1}
+        return True, None, dict(self.health_snapshot)
 
 
 class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -107,6 +108,26 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["pending_sessions"], 0)
         self.assertEqual(snapshot["connected_sessions"], 0)
         self.assertEqual(router.release_calls, ["endpoint-1"])
+
+    async def test_healthcheck_counts_observed_router_sessions_without_pending(self):
+        router = FakeLeaseRouter({"running_endpoints": 1, "active_sessions": 2})
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=60,
+            session_token_ttl_s=3600,
+            reap_interval_s=60,
+        )
+        await self.manager.start()
+
+        await self.manager.allocate("https://lb.example")
+        healthy, detail, snapshot = await self.manager.healthcheck()
+
+        self.assertTrue(healthy)
+        self.assertIsNone(detail)
+        self.assertEqual(snapshot["pending_sessions"], 1)
+        self.assertEqual(snapshot["connected_sessions"], 1)
+        self.assertEqual(snapshot["router"], {"running_endpoints": 1, "active_sessions": 2})
 
 
 if __name__ == "__main__":
