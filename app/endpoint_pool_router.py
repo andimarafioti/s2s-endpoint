@@ -201,7 +201,9 @@ class ManagedEndpoint:
     raw_status: str = "unknown"
     url: Optional[str] = None
     active_sessions: int = 0
+    connected_sessions: int = 0
     observed_active_sessions: int = 0
+    unobserved_connected_sessions: int = 0
     waking: bool = False
     parking: bool = False
     restarting: bool = False
@@ -224,7 +226,16 @@ class ManagedEndpoint:
 
     @property
     def busy_sessions(self) -> int:
-        return max(self.active_sessions, self.observed_active_sessions)
+        return min(
+            self.observed_active_sessions
+            + self.pending_sessions
+            + self.unobserved_connected_sessions,
+            self.slots,
+        )
+
+    @property
+    def pending_sessions(self) -> int:
+        return max(self.active_sessions - self.connected_sessions, 0)
 
     @property
     def ws_url(self) -> Optional[str]:
@@ -353,13 +364,38 @@ class EndpointPoolRouter:
         self._spawn_wake_tasks(wake_names)
         return lease
 
-    async def release(self, slot_id: str) -> None:
+    async def mark_connected(self, slot_id: str) -> None:
+        async with self._condition:
+            endpoint = self._endpoints.get(slot_id)
+            if endpoint is None:
+                return
+            if endpoint.connected_sessions >= endpoint.active_sessions:
+                return
+
+            endpoint.connected_sessions += 1
+            endpoint.unobserved_connected_sessions += 1
+            endpoint.last_used_at = time.monotonic()
+
+            self._condition.notify_all()
+
+    async def release(self, slot_id: str, *, connected: bool = False) -> None:
         async with self._condition:
             endpoint = self._endpoints.get(slot_id)
             if endpoint is None:
                 return
 
             endpoint.active_sessions = max(endpoint.active_sessions - 1, 0)
+            if connected:
+                endpoint.connected_sessions = max(endpoint.connected_sessions - 1, 0)
+                endpoint.unobserved_connected_sessions = max(
+                    endpoint.unobserved_connected_sessions - 1,
+                    0,
+                )
+            endpoint.connected_sessions = min(endpoint.connected_sessions, endpoint.active_sessions)
+            endpoint.unobserved_connected_sessions = min(
+                endpoint.unobserved_connected_sessions,
+                endpoint.connected_sessions,
+            )
             endpoint.last_used_at = time.monotonic()
 
             self._condition.notify_all()
@@ -392,7 +428,12 @@ class EndpointPoolRouter:
             if self._counts_as_warming_capacity(endpoint, now):
                 warming_slots += endpoint.slots
         active_sessions = sum(endpoint.active_sessions for endpoint in endpoints)
+        connected_sessions = sum(endpoint.connected_sessions for endpoint in endpoints)
+        pending_sessions = sum(endpoint.pending_sessions for endpoint in endpoints)
         observed_active_sessions = sum(endpoint.observed_active_sessions for endpoint in endpoints)
+        unobserved_connected_sessions = sum(
+            endpoint.unobserved_connected_sessions for endpoint in endpoints
+        )
         busy_sessions = sum(endpoint.busy_sessions for endpoint in endpoints)
         errors = [
             {"endpoint": endpoint.name, "error": endpoint.last_error}
@@ -417,7 +458,10 @@ class EndpointPoolRouter:
             "restarting_endpoints": restarting,
             "active_sessions": busy_sessions,
             "local_active_sessions": active_sessions,
+            "local_connected_sessions": connected_sessions,
+            "local_pending_sessions": pending_sessions,
             "observed_active_sessions": observed_active_sessions,
+            "unobserved_connected_sessions": unobserved_connected_sessions,
             "free_slots": free_slots,
             "warming_slots": warming_slots,
             "effective_free_slots": free_slots + warming_slots,
@@ -432,7 +476,10 @@ class EndpointPoolRouter:
                     "restart_attempts": endpoint.restart_attempts,
                     "active_sessions": endpoint.busy_sessions,
                     "local_active_sessions": endpoint.active_sessions,
+                    "local_connected_sessions": endpoint.connected_sessions,
+                    "local_pending_sessions": endpoint.pending_sessions,
                     "observed_active_sessions": endpoint.observed_active_sessions,
+                    "unobserved_connected_sessions": endpoint.unobserved_connected_sessions,
                     "free_slots": endpoint.free_slots,
                     "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
                     "url": endpoint.url,
@@ -485,10 +532,13 @@ class EndpointPoolRouter:
 
                 if was_running and not endpoint.running and not _is_parked_status(endpoint.status):
                     endpoint.active_sessions = 0
+                    endpoint.connected_sessions = 0
                     endpoint.observed_active_sessions = 0
+                    endpoint.unobserved_connected_sessions = 0
                     downed_endpoints.append(endpoint.name)
                 elif not endpoint.running:
                     endpoint.observed_active_sessions = 0
+                    endpoint.unobserved_connected_sessions = 0
 
                 if (
                     _is_failed_status(endpoint.status)
@@ -559,7 +609,12 @@ class EndpointPoolRouter:
                     logger.warning("Failed to sync compute usage for %s: %s", name, result)
                     continue
 
+                previous_observed_active_sessions = endpoint.observed_active_sessions
                 observed_active_sessions = min(max(int(result), 0), endpoint.slots)
+                observed_increase = max(
+                    observed_active_sessions - previous_observed_active_sessions,
+                    0,
+                )
                 if observed_active_sessions != endpoint.observed_active_sessions:
                     logger.info(
                         "Synced compute usage for %s: observed active sessions %s -> %s",
@@ -568,6 +623,11 @@ class EndpointPoolRouter:
                         observed_active_sessions,
                     )
                 endpoint.observed_active_sessions = observed_active_sessions
+                if observed_increase:
+                    endpoint.unobserved_connected_sessions = max(
+                        endpoint.unobserved_connected_sessions - observed_increase,
+                        0,
+                    )
                 if observed_active_sessions:
                     endpoint.last_used_at = now
 

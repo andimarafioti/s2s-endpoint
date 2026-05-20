@@ -254,6 +254,93 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["endpoints"][0]["active_sessions"], 1)
         self.assertEqual(snapshot["endpoints"][0]["observed_active_sessions"], 1)
 
+    async def test_observed_usage_and_local_pending_do_not_oversubscribe_multi_slot_endpoint(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        usage_fetcher = FakeComputeUsageFetcher({endpoint_url: 1})
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=2,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=usage_fetcher,
+        )
+
+        await self.router.start()
+        lease = await self.router.acquire(timeout_s=0.2)
+
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["active_sessions"], 2)
+        self.assertEqual(snapshot["local_active_sessions"], 1)
+        self.assertEqual(snapshot["local_pending_sessions"], 1)
+        self.assertEqual(snapshot["observed_active_sessions"], 1)
+        self.assertEqual(snapshot["free_slots"], 0)
+
+        with self.assertRaises(TimeoutError):
+            await self.router.acquire(timeout_s=0.01)
+
+        await self.router.release(lease.slot_id, connected=False)
+
+    async def test_connected_local_session_frees_capacity_after_compute_usage_clears(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        usage_fetcher = FakeComputeUsageFetcher({endpoint_url: 1})
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=2,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=usage_fetcher,
+        )
+
+        await self.router.start()
+        lease = await self.router.acquire(timeout_s=0.2)
+        await self.router.mark_connected(lease.slot_id)
+
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["active_sessions"], 2)
+        self.assertEqual(snapshot["local_pending_sessions"], 0)
+        self.assertEqual(snapshot["unobserved_connected_sessions"], 1)
+        self.assertEqual(snapshot["free_slots"], 0)
+
+        usage_fetcher.busy_by_url[endpoint_url] = 2
+        await self.router.refresh()
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["active_sessions"], 2)
+        self.assertEqual(snapshot["unobserved_connected_sessions"], 0)
+        self.assertEqual(snapshot["free_slots"], 0)
+
+        await self.router.release(lease.slot_id, connected=True)
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["active_sessions"], 2)
+        self.assertEqual(snapshot["local_active_sessions"], 0)
+        self.assertEqual(snapshot["free_slots"], 0)
+
+        usage_fetcher.busy_by_url[endpoint_url] = 1
+        await self.router.refresh()
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["active_sessions"], 1)
+        self.assertEqual(snapshot["observed_active_sessions"], 1)
+        self.assertEqual(snapshot["free_slots"], 1)
+
     async def test_refresh_marks_compute_available_after_observed_usage_clears(self):
         endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
         usage_fetcher = FakeComputeUsageFetcher({endpoint_url: 1})

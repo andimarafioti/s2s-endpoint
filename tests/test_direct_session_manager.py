@@ -11,6 +11,8 @@ class FakeLeaseRouter:
     def __init__(self, health_snapshot: dict[str, object] | None = None):
         self.acquire_calls = 0
         self.release_calls = []
+        self.release_connected_calls = []
+        self.mark_connected_calls = []
         self.started = False
         self.stopped = False
         self.health_snapshot = health_snapshot or {"running_endpoints": 1}
@@ -30,8 +32,12 @@ class FakeLeaseRouter:
             ws_url=f"wss://{endpoint_name}.example.endpoints.huggingface.cloud/ws",
         )
 
-    async def release(self, slot_id: str) -> None:
+    async def mark_connected(self, slot_id: str) -> None:
+        self.mark_connected_calls.append(slot_id)
+
+    async def release(self, slot_id: str, *, connected: bool = False) -> None:
         self.release_calls.append(slot_id)
+        self.release_connected_calls.append(connected)
 
     async def healthcheck(self):
         return True, None, dict(self.health_snapshot)
@@ -86,7 +92,9 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(released["state"], "released")
         self.assertTrue(released["conversation_counted"])
         self.assertAlmostEqual(released["conversation_duration_s"], 12.5, places=3)
+        self.assertEqual(router.mark_connected_calls, ["endpoint-1"])
         self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual(router.release_connected_calls, [True])
 
     async def test_pending_session_is_released_if_client_never_connects(self):
         router = FakeLeaseRouter()
@@ -108,6 +116,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["pending_sessions"], 0)
         self.assertEqual(snapshot["connected_sessions"], 0)
         self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual(router.release_connected_calls, [False])
 
     async def test_healthcheck_counts_observed_router_sessions_without_pending(self):
         router = FakeLeaseRouter({"running_endpoints": 1, "active_sessions": 2})
