@@ -3,7 +3,7 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional, Protocol
 
@@ -159,6 +159,7 @@ class SwarmHistoryBucket:
     parked_endpoints_sum: float = 0.0
     connected_sessions_last: int = 0
     connected_sessions_sum: float = 0.0
+    connected_sessions_max: int = 0
     pending_sessions_last: int = 0
     pending_sessions_sum: float = 0.0
     free_slots_last: int = 0
@@ -179,6 +180,7 @@ class SwarmHistoryBucket:
     completed_conversations: int = 0
     completed_conversation_duration_total_s: float = 0.0
     completed_conversation_duration_max_s: float = 0.0
+    completed_conversation_duration_samples_s: list[float] = field(default_factory=list)
 
     def record_sample(self, sample: SwarmStateSample) -> None:
         self.sample_count += 1
@@ -192,6 +194,7 @@ class SwarmHistoryBucket:
         self.parked_endpoints_sum += sample.parked_endpoints
         self.connected_sessions_last = sample.connected_sessions
         self.connected_sessions_sum += sample.connected_sessions
+        self.connected_sessions_max = max(self.connected_sessions_max, sample.connected_sessions)
         self.pending_sessions_last = sample.pending_sessions
         self.pending_sessions_sum += sample.pending_sessions
         self.free_slots_last = sample.free_slots
@@ -253,6 +256,7 @@ class SwarmHistoryBucket:
             "parked_endpoints_sum": self.parked_endpoints_sum,
             "connected_sessions_last": self.connected_sessions_last,
             "connected_sessions_sum": self.connected_sessions_sum,
+            "connected_sessions_max": self.connected_sessions_max,
             "pending_sessions_last": self.pending_sessions_last,
             "pending_sessions_sum": self.pending_sessions_sum,
             "free_slots_last": self.free_slots_last,
@@ -273,6 +277,7 @@ class SwarmHistoryBucket:
             "completed_conversations": self.completed_conversations,
             "completed_conversation_duration_total_s": self.completed_conversation_duration_total_s,
             "completed_conversation_duration_max_s": self.completed_conversation_duration_max_s,
+            "completed_conversation_duration_samples_s": self.completed_conversation_duration_samples_s,
         }
 
     @classmethod
@@ -290,6 +295,10 @@ class SwarmHistoryBucket:
             parked_endpoints_sum=float(payload.get("parked_endpoints_sum", 0.0)),
             connected_sessions_last=int(payload.get("connected_sessions_last", 0)),
             connected_sessions_sum=float(payload.get("connected_sessions_sum", 0.0)),
+            connected_sessions_max=max(
+                int(payload.get("connected_sessions_max", 0)),
+                int(payload.get("connected_sessions_last", 0)),
+            ),
             pending_sessions_last=int(payload.get("pending_sessions_last", 0)),
             pending_sessions_sum=float(payload.get("pending_sessions_sum", 0.0)),
             free_slots_last=int(payload.get("free_slots_last", 0)),
@@ -314,6 +323,10 @@ class SwarmHistoryBucket:
             completed_conversation_duration_max_s=float(
                 payload.get("completed_conversation_duration_max_s", 0.0)
             ),
+            completed_conversation_duration_samples_s=[
+                max(float(value), 0.0)
+                for value in list(payload.get("completed_conversation_duration_samples_s") or [])
+            ],
         )
 
 
@@ -578,13 +591,14 @@ class SwarmDashboard:
         }
 
         minute_starts = list(range(context_start_bucket, end_bucket + 1, 60))
+        bucket_sequence = [minute_map.get(bucket_start_s) for bucket_start_s in minute_starts]
         completed_prefix = [0]
         duration_prefix = [0.0]
         connected_sum_prefix = [0.0]
         sample_count_prefix = [0]
         active_conversation_minutes_prefix = [0.0]
-        for bucket_start_s in minute_starts:
-            bucket = minute_map.get(bucket_start_s)
+        connected_max_values = []
+        for bucket in bucket_sequence:
             completed_prefix.append(
                 completed_prefix[-1] + (bucket.completed_conversations if bucket is not None else 0)
             )
@@ -606,15 +620,41 @@ class SwarmDashboard:
                     else 0.0
                 )
             )
+            connected_max_values.append(bucket.connected_sessions_max if bucket is not None else 0)
 
-        def range_sum(prefix: list[int] | list[float], start_s: int, end_s: int) -> int | float:
+        def range_indices(start_s: int, end_s: int) -> tuple[int, int] | None:
             if start_s > end_bucket or end_s < context_start_bucket:
-                return 0
+                return None
             bounded_start_s = max(start_s, context_start_bucket)
             bounded_end_s = min(end_s, end_bucket)
-            start_index = (bounded_start_s - context_start_bucket) // 60
-            end_index = (bounded_end_s - context_start_bucket) // 60
+            return (
+                int((bounded_start_s - context_start_bucket) // 60),
+                int((bounded_end_s - context_start_bucket) // 60),
+            )
+
+        def range_sum(prefix: list[int] | list[float], start_s: int, end_s: int) -> int | float:
+            indices = range_indices(start_s, end_s)
+            if indices is None:
+                return 0
+            start_index, end_index = indices
             return prefix[end_index + 1] - prefix[start_index]
+
+        def range_connected_max(start_s: int, end_s: int) -> int:
+            indices = range_indices(start_s, end_s)
+            if indices is None:
+                return 0
+            start_index, end_index = indices
+            return max(connected_max_values[start_index : end_index + 1], default=0)
+
+        def range_duration_samples(start_s: int, end_s: int) -> list[float]:
+            indices = range_indices(start_s, end_s)
+            if indices is None:
+                return []
+            start_index, end_index = indices
+            samples = []
+            for bucket in bucket_sequence[start_index : end_index + 1]:
+                samples.extend(self._completed_duration_samples_for_bucket(bucket))
+            return samples
 
         step_s = 60 if resolution == "minute" else 3600
         first_point_s = start_bucket if resolution == "minute" else _bucket_start_epoch_s(start_bucket, 60)
@@ -631,6 +671,7 @@ class SwarmDashboard:
                 active_conversation_minutes = float(
                     range_sum(active_conversation_minutes_prefix, window_start_s, point_end_s)
                 )
+                median_duration_s = self._median(range_duration_samples(window_start_s, point_end_s))
 
                 point[f"completed_conversations_{label}"] = completed
                 point[f"active_conversation_minutes_{label}"] = round(active_conversation_minutes, 2)
@@ -645,6 +686,9 @@ class SwarmDashboard:
                 point[f"connected_sessions_avg_{label}"] = (
                     round(connected_sum / sample_count, 2) if sample_count else 0.0
                 )
+                point[f"connected_sessions_max_{label}"] = range_connected_max(window_start_s, point_end_s)
+                point[f"median_conversation_duration_s_{label}"] = round(median_duration_s, 2)
+                point[f"median_conversation_duration_min_{label}"] = round(median_duration_s / 60.0, 2)
             points.append(point)
 
         return points
@@ -705,9 +749,27 @@ class SwarmDashboard:
                 bucket.completed_conversation_duration_max_s,
                 duration_s,
             )
+            bucket.completed_conversation_duration_samples_s.append(duration_s)
             self._dirty_bucket_starts.add(bucket.bucket_start_s)
             self._prune_unlocked(now)
             self._schedule_flush_unlocked(include_open_bucket=False)
+
+    def _completed_duration_samples_for_bucket(self, bucket: Optional[SwarmHistoryBucket]) -> list[float]:
+        if bucket is None or bucket.completed_conversations <= 0:
+            return []
+        if bucket.completed_conversation_duration_samples_s:
+            return bucket.completed_conversation_duration_samples_s
+        avg_duration_s = bucket.completed_conversation_duration_total_s / bucket.completed_conversations
+        return [avg_duration_s] * bucket.completed_conversations
+
+    def _median(self, values: list[float]) -> float:
+        if not values:
+            return 0.0
+        sorted_values = sorted(values)
+        middle = len(sorted_values) // 2
+        if len(sorted_values) % 2:
+            return sorted_values[middle]
+        return (sorted_values[middle - 1] + sorted_values[middle]) / 2.0
 
     def _get_bucket_unlocked(self, epoch_s: float) -> SwarmHistoryBucket:
         bucket_start_s = _bucket_start_epoch_s(epoch_s, 1)
@@ -1564,6 +1626,28 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         </div>
         <div class="chart-shell"><canvas id="rolling-users-chart" width="720" height="260"></canvas></div>
       </div>
+
+      <div class="panel card">
+        <div class="label">Rolling / Users</div>
+        <h2>Maximum Connected Users</h2>
+        <div class="legend">
+          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="connected_sessions_max_1h" aria-pressed="true">1h max</button>
+          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="connected_sessions_max_6h" aria-pressed="true">6h max</button>
+          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="connected_sessions_max_24h" aria-pressed="true">24h max</button>
+        </div>
+        <div class="chart-shell"><canvas id="rolling-max-users-chart" width="720" height="260"></canvas></div>
+      </div>
+
+      <div class="panel card">
+        <div class="label">Rolling / Duration</div>
+        <h2>Median Duration</h2>
+        <div class="legend">
+          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="median_conversation_duration_min_1h" aria-pressed="true">1h median</button>
+          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="median_conversation_duration_min_6h" aria-pressed="true">6h median</button>
+          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="median_conversation_duration_min_24h" aria-pressed="true">24h median</button>
+        </div>
+        <div class="chart-shell"><canvas id="rolling-median-duration-chart" width="720" height="260"></canvas></div>
+      </div>
     </section>
 
     <section class="kpis" id="kpis"></section>
@@ -1667,6 +1751,16 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         { key: 'connected_sessions_avg_6h', color: '#117a65' },
         { key: 'connected_sessions_avg_24h', color: '#d9822b' },
       ],
+      maxUsers: [
+        { key: 'connected_sessions_max_1h', color: '#0b5cab' },
+        { key: 'connected_sessions_max_6h', color: '#117a65' },
+        { key: 'connected_sessions_max_24h', color: '#d9822b' },
+      ],
+      medianDuration: [
+        { key: 'median_conversation_duration_min_1h', color: '#0b5cab' },
+        { key: 'median_conversation_duration_min_6h', color: '#117a65' },
+        { key: 'median_conversation_duration_min_24h', color: '#d9822b' },
+      ],
     };
 
     function prettyNumber(value) {
@@ -1761,6 +1855,16 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         document.getElementById('rolling-users-chart'),
         rollingSeries,
         activeSeries(rollingChartConfigs.users),
+      );
+      drawChart(
+        document.getElementById('rolling-max-users-chart'),
+        rollingSeries,
+        activeSeries(rollingChartConfigs.maxUsers),
+      );
+      drawChart(
+        document.getElementById('rolling-median-duration-chart'),
+        rollingSeries,
+        activeSeries(rollingChartConfigs.medianDuration),
       );
     }
 

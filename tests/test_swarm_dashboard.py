@@ -359,13 +359,17 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             bucket_start_s: int,
             completed_conversations: int,
             duration_total_s: float,
+            duration_samples_s: list[float],
             connected_sessions_sum: float,
+            connected_sessions_max: int,
             sample_count: int,
         ) -> None:
             bucket = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
             bucket.completed_conversations = completed_conversations
             bucket.completed_conversation_duration_total_s = duration_total_s
+            bucket.completed_conversation_duration_samples_s = duration_samples_s
             bucket.connected_sessions_sum = connected_sessions_sum
+            bucket.connected_sessions_max = connected_sessions_max
             bucket.sample_count = sample_count
             dashboard._history[bucket_start_s] = bucket
 
@@ -373,21 +377,27 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             bucket_start_s=now_s - 23 * 3600,
             completed_conversations=1,
             duration_total_s=60.0,
+            duration_samples_s=[60.0],
             connected_sessions_sum=2.0,
+            connected_sessions_max=11,
             sample_count=1,
         )
         add_bucket(
             bucket_start_s=now_s - 5 * 3600,
             completed_conversations=2,
             duration_total_s=600.0,
+            duration_samples_s=[120.0, 480.0],
             connected_sessions_sum=10.0,
+            connected_sessions_max=7,
             sample_count=2,
         )
         add_bucket(
             bucket_start_s=now_s - 30 * 60,
             completed_conversations=3,
             duration_total_s=1800.0,
+            duration_samples_s=[300.0, 600.0, 900.0],
             connected_sessions_sum=8.0,
+            connected_sessions_max=9,
             sample_count=1,
         )
 
@@ -409,9 +419,15 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["avg_conversation_duration_min_1h"], 10.0)
         self.assertEqual(point["avg_conversation_duration_min_6h"], 8.0)
         self.assertEqual(point["avg_conversation_duration_min_24h"], 6.83)
+        self.assertEqual(point["median_conversation_duration_min_1h"], 10.0)
+        self.assertEqual(point["median_conversation_duration_min_6h"], 8.0)
+        self.assertEqual(point["median_conversation_duration_min_24h"], 6.5)
         self.assertEqual(point["connected_sessions_avg_1h"], 8.0)
         self.assertEqual(point["connected_sessions_avg_6h"], 6.0)
         self.assertEqual(point["connected_sessions_avg_24h"], 5.0)
+        self.assertEqual(point["connected_sessions_max_1h"], 9)
+        self.assertEqual(point["connected_sessions_max_6h"], 9)
+        self.assertEqual(point["connected_sessions_max_24h"], 11)
 
     async def test_prunes_buckets_older_than_retention_window(self):
         clock = FakeClock(10 * 3600)
@@ -541,8 +557,10 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         persisted = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
         self.assertEqual(persisted.session_requests, 1)
         self.assertEqual(persisted.connected_sessions_last, 1)
+        self.assertEqual(persisted.connected_sessions_max, 1)
         self.assertEqual(persisted.completed_conversations, 1)
         self.assertEqual(persisted.completed_conversation_duration_total_s, 90.0)
+        self.assertEqual(persisted.completed_conversation_duration_samples_s, [90.0])
 
     async def test_restores_persisted_history_from_store_on_start(self):
         bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600)
