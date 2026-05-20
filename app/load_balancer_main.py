@@ -8,7 +8,11 @@ from app.app_utils import build_lifespan, public_base_url, setup_logging
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
 from app.direct_session_manager import DirectSessionManager
-from app.endpoint_pool_router import EndpointPoolRouter, HuggingFaceEndpointController
+from app.endpoint_pool_router import (
+    EndpointPoolRouter,
+    HuggingFaceEndpointController,
+    fetch_compute_active_sessions,
+)
 from app.swarm_dashboard import SwarmDashboard
 
 setup_logging()
@@ -42,7 +46,7 @@ SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
 SESSION_TOKEN_TTL_S = float(os.getenv("SESSION_TOKEN_TTL_S", "86400"))
 SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
 DASHBOARD_SAMPLE_INTERVAL_S = float(os.getenv("DASHBOARD_SAMPLE_INTERVAL_S", "15"))
-DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(7 * 24 * 60)))
+DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(28 * 24 * 60)))
 DASHBOARD_BUCKET_ID = os.getenv("DASHBOARD_BUCKET_ID", "").strip() or None
 DASHBOARD_BUCKET_PREFIX = os.getenv("DASHBOARD_BUCKET_PREFIX", "s2s-endpoint/swarm-dashboard").strip()
 DASHBOARD_BUCKET_TOKEN = os.getenv("DASHBOARD_BUCKET_TOKEN", "").strip() or HF_CONTROL_TOKEN
@@ -83,6 +87,7 @@ def build_endpoint_router() -> EndpointPoolRouter:
         restart_backoff_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_S,
         restart_backoff_max_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S,
         restart_stable_running_s=COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S,
+        compute_usage_fetcher=fetch_compute_active_sessions,
     )
 
 
