@@ -1,4 +1,3 @@
-import inspect
 import json
 import logging
 import re
@@ -55,7 +54,6 @@ class HuggingFaceBucketHistoryStore:
         self._batch_bucket_files = batch_bucket_files
         self._download_bucket_files = download_bucket_files
         self._list_bucket_tree = list_bucket_tree
-        self._batch_bucket_files_supports_copy = "copy" in inspect.signature(batch_bucket_files).parameters
 
         if not self.bucket_id:
             raise ValueError("bucket_id must be set")
@@ -97,12 +95,7 @@ class HuggingFaceBucketHistoryStore:
             )
             for bucket in minute_buckets:
                 loaded_by_start[bucket.bucket_start_s] = bucket
-            self._cache_complete_days(
-                day_starts=days_needing_minute_lookup,
-                buckets=list(loaded_by_start.values()),
-                now_epoch_s=now_epoch_s,
-            )
-            self._cache_finalized_partial_days(
+            self._cache_day_files(
                 day_starts=days_needing_minute_lookup,
                 buckets=list(loaded_by_start.values()),
                 now_epoch_s=now_epoch_s,
@@ -471,7 +464,7 @@ class HuggingFaceBucketHistoryStore:
                 token=self.token,
             )
 
-    def _cache_complete_days(
+    def _cache_day_files(
         self,
         *,
         day_starts: list[int],
@@ -487,18 +480,23 @@ class HuggingFaceBucketHistoryStore:
 
         current_day_start = _day_start_epoch_s(now_epoch_s)
         add = []
+        complete_count = 0
+        partial_count = 0
         for day_start in day_starts:
             if day_start >= current_day_start:
                 continue
             day_buckets = sorted(buckets_by_day.get(day_start, []), key=lambda bucket: bucket.bucket_start_s)
-            if len(day_buckets) != 24 * 60:
+            if not day_buckets:
                 continue
+            complete = len(day_buckets) == 24 * 60
+            complete_count += int(complete)
+            partial_count += int(not complete)
             add.append(
                 (
                     self._day_payload(
                         day_start=day_start,
                         day_buckets=day_buckets,
-                        complete=True,
+                        complete=complete,
                         finalized=True,
                     ),
                     self._day_path(day_start),
@@ -508,52 +506,10 @@ class HuggingFaceBucketHistoryStore:
         if not add:
             return []
 
-        logger.info("Caching %s complete dashboard history day files in %s", len(add), self.bucket_id)
-        self._batch_bucket_files(
-            self.bucket_id,
-            add=add,
-            token=self.token,
-        )
-        return [path for _, path in add]
-
-    def _cache_finalized_partial_days(
-        self,
-        *,
-        day_starts: list[int],
-        buckets: list[SwarmHistoryBucket],
-        now_epoch_s: float,
-    ) -> list[str]:
-        if self.read_only:
-            return []
-
-        buckets_by_day: dict[int, list[SwarmHistoryBucket]] = {}
-        for bucket in buckets:
-            buckets_by_day.setdefault(_day_start_epoch_s(bucket.bucket_start_s), []).append(bucket)
-
-        current_day_start = _day_start_epoch_s(now_epoch_s)
-        add = []
-        for day_start in day_starts:
-            if day_start >= current_day_start:
-                continue
-            day_buckets = sorted(buckets_by_day.get(day_start, []), key=lambda bucket: bucket.bucket_start_s)
-            if not day_buckets or len(day_buckets) == 24 * 60:
-                continue
-            add.append(
-                (
-                    self._day_payload(
-                        day_start=day_start,
-                        day_buckets=day_buckets,
-                        complete=False,
-                        finalized=True,
-                    ),
-                    self._day_path(day_start),
-                )
-            )
-
-        if not add:
-            return []
-
-        logger.warning("Finalizing %s partial dashboard history day files in %s", len(add), self.bucket_id)
+        if complete_count:
+            logger.info("Caching %s complete dashboard history day files in %s", complete_count, self.bucket_id)
+        if partial_count:
+            logger.warning("Finalizing %s partial dashboard history day files in %s", partial_count, self.bucket_id)
         self._batch_bucket_files(
             self.bucket_id,
             add=add,
@@ -749,23 +705,18 @@ class HuggingFaceBucketHistoryStore:
         return result
 
     def _move_legacy_minute_candidates(self, candidates: list[tuple[int, str, str, Optional[str]]]) -> int:
-        if self._batch_bucket_files_supports_copy:
-            server_copy_candidates = [
-                (bucket_start_s, legacy_path, target_path, xet_hash)
-                for bucket_start_s, legacy_path, target_path, xet_hash in candidates
-                if xet_hash
-            ]
-            fallback_candidates = [
-                (bucket_start_s, legacy_path, target_path)
-                for bucket_start_s, legacy_path, target_path, xet_hash in candidates
-                if not xet_hash
-            ]
-            return self._copy_legacy_minute_candidates(server_copy_candidates) + self._upload_legacy_minute_candidates(
-                fallback_candidates
-            )
-
-        return self._upload_legacy_minute_candidates(
-            [(bucket_start_s, legacy_path, target_path) for bucket_start_s, legacy_path, target_path, _ in candidates]
+        server_copy_candidates = [
+            (bucket_start_s, legacy_path, target_path, xet_hash)
+            for bucket_start_s, legacy_path, target_path, xet_hash in candidates
+            if xet_hash
+        ]
+        fallback_candidates = [
+            (bucket_start_s, legacy_path, target_path)
+            for bucket_start_s, legacy_path, target_path, xet_hash in candidates
+            if not xet_hash
+        ]
+        return self._copy_legacy_minute_candidates(server_copy_candidates) + self._upload_legacy_minute_candidates(
+            fallback_candidates
         )
 
     def _copy_legacy_minute_candidates(self, candidates: list[tuple[int, str, str, str]]) -> int:

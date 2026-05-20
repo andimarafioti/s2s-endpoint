@@ -3,9 +3,9 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Optional, Protocol
+from typing import Awaitable, Callable, Iterable, Optional, Protocol
 
 
 SnapshotProvider = Callable[[], Awaitable[tuple[bool, Optional[str], dict[str, object]]]]
@@ -30,6 +30,16 @@ def _bucket_start_epoch_s(epoch_s: float, bucket_minutes: int) -> int:
 
 def _day_start_epoch_s(epoch_s: float) -> int:
     return _bucket_start_epoch_s(epoch_s, DAY_MINUTES)
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    middle = len(sorted_values) // 2
+    if len(sorted_values) % 2:
+        return sorted_values[middle]
+    return (sorted_values[middle - 1] + sorted_values[middle]) / 2.0
 
 
 def _day_key(epoch_s: int | float) -> str:
@@ -243,91 +253,214 @@ class SwarmHistoryBucket:
         }
 
     def to_dict(self) -> dict[str, object]:
+        payload = {}
+        for bucket_field in dataclass_fields(self):
+            value = getattr(self, bucket_field.name)
+            payload[bucket_field.name] = list(value) if isinstance(value, list) else value
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "SwarmHistoryBucket":
+        values = {
+            bucket_field.name: _coerce_history_bucket_field(bucket_field.name, payload)
+            for bucket_field in dataclass_fields(cls)
+        }
+        return cls(**values)
+
+    def completed_duration_samples(self) -> list[float]:
+        if self.completed_conversations <= 0:
+            return []
+        if self.completed_conversation_duration_samples_s:
+            return list(self.completed_conversation_duration_samples_s)
+        avg_duration_s = self.completed_conversation_duration_total_s / self.completed_conversations
+        return [avg_duration_s] * self.completed_conversations
+
+
+_HISTORY_BUCKET_INT_FIELDS = {
+    "bucket_start_s",
+    "sample_count",
+    "running_endpoints_last",
+    "warming_endpoints_last",
+    "transitioning_endpoints_last",
+    "parked_endpoints_last",
+    "connected_sessions_last",
+    "connected_sessions_max",
+    "pending_sessions_last",
+    "free_slots_last",
+    "effective_free_slots_last",
+    "router_active_sessions_last",
+    "healthy_samples",
+    "errors_count_last",
+    "session_requests",
+    "session_allocation_successes",
+    "session_allocation_failures",
+    "session_connected_events",
+    "session_disconnected_events",
+    "completed_conversations",
+}
+_HISTORY_BUCKET_FLOAT_FIELDS = {
+    "running_endpoints_sum",
+    "warming_endpoints_sum",
+    "transitioning_endpoints_sum",
+    "parked_endpoints_sum",
+    "connected_sessions_sum",
+    "pending_sessions_sum",
+    "free_slots_sum",
+    "effective_free_slots_sum",
+    "router_active_sessions_sum",
+    "errors_count_sum",
+    "completed_conversation_duration_total_s",
+    "completed_conversation_duration_max_s",
+}
+
+
+def _coerce_history_bucket_field(name: str, payload: dict[str, object]) -> object:
+    if name == "connected_sessions_max":
+        return max(
+            int(payload.get("connected_sessions_max", 0)),
+            int(payload.get("connected_sessions_last", 0)),
+        )
+    if name in _HISTORY_BUCKET_INT_FIELDS:
+        return int(payload.get(name, 0))
+    if name in _HISTORY_BUCKET_FLOAT_FIELDS:
+        return float(payload.get(name, 0.0))
+    if name == "healthy_last":
+        return bool(payload.get(name, False))
+    if name == "completed_conversation_duration_samples_s":
+        return [max(float(value), 0.0) for value in list(payload.get(name) or [])]
+    raise KeyError(f"Unknown SwarmHistoryBucket field: {name}")
+
+
+@dataclass
+class SwarmBucketAggregate:
+    sample_count: int = 0
+    running_endpoints_sum: float = 0.0
+    warming_endpoints_sum: float = 0.0
+    transitioning_endpoints_sum: float = 0.0
+    parked_endpoints_sum: float = 0.0
+    connected_sessions_sum: float = 0.0
+    connected_sessions_max: int = 0
+    pending_sessions_sum: float = 0.0
+    free_slots_sum: float = 0.0
+    effective_free_slots_sum: float = 0.0
+    router_active_sessions_sum: float = 0.0
+    healthy_samples: int = 0
+    errors_count_sum: float = 0.0
+    session_requests: int = 0
+    session_allocation_successes: int = 0
+    session_allocation_failures: int = 0
+    session_connected_events: int = 0
+    session_disconnected_events: int = 0
+    completed_conversations: int = 0
+    completed_conversation_duration_total_s: float = 0.0
+    completed_conversation_duration_max_s: float = 0.0
+    completed_conversation_duration_samples_s: list[float] = field(default_factory=list)
+    peak_running_endpoints: int = 0
+    active_conversation_minutes: float = 0.0
+
+    @classmethod
+    def from_buckets(cls, buckets: Iterable[SwarmHistoryBucket]) -> "SwarmBucketAggregate":
+        aggregate = cls()
+        for bucket in buckets:
+            aggregate.sample_count += bucket.sample_count
+            aggregate.running_endpoints_sum += bucket.running_endpoints_sum
+            aggregate.warming_endpoints_sum += bucket.warming_endpoints_sum
+            aggregate.transitioning_endpoints_sum += bucket.transitioning_endpoints_sum
+            aggregate.parked_endpoints_sum += bucket.parked_endpoints_sum
+            aggregate.connected_sessions_sum += bucket.connected_sessions_sum
+            aggregate.connected_sessions_max = max(aggregate.connected_sessions_max, bucket.connected_sessions_max)
+            aggregate.pending_sessions_sum += bucket.pending_sessions_sum
+            aggregate.free_slots_sum += bucket.free_slots_sum
+            aggregate.effective_free_slots_sum += bucket.effective_free_slots_sum
+            aggregate.router_active_sessions_sum += bucket.router_active_sessions_sum
+            aggregate.healthy_samples += bucket.healthy_samples
+            aggregate.errors_count_sum += bucket.errors_count_sum
+            aggregate.session_requests += bucket.session_requests
+            aggregate.session_allocation_successes += bucket.session_allocation_successes
+            aggregate.session_allocation_failures += bucket.session_allocation_failures
+            aggregate.session_connected_events += bucket.session_connected_events
+            aggregate.session_disconnected_events += bucket.session_disconnected_events
+            aggregate.completed_conversations += bucket.completed_conversations
+            aggregate.completed_conversation_duration_total_s += bucket.completed_conversation_duration_total_s
+            aggregate.completed_conversation_duration_max_s = max(
+                aggregate.completed_conversation_duration_max_s,
+                bucket.completed_conversation_duration_max_s,
+            )
+            aggregate.completed_conversation_duration_samples_s.extend(bucket.completed_duration_samples())
+            aggregate.peak_running_endpoints = max(aggregate.peak_running_endpoints, bucket.running_endpoints_last)
+            if bucket.sample_count:
+                aggregate.active_conversation_minutes += bucket.connected_sessions_sum / bucket.sample_count
+        return aggregate
+
+    def sample_average(self, value_sum: float) -> float:
+        return round(value_sum / self.sample_count, 2) if self.sample_count else 0.0
+
+    @property
+    def avg_conversation_duration_s(self) -> float:
+        if not self.completed_conversations:
+            return 0.0
+        return round(self.completed_conversation_duration_total_s / self.completed_conversations, 2)
+
+    @property
+    def median_conversation_duration_s(self) -> float:
+        return round(_median(self.completed_conversation_duration_samples_s), 2)
+
+    def as_summary_dict(self) -> dict[str, object]:
         return {
-            "bucket_start_s": self.bucket_start_s,
-            "sample_count": self.sample_count,
-            "running_endpoints_last": self.running_endpoints_last,
-            "running_endpoints_sum": self.running_endpoints_sum,
-            "warming_endpoints_last": self.warming_endpoints_last,
-            "warming_endpoints_sum": self.warming_endpoints_sum,
-            "transitioning_endpoints_last": self.transitioning_endpoints_last,
-            "transitioning_endpoints_sum": self.transitioning_endpoints_sum,
-            "parked_endpoints_last": self.parked_endpoints_last,
-            "parked_endpoints_sum": self.parked_endpoints_sum,
-            "connected_sessions_last": self.connected_sessions_last,
-            "connected_sessions_sum": self.connected_sessions_sum,
-            "connected_sessions_max": self.connected_sessions_max,
-            "pending_sessions_last": self.pending_sessions_last,
-            "pending_sessions_sum": self.pending_sessions_sum,
-            "free_slots_last": self.free_slots_last,
-            "free_slots_sum": self.free_slots_sum,
-            "effective_free_slots_last": self.effective_free_slots_last,
-            "effective_free_slots_sum": self.effective_free_slots_sum,
-            "router_active_sessions_last": self.router_active_sessions_last,
-            "router_active_sessions_sum": self.router_active_sessions_sum,
-            "healthy_last": self.healthy_last,
-            "healthy_samples": self.healthy_samples,
-            "errors_count_last": self.errors_count_last,
-            "errors_count_sum": self.errors_count_sum,
             "session_requests": self.session_requests,
             "session_allocation_successes": self.session_allocation_successes,
             "session_allocation_failures": self.session_allocation_failures,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
-            "completed_conversation_duration_total_s": self.completed_conversation_duration_total_s,
-            "completed_conversation_duration_max_s": self.completed_conversation_duration_max_s,
-            "completed_conversation_duration_samples_s": self.completed_conversation_duration_samples_s,
+            "active_conversation_minutes": round(self.active_conversation_minutes, 2),
+            "active_conversation_hours": round(self.active_conversation_minutes / 60.0, 2),
+            "active_conversation_days": round(self.active_conversation_minutes / (24.0 * 60.0), 3),
+            "avg_conversation_duration_s": self.avg_conversation_duration_s,
+            "max_conversation_duration_s": round(self.completed_conversation_duration_max_s, 2),
+            "peak_connected_sessions": self.connected_sessions_max,
+            "peak_running_endpoints": self.peak_running_endpoints,
         }
 
-    @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "SwarmHistoryBucket":
-        return cls(
-            bucket_start_s=int(payload.get("bucket_start_s", 0)),
-            sample_count=int(payload.get("sample_count", 0)),
-            running_endpoints_last=int(payload.get("running_endpoints_last", 0)),
-            running_endpoints_sum=float(payload.get("running_endpoints_sum", 0.0)),
-            warming_endpoints_last=int(payload.get("warming_endpoints_last", 0)),
-            warming_endpoints_sum=float(payload.get("warming_endpoints_sum", 0.0)),
-            transitioning_endpoints_last=int(payload.get("transitioning_endpoints_last", 0)),
-            transitioning_endpoints_sum=float(payload.get("transitioning_endpoints_sum", 0.0)),
-            parked_endpoints_last=int(payload.get("parked_endpoints_last", 0)),
-            parked_endpoints_sum=float(payload.get("parked_endpoints_sum", 0.0)),
-            connected_sessions_last=int(payload.get("connected_sessions_last", 0)),
-            connected_sessions_sum=float(payload.get("connected_sessions_sum", 0.0)),
-            connected_sessions_max=max(
-                int(payload.get("connected_sessions_max", 0)),
-                int(payload.get("connected_sessions_last", 0)),
-            ),
-            pending_sessions_last=int(payload.get("pending_sessions_last", 0)),
-            pending_sessions_sum=float(payload.get("pending_sessions_sum", 0.0)),
-            free_slots_last=int(payload.get("free_slots_last", 0)),
-            free_slots_sum=float(payload.get("free_slots_sum", 0.0)),
-            effective_free_slots_last=int(payload.get("effective_free_slots_last", 0)),
-            effective_free_slots_sum=float(payload.get("effective_free_slots_sum", 0.0)),
-            router_active_sessions_last=int(payload.get("router_active_sessions_last", 0)),
-            router_active_sessions_sum=float(payload.get("router_active_sessions_sum", 0.0)),
-            healthy_last=bool(payload.get("healthy_last", False)),
-            healthy_samples=int(payload.get("healthy_samples", 0)),
-            errors_count_last=int(payload.get("errors_count_last", 0)),
-            errors_count_sum=float(payload.get("errors_count_sum", 0.0)),
-            session_requests=int(payload.get("session_requests", 0)),
-            session_allocation_successes=int(payload.get("session_allocation_successes", 0)),
-            session_allocation_failures=int(payload.get("session_allocation_failures", 0)),
-            session_connected_events=int(payload.get("session_connected_events", 0)),
-            session_disconnected_events=int(payload.get("session_disconnected_events", 0)),
-            completed_conversations=int(payload.get("completed_conversations", 0)),
-            completed_conversation_duration_total_s=float(
-                payload.get("completed_conversation_duration_total_s", 0.0)
-            ),
-            completed_conversation_duration_max_s=float(
-                payload.get("completed_conversation_duration_max_s", 0.0)
-            ),
-            completed_conversation_duration_samples_s=[
-                max(float(value), 0.0)
-                for value in list(payload.get("completed_conversation_duration_samples_s") or [])
-            ],
-        )
+    def as_hourly_point(self, timestamp_s: int) -> dict[str, object]:
+        return {
+            "timestamp": _isoformat(timestamp_s),
+            "running_endpoints": self.sample_average(self.running_endpoints_sum),
+            "warming_endpoints": self.sample_average(self.warming_endpoints_sum),
+            "transitioning_endpoints": self.sample_average(self.transitioning_endpoints_sum),
+            "parked_endpoints": self.sample_average(self.parked_endpoints_sum),
+            "connected_sessions": self.sample_average(self.connected_sessions_sum),
+            "pending_sessions": self.sample_average(self.pending_sessions_sum),
+            "free_slots": self.sample_average(self.free_slots_sum),
+            "effective_free_slots": self.sample_average(self.effective_free_slots_sum),
+            "router_active_sessions": self.sample_average(self.router_active_sessions_sum),
+            "errors_count": self.sample_average(self.errors_count_sum),
+            "healthy": (self.healthy_samples / self.sample_count) >= 0.5 if self.sample_count else False,
+            "session_requests": self.session_requests,
+            "session_allocation_successes": self.session_allocation_successes,
+            "session_allocation_failures": self.session_allocation_failures,
+            "session_connected_events": self.session_connected_events,
+            "session_disconnected_events": self.session_disconnected_events,
+            "completed_conversations": self.completed_conversations,
+            "avg_conversation_duration_s": self.avg_conversation_duration_s,
+            "avg_conversation_duration_min": round(self.avg_conversation_duration_s / 60.0, 2),
+            "max_conversation_duration_s": round(self.completed_conversation_duration_max_s, 2),
+            "max_conversation_duration_min": round(self.completed_conversation_duration_max_s / 60.0, 2),
+        }
+
+    def as_rolling_fields(self, label: str) -> dict[str, object]:
+        return {
+            f"completed_conversations_{label}": self.completed_conversations,
+            f"active_conversation_minutes_{label}": round(self.active_conversation_minutes, 2),
+            f"active_conversation_hours_{label}": round(self.active_conversation_minutes / 60.0, 2),
+            f"active_conversation_days_{label}": round(self.active_conversation_minutes / (24.0 * 60.0), 3),
+            f"avg_conversation_duration_s_{label}": self.avg_conversation_duration_s,
+            f"avg_conversation_duration_min_{label}": round(self.avg_conversation_duration_s / 60.0, 2),
+            f"connected_sessions_avg_{label}": self.sample_average(self.connected_sessions_sum),
+            f"connected_sessions_max_{label}": self.connected_sessions_max,
+            f"median_conversation_duration_s_{label}": self.median_conversation_duration_s,
+            f"median_conversation_duration_min_{label}": round(self.median_conversation_duration_s / 60.0, 2),
+        }
 
 
 
@@ -592,35 +725,6 @@ class SwarmDashboard:
 
         minute_starts = list(range(context_start_bucket, end_bucket + 1, 60))
         bucket_sequence = [minute_map.get(bucket_start_s) for bucket_start_s in minute_starts]
-        completed_prefix = [0]
-        duration_prefix = [0.0]
-        connected_sum_prefix = [0.0]
-        sample_count_prefix = [0]
-        active_conversation_minutes_prefix = [0.0]
-        connected_max_values = []
-        for bucket in bucket_sequence:
-            completed_prefix.append(
-                completed_prefix[-1] + (bucket.completed_conversations if bucket is not None else 0)
-            )
-            duration_prefix.append(
-                duration_prefix[-1]
-                + (bucket.completed_conversation_duration_total_s if bucket is not None else 0.0)
-            )
-            connected_sum_prefix.append(
-                connected_sum_prefix[-1] + (bucket.connected_sessions_sum if bucket is not None else 0.0)
-            )
-            sample_count_prefix.append(
-                sample_count_prefix[-1] + (bucket.sample_count if bucket is not None else 0)
-            )
-            active_conversation_minutes_prefix.append(
-                active_conversation_minutes_prefix[-1]
-                + (
-                    bucket.connected_sessions_sum / bucket.sample_count
-                    if bucket is not None and bucket.sample_count
-                    else 0.0
-                )
-            )
-            connected_max_values.append(bucket.connected_sessions_max if bucket is not None else 0)
 
         def range_indices(start_s: int, end_s: int) -> tuple[int, int] | None:
             if start_s > end_bucket or end_s < context_start_bucket:
@@ -632,29 +736,12 @@ class SwarmDashboard:
                 int((bounded_end_s - context_start_bucket) // 60),
             )
 
-        def range_sum(prefix: list[int] | list[float], start_s: int, end_s: int) -> int | float:
-            indices = range_indices(start_s, end_s)
-            if indices is None:
-                return 0
-            start_index, end_index = indices
-            return prefix[end_index + 1] - prefix[start_index]
-
-        def range_connected_max(start_s: int, end_s: int) -> int:
-            indices = range_indices(start_s, end_s)
-            if indices is None:
-                return 0
-            start_index, end_index = indices
-            return max(connected_max_values[start_index : end_index + 1], default=0)
-
-        def range_duration_samples(start_s: int, end_s: int) -> list[float]:
+        def range_buckets(start_s: int, end_s: int) -> list[SwarmHistoryBucket]:
             indices = range_indices(start_s, end_s)
             if indices is None:
                 return []
             start_index, end_index = indices
-            samples = []
-            for bucket in bucket_sequence[start_index : end_index + 1]:
-                samples.extend(self._completed_duration_samples_for_bucket(bucket))
-            return samples
+            return [bucket for bucket in bucket_sequence[start_index : end_index + 1] if bucket is not None]
 
         step_s = 60 if resolution == "minute" else 3600
         first_point_s = start_bucket if resolution == "minute" else _bucket_start_epoch_s(start_bucket, 60)
@@ -664,31 +751,8 @@ class SwarmDashboard:
             point: dict[str, object] = {"timestamp": _isoformat(point_start_s)}
             for label, minutes in ROLLING_VIEW_WINDOWS:
                 window_start_s = point_end_s - (minutes - 1) * 60
-                completed = int(range_sum(completed_prefix, window_start_s, point_end_s))
-                duration_total_s = float(range_sum(duration_prefix, window_start_s, point_end_s))
-                connected_sum = float(range_sum(connected_sum_prefix, window_start_s, point_end_s))
-                sample_count = int(range_sum(sample_count_prefix, window_start_s, point_end_s))
-                active_conversation_minutes = float(
-                    range_sum(active_conversation_minutes_prefix, window_start_s, point_end_s)
-                )
-                median_duration_s = self._median(range_duration_samples(window_start_s, point_end_s))
-
-                point[f"completed_conversations_{label}"] = completed
-                point[f"active_conversation_minutes_{label}"] = round(active_conversation_minutes, 2)
-                point[f"active_conversation_hours_{label}"] = round(active_conversation_minutes / 60.0, 2)
-                point[f"active_conversation_days_{label}"] = round(active_conversation_minutes / (24.0 * 60.0), 3)
-                point[f"avg_conversation_duration_s_{label}"] = (
-                    round(duration_total_s / completed, 2) if completed else 0.0
-                )
-                point[f"avg_conversation_duration_min_{label}"] = (
-                    round((duration_total_s / completed) / 60.0, 2) if completed else 0.0
-                )
-                point[f"connected_sessions_avg_{label}"] = (
-                    round(connected_sum / sample_count, 2) if sample_count else 0.0
-                )
-                point[f"connected_sessions_max_{label}"] = range_connected_max(window_start_s, point_end_s)
-                point[f"median_conversation_duration_s_{label}"] = round(median_duration_s, 2)
-                point[f"median_conversation_duration_min_{label}"] = round(median_duration_s / 60.0, 2)
+                aggregate = self._aggregate_buckets(range_buckets(window_start_s, point_end_s))
+                point.update(aggregate.as_rolling_fields(label))
             points.append(point)
 
         return points
@@ -754,23 +818,6 @@ class SwarmDashboard:
             self._prune_unlocked(now)
             self._schedule_flush_unlocked(include_open_bucket=False)
 
-    def _completed_duration_samples_for_bucket(self, bucket: Optional[SwarmHistoryBucket]) -> list[float]:
-        if bucket is None or bucket.completed_conversations <= 0:
-            return []
-        if bucket.completed_conversation_duration_samples_s:
-            return bucket.completed_conversation_duration_samples_s
-        avg_duration_s = bucket.completed_conversation_duration_total_s / bucket.completed_conversations
-        return [avg_duration_s] * bucket.completed_conversations
-
-    def _median(self, values: list[float]) -> float:
-        if not values:
-            return 0.0
-        sorted_values = sorted(values)
-        middle = len(sorted_values) // 2
-        if len(sorted_values) % 2:
-            return sorted_values[middle]
-        return (sorted_values[middle - 1] + sorted_values[middle]) / 2.0
-
     def _get_bucket_unlocked(self, epoch_s: float) -> SwarmHistoryBucket:
         bucket_start_s = _bucket_start_epoch_s(epoch_s, 1)
         bucket = self._history.get(bucket_start_s)
@@ -788,41 +835,14 @@ class SwarmDashboard:
             self._history.popitem(last=False)
             self._dirty_bucket_starts.discard(oldest_key)
 
+    def _aggregate_buckets(self, buckets: Iterable[SwarmHistoryBucket]) -> SwarmBucketAggregate:
+        return SwarmBucketAggregate.from_buckets(buckets)
+
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()
         min_bucket = _bucket_start_epoch_s(now, 1) - (window_minutes - 1) * 60
         selected = [bucket for bucket in minute_buckets if bucket.bucket_start_s >= min_bucket]
-        completed_conversations = sum(bucket.completed_conversations for bucket in selected)
-        completed_conversation_duration_total_s = sum(
-            bucket.completed_conversation_duration_total_s for bucket in selected
-        )
-        active_conversation_minutes = sum(
-            bucket.connected_sessions_sum / bucket.sample_count
-            for bucket in selected
-            if bucket.sample_count
-        )
-        return {
-            "session_requests": sum(bucket.session_requests for bucket in selected),
-            "session_allocation_successes": sum(bucket.session_allocation_successes for bucket in selected),
-            "session_allocation_failures": sum(bucket.session_allocation_failures for bucket in selected),
-            "session_connected_events": sum(bucket.session_connected_events for bucket in selected),
-            "session_disconnected_events": sum(bucket.session_disconnected_events for bucket in selected),
-            "completed_conversations": completed_conversations,
-            "active_conversation_minutes": round(active_conversation_minutes, 2),
-            "active_conversation_hours": round(active_conversation_minutes / 60.0, 2),
-            "active_conversation_days": round(active_conversation_minutes / (24.0 * 60.0), 3),
-            "avg_conversation_duration_s": (
-                round(completed_conversation_duration_total_s / completed_conversations, 2)
-                if completed_conversations
-                else 0.0
-            ),
-            "max_conversation_duration_s": round(
-                max((bucket.completed_conversation_duration_max_s for bucket in selected), default=0.0),
-                2,
-            ),
-            "peak_connected_sessions": max((bucket.connected_sessions_last for bucket in selected), default=0),
-            "peak_running_endpoints": max((bucket.running_endpoints_last for bucket in selected), default=0),
-        }
+        return self._aggregate_buckets(selected).as_summary_dict()
 
     def _aggregate_hourly(
         self,
@@ -842,105 +862,7 @@ class SwarmDashboard:
             ]
             minute_buckets = [bucket for bucket in minute_buckets if bucket is not None]
 
-            sample_count = sum(bucket.sample_count for bucket in minute_buckets)
-            if sample_count == 0:
-                point = {
-                    "timestamp": _isoformat(current_hour_s),
-                    "running_endpoints": 0.0,
-                    "warming_endpoints": 0.0,
-                    "transitioning_endpoints": 0.0,
-                    "parked_endpoints": 0.0,
-                    "connected_sessions": 0.0,
-                    "pending_sessions": 0.0,
-                    "free_slots": 0.0,
-                    "effective_free_slots": 0.0,
-                    "router_active_sessions": 0.0,
-                    "errors_count": 0.0,
-                    "healthy": False,
-                    "session_requests": 0,
-                    "session_allocation_successes": 0,
-                    "session_allocation_failures": 0,
-                    "session_connected_events": 0,
-                    "session_disconnected_events": 0,
-                    "completed_conversations": 0,
-                    "avg_conversation_duration_s": 0.0,
-                    "avg_conversation_duration_min": 0.0,
-                    "max_conversation_duration_s": 0.0,
-                    "max_conversation_duration_min": 0.0,
-                }
-            else:
-                completed_conversations = sum(bucket.completed_conversations for bucket in minute_buckets)
-                completed_conversation_duration_total_s = sum(
-                    bucket.completed_conversation_duration_total_s for bucket in minute_buckets
-                )
-                point = {
-                    "timestamp": _isoformat(current_hour_s),
-                    "running_endpoints": round(
-                        sum(bucket.running_endpoints_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "warming_endpoints": round(
-                        sum(bucket.warming_endpoints_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "transitioning_endpoints": round(
-                        sum(bucket.transitioning_endpoints_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "parked_endpoints": round(
-                        sum(bucket.parked_endpoints_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "connected_sessions": round(
-                        sum(bucket.connected_sessions_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "pending_sessions": round(
-                        sum(bucket.pending_sessions_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "free_slots": round(
-                        sum(bucket.free_slots_sum for bucket in minute_buckets) / sample_count,
-                        2,
-                    ),
-                    "effective_free_slots": round(
-                        sum(bucket.effective_free_slots_sum for bucket in minute_buckets) / sample_count,
-                        2,
-                    ),
-                    "router_active_sessions": round(
-                        sum(bucket.router_active_sessions_sum for bucket in minute_buckets) / sample_count,
-                        2,
-                    ),
-                    "errors_count": round(
-                        sum(bucket.errors_count_sum for bucket in minute_buckets) / sample_count,
-                        2,
-                    ),
-                    "healthy": (sum(bucket.healthy_samples for bucket in minute_buckets) / sample_count) >= 0.5,
-                    "session_requests": sum(bucket.session_requests for bucket in minute_buckets),
-                    "session_allocation_successes": sum(
-                        bucket.session_allocation_successes for bucket in minute_buckets
-                    ),
-                    "session_allocation_failures": sum(
-                        bucket.session_allocation_failures for bucket in minute_buckets
-                    ),
-                    "session_connected_events": sum(bucket.session_connected_events for bucket in minute_buckets),
-                    "session_disconnected_events": sum(
-                        bucket.session_disconnected_events for bucket in minute_buckets
-                    ),
-                    "completed_conversations": completed_conversations,
-                    "avg_conversation_duration_s": round(
-                        completed_conversation_duration_total_s / completed_conversations,
-                        2,
-                    ) if completed_conversations else 0.0,
-                    "avg_conversation_duration_min": round(
-                        (completed_conversation_duration_total_s / completed_conversations) / 60.0,
-                        2,
-                    ) if completed_conversations else 0.0,
-                    "max_conversation_duration_s": round(
-                        max((bucket.completed_conversation_duration_max_s for bucket in minute_buckets), default=0.0),
-                        2,
-                    ),
-                    "max_conversation_duration_min": round(
-                        max((bucket.completed_conversation_duration_max_s for bucket in minute_buckets), default=0.0)
-                        / 60.0,
-                        2,
-                    ),
-                }
-            points.append(point)
+            points.append(self._aggregate_buckets(minute_buckets).as_hourly_point(current_hour_s))
             current_hour_s += 3600
 
         return points
@@ -1582,73 +1504,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       <button class="toggle" data-resolution="hour">Hour</button>
     </div>
 
-    <section class="rolling-grid">
-      <div class="panel card">
-        <div class="label">Rolling / Conversations</div>
-        <h2>Completed Conversations</h2>
-        <div class="legend">
-          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="completed_conversations_1h" aria-pressed="true">1h total</button>
-          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="completed_conversations_6h" aria-pressed="true">6h total</button>
-          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="completed_conversations_24h" aria-pressed="true">24h total</button>
-        </div>
-        <div class="chart-shell"><canvas id="rolling-conversations-chart" width="720" height="260"></canvas></div>
-      </div>
-
-      <div class="panel card">
-        <div class="label">Rolling / Workload</div>
-        <h2>Conversation Days Served</h2>
-        <div class="legend">
-          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="active_conversation_days_1h" aria-pressed="true">1h sum</button>
-          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="active_conversation_days_6h" aria-pressed="true">6h sum</button>
-          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="active_conversation_days_24h" aria-pressed="true">24h sum</button>
-        </div>
-        <div class="chart-shell"><canvas id="rolling-active-days-chart" width="720" height="260"></canvas></div>
-      </div>
-
-      <div class="panel card">
-        <div class="label">Rolling / Duration</div>
-        <h2>Average Duration</h2>
-        <div class="legend">
-          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="avg_conversation_duration_min_1h" aria-pressed="true">1h avg</button>
-          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="avg_conversation_duration_min_6h" aria-pressed="true">6h avg</button>
-          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="avg_conversation_duration_min_24h" aria-pressed="true">24h avg</button>
-        </div>
-        <div class="chart-shell"><canvas id="rolling-duration-chart" width="720" height="260"></canvas></div>
-      </div>
-
-      <div class="panel card">
-        <div class="label">Rolling / Users</div>
-        <h2>Connected Users</h2>
-        <div class="legend">
-          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="connected_sessions_avg_1h" aria-pressed="true">1h avg</button>
-          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="connected_sessions_avg_6h" aria-pressed="true">6h avg</button>
-          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="connected_sessions_avg_24h" aria-pressed="true">24h avg</button>
-        </div>
-        <div class="chart-shell"><canvas id="rolling-users-chart" width="720" height="260"></canvas></div>
-      </div>
-
-      <div class="panel card">
-        <div class="label">Rolling / Users</div>
-        <h2>Maximum Connected Users</h2>
-        <div class="legend">
-          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="connected_sessions_max_1h" aria-pressed="true">1h max</button>
-          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="connected_sessions_max_6h" aria-pressed="true">6h max</button>
-          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="connected_sessions_max_24h" aria-pressed="true">24h max</button>
-        </div>
-        <div class="chart-shell"><canvas id="rolling-max-users-chart" width="720" height="260"></canvas></div>
-      </div>
-
-      <div class="panel card">
-        <div class="label">Rolling / Duration</div>
-        <h2>Median Duration</h2>
-        <div class="legend">
-          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="median_conversation_duration_min_1h" aria-pressed="true">1h median</button>
-          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="median_conversation_duration_min_6h" aria-pressed="true">6h median</button>
-          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="median_conversation_duration_min_24h" aria-pressed="true">24h median</button>
-        </div>
-        <div class="chart-shell"><canvas id="rolling-median-duration-chart" width="720" height="260"></canvas></div>
-      </div>
-    </section>
+    <section class="rolling-grid" id="rolling-charts"></section>
 
     <section class="kpis" id="kpis"></section>
 
@@ -1730,38 +1586,68 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     let refreshHandle = null;
     let latestDashboardPayload = null;
     const hiddenSeries = new Set();
-    const rollingChartConfigs = {
-      conversations: [
-        { key: 'completed_conversations_1h', color: '#0b5cab' },
-        { key: 'completed_conversations_6h', color: '#117a65' },
-        { key: 'completed_conversations_24h', color: '#d9822b' },
-      ],
-      activeDays: [
-        { key: 'active_conversation_days_1h', color: '#0b5cab' },
-        { key: 'active_conversation_days_6h', color: '#117a65' },
-        { key: 'active_conversation_days_24h', color: '#d9822b' },
-      ],
-      duration: [
-        { key: 'avg_conversation_duration_min_1h', color: '#0b5cab' },
-        { key: 'avg_conversation_duration_min_6h', color: '#117a65' },
-        { key: 'avg_conversation_duration_min_24h', color: '#d9822b' },
-      ],
-      users: [
-        { key: 'connected_sessions_avg_1h', color: '#0b5cab' },
-        { key: 'connected_sessions_avg_6h', color: '#117a65' },
-        { key: 'connected_sessions_avg_24h', color: '#d9822b' },
-      ],
-      maxUsers: [
-        { key: 'connected_sessions_max_1h', color: '#0b5cab' },
-        { key: 'connected_sessions_max_6h', color: '#117a65' },
-        { key: 'connected_sessions_max_24h', color: '#d9822b' },
-      ],
-      medianDuration: [
-        { key: 'median_conversation_duration_min_1h', color: '#0b5cab' },
-        { key: 'median_conversation_duration_min_6h', color: '#117a65' },
-        { key: 'median_conversation_duration_min_24h', color: '#d9822b' },
-      ],
-    };
+    const rollingCharts = [
+      {
+        label: 'Rolling / Conversations',
+        title: 'Completed Conversations',
+        canvasId: 'rolling-conversations-chart',
+        series: [
+          { key: 'completed_conversations_1h', label: '1h total', color: '#0b5cab' },
+          { key: 'completed_conversations_6h', label: '6h total', color: '#117a65' },
+          { key: 'completed_conversations_24h', label: '24h total', color: '#d9822b' },
+        ],
+      },
+      {
+        label: 'Rolling / Workload',
+        title: 'Conversation Days Served',
+        canvasId: 'rolling-active-days-chart',
+        series: [
+          { key: 'active_conversation_days_1h', label: '1h sum', color: '#0b5cab' },
+          { key: 'active_conversation_days_6h', label: '6h sum', color: '#117a65' },
+          { key: 'active_conversation_days_24h', label: '24h sum', color: '#d9822b' },
+        ],
+      },
+      {
+        label: 'Rolling / Duration',
+        title: 'Average Duration',
+        canvasId: 'rolling-duration-chart',
+        series: [
+          { key: 'avg_conversation_duration_min_1h', label: '1h avg', color: '#0b5cab' },
+          { key: 'avg_conversation_duration_min_6h', label: '6h avg', color: '#117a65' },
+          { key: 'avg_conversation_duration_min_24h', label: '24h avg', color: '#d9822b' },
+        ],
+      },
+      {
+        label: 'Rolling / Users',
+        title: 'Connected Users',
+        canvasId: 'rolling-users-chart',
+        series: [
+          { key: 'connected_sessions_avg_1h', label: '1h avg', color: '#0b5cab' },
+          { key: 'connected_sessions_avg_6h', label: '6h avg', color: '#117a65' },
+          { key: 'connected_sessions_avg_24h', label: '24h avg', color: '#d9822b' },
+        ],
+      },
+      {
+        label: 'Rolling / Users',
+        title: 'Maximum Connected Users',
+        canvasId: 'rolling-max-users-chart',
+        series: [
+          { key: 'connected_sessions_max_1h', label: '1h max', color: '#0b5cab' },
+          { key: 'connected_sessions_max_6h', label: '6h max', color: '#117a65' },
+          { key: 'connected_sessions_max_24h', label: '24h max', color: '#d9822b' },
+        ],
+      },
+      {
+        label: 'Rolling / Duration',
+        title: 'Median Duration',
+        canvasId: 'rolling-median-duration-chart',
+        series: [
+          { key: 'median_conversation_duration_min_1h', label: '1h median', color: '#0b5cab' },
+          { key: 'median_conversation_duration_min_6h', label: '6h median', color: '#117a65' },
+          { key: 'median_conversation_duration_min_24h', label: '24h median', color: '#d9822b' },
+        ],
+      },
+    ];
 
     function prettyNumber(value) {
       const numeric = Number(value || 0);
@@ -1827,6 +1713,27 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       return seriesConfig.filter((series) => !hiddenSeries.has(series.key));
     }
 
+    function renderRollingChartCards() {
+      document.getElementById('rolling-charts').innerHTML = rollingCharts.map((chart) => `
+        <div class="panel card">
+          <div class="label">${htmlEscape(chart.label)}</div>
+          <h2>${htmlEscape(chart.title)}</h2>
+          <div class="legend">
+            ${chart.series.map((series) => `
+              <button
+                class="legend-toggle"
+                type="button"
+                style="color: ${series.color}"
+                data-series-toggle="${htmlEscape(series.key)}"
+                aria-pressed="true"
+              >${htmlEscape(series.label)}</button>
+            `).join('')}
+          </div>
+          <div class="chart-shell"><canvas id="${htmlEscape(chart.canvasId)}" width="720" height="260"></canvas></div>
+        </div>
+      `).join('');
+    }
+
     function updateLegendToggles() {
       for (const button of document.querySelectorAll('[data-series-toggle]')) {
         const hidden = hiddenSeries.has(button.dataset.seriesToggle);
@@ -1836,36 +1743,13 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     }
 
     function drawRollingCharts(rollingSeries) {
-      drawChart(
-        document.getElementById('rolling-conversations-chart'),
-        rollingSeries,
-        activeSeries(rollingChartConfigs.conversations),
-      );
-      drawChart(
-        document.getElementById('rolling-active-days-chart'),
-        rollingSeries,
-        activeSeries(rollingChartConfigs.activeDays),
-      );
-      drawChart(
-        document.getElementById('rolling-duration-chart'),
-        rollingSeries,
-        activeSeries(rollingChartConfigs.duration),
-      );
-      drawChart(
-        document.getElementById('rolling-users-chart'),
-        rollingSeries,
-        activeSeries(rollingChartConfigs.users),
-      );
-      drawChart(
-        document.getElementById('rolling-max-users-chart'),
-        rollingSeries,
-        activeSeries(rollingChartConfigs.maxUsers),
-      );
-      drawChart(
-        document.getElementById('rolling-median-duration-chart'),
-        rollingSeries,
-        activeSeries(rollingChartConfigs.medianDuration),
-      );
+      for (const chart of rollingCharts) {
+        drawChart(
+          document.getElementById(chart.canvasId),
+          rollingSeries,
+          activeSeries(chart.series),
+        );
+      }
     }
 
     function kpiCard(label, value, detail) {
@@ -2317,6 +2201,8 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         loadDashboard().catch((error) => console.error(error));
       });
     });
+
+    renderRollingChartCards();
 
     document.querySelectorAll('[data-series-toggle]').forEach((button) => {
       button.addEventListener('click', () => {

@@ -77,14 +77,15 @@ class SlowHistoryStore(FakeHistoryStore):
 
 
 class FakeBucketItem:
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, xet_hash: str | None = None):
         self.path = path
-        self.xet_hash = path
+        self.xet_hash = xet_hash
 
 
 class FakeBucketApi:
-    def __init__(self, files: dict[str, dict[str, object]]):
+    def __init__(self, files: dict[str, dict[str, object]], *, missing_xet_hash_paths: set[str] | None = None):
         self.files = files
+        self.missing_xet_hash_paths = set(missing_xet_hash_paths or [])
         self.list_prefixes = []
         self.downloads = []
         self.batch_adds = []
@@ -94,7 +95,7 @@ class FakeBucketApi:
     def list_bucket_tree(self, bucket_id, *, prefix=None, recursive=None, token=None):
         self.list_prefixes.append(prefix)
         return [
-            FakeBucketItem(path)
+            FakeBucketItem(path, xet_hash=None if path in self.missing_xet_hash_paths else path)
             for path in sorted(self.files)
             if prefix is None or path.startswith(prefix)
         ]
@@ -255,6 +256,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["summary"]["active_conversation_hours_window"], 0.03)
         self.assertEqual(payload["summary"]["active_conversation_days_window"], 0.001)
         self.assertEqual(payload["summary"]["avg_conversation_duration_window_s"], 150.0)
+        self.assertEqual(payload["summary"]["peak_connected_sessions_window"], 2)
 
     async def test_hourly_series_averages_state_metrics_and_sums_events(self):
         clock = FakeClock(3 * 3600)
@@ -336,6 +338,50 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["completed_conversations"], 1)
         self.assertEqual(point["avg_conversation_duration_s"], 600.0)
         self.assertEqual(point["max_conversation_duration_min"], 10.0)
+
+    def test_dashboard_html_generates_rolling_charts_from_descriptors(self):
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=0,
+                waking=0,
+                free_slots=0,
+                effective_free_slots=0,
+            )),
+        )
+
+        html = dashboard.html()
+
+        self.assertIn('id="rolling-charts"', html)
+        self.assertIn("const rollingCharts = [", html)
+        self.assertIn("Maximum Connected Users", html)
+        self.assertIn("Median Duration", html)
+        self.assertIn("renderRollingChartCards();", html)
+
+    async def test_summary_peak_connected_sessions_uses_bucket_max(self):
+        now_s = 6 * 3600
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=0,
+                waking=0,
+                free_slots=0,
+                effective_free_slots=0,
+            )),
+            time_fn=FakeClock(now_s).now,
+        )
+        bucket = SwarmHistoryBucket(bucket_start_s=now_s)
+        bucket.sample_count = 2
+        bucket.connected_sessions_last = 1
+        bucket.connected_sessions_sum = 6
+        bucket.connected_sessions_max = 5
+        dashboard._history[bucket.bucket_start_s] = bucket
+
+        summary = await dashboard.summary(window_minutes=60, requested_window="1h")
+
+        self.assertEqual(summary["peak_connected_sessions_window"], 5)
 
     async def test_rolling_series_reports_conversation_and_connected_user_windows(self):
         now_s = 48 * 3600
@@ -924,6 +970,34 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
                 f"reachy-s2s-lb/minutes/{day_start + 60}.json",
             ],
         )
+
+    def test_migrate_legacy_minute_files_uploads_files_without_xet_hash(self):
+        day_start = _day_start(2026, 5, 18)
+        legacy_path = f"reachy-s2s-lb/minutes/{day_start}.json"
+        target_path = f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json"
+        bucket = SwarmHistoryBucket(bucket_start_s=day_start)
+        api = FakeBucketApi(
+            {
+                legacy_path: {
+                    "version": 1,
+                    "bucket": bucket.to_dict(),
+                },
+            },
+            missing_xet_hash_paths={legacy_path},
+        )
+        store = _bucket_store(api)
+
+        result = store.migrate_legacy_minute_files(
+            start_epoch_s=day_start,
+            end_epoch_s=day_start,
+        )
+
+        self.assertEqual(result["moved_minute_files"], 1)
+        self.assertEqual([remote_path for remote_path, _ in api.downloads], [legacy_path])
+        self.assertEqual(api.batch_adds[0][1], target_path)
+        self.assertEqual(api.batch_deletes, [legacy_path])
+        self.assertNotIn(legacy_path, api.files)
+        self.assertIn(target_path, api.files)
 
     def test_migrate_legacy_minute_files_deletes_existing_sharded_duplicates(self):
         day_start = _day_start(2026, 5, 18)
