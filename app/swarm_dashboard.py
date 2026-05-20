@@ -751,7 +751,7 @@ class SwarmDashboard:
             point: dict[str, object] = {"timestamp": _isoformat(point_start_s)}
             for label, minutes in ROLLING_VIEW_WINDOWS:
                 window_start_s = point_end_s - (minutes - 1) * 60
-                aggregate = self._aggregate_buckets(range_buckets(window_start_s, point_end_s))
+                aggregate = SwarmBucketAggregate.from_buckets(range_buckets(window_start_s, point_end_s))
                 point.update(aggregate.as_rolling_fields(label))
             points.append(point)
 
@@ -835,14 +835,11 @@ class SwarmDashboard:
             self._history.popitem(last=False)
             self._dirty_bucket_starts.discard(oldest_key)
 
-    def _aggregate_buckets(self, buckets: Iterable[SwarmHistoryBucket]) -> SwarmBucketAggregate:
-        return SwarmBucketAggregate.from_buckets(buckets)
-
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()
         min_bucket = _bucket_start_epoch_s(now, 1) - (window_minutes - 1) * 60
         selected = [bucket for bucket in minute_buckets if bucket.bucket_start_s >= min_bucket]
-        return self._aggregate_buckets(selected).as_summary_dict()
+        return SwarmBucketAggregate.from_buckets(selected).as_summary_dict()
 
     def _aggregate_hourly(
         self,
@@ -862,7 +859,7 @@ class SwarmDashboard:
             ]
             minute_buckets = [bucket for bucket in minute_buckets if bucket is not None]
 
-            points.append(self._aggregate_buckets(minute_buckets).as_hourly_point(current_hour_s))
+            points.append(SwarmBucketAggregate.from_buckets(minute_buckets).as_hourly_point(current_hour_s))
             current_hour_s += 3600
 
         return points
