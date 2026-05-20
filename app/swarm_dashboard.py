@@ -476,6 +476,7 @@ class SwarmDashboard:
             "conversations_completed_window": selected["completed_conversations"],
             "active_conversation_minutes_window": selected["active_conversation_minutes"],
             "active_conversation_hours_window": selected["active_conversation_hours"],
+            "active_conversation_days_window": selected["active_conversation_days"],
             "avg_conversation_duration_window_s": selected["avg_conversation_duration_s"],
             "avg_conversation_duration_window_min": round(selected["avg_conversation_duration_s"] / 60.0, 2),
             "max_conversation_duration_window_s": selected["max_conversation_duration_s"],
@@ -607,6 +608,7 @@ class SwarmDashboard:
                 point[f"completed_conversations_{label}"] = completed
                 point[f"active_conversation_minutes_{label}"] = round(active_conversation_minutes, 2)
                 point[f"active_conversation_hours_{label}"] = round(active_conversation_minutes / 60.0, 2)
+                point[f"active_conversation_days_{label}"] = round(active_conversation_minutes / (24.0 * 60.0), 3)
                 point[f"avg_conversation_duration_s_{label}"] = (
                     round(duration_total_s / completed, 2) if completed else 0.0
                 )
@@ -709,6 +711,7 @@ class SwarmDashboard:
             "completed_conversations": completed_conversations,
             "active_conversation_minutes": round(active_conversation_minutes, 2),
             "active_conversation_hours": round(active_conversation_minutes / 60.0, 2),
+            "active_conversation_days": round(active_conversation_minutes / (24.0 * 60.0), 3),
             "avg_conversation_duration_s": (
                 round(completed_conversation_duration_total_s / completed_conversations, 2)
                 if completed_conversations
@@ -1431,13 +1434,13 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
 
       <div class="panel card">
         <div class="label">Rolling / Workload</div>
-        <h2>Conversation Hours Served</h2>
+        <h2>Conversation Days Served</h2>
         <div class="legend">
-          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="active_conversation_hours_1h" aria-pressed="true">1h sum</button>
-          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="active_conversation_hours_6h" aria-pressed="true">6h sum</button>
-          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="active_conversation_hours_24h" aria-pressed="true">24h sum</button>
+          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="active_conversation_days_1h" aria-pressed="true">1h sum</button>
+          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="active_conversation_days_6h" aria-pressed="true">6h sum</button>
+          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="active_conversation_days_24h" aria-pressed="true">24h sum</button>
         </div>
-        <div class="chart-shell"><canvas id="rolling-active-hours-chart" width="720" height="260"></canvas></div>
+        <div class="chart-shell"><canvas id="rolling-active-days-chart" width="720" height="260"></canvas></div>
       </div>
 
       <div class="panel card">
@@ -1549,10 +1552,10 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         { key: 'completed_conversations_6h', color: '#117a65' },
         { key: 'completed_conversations_24h', color: '#d9822b' },
       ],
-      activeHours: [
-        { key: 'active_conversation_hours_1h', color: '#0b5cab' },
-        { key: 'active_conversation_hours_6h', color: '#117a65' },
-        { key: 'active_conversation_hours_24h', color: '#d9822b' },
+      activeDays: [
+        { key: 'active_conversation_days_1h', color: '#0b5cab' },
+        { key: 'active_conversation_days_6h', color: '#117a65' },
+        { key: 'active_conversation_days_24h', color: '#d9822b' },
       ],
       duration: [
         { key: 'avg_conversation_duration_min_1h', color: '#0b5cab' },
@@ -1645,9 +1648,9 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         activeSeries(rollingChartConfigs.conversations),
       );
       drawChart(
-        document.getElementById('rolling-active-hours-chart'),
+        document.getElementById('rolling-active-days-chart'),
         rollingSeries,
-        activeSeries(rollingChartConfigs.activeHours),
+        activeSeries(rollingChartConfigs.activeDays),
       );
       drawChart(
         document.getElementById('rolling-duration-chart'),
