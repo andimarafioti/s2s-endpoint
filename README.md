@@ -123,7 +123,9 @@ restore it checks `days/` first, falls back to minute files for missing days,
 and backfills a `days/` file once it has all 1,440 minute buckets for a
 completed day. While the load balancer stays running, it also rolls over each
 complete UTC day from in-memory history into `days/YYYY-MM-DD.json` shortly
-after midnight UTC.
+after midnight UTC. Partial `days/` files are not treated as authoritative:
+restore and backfill continue to check minute files for that day and replace
+the partial file once the complete day is available.
 
 You can precompute day files without running the load balancer:
 

@@ -67,23 +67,27 @@ class HuggingFaceBucketHistoryStore:
         )
 
         day_candidates = self._list_day_candidates(min_bucket=min_bucket, max_bucket=max_bucket)
-        loaded = self._load_day_buckets(day_candidates)
+        loaded, complete_day_starts = self._load_day_buckets(day_candidates)
         loaded_by_start = {bucket.bucket_start_s: bucket for bucket in loaded}
 
-        missing_days = self._missing_day_starts(
+        days_needing_minute_lookup = self._days_without_complete_day_files(
             min_bucket=min_bucket,
             max_bucket=max_bucket,
-            loaded_buckets=loaded,
+            complete_day_starts=complete_day_starts,
         )
-        if missing_days:
+        if days_needing_minute_lookup:
             minute_buckets = self._load_minute_buckets_for_days(
-                day_starts=missing_days,
+                day_starts=days_needing_minute_lookup,
                 min_bucket=min_bucket,
                 max_bucket=max_bucket,
             )
             for bucket in minute_buckets:
                 loaded_by_start[bucket.bucket_start_s] = bucket
-            self._cache_complete_days(day_starts=missing_days, buckets=minute_buckets, now_epoch_s=now_epoch_s)
+            self._cache_complete_days(
+                day_starts=days_needing_minute_lookup,
+                buckets=list(loaded_by_start.values()),
+                now_epoch_s=now_epoch_s,
+            )
 
         loaded = [
             bucket
@@ -118,30 +122,41 @@ class HuggingFaceBucketHistoryStore:
         logger.info("Found %s dashboard day history files; downloading them", len(candidates))
         return candidates
 
-    def _load_day_buckets(self, candidates: list[tuple[int, str]]) -> list[SwarmHistoryBucket]:
+    def _load_day_buckets(self, candidates: list[tuple[int, str]]) -> tuple[list[SwarmHistoryBucket], set[int]]:
         if not candidates:
-            return []
+            return [], set()
 
         loaded: list[SwarmHistoryBucket] = []
+        complete_day_starts: set[int] = set()
         with tempfile.TemporaryDirectory() as tmpdir:
-            downloads = [
-                (path, Path(tmpdir) / f"{day_start_s}.json")
+            local_files = [
+                (day_start_s, path, Path(tmpdir) / f"{day_start_s}.json")
                 for day_start_s, path in candidates
             ]
             self._download_bucket_files(
                 self.bucket_id,
-                files=downloads,
+                files=[(path, local_path) for _, path, local_path in local_files],
                 raise_on_missing_files=False,
                 token=self.token,
             )
 
-            for day_start_s, local_path in downloads:
+            for day_start_s, _, local_path in local_files:
                 if not local_path.exists():
                     continue
                 try:
                     payload = json.loads(local_path.read_text())
-                    for bucket_payload in payload.get("buckets", []):
-                        loaded.append(SwarmHistoryBucket.from_dict(bucket_payload))
+                    day_buckets = [
+                        SwarmHistoryBucket.from_dict(bucket_payload)
+                        for bucket_payload in payload.get("buckets", [])
+                    ]
+                    loaded.extend(day_buckets)
+                    if self._day_payload_is_complete(payload, day_buckets):
+                        complete_day_starts.add(day_start_s)
+                    else:
+                        logger.info(
+                            "Dashboard day history file %s is partial; minute files will be checked too",
+                            _day_key(day_start_s),
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Failed to load persisted dashboard day %s from %s: %s",
@@ -150,18 +165,25 @@ class HuggingFaceBucketHistoryStore:
                         exc,
                     )
 
-        return loaded
+        return loaded, complete_day_starts
 
-    def _missing_day_starts(
+    def _day_payload_is_complete(self, payload: dict[str, object], day_buckets: list[SwarmHistoryBucket]) -> bool:
+        expected_count = int(payload.get("expected_minute_bucket_count") or 24 * 60)
+        minute_count = int(payload.get("minute_bucket_count") or len(day_buckets))
+        complete_flag = payload.get("complete")
+        if complete_flag is None:
+            return minute_count >= expected_count and len(day_buckets) >= expected_count
+        return bool(complete_flag) and minute_count >= expected_count and len(day_buckets) >= expected_count
+
+    def _days_without_complete_day_files(
         self,
         *,
         min_bucket: int,
         max_bucket: int,
-        loaded_buckets: list[SwarmHistoryBucket],
+        complete_day_starts: set[int],
     ) -> list[int]:
         wanted_days = list(range(_day_start_epoch_s(min_bucket), _day_start_epoch_s(max_bucket) + 1, 24 * 60 * 60))
-        loaded_days = {_day_start_epoch_s(bucket.bucket_start_s) for bucket in loaded_buckets}
-        return [day_start for day_start in wanted_days if day_start not in loaded_days]
+        return [day_start for day_start in wanted_days if day_start not in complete_day_starts]
 
     def _load_minute_buckets_for_days(
         self,
@@ -732,37 +754,43 @@ class HuggingFaceBucketHistoryStore:
         start_day = _day_start_epoch_s(start_epoch_s)
         end_day = _day_start_epoch_s(end_epoch_s)
         day_starts = list(range(start_day, end_day + 1, 24 * 60 * 60))
-        existing_day_starts = {
-            day_start
-            for day_start, _ in self._list_day_candidates(
-                min_bucket=start_day,
-                max_bucket=end_day + 24 * 60 * 60 - 60,
-            )
-        }
-        missing_day_starts = [day_start for day_start in day_starts if day_start not in existing_day_starts]
+        day_candidates = self._list_day_candidates(
+            min_bucket=start_day,
+            max_bucket=end_day + 24 * 60 * 60 - 60,
+        )
+        existing_day_file_starts = {day_start for day_start, _ in day_candidates}
+        existing_day_buckets, complete_day_starts = self._load_day_buckets(day_candidates)
+        partial_day_starts = existing_day_file_starts - complete_day_starts
+        days_without_complete_day_files = [
+            day_start for day_start in day_starts if day_start not in complete_day_starts
+        ]
         skipped_current_or_future = [
             _day_key(day_start)
-            for day_start in missing_day_starts
+            for day_start in days_without_complete_day_files
             if day_start >= current_day_start
         ]
         backfillable_day_starts = [
             day_start
-            for day_start in missing_day_starts
+            for day_start in days_without_complete_day_files
             if day_start < current_day_start
         ]
         logger.info(
-            "Dashboard day backfill found %s existing day files and %s missing completed day files",
-            len(existing_day_starts),
+            "Dashboard day backfill found %s complete day files, %s partial day files, and %s missing completed day files",
+            len(complete_day_starts),
+            len(partial_day_starts),
             len(backfillable_day_starts),
         )
         minute_candidates = self._list_minute_candidates_for_days(
-            day_starts=missing_day_starts,
+            day_starts=backfillable_day_starts,
             min_bucket=start_day,
             max_bucket=end_day + 24 * 60 * 60 - 60,
         )
         candidates_by_day: dict[int, list[tuple[int, str]]] = {}
         for bucket_start_s, path in minute_candidates:
             candidates_by_day.setdefault(_day_start_epoch_s(bucket_start_s), []).append((bucket_start_s, path))
+        existing_buckets_by_day: dict[int, list[SwarmHistoryBucket]] = {}
+        for bucket in existing_day_buckets:
+            existing_buckets_by_day.setdefault(_day_start_epoch_s(bucket.bucket_start_s), []).append(bucket)
 
         created_paths = []
         created_days = []
@@ -779,8 +807,15 @@ class HuggingFaceBucketHistoryStore:
                 _day_key(day_start),
                 len(day_candidates),
             )
-            day_buckets = self._download_minute_bucket_candidates(day_candidates)
-            minute_buckets_loaded += len(day_buckets)
+            minute_buckets = self._download_minute_bucket_candidates(day_candidates)
+            minute_buckets_loaded += len(minute_buckets)
+            day_bucket_map = {
+                bucket.bucket_start_s: bucket
+                for bucket in existing_buckets_by_day.get(day_start, [])
+            }
+            for bucket in minute_buckets:
+                day_bucket_map[bucket.bucket_start_s] = bucket
+            day_buckets = list(day_bucket_map.values())
             complete = len(day_buckets) == 24 * 60
             cacheable_partial = allow_partial_days and bool(day_buckets)
             if (complete or cacheable_partial) and self.read_only:
@@ -821,7 +856,8 @@ class HuggingFaceBucketHistoryStore:
             "bucket_id": self.bucket_id,
             "prefix": self.prefix,
             "requested_days": [_day_key(day_start) for day_start in day_starts],
-            "existing_days": [_day_key(day_start) for day_start in sorted(existing_day_starts)],
+            "existing_days": [_day_key(day_start) for day_start in sorted(complete_day_starts)],
+            "existing_partial_days": [_day_key(day_start) for day_start in sorted(partial_day_starts)],
             "created_days": [_day_key(day_start) for day_start in created_days],
             "created_partial_days": [_day_key(day_start) for day_start in created_partial_days],
             "created_paths": created_paths,
