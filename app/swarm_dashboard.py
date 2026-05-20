@@ -10,6 +10,11 @@ from typing import Awaitable, Callable, Optional, Protocol
 
 SnapshotProvider = Callable[[], Awaitable[tuple[bool, Optional[str], dict[str, object]]]]
 logger = logging.getLogger("s2s-endpoint")
+ROLLING_VIEW_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("1h", 60),
+    ("6h", 6 * 60),
+    ("24h", 24 * 60),
+)
 
 
 def _normalize_status(status: object) -> str:
@@ -306,7 +311,7 @@ class SwarmDashboard:
         *,
         snapshot_provider: SnapshotProvider,
         sample_interval_s: float = 15.0,
-        retention_minutes: int = 7 * 24 * 60,
+        retention_minutes: int = 28 * 24 * 60,
         history_store: Optional[DashboardHistoryStore] = None,
         restore_history_in_background: bool = False,
         time_fn: Callable[[], float] = time.time,
@@ -429,6 +434,7 @@ class SwarmDashboard:
 
         current = await self.live_sample()
         series = await self.series(window_minutes=window_minutes, resolution=resolved_resolution)
+        rolling_series = await self.rolling_series(window_minutes=window_minutes, resolution=resolved_resolution)
         summary = await self.summary(window_minutes=window_minutes, requested_window=window or "6h")
 
         return {
@@ -441,6 +447,11 @@ class SwarmDashboard:
             "current": current.to_dict(),
             "summary": summary,
             "series": series,
+            "rolling_windows": [
+                {"label": label, "minutes": minutes}
+                for label, minutes in ROLLING_VIEW_WINDOWS
+            ],
+            "rolling_series": rolling_series,
             "retention_minutes": self.retention_minutes,
             "history_restore": self.history_restore_status(),
         }
@@ -463,6 +474,7 @@ class SwarmDashboard:
             "session_disconnects_window": selected["session_disconnected_events"],
             "conversations_started_window": selected["session_connected_events"],
             "conversations_completed_window": selected["completed_conversations"],
+            "active_conversation_minutes_window": selected["active_conversation_minutes"],
             "avg_conversation_duration_window_s": selected["avg_conversation_duration_s"],
             "avg_conversation_duration_window_min": round(selected["avg_conversation_duration_s"] / 60.0, 2),
             "max_conversation_duration_window_s": selected["max_conversation_duration_s"],
@@ -520,6 +532,91 @@ class SwarmDashboard:
             return points
 
         return self._aggregate_hourly(minute_map, start_bucket, end_bucket)
+
+    async def rolling_series(self, *, window_minutes: int, resolution: str) -> list[dict[str, object]]:
+        async with self._lock:
+            minute_buckets = list(self._history.values())
+
+        now = self._time_fn()
+        end_bucket = _bucket_start_epoch_s(now, 1)
+        start_bucket = end_bucket - (window_minutes - 1) * 60
+        max_window_minutes = max(minutes for _, minutes in ROLLING_VIEW_WINDOWS)
+        context_start_bucket = start_bucket - (max_window_minutes - 1) * 60
+        minute_map = {
+            bucket.bucket_start_s: bucket
+            for bucket in minute_buckets
+            if context_start_bucket <= bucket.bucket_start_s <= end_bucket
+        }
+
+        minute_starts = list(range(context_start_bucket, end_bucket + 1, 60))
+        completed_prefix = [0]
+        duration_prefix = [0.0]
+        connected_sum_prefix = [0.0]
+        sample_count_prefix = [0]
+        active_conversation_minutes_prefix = [0.0]
+        for bucket_start_s in minute_starts:
+            bucket = minute_map.get(bucket_start_s)
+            completed_prefix.append(
+                completed_prefix[-1] + (bucket.completed_conversations if bucket is not None else 0)
+            )
+            duration_prefix.append(
+                duration_prefix[-1]
+                + (bucket.completed_conversation_duration_total_s if bucket is not None else 0.0)
+            )
+            connected_sum_prefix.append(
+                connected_sum_prefix[-1] + (bucket.connected_sessions_sum if bucket is not None else 0.0)
+            )
+            sample_count_prefix.append(
+                sample_count_prefix[-1] + (bucket.sample_count if bucket is not None else 0)
+            )
+            active_conversation_minutes_prefix.append(
+                active_conversation_minutes_prefix[-1]
+                + (
+                    bucket.connected_sessions_sum / bucket.sample_count
+                    if bucket is not None and bucket.sample_count
+                    else 0.0
+                )
+            )
+
+        def range_sum(prefix: list[int] | list[float], start_s: int, end_s: int) -> int | float:
+            if start_s > end_bucket or end_s < context_start_bucket:
+                return 0
+            bounded_start_s = max(start_s, context_start_bucket)
+            bounded_end_s = min(end_s, end_bucket)
+            start_index = (bounded_start_s - context_start_bucket) // 60
+            end_index = (bounded_end_s - context_start_bucket) // 60
+            return prefix[end_index + 1] - prefix[start_index]
+
+        step_s = 60 if resolution == "minute" else 3600
+        first_point_s = start_bucket if resolution == "minute" else _bucket_start_epoch_s(start_bucket, 60)
+        points = []
+        for point_start_s in range(first_point_s, end_bucket + 1, step_s):
+            point_end_s = point_start_s if resolution == "minute" else min(point_start_s + 59 * 60, end_bucket)
+            point: dict[str, object] = {"timestamp": _isoformat(point_start_s)}
+            for label, minutes in ROLLING_VIEW_WINDOWS:
+                window_start_s = point_end_s - (minutes - 1) * 60
+                completed = int(range_sum(completed_prefix, window_start_s, point_end_s))
+                duration_total_s = float(range_sum(duration_prefix, window_start_s, point_end_s))
+                connected_sum = float(range_sum(connected_sum_prefix, window_start_s, point_end_s))
+                sample_count = int(range_sum(sample_count_prefix, window_start_s, point_end_s))
+                active_conversation_minutes = float(
+                    range_sum(active_conversation_minutes_prefix, window_start_s, point_end_s)
+                )
+
+                point[f"completed_conversations_{label}"] = completed
+                point[f"active_conversation_minutes_{label}"] = round(active_conversation_minutes, 2)
+                point[f"avg_conversation_duration_s_{label}"] = (
+                    round(duration_total_s / completed, 2) if completed else 0.0
+                )
+                point[f"avg_conversation_duration_min_{label}"] = (
+                    round((duration_total_s / completed) / 60.0, 2) if completed else 0.0
+                )
+                point[f"connected_sessions_avg_{label}"] = (
+                    round(connected_sum / sample_count, 2) if sample_count else 0.0
+                )
+            points.append(point)
+
+        return points
 
     def html(self) -> str:
         return _dashboard_html(history_persisted=self.history_store is not None)
@@ -603,6 +700,14 @@ class SwarmDashboard:
             "session_connected_events": sum(bucket.session_connected_events for bucket in selected),
             "session_disconnected_events": sum(bucket.session_disconnected_events for bucket in selected),
             "completed_conversations": completed_conversations,
+            "active_conversation_minutes": round(
+                sum(
+                    bucket.connected_sessions_sum / bucket.sample_count
+                    for bucket in selected
+                    if bucket.sample_count
+                ),
+                2,
+            ),
             "avg_conversation_duration_s": (
                 round(completed_conversation_duration_total_s / completed_conversations, 2)
                 if completed_conversations
@@ -966,6 +1071,11 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       border-color: var(--ink);
     }
 
+    .toggle:disabled {
+      cursor: not-allowed;
+      opacity: 0.42;
+    }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(12, minmax(0, 1fr));
@@ -990,6 +1100,13 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     .kpis {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .rolling-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 18px;
       margin-bottom: 18px;
     }
@@ -1021,7 +1138,8 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       font-size: 13px;
     }
 
-    .legend span::before {
+    .legend span::before,
+    .legend-toggle::before {
       content: "";
       display: inline-block;
       width: 10px;
@@ -1030,6 +1148,28 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       margin-right: 8px;
       background: currentColor;
       vertical-align: middle;
+    }
+
+    .legend-toggle {
+      display: inline-flex;
+      align-items: center;
+      border: 0;
+      background: transparent;
+      padding: 0;
+      font: inherit;
+      color: inherit;
+      cursor: pointer;
+    }
+
+    .legend-toggle.hidden {
+      opacity: 0.36;
+      text-decoration: line-through;
+    }
+
+    .legend-toggle:focus-visible {
+      outline: 2px solid currentColor;
+      outline-offset: 3px;
+      border-radius: 4px;
     }
 
     canvas {
@@ -1234,7 +1374,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     .footer-note { margin-top: 14px; color: var(--muted); font-size: 13px; }
 
     @media (max-width: 1100px) {
-      .hero, .kpis { grid-template-columns: 1fr; }
+      .hero, .kpis, .rolling-grid { grid-template-columns: 1fr; }
       .span-4, .span-6, .span-8 { grid-column: span 12; }
     }
 
@@ -1270,9 +1410,57 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       <button class="toggle active" data-window="6h">6h</button>
       <button class="toggle" data-window="24h">24h</button>
       <button class="toggle" data-window="7d">7d</button>
+      <button class="toggle" data-window="14d">14d</button>
+      <button class="toggle" data-window="28d">28d</button>
       <button class="toggle" data-resolution="minute">Minute</button>
       <button class="toggle" data-resolution="hour">Hour</button>
     </div>
+
+    <section class="rolling-grid">
+      <div class="panel card">
+        <div class="label">Rolling / Conversations</div>
+        <h2>Completed Conversations</h2>
+        <div class="legend">
+          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="completed_conversations_1h" aria-pressed="true">1h total</button>
+          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="completed_conversations_6h" aria-pressed="true">6h total</button>
+          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="completed_conversations_24h" aria-pressed="true">24h total</button>
+        </div>
+        <div class="chart-shell"><canvas id="rolling-conversations-chart" width="720" height="260"></canvas></div>
+      </div>
+
+      <div class="panel card">
+        <div class="label">Rolling / Workload</div>
+        <h2>Conversation Minutes Served</h2>
+        <div class="legend">
+          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="active_conversation_minutes_1h" aria-pressed="true">1h sum</button>
+          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="active_conversation_minutes_6h" aria-pressed="true">6h sum</button>
+          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="active_conversation_minutes_24h" aria-pressed="true">24h sum</button>
+        </div>
+        <div class="chart-shell"><canvas id="rolling-active-minutes-chart" width="720" height="260"></canvas></div>
+      </div>
+
+      <div class="panel card">
+        <div class="label">Rolling / Duration</div>
+        <h2>Average Duration</h2>
+        <div class="legend">
+          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="avg_conversation_duration_min_1h" aria-pressed="true">1h avg</button>
+          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="avg_conversation_duration_min_6h" aria-pressed="true">6h avg</button>
+          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="avg_conversation_duration_min_24h" aria-pressed="true">24h avg</button>
+        </div>
+        <div class="chart-shell"><canvas id="rolling-duration-chart" width="720" height="260"></canvas></div>
+      </div>
+
+      <div class="panel card">
+        <div class="label">Rolling / Users</div>
+        <h2>Connected Users</h2>
+        <div class="legend">
+          <button class="legend-toggle" type="button" style="color: #0b5cab" data-series-toggle="connected_sessions_avg_1h" aria-pressed="true">1h avg</button>
+          <button class="legend-toggle" type="button" style="color: #117a65" data-series-toggle="connected_sessions_avg_6h" aria-pressed="true">6h avg</button>
+          <button class="legend-toggle" type="button" style="color: #d9822b" data-series-toggle="connected_sessions_avg_24h" aria-pressed="true">24h avg</button>
+        </div>
+        <div class="chart-shell"><canvas id="rolling-users-chart" width="720" height="260"></canvas></div>
+      </div>
+    </section>
 
     <section class="kpis" id="kpis"></section>
 
@@ -1352,6 +1540,30 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     let selectedWindow = '6h';
     let selectedResolution = '';
     let refreshHandle = null;
+    let latestDashboardPayload = null;
+    const hiddenSeries = new Set();
+    const rollingChartConfigs = {
+      conversations: [
+        { key: 'completed_conversations_1h', color: '#0b5cab' },
+        { key: 'completed_conversations_6h', color: '#117a65' },
+        { key: 'completed_conversations_24h', color: '#d9822b' },
+      ],
+      activeMinutes: [
+        { key: 'active_conversation_minutes_1h', color: '#0b5cab' },
+        { key: 'active_conversation_minutes_6h', color: '#117a65' },
+        { key: 'active_conversation_minutes_24h', color: '#d9822b' },
+      ],
+      duration: [
+        { key: 'avg_conversation_duration_min_1h', color: '#0b5cab' },
+        { key: 'avg_conversation_duration_min_6h', color: '#117a65' },
+        { key: 'avg_conversation_duration_min_24h', color: '#d9822b' },
+      ],
+      users: [
+        { key: 'connected_sessions_avg_1h', color: '#0b5cab' },
+        { key: 'connected_sessions_avg_6h', color: '#117a65' },
+        { key: 'connected_sessions_avg_24h', color: '#d9822b' },
+      ],
+    };
 
     function prettyNumber(value) {
       const numeric = Number(value || 0);
@@ -1375,18 +1587,71 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       return `${secs}s`;
     }
 
+    function formatMinutesServed(minutes) {
+      const numeric = Number(minutes || 0);
+      if (numeric >= 1000) {
+        return Math.round(numeric).toLocaleString();
+      }
+      return prettyNumber(numeric);
+    }
+
     function statusClass(healthy, errors) {
       if (!healthy || errors > 0) return 'bad';
       return 'good';
     }
 
     function setActiveButtons() {
+      const longWindow = isLongWindow(selectedWindow);
+      if (longWindow) {
+        selectedResolution = 'hour';
+      }
       for (const button of windowButtons) {
         button.classList.toggle('active', button.dataset.window === selectedWindow);
       }
       for (const button of resolutionButtons) {
+        button.disabled = longWindow && button.dataset.resolution === 'minute';
         button.classList.toggle('active', button.dataset.resolution === selectedResolution);
       }
+    }
+
+    function isLongWindow(windowValue) {
+      const match = String(windowValue || '').match(/^(\\d+)d$/);
+      return Boolean(match && Number(match[1]) >= 7);
+    }
+
+    function activeSeries(seriesConfig) {
+      return seriesConfig.filter((series) => !hiddenSeries.has(series.key));
+    }
+
+    function updateLegendToggles() {
+      for (const button of document.querySelectorAll('[data-series-toggle]')) {
+        const hidden = hiddenSeries.has(button.dataset.seriesToggle);
+        button.classList.toggle('hidden', hidden);
+        button.setAttribute('aria-pressed', hidden ? 'false' : 'true');
+      }
+    }
+
+    function drawRollingCharts(rollingSeries) {
+      drawChart(
+        document.getElementById('rolling-conversations-chart'),
+        rollingSeries,
+        activeSeries(rollingChartConfigs.conversations),
+      );
+      drawChart(
+        document.getElementById('rolling-active-minutes-chart'),
+        rollingSeries,
+        activeSeries(rollingChartConfigs.activeMinutes),
+      );
+      drawChart(
+        document.getElementById('rolling-duration-chart'),
+        rollingSeries,
+        activeSeries(rollingChartConfigs.duration),
+      );
+      drawChart(
+        document.getElementById('rolling-users-chart'),
+        rollingSeries,
+        activeSeries(rollingChartConfigs.users),
+      );
     }
 
     function kpiCard(label, value, detail) {
@@ -1406,7 +1671,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       const stats = [
         ['Running', current.running_endpoints],
         ['Connected', current.connected_sessions],
-        [`Conversations / ${windowLabel}`, summary.conversations_completed_window],
+        [`Minutes served / ${windowLabel}`, formatMinutesServed(summary.active_conversation_minutes_window)],
         [`Avg Duration / ${windowLabel}`, formatDuration(summary.avg_conversation_duration_window_s)],
       ];
       document.getElementById('hero-stats').innerHTML = stats.map(([label, value]) => `
@@ -1546,16 +1811,29 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       document.getElementById('endpoint-wall').innerHTML = cards;
     }
 
-    function drawStatePieChart(canvas, counts) {
+    function prepareCanvas(canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const cssWidth = Math.max(1, Math.round(rect.width || canvas.clientWidth || canvas.width));
+      const cssHeight = Math.max(1, Math.round(rect.height || canvas.clientHeight || canvas.height));
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const pixelWidth = Math.round(cssWidth * dpr);
+      const pixelHeight = Math.round(cssHeight * dpr);
+      if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+        canvas.width = pixelWidth;
+        canvas.height = pixelHeight;
+      }
       const ctx = canvas.getContext('2d');
-      const width = canvas.width;
-      const height = canvas.height;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssWidth, cssHeight);
+      return { ctx, width: cssWidth, height: cssHeight };
+    }
+
+    function drawStatePieChart(canvas, counts) {
+      const { ctx, width, height } = prepareCanvas(canvas);
       const radius = Math.min(width, height) * 0.34;
       const centerX = width / 2;
       const centerY = height / 2;
       const total = counts.running + counts.warm + counts.parked + counts.error;
-
-      ctx.clearRect(0, 0, width, height);
 
       const segments = [
         { value: counts.running, color: '#117a65', label: 'Healthy' },
@@ -1616,36 +1894,96 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       `).join('');
     }
 
-    function drawChart(canvas, points, seriesConfig) {
-      const ctx = canvas.getContext('2d');
-      const width = canvas.width;
-      const height = canvas.height;
-      ctx.clearRect(0, 0, width, height);
+    function niceTickSize(value) {
+      if (value <= 0) return 1;
+      const exponent = Math.floor(Math.log10(value));
+      const magnitude = 10 ** exponent;
+      const fraction = value / magnitude;
+      if (fraction <= 1) return magnitude;
+      if (fraction <= 2) return 2 * magnitude;
+      if (fraction <= 5) return 5 * magnitude;
+      return 10 * magnitude;
+    }
 
-      const padding = { top: 18, right: 18, bottom: 28, left: 34 };
+    function chartTickValues(maxValue) {
+      const tickSize = niceTickSize(maxValue / 4);
+      const niceMax = Math.max(tickSize, Math.ceil(maxValue / tickSize) * tickSize);
+      const ticks = [];
+      for (let value = 0; value <= niceMax + tickSize * 0.5; value += tickSize) {
+        ticks.push(Number(value.toFixed(10)));
+      }
+      return ticks;
+    }
+
+    function formatAxisNumber(value) {
+      const numeric = Number(value || 0);
+      if (numeric >= 1000) {
+        return Intl.NumberFormat([], { notation: 'compact', maximumFractionDigits: 1 }).format(numeric);
+      }
+      if (Math.abs(numeric - Math.round(numeric)) < 0.01) {
+        return String(Math.round(numeric));
+      }
+      if (numeric >= 10) return numeric.toFixed(1);
+      return numeric.toFixed(2).replace(/\\.?0+$/, '');
+    }
+
+    function xAxisLabel(timestamp, includeDate) {
+      const date = new Date(timestamp);
+      if (!includeDate) {
+        return {
+          primary: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          secondary: '',
+        };
+      }
+      return {
+        primary: date.toLocaleDateString([], { month: 'short', day: 'numeric' }),
+        secondary: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      };
+    }
+
+    function drawXAxisLabel(ctx, label, x, y, align) {
+      ctx.textAlign = align;
+      ctx.fillText(label.primary, x, y);
+      if (label.secondary) {
+        ctx.fillText(label.secondary, x, y + 14);
+      }
+    }
+
+    function drawChart(canvas, points, seriesConfig) {
+      const { ctx, width, height } = prepareCanvas(canvas);
+      const first = points.length ? new Date(points[0].timestamp) : null;
+      const last = points.length ? new Date(points[points.length - 1].timestamp) : null;
+      const spanMs = first && last ? last.getTime() - first.getTime() : 0;
+      const includeDate = spanMs >= 36 * 3600 * 1000;
+
+      const padding = { top: 18, right: 22, bottom: includeDate ? 52 : 36, left: 50 };
       const plotWidth = width - padding.left - padding.right;
       const plotHeight = height - padding.top - padding.bottom;
-      const values = points.flatMap((point) => seriesConfig.map((series) => Number(point[series.key] || 0)));
+      const values = points
+        .flatMap((point) => seriesConfig.map((series) => Number(point[series.key] || 0)))
+        .filter((value) => Number.isFinite(value));
       const maxValue = Math.max(1, ...values);
+      const ticks = chartTickValues(maxValue);
+      const chartMax = ticks[ticks.length - 1] || 1;
       const xStep = points.length > 1 ? plotWidth / (points.length - 1) : 0;
 
       ctx.strokeStyle = 'rgba(24, 33, 37, 0.12)';
       ctx.lineWidth = 1;
-      for (let i = 0; i <= 4; i += 1) {
-        const y = padding.top + (plotHeight * i) / 4;
+      for (const value of ticks) {
+        const y = padding.top + plotHeight - (plotHeight * value) / chartMax;
         ctx.beginPath();
         ctx.moveTo(padding.left, y);
         ctx.lineTo(width - padding.right, y);
         ctx.stroke();
       }
 
-      ctx.fillStyle = 'rgba(24, 33, 37, 0.55)';
+      ctx.fillStyle = 'rgba(24, 33, 37, 0.74)';
       ctx.font = '12px Menlo, Consolas, monospace';
       ctx.textAlign = 'right';
-      for (let i = 0; i <= 4; i += 1) {
-        const value = maxValue - (maxValue * i) / 4;
-        const y = padding.top + (plotHeight * i) / 4 + 4;
-        ctx.fillText(prettyNumber(value), padding.left - 8, y);
+      ctx.textBaseline = 'middle';
+      for (const value of ticks) {
+        const y = padding.top + plotHeight - (plotHeight * value) / chartMax;
+        ctx.fillText(formatAxisNumber(value), padding.left - 10, y);
       }
 
       seriesConfig.forEach((series) => {
@@ -1654,7 +1992,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         ctx.beginPath();
         points.forEach((point, index) => {
           const x = padding.left + xStep * index;
-          const y = padding.top + plotHeight - (plotHeight * Number(point[series.key] || 0)) / maxValue;
+          const y = padding.top + plotHeight - (plotHeight * Number(point[series.key] || 0)) / chartMax;
           if (index === 0) {
             ctx.moveTo(x, y);
           } else {
@@ -1665,12 +2003,15 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       });
 
       if (points.length > 1) {
-        ctx.fillStyle = 'rgba(24, 33, 37, 0.55)';
-        ctx.textAlign = 'center';
-        const first = new Date(points[0].timestamp);
-        const last = new Date(points[points.length - 1].timestamp);
-        ctx.fillText(first.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), padding.left, height - 8);
-        ctx.fillText(last.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), width - padding.right, height - 8);
+        ctx.fillStyle = 'rgba(24, 33, 37, 0.74)';
+        ctx.font = '12px Menlo, Consolas, monospace';
+        ctx.textBaseline = 'alphabetic';
+        const middleIndex = Math.floor((points.length - 1) / 2);
+        const middleX = padding.left + xStep * middleIndex;
+        const labelY = includeDate ? height - 24 : height - 12;
+        drawXAxisLabel(ctx, xAxisLabel(points[0].timestamp, includeDate), padding.left, labelY, 'left');
+        drawXAxisLabel(ctx, xAxisLabel(points[middleIndex].timestamp, includeDate), middleX, labelY, 'center');
+        drawXAxisLabel(ctx, xAxisLabel(points[points.length - 1].timestamp, includeDate), width - padding.right, labelY, 'right');
       }
     }
 
@@ -1684,9 +2025,11 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         throw new Error(`Dashboard request failed: ${response.status}`);
       }
       const payload = await response.json();
+      latestDashboardPayload = payload;
       const current = payload.current;
       const summary = payload.summary;
       const series = payload.series;
+      const rollingSeries = payload.rolling_series || [];
 
       document.getElementById('generated-at').textContent =
         `Updated ${new Date(payload.generated_at).toLocaleString()} • ${payload.window.resolution} timeline • last ${payload.window.requested}`;
@@ -1724,6 +2067,8 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         { key: 'avg_conversation_duration_min', color: '#d9822b' },
         { key: 'max_conversation_duration_min', color: '#bb2d3b' },
       ]);
+
+      drawRollingCharts(rollingSeries);
     }
 
     function scheduleRefresh() {
@@ -1738,7 +2083,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     windowButtons.forEach((button) => {
       button.addEventListener('click', () => {
         selectedWindow = button.dataset.window;
-        if (selectedWindow === '7d' && !selectedResolution) {
+        if (isLongWindow(selectedWindow)) {
           selectedResolution = 'hour';
         }
         setActiveButtons();
@@ -1748,13 +2093,32 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
 
     resolutionButtons.forEach((button) => {
       button.addEventListener('click', () => {
+        if (button.disabled) {
+          return;
+        }
         selectedResolution = button.dataset.resolution === selectedResolution ? '' : button.dataset.resolution;
         setActiveButtons();
         loadDashboard().catch((error) => console.error(error));
       });
     });
 
+    document.querySelectorAll('[data-series-toggle]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const key = button.dataset.seriesToggle;
+        if (hiddenSeries.has(key)) {
+          hiddenSeries.delete(key);
+        } else {
+          hiddenSeries.add(key);
+        }
+        updateLegendToggles();
+        if (latestDashboardPayload) {
+          drawRollingCharts(latestDashboardPayload.rolling_series || []);
+        }
+      });
+    });
+
     setActiveButtons();
+    updateLegendToggles();
     loadDashboard().catch((error) => console.error(error));
     scheduleRefresh();
   </script>

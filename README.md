@@ -117,11 +117,11 @@ the endpoint can become ready before older dashboard buckets finish loading. The
 `/dashboard/data` response includes a `history_restore` object with the restore
 status, elapsed time, and restored bucket count.
 
-The dashboard store keeps the original minute files under `minutes/` and also
+The dashboard store keeps minute files under `minutes/YYYY-MM-DD/` and also
 uses `days/YYYY-MM-DD.json` files as a compact cache for complete UTC days. On
-restore it checks `days/` first, falls back to `minutes/` for missing days, and
-backfills a `days/` file once it has all 1,440 minute buckets for a completed
-day. Existing minute files are left in place.
+restore it checks `days/` first, falls back to minute files for missing days,
+and backfills a `days/` file once it has all 1,440 minute buckets for a
+completed day.
 
 You can precompute day files without running the load balancer:
 
@@ -133,8 +133,19 @@ uv run --with-requirements requirements.txt python scripts/backfill_dashboard_da
 ```
 
 Use `--dry-run` to inspect which days would be created without writing files.
-The script processes and uploads one day at a time, so interrupted runs are
-resumable: the next run skips any day files that were already created.
+By default the script also migrates legacy flat `minutes/<epoch>.json` files
+for the requested days into `minutes/YYYY-MM-DD/<epoch>.json`; pass
+`--migrate-minutes-only` when day files already exist and you only want to move
+minute files, or `--skip-minute-migration` to leave legacy minute paths
+untouched. Minute migration uses server-side bucket copies when supported by
+`huggingface_hub`, then deletes the old flat paths. The script processes and
+uploads one day at a time, so interrupted runs are resumable: the next run skips
+any day files that were already created. It also keeps a local minute download
+cache under the user cache directory so interrupted day-file backfills can reuse
+already downloaded minute files; pass `--no-download-cache` to disable this.
+Historical partial days are cached too, which is useful for the first UTC day a
+load balancer existed. Pass `--require-complete-days` to only create day files
+when all 1,440 minute buckets are present.
 
 ## Load Balancer Env Vars
 
@@ -155,6 +166,7 @@ resumable: the next run skips any day files that were already created.
 - `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations
 - `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
 - `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
+  (defaults to 28 days so the 14d/28d dashboard windows can load persisted history)
 - `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
   endpoint/session data instead of connecting to real compute endpoints. You can
   also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.

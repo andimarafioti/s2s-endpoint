@@ -1,7 +1,9 @@
 import json
+import tempfile
 import time
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.swarm_dashboard import (
@@ -67,13 +69,16 @@ class SlowHistoryStore(FakeHistoryStore):
 class FakeBucketItem:
     def __init__(self, path: str):
         self.path = path
+        self.xet_hash = path
 
 
 class FakeBucketApi:
     def __init__(self, files: dict[str, dict[str, object]]):
         self.files = files
         self.list_prefixes = []
+        self.downloads = []
         self.batch_adds = []
+        self.batch_deletes = []
         self.batch_calls = []
 
     def list_bucket_tree(self, bucket_id, *, prefix=None, recursive=None, token=None):
@@ -85,15 +90,35 @@ class FakeBucketApi:
         ]
 
     def download_bucket_files(self, bucket_id, *, files, raise_on_missing_files, token=None):
+        self.downloads.extend(files)
         for remote_path, local_path in files:
             payload = self.files.get(remote_path)
             if payload is None:
                 continue
             local_path.write_text(json.dumps(payload))
 
-    def batch_bucket_files(self, bucket_id, *, add, token=None):
-        self.batch_calls.append(list(add))
-        self.batch_adds.extend(add)
+    def batch_bucket_files(self, bucket_id, *, add=None, copy=None, delete=None, token=None):
+        if add:
+            self.batch_calls.append(list(add))
+            self.batch_adds.extend(add)
+            for source, path in add:
+                if isinstance(source, bytes):
+                    payload = json.loads(source.decode("utf-8"))
+                else:
+                    payload = json.loads(Path(source).read_text())
+                self.files[path] = payload
+        if copy:
+            self.batch_calls.append(list(copy))
+            for source_repo_type, source_repo_id, xet_hash, path in copy:
+                if source_repo_type != "bucket" or source_repo_id != bucket_id:
+                    continue
+                payload = self.files.get(xet_hash)
+                if payload is not None:
+                    self.files[path] = payload
+        if delete:
+            self.batch_deletes.extend(delete)
+            for path in delete:
+                self.files.pop(path, None)
 
 
 def _health_snapshot(*, connected: int, pending: int, running: int, waking: int, free_slots: int, effective_free_slots: int):
@@ -216,6 +241,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["summary"]["window_label"], "60m")
         self.assertEqual(payload["summary"]["session_requests_window"], 1)
         self.assertEqual(payload["summary"]["conversations_completed_window"], 1)
+        self.assertEqual(payload["summary"]["active_conversation_minutes_window"], 2.0)
         self.assertEqual(payload["summary"]["avg_conversation_duration_window_s"], 150.0)
 
     async def test_hourly_series_averages_state_metrics_and_sums_events(self):
@@ -298,6 +324,76 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["completed_conversations"], 1)
         self.assertEqual(point["avg_conversation_duration_s"], 600.0)
         self.assertEqual(point["max_conversation_duration_min"], 10.0)
+
+    async def test_rolling_series_reports_conversation_and_connected_user_windows(self):
+        now_s = 48 * 3600
+        clock = FakeClock(now_s)
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=0,
+                waking=0,
+                free_slots=0,
+                effective_free_slots=0,
+            )),
+            sample_interval_s=15,
+            retention_minutes=48 * 60,
+            time_fn=clock.now,
+        )
+
+        def add_bucket(
+            *,
+            bucket_start_s: int,
+            completed_conversations: int,
+            duration_total_s: float,
+            connected_sessions_sum: float,
+            sample_count: int,
+        ) -> None:
+            bucket = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
+            bucket.completed_conversations = completed_conversations
+            bucket.completed_conversation_duration_total_s = duration_total_s
+            bucket.connected_sessions_sum = connected_sessions_sum
+            bucket.sample_count = sample_count
+            dashboard._history[bucket_start_s] = bucket
+
+        add_bucket(
+            bucket_start_s=now_s - 23 * 3600,
+            completed_conversations=1,
+            duration_total_s=60.0,
+            connected_sessions_sum=2.0,
+            sample_count=1,
+        )
+        add_bucket(
+            bucket_start_s=now_s - 5 * 3600,
+            completed_conversations=2,
+            duration_total_s=600.0,
+            connected_sessions_sum=10.0,
+            sample_count=2,
+        )
+        add_bucket(
+            bucket_start_s=now_s - 30 * 60,
+            completed_conversations=3,
+            duration_total_s=1800.0,
+            connected_sessions_sum=8.0,
+            sample_count=1,
+        )
+
+        points = await dashboard.rolling_series(window_minutes=24 * 60, resolution="hour")
+        point = points[-1]
+
+        self.assertEqual(point["completed_conversations_1h"], 3)
+        self.assertEqual(point["completed_conversations_6h"], 5)
+        self.assertEqual(point["completed_conversations_24h"], 6)
+        self.assertEqual(point["active_conversation_minutes_1h"], 8.0)
+        self.assertEqual(point["active_conversation_minutes_6h"], 13.0)
+        self.assertEqual(point["active_conversation_minutes_24h"], 15.0)
+        self.assertEqual(point["avg_conversation_duration_min_1h"], 10.0)
+        self.assertEqual(point["avg_conversation_duration_min_6h"], 8.0)
+        self.assertEqual(point["avg_conversation_duration_min_24h"], 6.83)
+        self.assertEqual(point["connected_sessions_avg_1h"], 8.0)
+        self.assertEqual(point["connected_sessions_avg_6h"], 6.0)
+        self.assertEqual(point["connected_sessions_avg_24h"], 5.0)
 
     async def test_prunes_buckets_older_than_retention_window(self):
         clock = FakeClock(10 * 3600)
@@ -568,6 +664,84 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         self.assertEqual(len(loaded), 24 * 60)
         self.assertEqual(api.batch_adds, [])
 
+    def test_write_buckets_uses_date_sharded_minute_path(self):
+        day_start = _day_start(2026, 5, 18)
+        bucket = SwarmHistoryBucket(bucket_start_s=day_start)
+        api = FakeBucketApi({})
+        store = _bucket_store(api)
+
+        store.write_buckets([bucket])
+
+        self.assertEqual(api.batch_adds[0][1], f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json")
+
+    def test_migrate_legacy_minute_files_moves_flat_files_to_day_folder(self):
+        day_start = _day_start(2026, 5, 18)
+        first_bucket = SwarmHistoryBucket(bucket_start_s=day_start)
+        second_bucket = SwarmHistoryBucket(bucket_start_s=day_start + 60)
+        api = FakeBucketApi(
+            {
+                f"reachy-s2s-lb/minutes/{day_start}.json": {
+                    "version": 1,
+                    "bucket": first_bucket.to_dict(),
+                },
+                f"reachy-s2s-lb/minutes/{day_start + 60}.json": {
+                    "version": 1,
+                    "bucket": second_bucket.to_dict(),
+                },
+            }
+        )
+        store = _bucket_store(api)
+
+        result = store.migrate_legacy_minute_files(
+            start_epoch_s=day_start,
+            end_epoch_s=day_start + 60,
+        )
+
+        self.assertEqual(result["moved_minute_files"], 2)
+        self.assertEqual(result["moved_days"], [{"day": "2026-05-18", "count": 2}])
+        self.assertNotIn(f"reachy-s2s-lb/minutes/{day_start}.json", api.files)
+        self.assertNotIn(f"reachy-s2s-lb/minutes/{day_start + 60}.json", api.files)
+        self.assertIn(f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json", api.files)
+        self.assertIn(f"reachy-s2s-lb/minutes/2026-05-18/{day_start + 60}.json", api.files)
+        self.assertEqual(api.downloads, [])
+        self.assertEqual(api.batch_adds, [])
+        self.assertEqual(
+            api.batch_deletes,
+            [
+                f"reachy-s2s-lb/minutes/{day_start}.json",
+                f"reachy-s2s-lb/minutes/{day_start + 60}.json",
+            ],
+        )
+
+    def test_migrate_legacy_minute_files_deletes_existing_sharded_duplicates(self):
+        day_start = _day_start(2026, 5, 18)
+        bucket = SwarmHistoryBucket(bucket_start_s=day_start)
+        api = FakeBucketApi(
+            {
+                f"reachy-s2s-lb/minutes/{day_start}.json": {
+                    "version": 1,
+                    "bucket": bucket.to_dict(),
+                },
+                f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json": {
+                    "version": 1,
+                    "bucket": bucket.to_dict(),
+                },
+            }
+        )
+        store = _bucket_store(api)
+
+        result = store.migrate_legacy_minute_files(
+            start_epoch_s=day_start,
+            end_epoch_s=day_start,
+        )
+
+        self.assertEqual(result["moved_minute_files"], 0)
+        self.assertEqual(result["deleted_legacy_duplicate_files"], 1)
+        self.assertEqual(result["deleted_legacy_duplicate_days"], [{"day": "2026-05-18", "count": 1}])
+        self.assertNotIn(f"reachy-s2s-lb/minutes/{day_start}.json", api.files)
+        self.assertIn(f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json", api.files)
+        self.assertEqual(api.batch_deletes, [f"reachy-s2s-lb/minutes/{day_start}.json"])
+
     def test_backfill_day_files_uses_same_day_cache_behavior(self):
         day_start = _day_start(2026, 5, 18)
         files = {}
@@ -615,6 +789,69 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         self.assertEqual(result["created_days"], [])
         self.assertEqual(result["incomplete_days"], [{"day": "2026-05-18", "minute_buckets_found": 12}])
         self.assertEqual(api.batch_adds, [])
+
+    def test_backfill_day_files_can_create_partial_past_day_file(self):
+        day_start = _day_start(2026, 5, 18)
+        files = {}
+        for minute in range(12):
+            bucket = SwarmHistoryBucket(bucket_start_s=day_start + minute * 60)
+            bucket.sample_count = 1
+            files[f"reachy-s2s-lb/minutes/{bucket.bucket_start_s}.json"] = {
+                "version": 1,
+                "bucket": bucket.to_dict(),
+            }
+        api = FakeBucketApi(files)
+        store = _bucket_store(api)
+
+        result = store.backfill_day_files(
+            start_epoch_s=day_start,
+            end_epoch_s=day_start,
+            now_epoch_s=day_start + 24 * 60 * 60,
+            allow_partial_days=True,
+        )
+
+        self.assertEqual(result["created_days"], [])
+        self.assertEqual(result["created_partial_days"], ["2026-05-18"])
+        self.assertEqual(result["created_paths"], ["reachy-s2s-lb/days/2026-05-18.json"])
+        self.assertEqual(result["incomplete_days"], [])
+        self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["complete"], False)
+        self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["minute_bucket_count"], 12)
+
+    def test_download_minute_bucket_candidates_reuses_local_cache(self):
+        day_start = _day_start(2026, 5, 18)
+        first_bucket = SwarmHistoryBucket(bucket_start_s=day_start)
+        second_bucket = SwarmHistoryBucket(bucket_start_s=day_start + 60)
+        first_path = f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json"
+        second_path = f"reachy-s2s-lb/minutes/2026-05-18/{day_start + 60}.json"
+        api = FakeBucketApi(
+            {
+                first_path: {
+                    "version": 1,
+                    "bucket": first_bucket.to_dict(),
+                },
+                second_path: {
+                    "version": 1,
+                    "bucket": second_bucket.to_dict(),
+                },
+            }
+        )
+        store = _bucket_store(api)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store.local_download_cache_dir = Path(tmpdir)
+            cached_path = Path(tmpdir) / store.bucket_id / first_path
+            cached_path.parent.mkdir(parents=True)
+            cached_path.write_text(json.dumps(api.files[first_path]))
+
+            loaded = store._download_minute_bucket_candidates(
+                [
+                    (day_start, first_path),
+                    (day_start + 60, second_path),
+                ]
+            )
+
+        self.assertEqual([bucket.bucket_start_s for bucket in loaded], [day_start, day_start + 60])
+        self.assertEqual([remote_path for remote_path, _ in api.downloads], [second_path])
 
     def test_backfill_day_files_writes_each_day_incrementally(self):
         first_day = _day_start(2026, 5, 17)
