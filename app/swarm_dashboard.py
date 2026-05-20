@@ -1005,13 +1005,15 @@ class SwarmDashboard:
         next_cursor_s = current_day_start_s
         for day_start in day_starts:
             day_buckets = sorted(buckets_by_day.get(day_start, []), key=lambda bucket: bucket.bucket_start_s)
-            if len(day_buckets) != DAY_MINUTES:
-                logger.info(
-                    "Skipping live dashboard day rollover for %s because only %s of 1440 minute buckets are in memory",
+            if not day_buckets:
+                logger.info("Skipping live dashboard day rollover for %s because no minute buckets are in memory", _day_key(day_start))
+                continue
+            if len(day_buckets) < DAY_MINUTES:
+                logger.warning(
+                    "Finalizing partial live dashboard day rollover for %s with only %s of 1440 minute buckets",
                     _day_key(day_start),
                     len(day_buckets),
                 )
-                continue
 
             try:
                 path = await asyncio.to_thread(writer, day_start_s=day_start, buckets=day_buckets)

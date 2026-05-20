@@ -118,14 +118,17 @@ the endpoint can become ready before older dashboard buckets finish loading. The
 status, elapsed time, and restored bucket count.
 
 The dashboard store keeps minute files under `minutes/YYYY-MM-DD/` and also
-uses `days/YYYY-MM-DD.json` files as a compact cache for complete UTC days. On
-restore it checks `days/` first, falls back to minute files for missing days,
-and backfills a `days/` file once it has all 1,440 minute buckets for a
-completed day. While the load balancer stays running, it also rolls over each
-complete UTC day from in-memory history into `days/YYYY-MM-DD.json` shortly
-after midnight UTC. Partial `days/` files are not treated as authoritative:
-restore and backfill continue to check minute files for that day and replace
-the partial file once the complete day is available.
+uses `days/YYYY-MM-DD.json` files as a compact cache for UTC days. On restore it
+checks `days/` first, falls back to minute files for days without an
+authoritative cache, and backfills a complete `days/` file once it has all 1,440
+minute buckets for a completed day. While the load balancer stays running, it
+also rolls over each completed UTC day from in-memory history into
+`days/YYYY-MM-DD.json` shortly after midnight UTC. If the day is missing minute
+buckets, the rollover still writes a finalized partial day file with
+`complete: false`, `finalized: true`, and a missing-minute count so later
+restores do not redownload the same minutes forever. Older/open partial day
+files without `finalized: true` are still allowed to merge newly appeared minute
+files and then become finalized.
 
 You can precompute day files without running the load balancer:
 
@@ -148,8 +151,10 @@ any day files that were already created. It also keeps a local minute download
 cache under the user cache directory so interrupted day-file backfills can reuse
 already downloaded minute files; pass `--no-download-cache` to disable this.
 Historical partial days are cached too, which is useful for the first UTC day a
-load balancer existed. Pass `--require-complete-days` to only create day files
-when all 1,440 minute buckets are present.
+load balancer existed. These partials are finalized after checking available
+minute files, so subsequent runs do not keep downloading the same incomplete
+day. Pass `--require-complete-days` to only create day files when all 1,440
+minute buckets are present.
 
 ## Load Balancer Env Vars
 
