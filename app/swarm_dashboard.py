@@ -1590,8 +1590,12 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
 
     function formatHoursServed(hoursValue) {
       const totalMinutes = Math.max(0, Math.round(Number(hoursValue || 0) * 60));
-      const hours = Math.floor(totalMinutes / 60);
+      const days = Math.floor(totalMinutes / (24 * 60));
+      const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
       const minutes = totalMinutes % 60;
+      if (days > 0) {
+        return `${days}d ${hours}h ${minutes}m`;
+      }
       if (hours > 0) {
         return `${hours}h ${String(minutes).padStart(2, '0')}m`;
       }
@@ -1674,7 +1678,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       const stats = [
         ['Running', current.running_endpoints],
         ['Connected', current.connected_sessions],
-        [`Hours served / ${windowLabel}`, formatHoursServed(summary.active_conversation_hours_window)],
+        [`Time served / ${windowLabel}`, formatHoursServed(summary.active_conversation_hours_window)],
         [`Avg Duration / ${windowLabel}`, formatDuration(summary.avg_conversation_duration_window_s)],
       ];
       document.getElementById('hero-stats').innerHTML = stats.map(([label, value]) => `
