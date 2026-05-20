@@ -113,6 +113,9 @@ def main() -> None:
         end_day = today - timedelta(days=1)
         start_day = end_day - timedelta(days=args.days - 1)
 
+    if start_day > end_day:
+        parser.error("--start-day must be on or before --end-day")
+
     requested_days = [
         (start_day + timedelta(days=offset)).strftime("%Y-%m-%d")
         for offset in range((end_day - start_day).days + 1)
