@@ -285,7 +285,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["observed_active_sessions"], 1)
         self.assertEqual(snapshot["free_slots"], 0)
 
-        with self.assertRaises(TimeoutError):
+        with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
             await self.router.acquire(timeout_s=0.01)
 
         await self.router.release(lease.slot_id, connected=False)

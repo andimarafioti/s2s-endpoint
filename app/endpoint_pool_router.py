@@ -357,7 +357,10 @@ class EndpointPoolRouter:
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
                     raise RuntimeError("timed out waiting for an available compute endpoint")
-                await asyncio.wait_for(self._condition.wait(), timeout=remaining)
+                try:
+                    await asyncio.wait_for(self._condition.wait(), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError("timed out waiting for an available compute endpoint") from exc
 
             self._spawn_wake_tasks(wake_names)
 
