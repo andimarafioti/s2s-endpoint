@@ -2203,6 +2203,8 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       seriesConfig.forEach((series) => {
         ctx.strokeStyle = series.color;
         ctx.lineWidth = series.width || 2.5;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
         ctx.beginPath();
         points.forEach((point, index) => {
           const x = padding.left + xStep * index;
