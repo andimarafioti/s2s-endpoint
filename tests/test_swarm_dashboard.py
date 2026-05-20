@@ -242,6 +242,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["summary"]["session_requests_window"], 1)
         self.assertEqual(payload["summary"]["conversations_completed_window"], 1)
         self.assertEqual(payload["summary"]["active_conversation_minutes_window"], 2.0)
+        self.assertEqual(payload["summary"]["active_conversation_hours_window"], 0.03)
         self.assertEqual(payload["summary"]["avg_conversation_duration_window_s"], 150.0)
 
     async def test_hourly_series_averages_state_metrics_and_sums_events(self):
@@ -388,6 +389,9 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["active_conversation_minutes_1h"], 8.0)
         self.assertEqual(point["active_conversation_minutes_6h"], 13.0)
         self.assertEqual(point["active_conversation_minutes_24h"], 15.0)
+        self.assertEqual(point["active_conversation_hours_1h"], 0.13)
+        self.assertEqual(point["active_conversation_hours_6h"], 0.22)
+        self.assertEqual(point["active_conversation_hours_24h"], 0.25)
         self.assertEqual(point["avg_conversation_duration_min_1h"], 10.0)
         self.assertEqual(point["avg_conversation_duration_min_6h"], 8.0)
         self.assertEqual(point["avg_conversation_duration_min_24h"], 6.83)
