@@ -121,7 +121,9 @@ The dashboard store keeps minute files under `minutes/YYYY-MM-DD/` and also
 uses `days/YYYY-MM-DD.json` files as a compact cache for complete UTC days. On
 restore it checks `days/` first, falls back to minute files for missing days,
 and backfills a `days/` file once it has all 1,440 minute buckets for a
-completed day.
+completed day. While the load balancer stays running, it also rolls over each
+complete UTC day from in-memory history into `days/YYYY-MM-DD.json` shortly
+after midnight UTC.
 
 You can precompute day files without running the load balancer:
 

@@ -441,6 +441,26 @@ class HuggingFaceBucketHistoryStore:
         )
         return [path for _, path in add]
 
+    def write_day_buckets(self, *, day_start_s: int, buckets: list[SwarmHistoryBucket]) -> Optional[str]:
+        day_start = _day_start_epoch_s(day_start_s)
+        day_buckets = sorted(
+            [
+                bucket
+                for bucket in buckets
+                if _day_start_epoch_s(bucket.bucket_start_s) == day_start
+            ],
+            key=lambda bucket: bucket.bucket_start_s,
+        )
+        if len(day_buckets) != 24 * 60:
+            logger.info(
+                "Skipping dashboard history day file %s because only %s of 1440 minute buckets were provided",
+                _day_key(day_start),
+                len(day_buckets),
+            )
+            return None
+
+        return self._cache_day_file(day_start=day_start, day_buckets=day_buckets, complete=True)
+
     def _cache_day_file(
         self,
         *,
@@ -896,6 +916,7 @@ class HuggingFaceBucketHistoryStore:
 class ReadOnlyDashboardHistoryStore:
     def __init__(self, wrapped: DashboardHistoryStore) -> None:
         self.wrapped = wrapped
+        self.read_only = True
         if hasattr(wrapped, "read_only"):
             wrapped.read_only = True
 
@@ -905,3 +926,8 @@ class ReadOnlyDashboardHistoryStore:
     def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
         if buckets:
             logger.debug("Skipping dashboard history write because history store is read-only")
+
+    def write_day_buckets(self, *, day_start_s: int, buckets: list[SwarmHistoryBucket]) -> Optional[str]:
+        if buckets:
+            logger.debug("Skipping dashboard day history write because history store is read-only")
+        return None

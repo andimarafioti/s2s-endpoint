@@ -56,6 +56,16 @@ class FakeHistoryStore:
             self.saved[bucket.bucket_start_s] = bucket.to_dict()
 
 
+class DayRolloverHistoryStore(FakeHistoryStore):
+    def __init__(self, initial_buckets=None):
+        super().__init__(initial_buckets=initial_buckets)
+        self.day_write_calls = []
+
+    def write_day_buckets(self, *, day_start_s: int, buckets):
+        self.day_write_calls.append((day_start_s, [bucket.bucket_start_s for bucket in buckets]))
+        return f"days/{day_start_s}.json"
+
+
 class SlowHistoryStore(FakeHistoryStore):
     def __init__(self, *, delay_s: float, initial_buckets=None):
         super().__init__(initial_buckets=initial_buckets)
@@ -568,6 +578,66 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.load_calls, 1)
         self.assertEqual(series[0]["running_endpoints"], 2)
 
+    async def test_live_day_rollover_writes_complete_past_day_from_memory(self):
+        day_start = _day_start(2026, 5, 18)
+        clock = FakeClock(day_start + 24 * 60 * 60 + 120)
+        store = DayRolloverHistoryStore()
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            sample_interval_s=3600,
+            retention_minutes=2 * 24 * 60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+        dashboard._day_rollover_cursor_s = day_start
+        for minute in range(24 * 60):
+            bucket_start_s = day_start + minute * 60
+            bucket = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
+            bucket.sample_count = 1
+            dashboard._history[bucket_start_s] = bucket
+
+        await dashboard._rollover_completed_days()
+
+        self.assertEqual(len(store.day_write_calls), 1)
+        self.assertEqual(store.day_write_calls[0][0], day_start)
+        self.assertEqual(len(store.day_write_calls[0][1]), 24 * 60)
+        self.assertEqual(dashboard._day_rollover_cursor_s, day_start + 24 * 60 * 60)
+
+    async def test_live_day_rollover_skips_incomplete_past_day(self):
+        day_start = _day_start(2026, 5, 18)
+        clock = FakeClock(day_start + 24 * 60 * 60 + 120)
+        store = DayRolloverHistoryStore()
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            sample_interval_s=3600,
+            retention_minutes=2 * 24 * 60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+        dashboard._day_rollover_cursor_s = day_start
+        for minute in range((24 * 60) - 1):
+            bucket_start_s = day_start + minute * 60
+            dashboard._history[bucket_start_s] = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
+
+        await dashboard._rollover_completed_days()
+
+        self.assertEqual(store.day_write_calls, [])
+        self.assertEqual(dashboard._day_rollover_cursor_s, day_start + 24 * 60 * 60)
+
     async def test_background_restore_does_not_block_start(self):
         bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600)
         bucket.running_endpoints_last = 2
@@ -681,6 +751,23 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         store.write_buckets([bucket])
 
         self.assertEqual(api.batch_adds[0][1], f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json")
+
+    def test_write_day_buckets_uses_day_path(self):
+        day_start = _day_start(2026, 5, 18)
+        api = FakeBucketApi({})
+        store = _bucket_store(api)
+        buckets = []
+        for minute in range(24 * 60):
+            bucket = SwarmHistoryBucket(bucket_start_s=day_start + minute * 60)
+            bucket.sample_count = 1
+            buckets.append(bucket)
+
+        path = store.write_day_buckets(day_start_s=day_start, buckets=buckets)
+
+        self.assertEqual(path, "reachy-s2s-lb/days/2026-05-18.json")
+        self.assertEqual(api.batch_adds[0][1], "reachy-s2s-lb/days/2026-05-18.json")
+        self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["complete"], True)
+        self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["minute_bucket_count"], 24 * 60)
 
     def test_migrate_legacy_minute_files_moves_flat_files_to_day_folder(self):
         day_start = _day_start(2026, 5, 18)

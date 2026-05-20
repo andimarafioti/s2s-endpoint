@@ -15,6 +15,8 @@ ROLLING_VIEW_WINDOWS: tuple[tuple[str, int], ...] = (
     ("6h", 6 * 60),
     ("24h", 24 * 60),
 )
+DAY_MINUTES = 24 * 60
+DAY_SECONDS = DAY_MINUTES * 60
 
 
 def _normalize_status(status: object) -> str:
@@ -24,6 +26,14 @@ def _normalize_status(status: object) -> str:
 def _bucket_start_epoch_s(epoch_s: float, bucket_minutes: int) -> int:
     bucket_seconds = bucket_minutes * 60
     return int(epoch_s // bucket_seconds) * bucket_seconds
+
+
+def _day_start_epoch_s(epoch_s: float) -> int:
+    return _bucket_start_epoch_s(epoch_s, DAY_MINUTES)
+
+
+def _day_key(epoch_s: int | float) -> str:
+    return datetime.fromtimestamp(epoch_s, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 def _isoformat(epoch_s: int | float) -> str:
@@ -53,6 +63,9 @@ class DashboardHistoryStore(Protocol):
         ...
 
     def write_buckets(self, buckets: list["SwarmHistoryBucket"]) -> None:
+        ...
+
+    def write_day_buckets(self, *, day_start_s: int, buckets: list["SwarmHistoryBucket"]) -> Optional[str]:
         ...
 
 
@@ -333,7 +346,9 @@ class SwarmDashboard:
         self._sample_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._flush_task: Optional[asyncio.Task] = None
+        self._day_rollover_task: Optional[asyncio.Task] = None
         self._dirty_bucket_starts: set[int] = set()
+        self._day_rollover_cursor_s: Optional[int] = None
         self._history_restore_status = "disabled" if history_store is None else "pending"
         self._history_restore_detail: Optional[str] = None
         self._history_restore_started_at_s: Optional[float] = None
@@ -350,6 +365,9 @@ class SwarmDashboard:
                 self._restore_task = asyncio.create_task(self._restore_history())
             else:
                 await self._restore_history()
+        if self._history_store_day_writer() is not None:
+            self._day_rollover_cursor_s = _day_start_epoch_s(self._time_fn())
+            self._day_rollover_task = asyncio.create_task(self._day_rollover_loop())
         self._sample_task = asyncio.create_task(self._sample_loop())
 
     async def stop(self) -> None:
@@ -369,6 +387,14 @@ class SwarmDashboard:
                 pass
             self._sample_task = None
 
+        if self._day_rollover_task is not None:
+            self._day_rollover_task.cancel()
+            try:
+                await self._day_rollover_task
+            except asyncio.CancelledError:
+                pass
+            self._day_rollover_task = None
+
         if self._flush_task is not None:
             try:
                 await self._flush_task
@@ -377,6 +403,7 @@ class SwarmDashboard:
             self._flush_task = None
 
         await self._flush_dirty_buckets(include_open_bucket=True)
+        await self._rollover_completed_days()
 
     async def capture_sample(self) -> SwarmStateSample:
         healthy, detail, snapshot = await self.snapshot_provider()
@@ -646,6 +673,16 @@ class SwarmDashboard:
             while True:
                 await asyncio.sleep(self.sample_interval_s)
                 await self.capture_sample()
+        except asyncio.CancelledError:
+            raise
+
+    async def _day_rollover_loop(self) -> None:
+        try:
+            while True:
+                now_s = self._time_fn()
+                next_day_start_s = _day_start_epoch_s(now_s) + DAY_SECONDS
+                await asyncio.sleep(max(1.0, next_day_start_s + 90 - now_s))
+                await self._rollover_completed_days()
         except asyncio.CancelledError:
             raise
 
@@ -927,6 +964,67 @@ class SwarmDashboard:
             async with self._lock:
                 for bucket in buckets:
                     self._dirty_bucket_starts.discard(bucket.bucket_start_s)
+
+    def _history_store_day_writer(self) -> Optional[Callable[..., Optional[str]]]:
+        if self.history_store is None:
+            return None
+        if getattr(self.history_store, "read_only", False):
+            return None
+        writer = getattr(self.history_store, "write_day_buckets", None)
+        return writer if callable(writer) else None
+
+    async def _rollover_completed_days(self) -> None:
+        writer = self._history_store_day_writer()
+        if writer is None:
+            return
+
+        current_task = asyncio.current_task()
+        if self._flush_task is not None and self._flush_task is not current_task and not self._flush_task.done():
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                raise
+
+        await self._flush_dirty_buckets(include_open_bucket=False)
+
+        async with self._lock:
+            current_day_start_s = _day_start_epoch_s(self._time_fn())
+            if self._day_rollover_cursor_s is None:
+                self._day_rollover_cursor_s = current_day_start_s
+                return
+            if self._day_rollover_cursor_s >= current_day_start_s:
+                return
+
+            day_starts = list(range(self._day_rollover_cursor_s, current_day_start_s, DAY_SECONDS))
+            buckets_by_day: dict[int, list[SwarmHistoryBucket]] = {day_start: [] for day_start in day_starts}
+            for bucket in self._history.values():
+                day_start = _day_start_epoch_s(bucket.bucket_start_s)
+                if day_start in buckets_by_day:
+                    buckets_by_day[day_start].append(bucket)
+
+        next_cursor_s = current_day_start_s
+        for day_start in day_starts:
+            day_buckets = sorted(buckets_by_day.get(day_start, []), key=lambda bucket: bucket.bucket_start_s)
+            if len(day_buckets) != DAY_MINUTES:
+                logger.info(
+                    "Skipping live dashboard day rollover for %s because only %s of 1440 minute buckets are in memory",
+                    _day_key(day_start),
+                    len(day_buckets),
+                )
+                continue
+
+            try:
+                path = await asyncio.to_thread(writer, day_start_s=day_start, buckets=day_buckets)
+            except Exception as exc:
+                logger.warning("Failed to cache live dashboard history day %s: %s", _day_key(day_start), exc)
+                next_cursor_s = day_start
+                break
+            if path:
+                logger.info("Cached live dashboard history day %s at %s", _day_key(day_start), path)
+
+        async with self._lock:
+            if self._day_rollover_cursor_s is None or self._day_rollover_cursor_s < next_cursor_s:
+                self._day_rollover_cursor_s = next_cursor_s
 
     def _collect_dirty_buckets_unlocked(self, *, include_open_bucket: bool) -> list[SwarmHistoryBucket]:
         current_bucket_start_s = _bucket_start_epoch_s(self._time_fn(), 1)
