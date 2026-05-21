@@ -23,6 +23,7 @@ INTERNAL_WS_BASE_PORT = int(os.getenv("INTERNAL_WS_PORT", "9000"))
 S2S_REPO_DIR = os.getenv("S2S_REPO_DIR", "/opt/speech-to-speech")
 PIPELINE_MAX_INSTANCES = int(os.getenv("PIPELINE_MAX_INSTANCES", "1"))
 PIPELINE_MIN_IDLE_INSTANCES = int(os.getenv("PIPELINE_MIN_IDLE_INSTANCES", "1"))
+NUM_SERVERS = os.getenv("NUM_SERVERS", "2").strip()
 
 # Core pipeline selection
 LANGUAGE = os.getenv("LANGUAGE", "en").strip()
@@ -94,6 +95,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
         TTS,
     ]
 
+    _add_str_flag(cmd, NUM_SERVERS, "--num_servers")
     _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
     _add_str_flag(cmd, MODEL_NAME, "--model_name")

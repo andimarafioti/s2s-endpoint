@@ -103,6 +103,7 @@ def build_endpoint_env(
     session_shared_secret: str | None,
     pipeline_max_instances: int | None,
     pipeline_min_idle_instances: int | None,
+    num_servers: int | None,
     lb_callback_auth_token: str | None,
 ) -> dict[str, str]:
     endpoint_env = dict(base_env)
@@ -124,6 +125,11 @@ def build_endpoint_env(
         endpoint_env["PIPELINE_MIN_IDLE_INSTANCES"] = str(pipeline_min_idle_instances)
     elif "PIPELINE_MIN_IDLE_INSTANCES" not in endpoint_env:
         endpoint_env["PIPELINE_MIN_IDLE_INSTANCES"] = "1"
+
+    if num_servers is not None:
+        endpoint_env["NUM_SERVERS"] = str(num_servers)
+    elif "NUM_SERVERS" not in endpoint_env:
+        endpoint_env["NUM_SERVERS"] = "2"
 
     if lb_callback_auth_token:
         endpoint_env["LB_CALLBACK_AUTH_TOKEN"] = lb_callback_auth_token
@@ -159,6 +165,7 @@ def main() -> None:
     parser.add_argument("--scale-to-zero-timeout", type=int, help="Optional scale-to-zero timeout")
     parser.add_argument("--pipeline-max-instances", type=int, help="Local pipeline slots per compute endpoint")
     parser.add_argument("--pipeline-min-idle-instances", type=int, help="Warm local pipeline slots per compute endpoint")
+    parser.add_argument("--num-servers", type=int, help="Concurrent realtime sessions per s2s pipeline process (--num_servers)")
     parser.add_argument("--env-file", help="JSON file with extra env vars")
     parser.add_argument("--secret-file", help="JSON file with secrets")
     parser.add_argument("--env", action="append", default=[], help="Extra env var in KEY=VALUE form")
