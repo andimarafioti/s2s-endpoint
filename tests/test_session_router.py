@@ -43,18 +43,52 @@ class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await self.router.acquire()
 
-    async def test_acquire_multiple_times_returns_same_slot(self):
-        self.router._ready = True
-        slot1 = await self.router.acquire()
-        slot2 = await self.router.acquire()
+    async def test_acquire_concurrent_up_to_max_sessions(self):
+        router = SessionRouter(
+            host="127.0.0.1",
+            base_port=9000,
+            repo_dir=".",
+            build_command=fake_build_command,
+            wait_for_ready=fake_wait_for_ready,
+            max_sessions=2,
+        )
+        router._ready = True
+
+        slot1 = await router.acquire()
+        slot2 = await router.acquire()
         self.assertEqual(slot1.slot_id, slot2.slot_id)
 
-    async def test_release_is_noop(self):
+        with self.assertRaises(RuntimeError):
+            await router.acquire()
+
+    async def test_release_frees_session(self):
         self.router._ready = True
         slot = await self.router.acquire()
+
+        with self.assertRaises(RuntimeError):
+            await self.router.acquire()
+
         await self.router.release(slot.slot_id)
         slot_again = await self.router.acquire()
         self.assertEqual(slot.slot_id, slot_again.slot_id)
+
+    async def test_snapshot_reports_active_sessions(self):
+        router = SessionRouter(
+            host="127.0.0.1",
+            base_port=9000,
+            repo_dir=".",
+            build_command=fake_build_command,
+            wait_for_ready=fake_wait_for_ready,
+            max_sessions=3,
+        )
+        router._ready = True
+
+        await router.acquire()
+        await router.acquire()
+        snapshot = await router.snapshot()
+        self.assertEqual(snapshot["max_sessions"], 3)
+        self.assertEqual(snapshot["active_sessions"], 2)
+        self.assertEqual(snapshot["free_sessions"], 1)
 
     async def test_healthcheck_healthy_when_ready(self):
         self.router._ready = True

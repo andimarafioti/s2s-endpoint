@@ -151,6 +151,7 @@ session_router = SessionRouter(
     repo_dir=S2S_REPO_DIR,
     build_command=build_s2s_command,
     wait_for_ready=wait_for_internal_server,
+    max_sessions=int(NUM_PIPELINES),
 )
 
 app = FastAPI(lifespan=build_lifespan(session_router))

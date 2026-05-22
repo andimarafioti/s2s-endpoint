@@ -43,19 +43,25 @@ class SessionRouter:
         build_command: BuildCommand,
         wait_for_ready: WaitForReady,
         ws_path: str = "",
+        max_sessions: int = 1,
     ) -> None:
+        if max_sessions < 1:
+            raise ValueError("max_sessions must be >= 1")
+
         self.host = host
         self.base_port = base_port
         self.ws_path = ws_path
         self.repo_dir = repo_dir
         self.build_command = build_command
         self.wait_for_ready = wait_for_ready
+        self.max_sessions = max_sessions
 
         self._slot = PipelineSlot(slot_id=0, host=host, port=base_port, ws_path=ws_path)
         self._process: Optional[subprocess.Popen] = None
         self._ready = False
         self._starting = False
         self._closed = False
+        self._active_sessions = 0
         self._last_error: Optional[str] = None
 
     async def start(self) -> None:
@@ -74,16 +80,24 @@ class SessionRouter:
             raise RuntimeError(
                 f"speech-to-speech process exited with code {self._process.returncode}"
             )
+        if self._active_sessions >= self.max_sessions:
+            raise RuntimeError(
+                f"all {self.max_sessions} pipeline session(s) are in use"
+            )
+        self._active_sessions += 1
         return self._slot
 
     async def release(self, slot_id: int) -> None:
-        pass
+        self._active_sessions = max(self._active_sessions - 1, 0)
 
     async def snapshot(self) -> dict[str, object]:
         return {
             "ws_url": self._slot.ws_url,
             "ready": self._ready,
             "starting": self._starting,
+            "max_sessions": self.max_sessions,
+            "active_sessions": self._active_sessions,
+            "free_sessions": max(self.max_sessions - self._active_sessions, 0),
             "errors": [self._last_error] if self._last_error else [],
         }
 
