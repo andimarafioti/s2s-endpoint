@@ -13,51 +13,66 @@ def fake_build_command(host, port):
 
 
 class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+    def setUp(self):
         self.router = SessionRouter(
             host="127.0.0.1",
             base_port=9000,
             repo_dir=".",
-            min_idle_instances=1,
-            max_instances=2,
             build_command=fake_build_command,
             wait_for_ready=fake_wait_for_ready,
         )
 
-        async def fake_start_slot(slot, timeout_s):
-            slot.starting = False
-            slot.ready = True
-            slot.last_error = None
+    async def _fake_start(self):
+        self.router._ready = True
+        self.router._starting = False
+        self.router._last_error = None
 
-        self.router._start_slot = fake_start_slot  # type: ignore[method-assign]
-        self.router._stop_slot_process = lambda slot: None  # type: ignore[method-assign]
-
-    async def test_start_ensures_min_idle_slot(self):
+    async def test_start_makes_pipeline_ready(self):
+        self.router._start_process = lambda timeout_s: self._fake_start()
         await self.router.start()
 
         snapshot = await self.router.snapshot()
-        self.assertEqual(snapshot["total_slots"], 1)
-        self.assertEqual(snapshot["ready_idle"], 1)
-        self.assertEqual(snapshot["ready_busy"], 0)
+        self.assertTrue(snapshot["ready"])
 
-    async def test_acquire_waits_until_slot_is_released(self):
-        self.router.max_instances = 1
-        await self.router.start()
+    async def test_acquire_returns_slot_when_ready(self):
+        self.router._ready = True
+        slot = await self.router.acquire()
+        self.assertEqual(slot.ws_url, "ws://127.0.0.1:9000")
 
-        slot = await self.router.acquire(timeout_s=0.2)
+    async def test_acquire_raises_when_not_ready(self):
+        with self.assertRaises(RuntimeError):
+            await self.router.acquire()
 
-        async def acquire_again():
-            return await self.router.acquire(timeout_s=0.2)
+    async def test_acquire_multiple_times_returns_same_slot(self):
+        self.router._ready = True
+        slot1 = await self.router.acquire()
+        slot2 = await self.router.acquire()
+        self.assertEqual(slot1.slot_id, slot2.slot_id)
 
-        waiter = asyncio.create_task(acquire_again())
-        await asyncio.sleep(0.05)
-        self.assertFalse(waiter.done())
-
+    async def test_release_is_noop(self):
+        self.router._ready = True
+        slot = await self.router.acquire()
         await self.router.release(slot.slot_id)
-        reused_slot = await waiter
+        slot_again = await self.router.acquire()
+        self.assertEqual(slot.slot_id, slot_again.slot_id)
 
-        self.assertEqual(reused_slot.slot_id, slot.slot_id)
-        self.assertTrue(reused_slot.busy)
+    async def test_healthcheck_healthy_when_ready(self):
+        self.router._ready = True
+        healthy, detail, snapshot = await self.router.healthcheck()
+        self.assertTrue(healthy)
+        self.assertIsNone(detail)
+
+    async def test_healthcheck_unhealthy_when_starting(self):
+        self.router._starting = True
+        healthy, detail, _ = await self.router.healthcheck()
+        self.assertFalse(healthy)
+        self.assertIn("starting", detail)
+
+    async def test_healthcheck_unhealthy_with_error(self):
+        self.router._last_error = "process crashed"
+        healthy, detail, _ = await self.router.healthcheck()
+        self.assertFalse(healthy)
+        self.assertEqual(detail, "process crashed")
 
 
 if __name__ == "__main__":

@@ -91,14 +91,10 @@ class CreateComputeEndpointsTests(unittest.TestCase):
         env = build_endpoint_env(
             base_env={
                 "SESSION_SHARED_SECRET": "shared",
-                "PIPELINE_MAX_INSTANCES": "2",
-                "PIPELINE_MIN_IDLE_INSTANCES": "2",
                 "OPEN_API_MODEL_NAME": "template-model",
             },
             session_shared_secret=None,
-            pipeline_max_instances=None,
-            pipeline_min_idle_instances=None,
-            num_servers=None,
+            num_pipelines=None,
             lb_callback_auth_token=None,
         )
 
@@ -106,9 +102,7 @@ class CreateComputeEndpointsTests(unittest.TestCase):
             env,
             {
                 "SESSION_SHARED_SECRET": "shared",
-                "PIPELINE_MAX_INSTANCES": "2",
-                "PIPELINE_MIN_IDLE_INSTANCES": "2",
-                "NUM_SERVERS": "2",
+                "NUM_PIPELINES": "1",
                 "OPEN_API_MODEL_NAME": "template-model",
             },
         )
@@ -118,9 +112,7 @@ class CreateComputeEndpointsTests(unittest.TestCase):
             build_endpoint_env(
                 base_env={},
                 session_shared_secret=None,
-                pipeline_max_instances=None,
-                pipeline_min_idle_instances=None,
-                num_servers=None,
+                num_pipelines=None,
                 lb_callback_auth_token=None,
             )
 
