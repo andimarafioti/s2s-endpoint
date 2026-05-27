@@ -1,8 +1,10 @@
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional, Protocol
 from urllib.parse import urlparse, urlunparse
@@ -60,6 +62,9 @@ class EndpointController(Protocol):
         ...
 
     def restart(self, name: str) -> EndpointSnapshot:
+        ...
+
+    def force_restart(self, name: str) -> EndpointSnapshot:
         ...
 
 
@@ -145,6 +150,17 @@ class HuggingFaceEndpointController:
         endpoint.fetch()
         return self._snapshot(name, endpoint)
 
+    def force_restart(self, name: str) -> EndpointSnapshot:
+        """Pause then resume regardless of current status (used for drain recovery)."""
+        endpoint = self._get(name)
+        try:
+            endpoint.pause()
+        except Exception:
+            pass
+        endpoint.resume(running_ok=True)
+        endpoint.fetch()
+        return self._snapshot(name, endpoint)
+
     def _get(self, name: str):
         return self._get_inference_endpoint(
             name,
@@ -180,6 +196,8 @@ class ManagedEndpoint:
     restart_attempts: int = 0
     last_restart_at: Optional[float] = None
     running_since: Optional[float] = None
+    drain_detected_at: Optional[float] = None
+    drain_restarting: bool = False
 
     @property
     def running(self) -> bool:
@@ -187,7 +205,7 @@ class ManagedEndpoint:
 
     @property
     def free_slots(self) -> int:
-        if not self.running or self.parking:
+        if not self.running or self.parking or self.drain_restarting:
             return 0
         return max(self.slots - self.active_sessions, 0)
 
@@ -217,6 +235,7 @@ class EndpointPoolRouter:
         restart_backoff_s: float = 30.0,
         restart_backoff_max_s: float = 300.0,
         restart_stable_running_s: float = 120.0,
+        drain_restart_timeout_s: float = 600.0,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
         if not names:
@@ -250,6 +269,7 @@ class EndpointPoolRouter:
         self.restart_backoff_s = restart_backoff_s
         self.restart_backoff_max_s = restart_backoff_max_s
         self.restart_stable_running_s = restart_stable_running_s
+        self.drain_restart_timeout_s = drain_restart_timeout_s
 
         self._on_endpoint_down: Optional[Callable[[str], Awaitable[None]]] = None
         self._endpoints = {
@@ -388,6 +408,8 @@ class EndpointPoolRouter:
                     "waking": endpoint.waking,
                     "parking": endpoint.parking,
                     "restarting": endpoint.restarting,
+                    "drain_restarting": endpoint.drain_restarting,
+                    "drain_stuck_for_s": round(now - endpoint.drain_detected_at, 1) if endpoint.drain_detected_at is not None else None,
                     "restart_attempts": endpoint.restart_attempts,
                     "active_sessions": endpoint.active_sessions,
                     "free_slots": endpoint.free_slots,
@@ -427,6 +449,7 @@ class EndpointPoolRouter:
                     endpoint.wake_capacity_until = None
                     if not was_running:
                         endpoint.running_since = now
+                        endpoint.drain_restarting = False
                     if (
                         endpoint.restart_attempts > 0
                         and endpoint.running_since is not None
@@ -538,6 +561,7 @@ class EndpointPoolRouter:
                 await asyncio.sleep(self.reconcile_interval_s)
                 await self.refresh()
                 await self._schedule_restarts_if_needed()
+                await self._check_drain_restarts()
                 await self.ensure_min_warm()
                 await self._schedule_wakes_if_needed()
                 await self._schedule_parks_if_needed()
@@ -683,7 +707,7 @@ class EndpointPoolRouter:
         return []
 
     def _should_park_endpoint_unlocked(self, endpoint: ManagedEndpoint) -> bool:
-        if not endpoint.running or endpoint.waking or endpoint.parking or endpoint.restarting:
+        if not endpoint.running or endpoint.waking or endpoint.parking or endpoint.restarting or endpoint.drain_restarting:
             return False
         if endpoint.active_sessions != 0:
             return False
@@ -751,6 +775,113 @@ class EndpointPoolRouter:
     def _spawn_park_tasks(self, names: list[str]) -> None:
         for name in names:
             asyncio.create_task(self._park_endpoint(name))
+
+    @staticmethod
+    def _fetch_pool_units(url: str) -> Optional[list[dict]]:
+        """GET {url}/v1/pool and return the units list, or None if unavailable."""
+        pool_url = url.rstrip("/") + "/v1/pool"
+        req = urllib.request.Request(pool_url, headers={"Accept": "application/json"}, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                body = response.read()
+            data = json.loads(body.decode("utf-8"))
+            units = data.get("units")
+            return units if isinstance(units, list) else None
+        except Exception:
+            return None
+
+    async def _check_drain_restarts(self) -> None:
+        """Poll /v1/pool on each running endpoint; force-restart any stuck draining > drain_restart_timeout_s."""
+        now = time.monotonic()
+
+        async with self._lock:
+            to_poll = [
+                (ep.name, ep.url)
+                for ep in self._endpoints.values()
+                if ep.running
+                and not ep.waking
+                and not ep.parking
+                and not ep.restarting
+                and not ep.drain_restarting
+                and ep.url is not None
+            ]
+
+        if not to_poll:
+            return
+
+        # Poll all endpoints concurrently so a slow/unreachable node doesn't stall the reconcile loop.
+        poll_results = await asyncio.gather(
+            *(asyncio.to_thread(self._fetch_pool_units, url) for _, url in to_poll),
+            return_exceptions=True,
+        )
+
+        newly_detected: list[str] = []
+        to_restart: list[str] = []
+
+        for (name, _), units in zip(to_poll, poll_results):
+            if isinstance(units, BaseException) or units is None:
+                continue
+
+            has_draining = any(unit.get("state") == "draining" for unit in units)
+
+            async with self._condition:
+                ep = self._endpoints.get(name)
+                if ep is None or ep.drain_restarting or ep.restarting or ep.parking or ep.waking:
+                    continue
+
+                if has_draining:
+                    if ep.drain_detected_at is None:
+                        ep.drain_detected_at = now
+                        newly_detected.append(name)
+                    elif now - ep.drain_detected_at >= self.drain_restart_timeout_s:
+                        ep.drain_restarting = True
+                        ep.drain_detected_at = None
+                        to_restart.append(name)
+                        self._condition.notify_all()
+                else:
+                    ep.drain_detected_at = None
+
+        for name in newly_detected:
+            logger.warning(
+                "Endpoint %s has a draining pipeline unit — will force-restart in %.0fs if not resolved",
+                name,
+                self.drain_restart_timeout_s,
+            )
+
+        for name in to_restart:
+            logger.error(
+                "Endpoint %s stuck draining for %.0fs — triggering force restart (pause → resume)",
+                name,
+                self.drain_restart_timeout_s,
+            )
+            asyncio.create_task(self._drain_restart_endpoint(name))
+
+    async def _drain_restart_endpoint(self, name: str) -> None:
+        try:
+            snapshot = await asyncio.to_thread(self.controller.force_restart, name)
+        except Exception as exc:
+            async with self._condition:
+                ep = self._endpoints[name]
+                ep.drain_restarting = False
+                ep.last_error = str(exc)
+                self._last_error = ep.last_error
+                self._condition.notify_all()
+            logger.error("Drain restart failed for endpoint %s: %s", name, exc)
+            return
+
+        async with self._condition:
+            ep = self._endpoints[name]
+            ep.status = snapshot.status
+            ep.raw_status = snapshot.raw_status
+            ep.url = snapshot.url
+            ep.drain_restarting = False
+            ep.last_error = None
+            self._last_error = None
+            if ep.running:
+                ep.running_since = time.monotonic()
+            self._condition.notify_all()
+
+        logger.info("Drain restart completed for endpoint %s (status: %s)", name, snapshot.raw_status)
 
     def _raise_if_closed(self) -> None:
         if self._closed:

@@ -39,6 +39,13 @@ class FakeEndpointController:
         }
         return self.fetch(name)
 
+    def restart(self, name: str) -> EndpointSnapshot:
+        return self.wake(name)
+
+    def force_restart(self, name: str) -> EndpointSnapshot:
+        self.park(name)
+        return self.wake(name)
+
 
 class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
