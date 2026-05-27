@@ -196,6 +196,13 @@ def main() -> None:
 
     endpoints = []
 
+    endpoint_env = build_endpoint_env(
+        base_env=env,
+        session_shared_secret=args.session_shared_secret,
+        num_pipelines=args.num_pipelines,
+        lb_callback_auth_token=args.lb_callback_auth_token,
+    )
+
     for name in names:
         endpoint = api.create_inference_endpoint(
             name,
@@ -214,7 +221,7 @@ def main() -> None:
             scale_to_zero_timeout=args.scale_to_zero_timeout,
             revision=args.revision,
             custom_image=custom_image,
-            env=dict(env) or None,
+            env=endpoint_env or None,
             secrets=secrets or None,
             type=args.type,
         )

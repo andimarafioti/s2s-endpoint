@@ -71,7 +71,7 @@ class SessionRouter:
         self._closed = True
         await asyncio.to_thread(self._stop_process)
 
-    async def acquire(self, timeout_s: float = 900.0) -> PipelineSlot:
+    async def acquire(self) -> PipelineSlot:
         if self._closed:
             raise RuntimeError("session router is shutting down")
         if not self._ready:

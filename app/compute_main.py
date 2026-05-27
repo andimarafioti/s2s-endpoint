@@ -216,7 +216,7 @@ async def websocket_proxy(client_ws: WebSocket):
 
         await proxy_websocket(
             client_ws,
-            acquire_lease=lambda timeout_s: session_router.acquire(timeout_s=timeout_s),
+            acquire_lease=lambda _: session_router.acquire(),
             release_lease=session_router.release,
             describe_lease=lambda slot: f"slot {slot.slot_id} at {slot.ws_url}",
             no_capacity_reason="No pipeline capacity available",
