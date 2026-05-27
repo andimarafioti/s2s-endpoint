@@ -187,6 +187,13 @@ async def create_session(request: Request):
         await dashboard.record_session_allocation_failure()
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
 
+    if await request.is_disconnected():
+        session_id = allocation.get("session_id")
+        if session_id and hasattr(session_manager, "cancel_pending_session"):
+            await session_manager.cancel_pending_session(session_id)
+        logger.warning("Client disconnected during session allocation, released session %s", session_id)
+        raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
+
     await dashboard.record_session_allocation_success()
     return JSONResponse(allocation)
 

@@ -91,8 +91,12 @@ class DirectSessionManager:
             allocated_at_monotonic=time.monotonic(),
         )
 
-        async with self._lock:
-            self._sessions[session_id] = session
+        try:
+            async with self._lock:
+                self._sessions[session_id] = session
+        except BaseException:
+            await self.endpoint_router.release(lease.slot_id, connected=False)
+            raise
 
         return {
             "session_id": session_id,
@@ -101,6 +105,13 @@ class DirectSessionManager:
             "session_token": session_token,
             "pending_timeout_s": self.pending_timeout_s,
         }
+
+    async def cancel_pending_session(self, session_id: str) -> None:
+        async with self._lock:
+            session = self._sessions.pop(session_id, None)
+        if session is not None and not session.connected:
+            await self.endpoint_router.release(session.lease.slot_id, connected=False)
+            logger.info("Released abandoned pending session %s (client disconnected before response)", session_id)
 
     async def handle_event(self, session_id: str, session_token: str, event: str) -> dict[str, object]:
         payload = verify_session_token(session_token, self.session_shared_secret)
