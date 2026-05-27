@@ -210,6 +210,8 @@ async def session_event(session_id: str, payload: dict[str, Any]):
     try:
         result = await session_manager.handle_event(session_id, session_token, event)
     except KeyError:
+        if event == "disconnected":
+            return JSONResponse({"status": "ok", "session_id": session_id, "state": "already_released"})
         raise HTTPException(status_code=404, detail="Unknown session id") from None
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
