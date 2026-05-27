@@ -53,6 +53,8 @@ PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_WS_URL = f"ws://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_SLOT_WS_PATH}"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_USAGE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_USAGE_PATH}"
+INTERNAL_POOL_PATH = "/v1/pool"
+INTERNAL_POOL_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_POOL_PATH}"
 
 
 def _add_bool_flag(cmd: list[str], enabled: bool, flag: str) -> None:
@@ -194,6 +196,15 @@ async def health():
             "router": snapshot,
         }
     )
+
+
+@app.get("/v1/pool")
+async def pool():
+    try:
+        data = await asyncio.to_thread(_http_get_json, INTERNAL_POOL_URL)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return JSONResponse(data)
 
 
 @app.websocket("/v1/realtime")
