@@ -196,7 +196,6 @@ class ManagedEndpoint:
     restart_attempts: int = 0
     last_restart_at: Optional[float] = None
     running_since: Optional[float] = None
-    drain_detected_at: Optional[float] = None
     drain_restarting: bool = False
 
     @property
@@ -409,7 +408,6 @@ class EndpointPoolRouter:
                     "parking": endpoint.parking,
                     "restarting": endpoint.restarting,
                     "drain_restarting": endpoint.drain_restarting,
-                    "drain_stuck_for_s": round(now - endpoint.drain_detected_at, 1) if endpoint.drain_detected_at is not None else None,
                     "restart_attempts": endpoint.restart_attempts,
                     "active_sessions": endpoint.active_sessions,
                     "free_slots": endpoint.free_slots,
@@ -791,9 +789,11 @@ class EndpointPoolRouter:
             return None
 
     async def _check_drain_restarts(self) -> None:
-        """Poll /v1/pool on each running endpoint; force-restart any stuck draining > drain_restart_timeout_s."""
-        now = time.monotonic()
-
+        """Poll /v1/pool on each running endpoint and force-restart (pause → resume) when:
+        - any unit has been draining for >= drain_restart_timeout_s, OR
+        - all units are simultaneously draining (pool fully wedged — restart immediately).
+        Uses draining_for_s from the pool response as the authoritative drain duration.
+        """
         async with self._lock:
             to_poll = [
                 (ep.name, ep.url)
@@ -815,44 +815,44 @@ class EndpointPoolRouter:
             return_exceptions=True,
         )
 
-        newly_detected: list[str] = []
-        to_restart: list[str] = []
+        to_restart: list[tuple[str, str]] = []  # (name, reason)
 
         for (name, _), units in zip(to_poll, poll_results):
-            if isinstance(units, BaseException) or units is None:
+            if isinstance(units, BaseException) or not units:
                 continue
 
-            has_draining = any(unit.get("state") == "draining" for unit in units)
+            draining = [u for u in units if u.get("state") == "draining"]
+            if not draining:
+                continue
+
+            all_draining = len(draining) == len(units)
+            max_draining_s = max(float(u.get("draining_for_s", 0)) for u in draining)
+
+            if all_draining:
+                reason = f"all {len(units)} pipeline unit(s) draining (max {max_draining_s:.0f}s)"
+            elif max_draining_s >= self.drain_restart_timeout_s:
+                reason = f"{len(draining)}/{len(units)} unit(s) stuck draining for {max_draining_s:.0f}s"
+            else:
+                logger.warning(
+                    "Endpoint %s: %d/%d pipeline unit(s) draining, max draining_for_s=%.0f "
+                    "(restart threshold %.0fs)",
+                    name, len(draining), len(units), max_draining_s, self.drain_restart_timeout_s,
+                )
+                continue
 
             async with self._condition:
                 ep = self._endpoints.get(name)
                 if ep is None or ep.drain_restarting or ep.restarting or ep.parking or ep.waking:
                     continue
+                ep.drain_restarting = True
+                self._condition.notify_all()
 
-                if has_draining:
-                    if ep.drain_detected_at is None:
-                        ep.drain_detected_at = now
-                        newly_detected.append(name)
-                    elif now - ep.drain_detected_at >= self.drain_restart_timeout_s:
-                        ep.drain_restarting = True
-                        ep.drain_detected_at = None
-                        to_restart.append(name)
-                        self._condition.notify_all()
-                else:
-                    ep.drain_detected_at = None
+            to_restart.append((name, reason))
 
-        for name in newly_detected:
-            logger.warning(
-                "Endpoint %s has a draining pipeline unit — will force-restart in %.0fs if not resolved",
-                name,
-                self.drain_restart_timeout_s,
-            )
-
-        for name in to_restart:
+        for name, reason in to_restart:
             logger.error(
-                "Endpoint %s stuck draining for %.0fs — triggering force restart (pause → resume)",
-                name,
-                self.drain_restart_timeout_s,
+                "Endpoint %s triggering force restart (pause → resume): %s",
+                name, reason,
             )
             asyncio.create_task(self._drain_restart_endpoint(name))
 
