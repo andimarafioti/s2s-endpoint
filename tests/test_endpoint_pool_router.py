@@ -476,6 +476,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             controller=controller,
         )
 
+        self.router._fetch_pool_units = lambda url: []
         await self.router.start()
         await asyncio.sleep(0.12)
         self.assertEqual(len(controller.park_calls), 1)
@@ -545,7 +546,7 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("endpoint-a", controller.force_restart_calls)
 
-    async def test_drain_restart_triggers_immediately_when_all_units_draining(self):
+    async def test_drain_restart_not_triggered_when_all_units_draining_below_threshold(self):
         controller = FakeEndpointController(
             [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
         )
@@ -554,10 +555,32 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
             endpoint_names=["endpoint-a"],
             drain_restart_timeout_s=600,
         )
-        # Both units draining — well below the 600s threshold, but all-draining triggers immediately.
+        # All units draining but well below the 600s threshold — normal session cleanup,
+        # should NOT trigger a force restart.
         self.router._fetch_pool_units = lambda url: [
             {"state": "draining", "draining_for_s": 5},
             {"state": "draining", "draining_for_s": 3},
+        ]
+
+        await self.router.start()
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(controller.force_restart_calls, [])
+
+    async def test_drain_restart_triggers_when_all_units_stuck_above_threshold(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=600,
+        )
+        # All units stuck draining above threshold — wedged pool, should trigger force restart.
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "draining", "draining_for_s": 700},
+            {"state": "draining", "draining_for_s": 650},
         ]
 
         await self.router.start()

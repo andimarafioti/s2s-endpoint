@@ -983,10 +983,11 @@ class EndpointPoolRouter:
             all_draining = len(draining) == len(units)
             max_draining_s = max(float(u.get("draining_for_s", 0)) for u in draining)
 
-            if all_draining:
-                reason = f"all {len(units)} pipeline unit(s) draining (max {max_draining_s:.0f}s)"
-            elif max_draining_s >= self.drain_restart_timeout_s:
-                reason = f"{len(draining)}/{len(units)} unit(s) stuck draining for {max_draining_s:.0f}s"
+            if max_draining_s >= self.drain_restart_timeout_s:
+                if all_draining:
+                    reason = f"all {len(units)} pipeline unit(s) stuck draining for {max_draining_s:.0f}s"
+                else:
+                    reason = f"{len(draining)}/{len(units)} unit(s) stuck draining for {max_draining_s:.0f}s"
             else:
                 logger.warning(
                     "Endpoint %s: %d/%d pipeline unit(s) draining, max draining_for_s=%.0f "
