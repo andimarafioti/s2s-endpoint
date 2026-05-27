@@ -31,11 +31,11 @@ class EndpointHelpersTests(unittest.TestCase):
         self.assertEqual(current_model_env({"model": {}}), {})
 
     def test_current_model_env_stringifies_values(self):
-        raw = {"model": {"env": {"PIPELINE_MAX_INSTANCES": 2, "DEBUG": True}}}
+        raw = {"model": {"env": {"NUM_PIPELINES": 2, "DEBUG": True}}}
         self.assertEqual(
             current_model_env(raw),
             {
-                "PIPELINE_MAX_INSTANCES": "2",
+                "NUM_PIPELINES": "2",
                 "DEBUG": "True",
             },
         )

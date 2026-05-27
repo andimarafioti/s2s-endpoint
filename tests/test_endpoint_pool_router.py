@@ -2,7 +2,7 @@ import asyncio
 import time
 import unittest
 
-from app.endpoint_pool_router import EndpointPoolRouter, EndpointSnapshot, _to_health_url, _to_ws_url
+from app.endpoint_pool_router import EndpointPoolRouter, EndpointSnapshot, ManagedEndpoint, _to_health_url, _to_ws_url
 
 
 class FakeEndpointController:
@@ -13,6 +13,7 @@ class FakeEndpointController:
         }
         self.wake_calls = []
         self.park_calls = []
+        self.force_restart_calls = []
 
     def fetch(self, name: str) -> EndpointSnapshot:
         state = self.states[name]
@@ -38,6 +39,14 @@ class FakeEndpointController:
             "url": None,
         }
         return self.fetch(name)
+
+    def restart(self, name: str) -> EndpointSnapshot:
+        return self.wake(name)
+
+    def force_restart(self, name: str) -> EndpointSnapshot:
+        self.force_restart_calls.append(name)
+        self.park(name)
+        return self.wake(name)
 
 
 class FakeComputeUsageFetcher:
@@ -467,6 +476,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             controller=controller,
         )
 
+        self.router._fetch_pool_units = lambda url: []
         await self.router.start()
         await asyncio.sleep(0.12)
         self.assertEqual(len(controller.park_calls), 1)
@@ -480,6 +490,166 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         snapshot = await self.router.snapshot()
         self.assertEqual(snapshot["running_endpoints"], 1)
+
+
+class ManagedEndpointPropertyTests(unittest.TestCase):
+    def test_drain_restarting_zeroes_free_slots(self):
+        ep = ManagedEndpoint(name="ep", slots=2)
+        ep.status = "running"
+        ep.url = "https://ep.example.endpoints.huggingface.cloud"
+
+        self.assertEqual(ep.free_slots, 2)
+
+        ep.drain_restarting = True
+        self.assertEqual(ep.free_slots, 0)
+
+
+def _make_drain_router(controller, *, drain_restart_timeout_s=600, endpoint_slots=1, **extra):
+    defaults = dict(
+        endpoint_slots=endpoint_slots,
+        min_warm_endpoints=1,
+        wake_threshold_slots=0,
+        idle_park_timeout_s=60,
+        reconcile_interval_s=60,
+        waking_capacity_timeout_s=300,
+        park_cooldown_s=0,
+        drain_restart_timeout_s=drain_restart_timeout_s,
+        controller=controller,
+    )
+    defaults.update(extra)
+    return EndpointPoolRouter(**defaults)
+
+
+class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        router = getattr(self, "router", None)
+        if router is not None:
+            await router.stop()
+
+    async def test_drain_restart_triggers_when_unit_stuck_above_threshold(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=600,
+        )
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "active"},
+            {"state": "draining", "draining_for_s": 700},
+        ]
+
+        await self.router.start()
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertIn("endpoint-a", controller.force_restart_calls)
+
+    async def test_drain_restart_not_triggered_when_all_units_draining_below_threshold(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=600,
+        )
+        # All units draining but well below the 600s threshold — normal session cleanup,
+        # should NOT trigger a force restart.
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "draining", "draining_for_s": 5},
+            {"state": "draining", "draining_for_s": 3},
+        ]
+
+        await self.router.start()
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(controller.force_restart_calls, [])
+
+    async def test_drain_restart_triggers_when_all_units_stuck_above_threshold(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=600,
+        )
+        # All units stuck draining above threshold — wedged pool, should trigger force restart.
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "draining", "draining_for_s": 700},
+            {"state": "draining", "draining_for_s": 650},
+        ]
+
+        await self.router.start()
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertIn("endpoint-a", controller.force_restart_calls)
+
+    async def test_drain_restart_not_triggered_below_threshold(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=600,
+        )
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "active"},
+            {"state": "draining", "draining_for_s": 100},
+        ]
+
+        await self.router.start()
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(controller.force_restart_calls, [])
+
+    async def test_drain_restart_skips_already_drain_restarting_endpoint(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=0,
+        )
+        self.router._fetch_pool_units = lambda url: [{"state": "draining", "draining_for_s": 999}]
+
+        await self.router.start()
+        async with self.router._condition:
+            self.router._endpoints["endpoint-a"].drain_restarting = True
+
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(controller.force_restart_calls, [])
+
+    async def test_drain_restarting_cleared_after_force_restart_completes(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=600,
+        )
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "active"},
+            {"state": "draining", "draining_for_s": 700},
+        ]
+
+        await self.router.start()
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        async with self.router._condition:
+            ep = self.router._endpoints["endpoint-a"]
+        self.assertFalse(ep.drain_restarting)
 
 
 class EndpointUrlTests(unittest.TestCase):

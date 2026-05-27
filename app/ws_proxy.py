@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from typing import Awaitable, Callable, Optional, Protocol
 
@@ -35,7 +36,21 @@ async def proxy_websocket(
     try:
         lease = await acquire_lease(900.0)
     except Exception as exc:
-        await client_ws.close(code=1013, reason=no_capacity_reason)
+        try:
+            await client_ws.accept()
+            await client_ws.send_text(json.dumps({
+                "type": "error",
+                "error": {
+                    "type": "session_limit_reached",
+                    "message": no_capacity_reason,
+                },
+            }))
+        except Exception:
+            pass
+        try:
+            await client_ws.close(code=1013, reason=no_capacity_reason[:123])
+        except Exception:
+            pass
         logger.warning("%s: %s", no_capacity_log, exc)
         return
 

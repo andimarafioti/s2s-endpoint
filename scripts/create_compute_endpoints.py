@@ -101,8 +101,7 @@ def build_endpoint_env(
     *,
     base_env: dict[str, str],
     session_shared_secret: str | None,
-    pipeline_max_instances: int | None,
-    pipeline_min_idle_instances: int | None,
+    num_pipelines: int | None,
     lb_callback_auth_token: str | None,
 ) -> dict[str, str]:
     endpoint_env = dict(base_env)
@@ -115,15 +114,10 @@ def build_endpoint_env(
     elif not endpoint_env.get("SESSION_SHARED_SECRET", "").strip():
         raise ValueError("--session-shared-secret is required unless copied from --copy-env-from")
 
-    if pipeline_max_instances is not None:
-        endpoint_env["PIPELINE_MAX_INSTANCES"] = str(pipeline_max_instances)
-    elif "PIPELINE_MAX_INSTANCES" not in endpoint_env:
-        endpoint_env["PIPELINE_MAX_INSTANCES"] = "1"
-
-    if pipeline_min_idle_instances is not None:
-        endpoint_env["PIPELINE_MIN_IDLE_INSTANCES"] = str(pipeline_min_idle_instances)
-    elif "PIPELINE_MIN_IDLE_INSTANCES" not in endpoint_env:
-        endpoint_env["PIPELINE_MIN_IDLE_INSTANCES"] = "1"
+    if num_pipelines is not None:
+        endpoint_env["NUM_PIPELINES"] = str(num_pipelines)
+    elif "NUM_PIPELINES" not in endpoint_env:
+        endpoint_env["NUM_PIPELINES"] = "1"
 
     if lb_callback_auth_token:
         endpoint_env["LB_CALLBACK_AUTH_TOKEN"] = lb_callback_auth_token
@@ -157,8 +151,7 @@ def main() -> None:
     parser.add_argument("--min-replica", type=int, default=0, help="Initial min replica count")
     parser.add_argument("--max-replica", type=int, default=1, help="Initial max replica count")
     parser.add_argument("--scale-to-zero-timeout", type=int, help="Optional scale-to-zero timeout")
-    parser.add_argument("--pipeline-max-instances", type=int, help="Local pipeline slots per compute endpoint")
-    parser.add_argument("--pipeline-min-idle-instances", type=int, help="Warm local pipeline slots per compute endpoint")
+    parser.add_argument("--num-pipelines", type=int, help="Concurrent realtime sessions per s2s pipeline process (--num_pipelines)")
     parser.add_argument("--env-file", help="JSON file with extra env vars")
     parser.add_argument("--secret-file", help="JSON file with secrets")
     parser.add_argument("--env", action="append", default=[], help="Extra env var in KEY=VALUE form")
@@ -203,6 +196,13 @@ def main() -> None:
 
     endpoints = []
 
+    endpoint_env = build_endpoint_env(
+        base_env=env,
+        session_shared_secret=args.session_shared_secret,
+        num_pipelines=args.num_pipelines,
+        lb_callback_auth_token=args.lb_callback_auth_token,
+    )
+
     for name in names:
         endpoint = api.create_inference_endpoint(
             name,
@@ -221,7 +221,7 @@ def main() -> None:
             scale_to_zero_timeout=args.scale_to_zero_timeout,
             revision=args.revision,
             custom_image=custom_image,
-            env=dict(env) or None,
+            env=endpoint_env or None,
             secrets=secrets or None,
             type=args.type,
         )

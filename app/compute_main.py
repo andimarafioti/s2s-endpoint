@@ -21,8 +21,7 @@ INTERNAL_WS_HOST = os.getenv("INTERNAL_WS_HOST", "127.0.0.1")
 INTERNAL_WS_BASE_PORT = int(os.getenv("INTERNAL_WS_PORT", "9000"))
 
 S2S_REPO_DIR = os.getenv("S2S_REPO_DIR", "/opt/speech-to-speech")
-PIPELINE_MAX_INSTANCES = int(os.getenv("PIPELINE_MAX_INSTANCES", "1"))
-PIPELINE_MIN_IDLE_INSTANCES = int(os.getenv("PIPELINE_MIN_IDLE_INSTANCES", "1"))
+NUM_PIPELINES = os.getenv("NUM_PIPELINES", "1").strip()
 
 # Core pipeline selection
 LANGUAGE = os.getenv("LANGUAGE", "en").strip()
@@ -54,6 +53,8 @@ PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_WS_URL = f"ws://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_SLOT_WS_PATH}"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_USAGE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_USAGE_PATH}"
+INTERNAL_POOL_PATH = "/v1/pool"
+INTERNAL_POOL_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_POOL_PATH}"
 
 
 def _add_bool_flag(cmd: list[str], enabled: bool, flag: str) -> None:
@@ -94,6 +95,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
         TTS,
     ]
 
+    _add_str_flag(cmd, NUM_PIPELINES, "--num_pipelines")
     _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
     _add_str_flag(cmd, MODEL_NAME, "--model_name")
@@ -149,10 +151,9 @@ session_router = SessionRouter(
     base_port=INTERNAL_WS_BASE_PORT,
     ws_path=INTERNAL_SLOT_WS_PATH,
     repo_dir=S2S_REPO_DIR,
-    min_idle_instances=PIPELINE_MIN_IDLE_INSTANCES,
-    max_instances=PIPELINE_MAX_INSTANCES,
     build_command=build_s2s_command,
     wait_for_ready=wait_for_internal_server,
+    max_sessions=int(NUM_PIPELINES),
 )
 
 app = FastAPI(lifespan=build_lifespan(session_router))
@@ -197,6 +198,15 @@ async def health():
     )
 
 
+@app.get("/v1/pool")
+async def pool():
+    try:
+        data = await asyncio.to_thread(_http_get_json, INTERNAL_POOL_URL)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return JSONResponse(data)
+
+
 @app.websocket("/v1/realtime")
 async def websocket_proxy(client_ws: WebSocket):
     session_payload = _get_session_payload(client_ws)
@@ -217,7 +227,7 @@ async def websocket_proxy(client_ws: WebSocket):
 
         await proxy_websocket(
             client_ws,
-            acquire_lease=lambda timeout_s: session_router.acquire(timeout_s=timeout_s),
+            acquire_lease=lambda _: session_router.acquire(),
             release_lease=session_router.release,
             describe_lease=lambda slot: f"slot {slot.slot_id} at {slot.ws_url}",
             no_capacity_reason="No pipeline capacity available",

@@ -26,7 +26,7 @@ COMPUTE_ENDPOINT_MIN_WARM = int(os.getenv("COMPUTE_ENDPOINT_MIN_WARM", "1"))
 COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS = int(
     os.getenv("COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS", str(COMPUTE_ENDPOINT_SLOTS))
 )
-COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "300"))
+COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "600"))
 COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S", "10"))
 COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S = float(
     os.getenv("COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S", "300")
@@ -39,6 +39,7 @@ COMPUTE_ENDPOINT_MAX_RESTART_ATTEMPTS = int(os.getenv("COMPUTE_ENDPOINT_MAX_REST
 COMPUTE_ENDPOINT_RESTART_BACKOFF_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_BACKOFF_S", "30"))
 COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S", "300"))
 COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S", "120"))
+COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S", "600"))
 HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TOKEN", "").strip() or None
 
 SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
@@ -87,6 +88,7 @@ def build_endpoint_router() -> EndpointPoolRouter:
         restart_backoff_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_S,
         restart_backoff_max_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S,
         restart_stable_running_s=COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S,
+        drain_restart_timeout_s=COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S,
         compute_usage_fetcher=fetch_compute_active_sessions,
     )
 
@@ -185,6 +187,13 @@ async def create_session(request: Request):
         await dashboard.record_session_allocation_failure()
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
 
+    if await request.is_disconnected():
+        session_id = allocation.get("session_id")
+        if session_id and hasattr(session_manager, "cancel_pending_session"):
+            await session_manager.cancel_pending_session(session_id)
+        logger.warning("Client disconnected during session allocation, released session %s", session_id)
+        raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
+
     await dashboard.record_session_allocation_success()
     return JSONResponse(allocation)
 
@@ -201,6 +210,8 @@ async def session_event(session_id: str, payload: dict[str, Any]):
     try:
         result = await session_manager.handle_event(session_id, session_token, event)
     except KeyError:
+        if event == "disconnected":
+            return JSONResponse({"status": "ok", "session_id": session_id, "state": "already_released"})
         raise HTTPException(status_code=404, detail="Unknown session id") from None
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
