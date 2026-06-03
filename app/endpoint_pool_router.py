@@ -174,6 +174,7 @@ class ManagedEndpoint:
     waking: bool = False
     parking: bool = False
     restarting: bool = False
+    draining: bool = False
     last_error: Optional[str] = None
     last_used_at: float = field(default_factory=time.monotonic)
     wake_capacity_until: Optional[float] = None
@@ -187,7 +188,7 @@ class ManagedEndpoint:
 
     @property
     def free_slots(self) -> int:
-        if not self.running or self.parking:
+        if not self.running or self.parking or self.draining:
             return 0
         return max(self.slots - self.active_sessions, 0)
 
@@ -327,6 +328,23 @@ class EndpointPoolRouter:
 
             self._condition.notify_all()
 
+    async def set_draining(self, name: str, draining: bool) -> None:
+        wake_names: list[str] = []
+        async with self._condition:
+            endpoint = self._endpoints.get(name)
+            if endpoint is None:
+                raise KeyError(name)
+
+            endpoint.draining = draining
+            if draining:
+                deficit = self.min_warm_endpoints - self._running_or_waking_count_unlocked()
+                if deficit > 0:
+                    wake_names = self._mark_endpoints_to_wake_unlocked(target_count=deficit)
+
+            self._condition.notify_all()
+
+        self._spawn_wake_tasks(wake_names)
+
     async def healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
         snapshot = await self.snapshot()
         if snapshot["running_endpoints"]:
@@ -388,6 +406,7 @@ class EndpointPoolRouter:
                     "waking": endpoint.waking,
                     "parking": endpoint.parking,
                     "restarting": endpoint.restarting,
+                    "draining": endpoint.draining,
                     "restart_attempts": endpoint.restart_attempts,
                     "active_sessions": endpoint.active_sessions,
                     "free_slots": endpoint.free_slots,
@@ -557,6 +576,8 @@ class EndpointPoolRouter:
                     continue
                 if endpoint.restarting or endpoint.waking or endpoint.parking:
                     continue
+                if endpoint.draining:
+                    continue
                 if endpoint.restart_attempts >= self.max_restart_attempts:
                     continue
                 if endpoint.last_restart_at is not None:
@@ -647,6 +668,7 @@ class EndpointPoolRouter:
             endpoint
             for endpoint in self._endpoints.values()
             if _is_parked_status(endpoint.status)
+            and not endpoint.draining
             and not endpoint.waking
             and not endpoint.parking
             and not endpoint.restarting
@@ -683,7 +705,13 @@ class EndpointPoolRouter:
         return []
 
     def _should_park_endpoint_unlocked(self, endpoint: ManagedEndpoint) -> bool:
-        if not endpoint.running or endpoint.waking or endpoint.parking or endpoint.restarting:
+        if (
+            not endpoint.running
+            or endpoint.waking
+            or endpoint.parking
+            or endpoint.restarting
+            or endpoint.draining
+        ):
             return False
         if endpoint.active_sessions != 0:
             return False
@@ -711,14 +739,19 @@ class EndpointPoolRouter:
         )
 
     def _running_count_unlocked(self) -> int:
-        return sum(1 for endpoint in self._endpoints.values() if endpoint.running and not endpoint.parking)
+        return sum(
+            1
+            for endpoint in self._endpoints.values()
+            if endpoint.running and not endpoint.parking and not endpoint.draining
+        )
 
     def _running_or_waking_count_unlocked(self) -> int:
         now = time.monotonic()
         return sum(
             1
             for endpoint in self._endpoints.values()
-            if (endpoint.running and not endpoint.parking) or self._counts_as_warming_capacity(endpoint, now)
+            if (endpoint.running and not endpoint.parking and not endpoint.draining)
+            or self._counts_as_warming_capacity(endpoint, now)
         )
 
     def _free_slots_unlocked(self) -> int:
@@ -739,6 +772,7 @@ class EndpointPoolRouter:
         return (
             endpoint.waking
             and not endpoint.parking
+            and not endpoint.draining
             and not endpoint.running
             and endpoint.wake_capacity_until is not None
             and now < endpoint.wake_capacity_until

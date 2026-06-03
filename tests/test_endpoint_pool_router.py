@@ -136,6 +136,36 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["running_endpoints"], 2)
         self.assertIn("endpoint-b", controller.wake_calls)
 
+    async def test_draining_endpoint_is_not_selected_for_new_sessions(self):
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+                ("endpoint-b", "running", "https://endpoint-b.example.endpoints.huggingface.cloud"),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a", "endpoint-b"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+
+        await self.router.start()
+        await self.router.set_draining("endpoint-a", True)
+
+        lease = await self.router.acquire(timeout_s=0.2)
+        snapshot = await self.router.snapshot()
+        endpoint_a = next(endpoint for endpoint in snapshot["endpoints"] if endpoint["name"] == "endpoint-a")
+
+        self.assertEqual(lease.endpoint_name, "endpoint-b")
+        self.assertTrue(endpoint_a["draining"])
+        self.assertEqual(endpoint_a["free_slots"], 0)
+
     async def test_reconcile_parks_idle_endpoints_above_warm_floor(self):
         controller = FakeEndpointController(
             [

@@ -416,6 +416,20 @@ uv run --with-requirements requirements.txt python scripts/update_endpoints_imag
   --load_balancer andito/s2s-load_balancer:v0.11
 ```
 
+To avoid interrupting active direct sessions, drain each compute endpoint before
+updating it:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_endpoints_images.py \
+  --namespace HuggingFaceM4 \
+  --compute andito/s2s-compute:v0.4 \
+  --compute-drain
+```
+
+Drain mode asks the load balancer to stop assigning new sessions to one compute
+endpoint, waits until that endpoint has zero active sessions, updates the image,
+and then makes the endpoint available again.
+
 Behavior:
 
 - if you pass `--compute`, the script updates the compute pool first
@@ -427,6 +441,8 @@ Behavior:
   back to deriving the compute prefix from the load-balancer name and scanning
   `-01`, `-02`, ... until the first missing endpoint
 - compute endpoint updates now run in parallel by default; use `--compute-parallelism 1` if you want the old sequential rollout behavior
+- with `--compute-drain`, compute endpoint updates run one at a time by default
+  and only after the load balancer reports zero active sessions for that endpoint
 - with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately
 - completion lines are printed as each endpoint finishes, so parked endpoints are reported immediately even if a few running endpoints are still becoming healthy
 - paused or scale-to-zero compute endpoints keep their parked state after the image update, and the script now waits for them to return to that original parked state instead of incorrectly waiting for `running`
@@ -440,6 +456,8 @@ Useful options:
 - `--compute-prefix reachy-s2s --compute-count 8`: override the LB env and
   update a generated prefix/count set
 - `--compute-parallelism 1`
+- `--compute-drain`
+- `--compute-drain-timeout-s 7200`
 - `--no-wait`
 - `--dry-run`
 

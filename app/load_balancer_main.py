@@ -192,6 +192,36 @@ async def session_event(session_id: str, payload: dict[str, Any]):
     return JSONResponse(result)
 
 
+@app.post("/internal/endpoints/{endpoint_name}/drain")
+async def endpoint_drain(endpoint_name: str, payload: dict[str, Any]):
+    draining = bool(payload.get("draining", True))
+    try:
+        await session_manager.endpoint_router.set_draining(endpoint_name, draining)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown endpoint") from None
+
+    _, _, snapshot = await session_manager.healthcheck()
+    router_snapshot = snapshot.get("router", {})
+    endpoints = router_snapshot.get("endpoints", []) if isinstance(router_snapshot, dict) else []
+    endpoint_snapshot = next(
+        (
+            endpoint
+            for endpoint in endpoints
+            if isinstance(endpoint, dict) and endpoint.get("name") == endpoint_name
+        ),
+        None,
+    )
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "endpoint_name": endpoint_name,
+            "draining": draining,
+            "endpoint": endpoint_snapshot,
+        }
+    )
+
+
 @app.websocket("/ws")
 async def deprecated_websocket_route(client_ws: WebSocket):
     await client_ws.close(code=1008, reason="Use POST /session and connect directly to the returned compute websocket URL")

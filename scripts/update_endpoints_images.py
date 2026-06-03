@@ -2,11 +2,15 @@
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import json
+import os
 import sys
 import time
 from typing import Any
+from urllib.error import HTTPError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, get_token
 from huggingface_hub.errors import HfHubHTTPError, InferenceEndpointError, InferenceEndpointTimeoutError
 
 from _endpoint_helpers import (
@@ -47,7 +51,31 @@ def main() -> None:
         "--compute-parallelism",
         type=int,
         default=0,
-        help="Number of compute endpoint updates to run in parallel. Default: all selected compute endpoints. Use 1 for sequential updates.",
+        help="Number of compute endpoint updates to run in parallel. Default: all selected compute endpoints, or 1 with --compute-drain.",
+    )
+    parser.add_argument(
+        "--compute-drain",
+        action="store_true",
+        help="Ask the load balancer to stop assigning each compute endpoint before waiting for it to become idle and updating it.",
+    )
+    parser.add_argument("--load-balancer-url", help="Load-balancer endpoint URL used by --compute-drain")
+    parser.add_argument(
+        "--compute-drain-timeout-s",
+        type=int,
+        default=7200,
+        help="Timeout while waiting for a drained compute endpoint to reach zero active sessions.",
+    )
+    parser.add_argument(
+        "--compute-drain-refresh-every-s",
+        type=int,
+        default=10,
+        help="Polling interval while waiting for a drained compute endpoint to become idle.",
+    )
+    parser.add_argument(
+        "--load-balancer-request-timeout-s",
+        type=float,
+        default=30,
+        help="HTTP timeout for load-balancer drain and health requests.",
     )
     parser.add_argument(
         "--wait",
@@ -64,13 +92,18 @@ def main() -> None:
     )
     parser.add_argument("--wait-timeout-s", type=int, default=1800, help="Timeout when waiting for an endpoint update")
     parser.add_argument("--wait-refresh-every-s", type=int, default=5, help="Polling interval while waiting")
+    parser.add_argument(
+        "--token",
+        default=default_token(),
+        help="Hugging Face token. Defaults to HF_TOKEN, HF_CONTROL_TOKEN, or the locally saved token.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print planned updates without applying them")
     args = parser.parse_args()
 
     if not args.compute and not args.load_balancer:
         raise ValueError("Provide at least one of --compute or --load_balancer")
 
-    api = HfApi()
+    api = HfApi(token=args.token or None)
     results: dict[str, object] = {}
 
     if args.compute:
@@ -87,10 +120,35 @@ def main() -> None:
             f"{build_compute_summary(compute_names, selection)}"
         )
         compute_namespace = selection.get("namespace", args.namespace)
-        results["compute"] = {
-            **selection,
-            "summary": build_compute_summary(compute_names, selection),
-            "updates": update_many(
+        compute_parallelism = args.compute_parallelism
+        if args.compute_drain and compute_parallelism <= 0:
+            compute_parallelism = 1
+        if args.compute_drain:
+            load_balancer_url = resolve_load_balancer_url(
+                api=api,
+                namespace=args.namespace,
+                load_balancer_name=args.load_balancer_name,
+                explicit_url=args.load_balancer_url,
+                selection=selection,
+            )
+            update_results = update_many_draining(
+                api=api,
+                namespace=compute_namespace if isinstance(compute_namespace, str) else args.namespace,
+                names=compute_names,
+                image_url=args.compute,
+                load_balancer_url=load_balancer_url,
+                token=args.token,
+                wait=args.wait,
+                wait_timeout_s=args.wait_timeout_s,
+                wait_refresh_every_s=args.wait_refresh_every_s,
+                drain_timeout_s=args.compute_drain_timeout_s,
+                drain_refresh_every_s=args.compute_drain_refresh_every_s,
+                request_timeout_s=args.load_balancer_request_timeout_s,
+                dry_run=args.dry_run,
+                parallelism=compute_parallelism,
+            )
+        else:
+            update_results = update_many(
                 api=api,
                 namespace=compute_namespace if isinstance(compute_namespace, str) else args.namespace,
                 names=compute_names,
@@ -99,8 +157,13 @@ def main() -> None:
                 wait_timeout_s=args.wait_timeout_s,
                 wait_refresh_every_s=args.wait_refresh_every_s,
                 dry_run=args.dry_run,
-                parallelism=args.compute_parallelism,
-            ),
+                parallelism=compute_parallelism,
+            )
+        results["compute"] = {
+            **selection,
+            "summary": build_compute_summary(compute_names, selection),
+            "drain": args.compute_drain,
+            "updates": update_results,
         }
 
     if args.load_balancer:
@@ -176,11 +239,15 @@ def discover_load_balancer_compute_names(
         return None
 
     compute_namespace = env.get("HF_ENDPOINT_NAMESPACE", "").strip() or namespace
-    return names, {
+    selection: dict[str, Any] = {
         "discovery": "load_balancer_env",
         "load_balancer_name": load_balancer_name,
         "namespace": compute_namespace,
     }
+    load_balancer_url = getattr(endpoint, "url", None)
+    if load_balancer_url:
+        selection["load_balancer_url"] = str(load_balancer_url)
+    return names, selection
 
 
 def parse_compute_endpoint_names(value: str) -> list[str]:
@@ -191,6 +258,32 @@ def default_compute_prefix(load_balancer_name: str) -> str:
     if load_balancer_name.endswith("-lb") and len(load_balancer_name) > len("-lb"):
         return load_balancer_name[: -len("-lb")]
     return load_balancer_name
+
+
+def default_token() -> str | None:
+    return os.getenv("HF_TOKEN") or os.getenv("HF_CONTROL_TOKEN") or get_token()
+
+
+def resolve_load_balancer_url(
+    *,
+    api: HfApi,
+    namespace: str | None,
+    load_balancer_name: str,
+    explicit_url: str | None,
+    selection: dict[str, Any],
+) -> str:
+    if explicit_url:
+        return explicit_url.rstrip("/")
+
+    selected_url = selection.get("load_balancer_url")
+    if isinstance(selected_url, str) and selected_url.strip():
+        return selected_url.strip().rstrip("/")
+
+    endpoint = api.get_inference_endpoint(load_balancer_name, namespace=namespace)
+    endpoint_url = getattr(endpoint, "url", None)
+    if not endpoint_url:
+        raise ValueError("Could not resolve load-balancer URL. Pass --load-balancer-url.")
+    return str(endpoint_url).rstrip("/")
 
 
 def discover_sequential_compute_names(
@@ -324,6 +417,97 @@ def update_many(
     return [result for result in results if result is not None]
 
 
+def update_many_draining(
+    *,
+    api: HfApi,
+    namespace: str | None,
+    names: list[str],
+    image_url: str,
+    load_balancer_url: str,
+    token: str | None,
+    wait: bool,
+    wait_timeout_s: int,
+    wait_refresh_every_s: int,
+    drain_timeout_s: int,
+    drain_refresh_every_s: int,
+    request_timeout_s: float,
+    dry_run: bool,
+    parallelism: int,
+) -> list[dict[str, object]]:
+    if dry_run:
+        return update_many(
+            api=api,
+            namespace=namespace,
+            names=names,
+            image_url=image_url,
+            wait=wait,
+            wait_timeout_s=wait_timeout_s,
+            wait_refresh_every_s=wait_refresh_every_s,
+            dry_run=dry_run,
+            parallelism=parallelism,
+        )
+
+    total = len(names)
+    if total == 0:
+        return []
+
+    max_workers = total if parallelism <= 0 else min(total, parallelism)
+    if max_workers == 1:
+        return update_many_draining_sequential(
+            api=api,
+            namespace=namespace,
+            names=names,
+            image_url=image_url,
+            load_balancer_url=load_balancer_url,
+            token=token,
+            wait=wait,
+            wait_timeout_s=wait_timeout_s,
+            wait_refresh_every_s=wait_refresh_every_s,
+            drain_timeout_s=drain_timeout_s,
+            drain_refresh_every_s=drain_refresh_every_s,
+            request_timeout_s=request_timeout_s,
+        )
+
+    log_progress(f"Draining and updating {total} compute endpoints in parallel with {max_workers} workers")
+    results: list[dict[str, object] | None] = [None] * total
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[Future[dict[str, object]], tuple[int, str]] = {}
+        for index, name in enumerate(names, start=1):
+            log_progress(f"[{index}/{total}] Submitting drained compute endpoint update for {name}")
+            future = executor.submit(
+                update_one_draining,
+                api=api,
+                namespace=namespace,
+                name=name,
+                image_url=image_url,
+                load_balancer_url=load_balancer_url,
+                token=token,
+                wait=wait,
+                wait_timeout_s=wait_timeout_s,
+                wait_refresh_every_s=wait_refresh_every_s,
+                drain_timeout_s=drain_timeout_s,
+                drain_refresh_every_s=drain_refresh_every_s,
+                request_timeout_s=request_timeout_s,
+            )
+            futures[future] = (index, name)
+
+        try:
+            for future in as_completed(futures):
+                index, name = futures[future]
+                result = future.result()
+                log_progress(
+                    f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
+                )
+                results[index - 1] = result
+        except BaseException:
+            for pending_future in futures:
+                if pending_future is not future:
+                    pending_future.cancel()
+            raise
+
+    return [result for result in results if result is not None]
+
+
 def update_many_sequential(
     *,
     api: HfApi,
@@ -348,6 +532,46 @@ def update_many_sequential(
             wait_timeout_s=wait_timeout_s,
             wait_refresh_every_s=wait_refresh_every_s,
             dry_run=dry_run,
+        )
+        log_progress(
+            f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
+        )
+        results.append(result)
+    return results
+
+
+def update_many_draining_sequential(
+    *,
+    api: HfApi,
+    namespace: str | None,
+    names: list[str],
+    image_url: str,
+    load_balancer_url: str,
+    token: str | None,
+    wait: bool,
+    wait_timeout_s: int,
+    wait_refresh_every_s: int,
+    drain_timeout_s: int,
+    drain_refresh_every_s: int,
+    request_timeout_s: float,
+) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    total = len(names)
+    for index, name in enumerate(names, start=1):
+        log_progress(f"[{index}/{total}] Draining compute endpoint {name}")
+        result = update_one_draining(
+            api=api,
+            namespace=namespace,
+            name=name,
+            image_url=image_url,
+            load_balancer_url=load_balancer_url,
+            token=token,
+            wait=wait,
+            wait_timeout_s=wait_timeout_s,
+            wait_refresh_every_s=wait_refresh_every_s,
+            drain_timeout_s=drain_timeout_s,
+            drain_refresh_every_s=drain_refresh_every_s,
+            request_timeout_s=request_timeout_s,
         )
         log_progress(
             f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
@@ -422,6 +646,70 @@ def update_one(
     return result
 
 
+def update_one_draining(
+    *,
+    api: HfApi,
+    namespace: str | None,
+    name: str,
+    image_url: str,
+    load_balancer_url: str,
+    token: str | None,
+    wait: bool,
+    wait_timeout_s: int,
+    wait_refresh_every_s: int,
+    drain_timeout_s: int,
+    drain_refresh_every_s: int,
+    request_timeout_s: float,
+) -> dict[str, object]:
+    set_compute_endpoint_draining(
+        load_balancer_url=load_balancer_url,
+        token=token,
+        name=name,
+        draining=True,
+        timeout_s=request_timeout_s,
+    )
+
+    result: dict[str, object] | None = None
+    try:
+        drain_snapshot = wait_for_compute_endpoint_free(
+            load_balancer_url=load_balancer_url,
+            token=token,
+            name=name,
+            timeout_s=drain_timeout_s,
+            refresh_every_s=drain_refresh_every_s,
+            request_timeout_s=request_timeout_s,
+        )
+        result = update_one(
+            api=api,
+            namespace=namespace,
+            name=name,
+            image_url=image_url,
+            wait=wait,
+            wait_timeout_s=wait_timeout_s,
+            wait_refresh_every_s=wait_refresh_every_s,
+            dry_run=False,
+        )
+        result["drain"] = {
+            "load_balancer_url": load_balancer_url,
+            "active_sessions_before_update": int(drain_snapshot.get("active_sessions", 0) or 0),
+            "draining_before_update": bool(drain_snapshot.get("draining", False)),
+        }
+        return result
+    finally:
+        try:
+            set_compute_endpoint_draining(
+                load_balancer_url=load_balancer_url,
+                token=token,
+                name=name,
+                draining=False,
+                timeout_s=request_timeout_s,
+            )
+        except Exception as exc:
+            log_progress(f"Failed to clear drain on {name}: {exc}")
+            if result is not None:
+                raise
+
+
 def wait_for_endpoint_update(
     endpoint,
     *,
@@ -453,6 +741,117 @@ def wait_for_endpoint_update(
             )
         time.sleep(refresh_every)
         endpoint.fetch()
+
+
+def wait_for_compute_endpoint_free(
+    *,
+    load_balancer_url: str,
+    token: str | None,
+    name: str,
+    timeout_s: int,
+    refresh_every_s: int,
+    request_timeout_s: float,
+) -> dict[str, object]:
+    start = time.time()
+    while True:
+        health = fetch_load_balancer_health(
+            load_balancer_url=load_balancer_url,
+            token=token,
+            timeout_s=request_timeout_s,
+        )
+        endpoint = find_compute_endpoint_snapshot(health, name)
+        active_sessions = int(endpoint.get("active_sessions", 0) or 0)
+        if active_sessions == 0:
+            return endpoint
+
+        elapsed = time.time() - start
+        if timeout_s is not None and elapsed > timeout_s:
+            raise TimeoutError(
+                f"Timed out waiting for compute endpoint {name} to become free "
+                f"({active_sessions} active session(s) remain)."
+            )
+
+        log_progress(
+            f"{name} still has {active_sessions} active session(s); "
+            f"waiting {refresh_every_s}s before checking again"
+        )
+        time.sleep(refresh_every_s)
+
+
+def find_compute_endpoint_snapshot(health: dict[str, Any], name: str) -> dict[str, object]:
+    sessions = health.get("sessions")
+    router = sessions.get("router") if isinstance(sessions, dict) else None
+    endpoints = router.get("endpoints") if isinstance(router, dict) else None
+    if not isinstance(endpoints, list):
+        raise ValueError("Load-balancer health response does not include router endpoint snapshots")
+
+    for endpoint in endpoints:
+        if isinstance(endpoint, dict) and endpoint.get("name") == name:
+            return endpoint
+
+    raise ValueError(f"Load-balancer health response does not include compute endpoint {name!r}")
+
+
+def fetch_load_balancer_health(
+    *,
+    load_balancer_url: str,
+    token: str | None,
+    timeout_s: float,
+) -> dict[str, Any]:
+    return request_json(
+        f"{load_balancer_url.rstrip('/')}/health",
+        token=token,
+        timeout_s=timeout_s,
+        allow_http_error_body=True,
+    )
+
+
+def set_compute_endpoint_draining(
+    *,
+    load_balancer_url: str,
+    token: str | None,
+    name: str,
+    draining: bool,
+    timeout_s: float,
+) -> dict[str, Any]:
+    escaped_name = quote(name, safe="")
+    return request_json(
+        f"{load_balancer_url.rstrip('/')}/internal/endpoints/{escaped_name}/drain",
+        method="POST",
+        token=token,
+        payload={"draining": draining},
+        timeout_s=timeout_s,
+    )
+
+
+def request_json(
+    url: str,
+    *,
+    method: str = "GET",
+    token: str | None,
+    payload: dict[str, object] | None = None,
+    timeout_s: float,
+    allow_http_error_body: bool = False,
+) -> dict[str, Any]:
+    headers: dict[str, str] = {}
+    data = None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+
+    request = Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=timeout_s) as response:
+            body = response.read()
+    except HTTPError as exc:
+        body = exc.read()
+        if allow_http_error_body and body:
+            return json.loads(body.decode("utf-8"))
+        raise
+
+    return json.loads(body.decode("utf-8"))
 
 
 if __name__ == "__main__":
