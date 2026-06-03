@@ -1,4 +1,5 @@
 import os
+import secrets
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
@@ -41,6 +42,7 @@ COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S = float(os.getenv("COMPUTE_ENDPOINT_RESTA
 COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S", "120"))
 COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S", "600"))
 HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TOKEN", "").strip() or None
+LB_ADMIN_AUTH_TOKEN = os.getenv("LB_ADMIN_AUTH_TOKEN", "").strip() or HF_CONTROL_TOKEN
 
 SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
 SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
@@ -225,7 +227,9 @@ async def session_event(session_id: str, payload: dict[str, Any]):
 
 
 @app.post("/internal/endpoints/{endpoint_name}/drain")
-async def endpoint_drain(endpoint_name: str, payload: dict[str, Any]):
+async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str, Any]):
+    require_admin_auth(request)
+
     endpoint_router = getattr(session_manager, "endpoint_router", None)
     if endpoint_router is None:
         raise HTTPException(status_code=404, detail="Endpoint draining is not available")
@@ -256,6 +260,26 @@ async def endpoint_drain(endpoint_name: str, payload: dict[str, Any]):
             "endpoint": endpoint_snapshot,
         }
     )
+
+
+def require_admin_auth(request: Request) -> None:
+    if not LB_ADMIN_AUTH_TOKEN:
+        raise HTTPException(status_code=503, detail="LB admin auth token is not configured")
+
+    authorization = request.headers.get("authorization", "")
+    if not _authorized_bearer_token(authorization, LB_ADMIN_AUTH_TOKEN):
+        raise HTTPException(status_code=403, detail="Invalid admin authorization")
+
+
+def _authorized_bearer_token(authorization: str | None, expected_token: str | None) -> bool:
+    if not expected_token:
+        return False
+
+    scheme, separator, token = (authorization or "").partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return False
+
+    return secrets.compare_digest(token.strip(), expected_token)
 
 
 @app.websocket("/ws")
