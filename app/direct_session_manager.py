@@ -66,7 +66,7 @@ class DirectSessionManager:
             self._sessions.clear()
 
         for session in sessions:
-            await self.endpoint_router.release(session.lease.slot_id)
+            await self.endpoint_router.release(session.lease.slot_id, connected=session.connected)
 
         await self.endpoint_router.stop()
 
@@ -91,8 +91,12 @@ class DirectSessionManager:
             allocated_at_monotonic=time.monotonic(),
         )
 
-        async with self._lock:
-            self._sessions[session_id] = session
+        try:
+            async with self._lock:
+                self._sessions[session_id] = session
+        except BaseException:
+            await self.endpoint_router.release(lease.slot_id, connected=False)
+            raise
 
         return {
             "session_id": session_id,
@@ -101,6 +105,15 @@ class DirectSessionManager:
             "session_token": session_token,
             "pending_timeout_s": self.pending_timeout_s,
         }
+
+    async def cancel_pending_session(self, session_id: str) -> None:
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.connected:
+                return
+            self._sessions.pop(session_id)
+        await self.endpoint_router.release(session.lease.slot_id, connected=False)
+        logger.info("Released abandoned pending session %s (client disconnected before response)", session_id)
 
     async def handle_event(self, session_id: str, session_token: str, event: str) -> dict[str, object]:
         payload = verify_session_token(session_token, self.session_shared_secret)
@@ -111,6 +124,7 @@ class DirectSessionManager:
             raise ValueError("event must be 'connected' or 'disconnected'")
 
         session_to_release: Optional[DirectSession] = None
+        connected_session: Optional[DirectSession] = None
 
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -120,19 +134,36 @@ class DirectSessionManager:
                 raise ValueError("session token does not match reserved endpoint")
 
             if event == "connected":
+                was_connected = session.connected
                 session.connected = True
                 session.pending_expires_at = None
                 if session.connected_at_monotonic is None:
                     session.connected_at_monotonic = time.monotonic()
-                return {
-                    "status": "ok",
-                    "session_id": session_id,
-                    "state": "connected",
-                }
+                if not was_connected:
+                    connected_session = session
+            else:
+                session_to_release = self._sessions.pop(session_id)
 
-            session_to_release = self._sessions.pop(session_id)
+        if connected_session is not None:
+            await self.endpoint_router.mark_connected(connected_session.lease.slot_id)
+            return {
+                "status": "ok",
+                "session_id": session_id,
+                "state": "connected",
+            }
 
-        await self.endpoint_router.release(session_to_release.lease.slot_id)
+        if event == "connected":
+            return {
+                "status": "ok",
+                "session_id": session_id,
+                "state": "connected",
+            }
+
+        assert session_to_release is not None
+        await self.endpoint_router.release(
+            session_to_release.lease.slot_id,
+            connected=session_to_release.connected,
+        )
         conversation_duration_s = 0.0
         if session_to_release.connected_at_monotonic is not None:
             conversation_duration_s = max(
@@ -177,6 +208,13 @@ class DirectSessionManager:
     async def healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
         healthy, detail, router_snapshot = await self.endpoint_router.healthcheck()
         snapshot = await self.snapshot()
+        router_active_sessions = int(router_snapshot.get("active_sessions", 0))
+        pending_sessions = int(snapshot.get("pending_sessions", 0))
+        observed_connected_sessions = max(router_active_sessions - pending_sessions, 0)
+        snapshot["connected_sessions"] = max(
+            int(snapshot.get("connected_sessions", 0)),
+            observed_connected_sessions,
+        )
         snapshot["router"] = router_snapshot
         return healthy, detail, snapshot
 
@@ -201,7 +239,7 @@ class DirectSessionManager:
                 expired.append(self._sessions.pop(session_id))
 
         for session in expired:
-            await self.endpoint_router.release(session.lease.slot_id)
+            await self.endpoint_router.release(session.lease.slot_id, connected=False)
             logger.info(
                 "Released expired pending session %s for endpoint %s",
                 session.session_id,
@@ -217,7 +255,7 @@ class DirectSessionManager:
                     to_release.append(self._sessions.pop(session_id))
 
         for session in to_release:
-            await self.endpoint_router.release(session.lease.slot_id)
+            await self.endpoint_router.release(session.lease.slot_id, connected=session.connected)
             logger.info(
                 "Released session %s for downed endpoint %s (connected=%s)",
                 session.session_id,

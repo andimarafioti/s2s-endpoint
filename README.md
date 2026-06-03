@@ -112,6 +112,50 @@ The timeline automatically switches between minute-level and hourly rollups depe
 
 If you want the dashboard history to survive LB restarts, you can configure it to persist completed minute buckets to a Hugging Face Storage Bucket. The live routing/session state still stays in memory; the bucket is only for historical dashboard data.
 
+Persisted history is restored in the background during load-balancer startup, so
+the endpoint can become ready before older dashboard buckets finish loading. The
+`/dashboard/data` response includes a `history_restore` object with the restore
+status, elapsed time, and restored bucket count.
+
+The dashboard store keeps minute files under `minutes/YYYY-MM-DD/` and also
+uses `days/YYYY-MM-DD.json` files as a compact cache for UTC days. On restore it
+checks `days/` first, falls back to minute files for days without an
+authoritative cache, and backfills a complete `days/` file once it has all 1,440
+minute buckets for a completed day. While the load balancer stays running, it
+also rolls over each completed UTC day from in-memory history into
+`days/YYYY-MM-DD.json` shortly after midnight UTC. If the day is missing minute
+buckets, the rollover still writes a finalized partial day file with
+`complete: false`, `finalized: true`, and a missing-minute count so later
+restores do not redownload the same minutes forever. Older/open partial day
+files without `finalized: true` are still allowed to merge newly appeared minute
+files and then become finalized.
+
+You can precompute day files without running the load balancer:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/backfill_dashboard_day_history.py \
+  --bucket-id HuggingFaceM4/reachy-s2s-dashboard \
+  --prefix reachy-s2s-lb \
+  --days 30
+```
+
+Use `--dry-run` to inspect which days would be created without writing files.
+By default the script also migrates legacy flat `minutes/<epoch>.json` files
+for the requested days into `minutes/YYYY-MM-DD/<epoch>.json`; pass
+`--migrate-minutes-only` when day files already exist and you only want to move
+minute files, or `--skip-minute-migration` to leave legacy minute paths
+untouched. Minute migration uses server-side bucket copies when supported by
+`huggingface_hub`, then deletes the old flat paths. The script processes and
+uploads one day at a time, so interrupted runs are resumable: the next run skips
+any day files that were already created. It also keeps a local minute download
+cache under the user cache directory so interrupted day-file backfills can reuse
+already downloaded minute files; pass `--no-download-cache` to disable this.
+Historical partial days are cached too, which is useful for the first UTC day a
+load balancer existed. These partials are finalized after checking available
+minute files, so subsequent runs do not keep downloading the same incomplete
+day. Pass `--require-complete-days` to only create day files when all 1,440
+minute buckets are present.
+
 ## Load Balancer Env Vars
 
 - `HF_ENDPOINT_NAMESPACE`: namespace that owns the compute endpoints
@@ -131,14 +175,19 @@ If you want the dashboard history to survive LB restarts, you can configure it t
 - `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations
 - `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
 - `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
+  (defaults to 28 days so the 14d/28d dashboard windows can load persisted history)
+- `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
+  endpoint/session data instead of connecting to real compute endpoints. You can
+  also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.
+  If `DASHBOARD_BUCKET_ID` is set, preview mode loads existing dashboard history
+  from the bucket read-only and never writes preview data back to the bucket.
 - `DASHBOARD_BUCKET_ID`: optional HF storage bucket id used to persist dashboard history
 - `DASHBOARD_BUCKET_PREFIX`: path prefix inside the bucket for dashboard files
 - `DASHBOARD_BUCKET_TOKEN`: optional token override for bucket reads/writes
 
 ## Compute Env Vars
 
-- `PIPELINE_MAX_INSTANCES`: local `speech-to-speech` pipelines per compute endpoint
-- `PIPELINE_MIN_IDLE_INSTANCES`: warm local pipeline slots to keep ready
+- `NUM_PIPELINES`: concurrent realtime sessions the `speech-to-speech` process handles internally (default `1`)
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
 
@@ -161,8 +210,6 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --instance-type nvidia-a10g \
   --vendor aws \
   --region us-east-1 \
-  --pipeline-max-instances 1 \
-  --pipeline-min-idle-instances 1 \
   --wait
 ```
 
@@ -180,8 +227,6 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --instance-type nvidia-a10g \
   --vendor aws \
   --region us-east-1 \
-  --pipeline-max-instances 1 \
-  --pipeline-min-idle-instances 1 \
   --wait
 ```
 

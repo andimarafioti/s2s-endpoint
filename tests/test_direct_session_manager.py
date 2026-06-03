@@ -8,11 +8,14 @@ from app.session_tokens import verify_session_token, websocket_host_matches
 
 
 class FakeLeaseRouter:
-    def __init__(self):
+    def __init__(self, health_snapshot: dict[str, object] | None = None):
         self.acquire_calls = 0
         self.release_calls = []
+        self.release_connected_calls = []
+        self.mark_connected_calls = []
         self.started = False
         self.stopped = False
+        self.health_snapshot = health_snapshot or {"running_endpoints": 1}
 
     async def start(self) -> None:
         self.started = True
@@ -29,11 +32,15 @@ class FakeLeaseRouter:
             ws_url=f"wss://{endpoint_name}.example.endpoints.huggingface.cloud/ws",
         )
 
-    async def release(self, slot_id: str) -> None:
+    async def mark_connected(self, slot_id: str) -> None:
+        self.mark_connected_calls.append(slot_id)
+
+    async def release(self, slot_id: str, *, connected: bool = False) -> None:
         self.release_calls.append(slot_id)
+        self.release_connected_calls.append(connected)
 
     async def healthcheck(self):
-        return True, None, {"running_endpoints": 1}
+        return True, None, dict(self.health_snapshot)
 
 
 class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -85,7 +92,9 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(released["state"], "released")
         self.assertTrue(released["conversation_counted"])
         self.assertAlmostEqual(released["conversation_duration_s"], 12.5, places=3)
+        self.assertEqual(router.mark_connected_calls, ["endpoint-1"])
         self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual(router.release_connected_calls, [True])
 
     async def test_pending_session_is_released_if_client_never_connects(self):
         router = FakeLeaseRouter()
@@ -107,6 +116,117 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["pending_sessions"], 0)
         self.assertEqual(snapshot["connected_sessions"], 0)
         self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual(router.release_connected_calls, [False])
+
+    async def test_healthcheck_counts_observed_router_sessions_without_pending(self):
+        router = FakeLeaseRouter({"running_endpoints": 1, "active_sessions": 2})
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=60,
+            session_token_ttl_s=3600,
+            reap_interval_s=60,
+        )
+        await self.manager.start()
+
+        await self.manager.allocate("https://lb.example")
+        healthy, detail, snapshot = await self.manager.healthcheck()
+
+        self.assertTrue(healthy)
+        self.assertIsNone(detail)
+        self.assertEqual(snapshot["pending_sessions"], 1)
+        self.assertEqual(snapshot["connected_sessions"], 1)
+        self.assertEqual(snapshot["router"], {"running_endpoints": 1, "active_sessions": 2})
+
+
+    async def test_cancel_pending_session_releases_slot_immediately(self):
+        router = FakeLeaseRouter()
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        await self.manager.start()
+
+        allocation = await self.manager.allocate("https://lb.example")
+        session_id = allocation["session_id"]
+
+        self.assertEqual(router.release_calls, [])
+
+        await self.manager.cancel_pending_session(session_id)
+
+        self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual(router.release_connected_calls, [False])
+
+        snapshot = await self.manager.snapshot()
+        self.assertEqual(snapshot["pending_sessions"], 0)
+
+    async def test_cancel_pending_session_ignores_unknown_session_id(self):
+        router = FakeLeaseRouter()
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        await self.manager.start()
+
+        await self.manager.cancel_pending_session("nonexistent-session-id")
+
+        self.assertEqual(router.release_calls, [])
+
+    async def test_cancel_pending_session_ignores_already_connected_session(self):
+        router = FakeLeaseRouter()
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        await self.manager.start()
+
+        allocation = await self.manager.allocate("https://lb.example")
+        await self.manager.handle_event(allocation["session_id"], allocation["session_token"], "connected")
+
+        await self.manager.cancel_pending_session(allocation["session_id"])
+
+        self.assertEqual(router.release_calls, [])
+        snapshot = await self.manager.snapshot()
+        self.assertEqual(snapshot["connected_sessions"], 1)
+
+    async def test_allocate_releases_lease_if_interrupted_after_acquire(self):
+        router = FakeLeaseRouter()
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        await self.manager.start()
+
+        original_lock = self.manager._lock
+
+        async def failing_lock_acquire():
+            raise RuntimeError("simulated failure after acquire")
+
+        class BrokenLock:
+            async def __aenter__(self):
+                raise RuntimeError("simulated failure after acquire")
+            async def __aexit__(self, *args):
+                pass
+
+        self.manager._lock = BrokenLock()
+        with self.assertRaises(RuntimeError):
+            await self.manager.allocate("https://lb.example")
+        self.manager._lock = original_lock
+
+        self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual(router.release_connected_calls, [False])
 
 
 if __name__ == "__main__":

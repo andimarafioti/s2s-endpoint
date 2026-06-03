@@ -5,23 +5,28 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.app_utils import build_lifespan, public_base_url, setup_logging
+from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
+from app.dashboard_preview import DashboardPreviewSessionManager
 from app.direct_session_manager import DirectSessionManager
-from app.endpoint_pool_router import EndpointPoolRouter, HuggingFaceEndpointController
-from app.swarm_dashboard import HuggingFaceBucketHistoryStore, SwarmDashboard
+from app.endpoint_pool_router import (
+    EndpointPoolRouter,
+    HuggingFaceEndpointController,
+    fetch_compute_active_sessions,
+)
+from app.swarm_dashboard import SwarmDashboard
 
 setup_logging()
 APP_ROLE = "load_balancer"
 
 HF_ENDPOINT_NAMESPACE = os.getenv("HF_ENDPOINT_NAMESPACE", "").strip() or None
-COMPUTE_ENDPOINT_NAMES = [
-    name.strip() for name in os.getenv("COMPUTE_ENDPOINT_NAMES", "").split(",") if name.strip()
-]
+COMPUTE_ENDPOINT_NAMES_ENV = os.getenv("COMPUTE_ENDPOINT_NAMES", "").strip()
+COMPUTE_ENDPOINT_NAMES = [name.strip() for name in COMPUTE_ENDPOINT_NAMES_ENV.split(",") if name.strip()]
 COMPUTE_ENDPOINT_SLOTS = int(os.getenv("COMPUTE_ENDPOINT_SLOTS", "1"))
 COMPUTE_ENDPOINT_MIN_WARM = int(os.getenv("COMPUTE_ENDPOINT_MIN_WARM", "1"))
 COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS = int(
     os.getenv("COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS", str(COMPUTE_ENDPOINT_SLOTS))
 )
-COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "300"))
+COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "600"))
 COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S", "10"))
 COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S = float(
     os.getenv("COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S", "300")
@@ -34,6 +39,7 @@ COMPUTE_ENDPOINT_MAX_RESTART_ATTEMPTS = int(os.getenv("COMPUTE_ENDPOINT_MAX_REST
 COMPUTE_ENDPOINT_RESTART_BACKOFF_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_BACKOFF_S", "30"))
 COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S", "300"))
 COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S", "120"))
+COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S", "600"))
 HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TOKEN", "").strip() or None
 
 SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
@@ -41,10 +47,17 @@ SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
 SESSION_TOKEN_TTL_S = float(os.getenv("SESSION_TOKEN_TTL_S", "86400"))
 SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
 DASHBOARD_SAMPLE_INTERVAL_S = float(os.getenv("DASHBOARD_SAMPLE_INTERVAL_S", "15"))
-DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(7 * 24 * 60)))
+DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(28 * 24 * 60)))
 DASHBOARD_BUCKET_ID = os.getenv("DASHBOARD_BUCKET_ID", "").strip() or None
 DASHBOARD_BUCKET_PREFIX = os.getenv("DASHBOARD_BUCKET_PREFIX", "s2s-endpoint/swarm-dashboard").strip()
 DASHBOARD_BUCKET_TOKEN = os.getenv("DASHBOARD_BUCKET_TOKEN", "").strip() or HF_CONTROL_TOKEN
+DASHBOARD_PREVIEW_MODE = os.getenv("DASHBOARD_PREVIEW_MODE", "").strip().lower() in {"true", "1", "yes"}
+DASHBOARD_PREVIEW_SENTINELS = {"test", "preview", "dashboard_preview"}
+if len(COMPUTE_ENDPOINT_NAMES) == 1 and COMPUTE_ENDPOINT_NAMES[0].strip().lower() in DASHBOARD_PREVIEW_SENTINELS:
+    DASHBOARD_PREVIEW_MODE = True
+    COMPUTE_ENDPOINT_NAMES = []
+if DASHBOARD_PREVIEW_MODE and not COMPUTE_ENDPOINT_NAMES:
+    COMPUTE_ENDPOINT_NAMES = ["preview-compute-01", "preview-compute-02", "preview-compute-03", "preview-compute-04"]
 
 
 def build_endpoint_router() -> EndpointPoolRouter:
@@ -75,16 +88,21 @@ def build_endpoint_router() -> EndpointPoolRouter:
         restart_backoff_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_S,
         restart_backoff_max_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S,
         restart_stable_running_s=COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S,
+        drain_restart_timeout_s=COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S,
+        compute_usage_fetcher=fetch_compute_active_sessions,
     )
 
 
-session_manager = DirectSessionManager(
-    endpoint_router=build_endpoint_router(),
-    session_shared_secret=SESSION_SHARED_SECRET,
-    pending_timeout_s=SESSION_PENDING_TIMEOUT_S,
-    session_token_ttl_s=SESSION_TOKEN_TTL_S,
-    reap_interval_s=SESSION_REAP_INTERVAL_S,
-)
+if DASHBOARD_PREVIEW_MODE:
+    session_manager = DashboardPreviewSessionManager(endpoint_slots=COMPUTE_ENDPOINT_SLOTS)
+else:
+    session_manager = DirectSessionManager(
+        endpoint_router=build_endpoint_router(),
+        session_shared_secret=SESSION_SHARED_SECRET,
+        pending_timeout_s=SESSION_PENDING_TIMEOUT_S,
+        session_token_ttl_s=SESSION_TOKEN_TTL_S,
+        reap_interval_s=SESSION_REAP_INTERVAL_S,
+    )
 
 dashboard_history_store = None
 if DASHBOARD_BUCKET_ID:
@@ -93,12 +111,15 @@ if DASHBOARD_BUCKET_ID:
         prefix=DASHBOARD_BUCKET_PREFIX,
         token=DASHBOARD_BUCKET_TOKEN,
     )
+    if DASHBOARD_PREVIEW_MODE:
+        dashboard_history_store = ReadOnlyDashboardHistoryStore(dashboard_history_store)
 
 dashboard = SwarmDashboard(
     snapshot_provider=session_manager.healthcheck,
     sample_interval_s=DASHBOARD_SAMPLE_INTERVAL_S,
     retention_minutes=DASHBOARD_RETENTION_MINUTES,
     history_store=dashboard_history_store,
+    restore_history_in_background=True,
 )
 
 
@@ -126,6 +147,7 @@ async def root():
         "dashboard": "/dashboard",
         "dashboard_data": "/dashboard/data",
         "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
+        "dashboard_preview_mode": DASHBOARD_PREVIEW_MODE,
     }
 
 
@@ -150,6 +172,7 @@ async def health():
             "status": "ok",
             "role": APP_ROLE,
             "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
+            "dashboard_preview_mode": DASHBOARD_PREVIEW_MODE,
             "sessions": snapshot,
         }
     )
@@ -163,6 +186,13 @@ async def create_session(request: Request):
     except Exception as exc:
         await dashboard.record_session_allocation_failure()
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
+
+    if await request.is_disconnected():
+        session_id = allocation.get("session_id")
+        if session_id and hasattr(session_manager, "cancel_pending_session"):
+            await session_manager.cancel_pending_session(session_id)
+        logger.warning("Client disconnected during session allocation, released session %s", session_id)
+        raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
 
     await dashboard.record_session_allocation_success()
     return JSONResponse(allocation)
@@ -180,6 +210,8 @@ async def session_event(session_id: str, payload: dict[str, Any]):
     try:
         result = await session_manager.handle_event(session_id, session_token, event)
     except KeyError:
+        if event == "disconnected":
+            return JSONResponse({"status": "ok", "session_id": session_id, "state": "already_released"})
         raise HTTPException(status_code=404, detail="Unknown session id") from None
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -194,9 +226,13 @@ async def session_event(session_id: str, payload: dict[str, Any]):
 
 @app.post("/internal/endpoints/{endpoint_name}/drain")
 async def endpoint_drain(endpoint_name: str, payload: dict[str, Any]):
+    endpoint_router = getattr(session_manager, "endpoint_router", None)
+    if endpoint_router is None:
+        raise HTTPException(status_code=404, detail="Endpoint draining is not available")
+
     draining = bool(payload.get("draining", True))
     try:
-        await session_manager.endpoint_router.set_draining(endpoint_name, draining)
+        await endpoint_router.set_draining(endpoint_name, draining)
     except KeyError:
         raise HTTPException(status_code=404, detail="Unknown endpoint") from None
 

@@ -1,18 +1,22 @@
 import asyncio
-import json
 import logging
 import re
-import tempfile
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Awaitable, Callable, Optional, Protocol
+from typing import Awaitable, Callable, Iterable, Optional, Protocol
 
 
 SnapshotProvider = Callable[[], Awaitable[tuple[bool, Optional[str], dict[str, object]]]]
 logger = logging.getLogger("s2s-endpoint")
+ROLLING_VIEW_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("1h", 60),
+    ("6h", 6 * 60),
+    ("24h", 24 * 60),
+)
+DAY_MINUTES = 24 * 60
+DAY_SECONDS = DAY_MINUTES * 60
 
 
 def _normalize_status(status: object) -> str:
@@ -22,6 +26,24 @@ def _normalize_status(status: object) -> str:
 def _bucket_start_epoch_s(epoch_s: float, bucket_minutes: int) -> int:
     bucket_seconds = bucket_minutes * 60
     return int(epoch_s // bucket_seconds) * bucket_seconds
+
+
+def _day_start_epoch_s(epoch_s: float) -> int:
+    return _bucket_start_epoch_s(epoch_s, DAY_MINUTES)
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    middle = len(sorted_values) // 2
+    if len(sorted_values) % 2:
+        return sorted_values[middle]
+    return (sorted_values[middle - 1] + sorted_values[middle]) / 2.0
+
+
+def _day_key(epoch_s: int | float) -> str:
+    return datetime.fromtimestamp(epoch_s, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 def _isoformat(epoch_s: int | float) -> str:
@@ -51,6 +73,9 @@ class DashboardHistoryStore(Protocol):
         ...
 
     def write_buckets(self, buckets: list["SwarmHistoryBucket"]) -> None:
+        ...
+
+    def write_day_buckets(self, *, day_start_s: int, buckets: list["SwarmHistoryBucket"]) -> Optional[str]:
         ...
 
 
@@ -144,6 +169,7 @@ class SwarmHistoryBucket:
     parked_endpoints_sum: float = 0.0
     connected_sessions_last: int = 0
     connected_sessions_sum: float = 0.0
+    connected_sessions_max: int = 0
     pending_sessions_last: int = 0
     pending_sessions_sum: float = 0.0
     free_slots_last: int = 0
@@ -164,6 +190,7 @@ class SwarmHistoryBucket:
     completed_conversations: int = 0
     completed_conversation_duration_total_s: float = 0.0
     completed_conversation_duration_max_s: float = 0.0
+    completed_conversation_duration_samples_s: list[float] = field(default_factory=list)
 
     def record_sample(self, sample: SwarmStateSample) -> None:
         self.sample_count += 1
@@ -177,6 +204,7 @@ class SwarmHistoryBucket:
         self.parked_endpoints_sum += sample.parked_endpoints
         self.connected_sessions_last = sample.connected_sessions
         self.connected_sessions_sum += sample.connected_sessions
+        self.connected_sessions_max = max(self.connected_sessions_max, sample.connected_sessions)
         self.pending_sessions_last = sample.pending_sessions
         self.pending_sessions_sum += sample.pending_sessions
         self.free_slots_last = sample.free_slots
@@ -225,189 +253,215 @@ class SwarmHistoryBucket:
         }
 
     def to_dict(self) -> dict[str, object]:
+        payload = {}
+        for bucket_field in dataclass_fields(self):
+            value = getattr(self, bucket_field.name)
+            payload[bucket_field.name] = list(value) if isinstance(value, list) else value
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "SwarmHistoryBucket":
+        values = {
+            bucket_field.name: _coerce_history_bucket_field(bucket_field.name, payload)
+            for bucket_field in dataclass_fields(cls)
+        }
+        return cls(**values)
+
+    def completed_duration_samples(self) -> list[float]:
+        if self.completed_conversations <= 0:
+            return []
+        if self.completed_conversation_duration_samples_s:
+            return list(self.completed_conversation_duration_samples_s)
+        avg_duration_s = self.completed_conversation_duration_total_s / self.completed_conversations
+        return [avg_duration_s] * self.completed_conversations
+
+
+_HISTORY_BUCKET_INT_FIELDS = {
+    "bucket_start_s",
+    "sample_count",
+    "running_endpoints_last",
+    "warming_endpoints_last",
+    "transitioning_endpoints_last",
+    "parked_endpoints_last",
+    "connected_sessions_last",
+    "connected_sessions_max",
+    "pending_sessions_last",
+    "free_slots_last",
+    "effective_free_slots_last",
+    "router_active_sessions_last",
+    "healthy_samples",
+    "errors_count_last",
+    "session_requests",
+    "session_allocation_successes",
+    "session_allocation_failures",
+    "session_connected_events",
+    "session_disconnected_events",
+    "completed_conversations",
+}
+_HISTORY_BUCKET_FLOAT_FIELDS = {
+    "running_endpoints_sum",
+    "warming_endpoints_sum",
+    "transitioning_endpoints_sum",
+    "parked_endpoints_sum",
+    "connected_sessions_sum",
+    "pending_sessions_sum",
+    "free_slots_sum",
+    "effective_free_slots_sum",
+    "router_active_sessions_sum",
+    "errors_count_sum",
+    "completed_conversation_duration_total_s",
+    "completed_conversation_duration_max_s",
+}
+
+
+def _coerce_history_bucket_field(name: str, payload: dict[str, object]) -> object:
+    if name == "connected_sessions_max":
+        return max(
+            int(payload.get("connected_sessions_max", 0)),
+            int(payload.get("connected_sessions_last", 0)),
+        )
+    if name in _HISTORY_BUCKET_INT_FIELDS:
+        return int(payload.get(name, 0))
+    if name in _HISTORY_BUCKET_FLOAT_FIELDS:
+        return float(payload.get(name, 0.0))
+    if name == "healthy_last":
+        return bool(payload.get(name, False))
+    if name == "completed_conversation_duration_samples_s":
+        return [max(float(value), 0.0) for value in list(payload.get(name) or [])]
+    raise KeyError(f"Unknown SwarmHistoryBucket field: {name}")
+
+
+@dataclass
+class SwarmBucketAggregate:
+    sample_count: int = 0
+    running_endpoints_sum: float = 0.0
+    warming_endpoints_sum: float = 0.0
+    transitioning_endpoints_sum: float = 0.0
+    parked_endpoints_sum: float = 0.0
+    connected_sessions_sum: float = 0.0
+    connected_sessions_max: int = 0
+    pending_sessions_sum: float = 0.0
+    free_slots_sum: float = 0.0
+    effective_free_slots_sum: float = 0.0
+    router_active_sessions_sum: float = 0.0
+    healthy_samples: int = 0
+    errors_count_sum: float = 0.0
+    session_requests: int = 0
+    session_allocation_successes: int = 0
+    session_allocation_failures: int = 0
+    session_connected_events: int = 0
+    session_disconnected_events: int = 0
+    completed_conversations: int = 0
+    completed_conversation_duration_total_s: float = 0.0
+    completed_conversation_duration_max_s: float = 0.0
+    completed_conversation_duration_samples_s: list[float] = field(default_factory=list)
+    peak_running_endpoints: int = 0
+    active_conversation_minutes: float = 0.0
+
+    @classmethod
+    def from_buckets(cls, buckets: Iterable[SwarmHistoryBucket]) -> "SwarmBucketAggregate":
+        aggregate = cls()
+        for bucket in buckets:
+            aggregate.sample_count += bucket.sample_count
+            aggregate.running_endpoints_sum += bucket.running_endpoints_sum
+            aggregate.warming_endpoints_sum += bucket.warming_endpoints_sum
+            aggregate.transitioning_endpoints_sum += bucket.transitioning_endpoints_sum
+            aggregate.parked_endpoints_sum += bucket.parked_endpoints_sum
+            aggregate.connected_sessions_sum += bucket.connected_sessions_sum
+            aggregate.connected_sessions_max = max(aggregate.connected_sessions_max, bucket.connected_sessions_max)
+            aggregate.pending_sessions_sum += bucket.pending_sessions_sum
+            aggregate.free_slots_sum += bucket.free_slots_sum
+            aggregate.effective_free_slots_sum += bucket.effective_free_slots_sum
+            aggregate.router_active_sessions_sum += bucket.router_active_sessions_sum
+            aggregate.healthy_samples += bucket.healthy_samples
+            aggregate.errors_count_sum += bucket.errors_count_sum
+            aggregate.session_requests += bucket.session_requests
+            aggregate.session_allocation_successes += bucket.session_allocation_successes
+            aggregate.session_allocation_failures += bucket.session_allocation_failures
+            aggregate.session_connected_events += bucket.session_connected_events
+            aggregate.session_disconnected_events += bucket.session_disconnected_events
+            aggregate.completed_conversations += bucket.completed_conversations
+            aggregate.completed_conversation_duration_total_s += bucket.completed_conversation_duration_total_s
+            aggregate.completed_conversation_duration_max_s = max(
+                aggregate.completed_conversation_duration_max_s,
+                bucket.completed_conversation_duration_max_s,
+            )
+            aggregate.completed_conversation_duration_samples_s.extend(bucket.completed_duration_samples())
+            aggregate.peak_running_endpoints = max(aggregate.peak_running_endpoints, bucket.running_endpoints_last)
+            if bucket.sample_count:
+                aggregate.active_conversation_minutes += bucket.connected_sessions_sum / bucket.sample_count
+        return aggregate
+
+    def sample_average(self, value_sum: float) -> float:
+        return round(value_sum / self.sample_count, 2) if self.sample_count else 0.0
+
+    @property
+    def avg_conversation_duration_s(self) -> float:
+        if not self.completed_conversations:
+            return 0.0
+        return round(self.completed_conversation_duration_total_s / self.completed_conversations, 2)
+
+    @property
+    def median_conversation_duration_s(self) -> float:
+        return round(_median(self.completed_conversation_duration_samples_s), 2)
+
+    def as_summary_dict(self) -> dict[str, object]:
         return {
-            "bucket_start_s": self.bucket_start_s,
-            "sample_count": self.sample_count,
-            "running_endpoints_last": self.running_endpoints_last,
-            "running_endpoints_sum": self.running_endpoints_sum,
-            "warming_endpoints_last": self.warming_endpoints_last,
-            "warming_endpoints_sum": self.warming_endpoints_sum,
-            "transitioning_endpoints_last": self.transitioning_endpoints_last,
-            "transitioning_endpoints_sum": self.transitioning_endpoints_sum,
-            "parked_endpoints_last": self.parked_endpoints_last,
-            "parked_endpoints_sum": self.parked_endpoints_sum,
-            "connected_sessions_last": self.connected_sessions_last,
-            "connected_sessions_sum": self.connected_sessions_sum,
-            "pending_sessions_last": self.pending_sessions_last,
-            "pending_sessions_sum": self.pending_sessions_sum,
-            "free_slots_last": self.free_slots_last,
-            "free_slots_sum": self.free_slots_sum,
-            "effective_free_slots_last": self.effective_free_slots_last,
-            "effective_free_slots_sum": self.effective_free_slots_sum,
-            "router_active_sessions_last": self.router_active_sessions_last,
-            "router_active_sessions_sum": self.router_active_sessions_sum,
-            "healthy_last": self.healthy_last,
-            "healthy_samples": self.healthy_samples,
-            "errors_count_last": self.errors_count_last,
-            "errors_count_sum": self.errors_count_sum,
             "session_requests": self.session_requests,
             "session_allocation_successes": self.session_allocation_successes,
             "session_allocation_failures": self.session_allocation_failures,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
-            "completed_conversation_duration_total_s": self.completed_conversation_duration_total_s,
-            "completed_conversation_duration_max_s": self.completed_conversation_duration_max_s,
+            "active_conversation_minutes": round(self.active_conversation_minutes, 2),
+            "active_conversation_hours": round(self.active_conversation_minutes / 60.0, 2),
+            "active_conversation_days": round(self.active_conversation_minutes / (24.0 * 60.0), 3),
+            "avg_conversation_duration_s": self.avg_conversation_duration_s,
+            "max_conversation_duration_s": round(self.completed_conversation_duration_max_s, 2),
+            "peak_connected_sessions": self.connected_sessions_max,
+            "peak_running_endpoints": self.peak_running_endpoints,
         }
 
-    @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "SwarmHistoryBucket":
-        return cls(
-            bucket_start_s=int(payload.get("bucket_start_s", 0)),
-            sample_count=int(payload.get("sample_count", 0)),
-            running_endpoints_last=int(payload.get("running_endpoints_last", 0)),
-            running_endpoints_sum=float(payload.get("running_endpoints_sum", 0.0)),
-            warming_endpoints_last=int(payload.get("warming_endpoints_last", 0)),
-            warming_endpoints_sum=float(payload.get("warming_endpoints_sum", 0.0)),
-            transitioning_endpoints_last=int(payload.get("transitioning_endpoints_last", 0)),
-            transitioning_endpoints_sum=float(payload.get("transitioning_endpoints_sum", 0.0)),
-            parked_endpoints_last=int(payload.get("parked_endpoints_last", 0)),
-            parked_endpoints_sum=float(payload.get("parked_endpoints_sum", 0.0)),
-            connected_sessions_last=int(payload.get("connected_sessions_last", 0)),
-            connected_sessions_sum=float(payload.get("connected_sessions_sum", 0.0)),
-            pending_sessions_last=int(payload.get("pending_sessions_last", 0)),
-            pending_sessions_sum=float(payload.get("pending_sessions_sum", 0.0)),
-            free_slots_last=int(payload.get("free_slots_last", 0)),
-            free_slots_sum=float(payload.get("free_slots_sum", 0.0)),
-            effective_free_slots_last=int(payload.get("effective_free_slots_last", 0)),
-            effective_free_slots_sum=float(payload.get("effective_free_slots_sum", 0.0)),
-            router_active_sessions_last=int(payload.get("router_active_sessions_last", 0)),
-            router_active_sessions_sum=float(payload.get("router_active_sessions_sum", 0.0)),
-            healthy_last=bool(payload.get("healthy_last", False)),
-            healthy_samples=int(payload.get("healthy_samples", 0)),
-            errors_count_last=int(payload.get("errors_count_last", 0)),
-            errors_count_sum=float(payload.get("errors_count_sum", 0.0)),
-            session_requests=int(payload.get("session_requests", 0)),
-            session_allocation_successes=int(payload.get("session_allocation_successes", 0)),
-            session_allocation_failures=int(payload.get("session_allocation_failures", 0)),
-            session_connected_events=int(payload.get("session_connected_events", 0)),
-            session_disconnected_events=int(payload.get("session_disconnected_events", 0)),
-            completed_conversations=int(payload.get("completed_conversations", 0)),
-            completed_conversation_duration_total_s=float(
-                payload.get("completed_conversation_duration_total_s", 0.0)
-            ),
-            completed_conversation_duration_max_s=float(
-                payload.get("completed_conversation_duration_max_s", 0.0)
-            ),
-        )
+    def as_hourly_point(self, timestamp_s: int) -> dict[str, object]:
+        return {
+            "timestamp": _isoformat(timestamp_s),
+            "running_endpoints": self.sample_average(self.running_endpoints_sum),
+            "warming_endpoints": self.sample_average(self.warming_endpoints_sum),
+            "transitioning_endpoints": self.sample_average(self.transitioning_endpoints_sum),
+            "parked_endpoints": self.sample_average(self.parked_endpoints_sum),
+            "connected_sessions": self.sample_average(self.connected_sessions_sum),
+            "pending_sessions": self.sample_average(self.pending_sessions_sum),
+            "free_slots": self.sample_average(self.free_slots_sum),
+            "effective_free_slots": self.sample_average(self.effective_free_slots_sum),
+            "router_active_sessions": self.sample_average(self.router_active_sessions_sum),
+            "errors_count": self.sample_average(self.errors_count_sum),
+            "healthy": (self.healthy_samples / self.sample_count) >= 0.5 if self.sample_count else False,
+            "session_requests": self.session_requests,
+            "session_allocation_successes": self.session_allocation_successes,
+            "session_allocation_failures": self.session_allocation_failures,
+            "session_connected_events": self.session_connected_events,
+            "session_disconnected_events": self.session_disconnected_events,
+            "completed_conversations": self.completed_conversations,
+            "avg_conversation_duration_s": self.avg_conversation_duration_s,
+            "avg_conversation_duration_min": round(self.avg_conversation_duration_s / 60.0, 2),
+            "max_conversation_duration_s": round(self.completed_conversation_duration_max_s, 2),
+            "max_conversation_duration_min": round(self.completed_conversation_duration_max_s / 60.0, 2),
+        }
 
+    def as_rolling_fields(self, label: str) -> dict[str, object]:
+        return {
+            f"completed_conversations_{label}": self.completed_conversations,
+            f"active_conversation_minutes_{label}": round(self.active_conversation_minutes, 2),
+            f"active_conversation_hours_{label}": round(self.active_conversation_minutes / 60.0, 2),
+            f"active_conversation_days_{label}": round(self.active_conversation_minutes / (24.0 * 60.0), 3),
+            f"avg_conversation_duration_s_{label}": self.avg_conversation_duration_s,
+            f"avg_conversation_duration_min_{label}": round(self.avg_conversation_duration_s / 60.0, 2),
+            f"connected_sessions_avg_{label}": self.sample_average(self.connected_sessions_sum),
+            f"connected_sessions_max_{label}": self.connected_sessions_max,
+            f"median_conversation_duration_s_{label}": self.median_conversation_duration_s,
+            f"median_conversation_duration_min_{label}": round(self.median_conversation_duration_s / 60.0, 2),
+        }
 
-class HuggingFaceBucketHistoryStore:
-    def __init__(
-        self,
-        *,
-        bucket_id: str,
-        prefix: str = "s2s-endpoint/swarm-dashboard",
-        token: Optional[str] = None,
-    ) -> None:
-        from huggingface_hub import batch_bucket_files, download_bucket_files, list_bucket_tree
-
-        self.bucket_id = bucket_id.strip()
-        self.prefix = prefix.strip().strip("/")
-        self.token = token or None
-        self._batch_bucket_files = batch_bucket_files
-        self._download_bucket_files = download_bucket_files
-        self._list_bucket_tree = list_bucket_tree
-
-        if not self.bucket_id:
-            raise ValueError("bucket_id must be set")
-
-    def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list[SwarmHistoryBucket]:
-        min_bucket = _bucket_start_epoch_s(now_epoch_s, 1) - (retention_minutes - 1) * 60
-        candidates: list[tuple[int, str]] = []
-        prefix = self._minutes_prefix()
-
-        for item in self._list_bucket_tree(
-            self.bucket_id,
-            prefix=prefix or None,
-            recursive=True,
-            token=self.token,
-        ):
-            path = getattr(item, "path", None)
-            bucket_start_s = self._bucket_start_from_path(path)
-            if bucket_start_s is None or bucket_start_s < min_bucket:
-                continue
-            candidates.append((bucket_start_s, str(path)))
-
-        if not candidates:
-            return []
-
-        candidates.sort(key=lambda item: item[0])
-        loaded: list[SwarmHistoryBucket] = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            downloads = [
-                (path, Path(tmpdir) / f"{bucket_start_s}.json")
-                for bucket_start_s, path in candidates
-            ]
-            self._download_bucket_files(
-                self.bucket_id,
-                files=downloads,
-                raise_on_missing_files=False,
-                token=self.token,
-            )
-
-            for bucket_start_s, local_path in downloads:
-                if not local_path.exists():
-                    continue
-                try:
-                    payload = json.loads(local_path.read_text())
-                    loaded.append(SwarmHistoryBucket.from_dict(payload["bucket"]))
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to load persisted dashboard bucket %s from %s: %s",
-                        bucket_start_s,
-                        self.bucket_id,
-                        exc,
-                    )
-
-        return loaded
-
-    def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
-        if not buckets:
-            return
-
-        add = []
-        for bucket in buckets:
-            payload = json.dumps(
-                {
-                    "version": 1,
-                    "bucket": bucket.to_dict(),
-                },
-                sort_keys=True,
-            ).encode("utf-8")
-            add.append((payload, self._bucket_path(bucket.bucket_start_s)))
-
-        self._batch_bucket_files(
-            self.bucket_id,
-            add=add,
-            token=self.token,
-        )
-
-    def _minutes_prefix(self) -> str:
-        if self.prefix:
-            return f"{self.prefix}/minutes"
-        return "minutes"
-
-    def _bucket_path(self, bucket_start_s: int) -> str:
-        return f"{self._minutes_prefix()}/{bucket_start_s}.json"
-
-    def _bucket_start_from_path(self, path: object) -> Optional[int]:
-        if path is None:
-            return None
-        match = re.search(r"/(\d+)\.json$", f"/{path}".replace("\\", "/"))
-        if match is None:
-            return None
-        return int(match.group(1))
 
 
 class SwarmDashboard:
@@ -416,8 +470,9 @@ class SwarmDashboard:
         *,
         snapshot_provider: SnapshotProvider,
         sample_interval_s: float = 15.0,
-        retention_minutes: int = 7 * 24 * 60,
+        retention_minutes: int = 28 * 24 * 60,
         history_store: Optional[DashboardHistoryStore] = None,
+        restore_history_in_background: bool = False,
         time_fn: Callable[[], float] = time.time,
     ) -> None:
         if sample_interval_s <= 0:
@@ -429,20 +484,47 @@ class SwarmDashboard:
         self.sample_interval_s = sample_interval_s
         self.retention_minutes = retention_minutes
         self.history_store = history_store
+        self.restore_history_in_background = restore_history_in_background
         self._time_fn = time_fn
         self._lock = asyncio.Lock()
         self._history: "OrderedDict[int, SwarmHistoryBucket]" = OrderedDict()
         self._latest_sample: Optional[SwarmStateSample] = None
         self._sample_task: Optional[asyncio.Task] = None
+        self._restore_task: Optional[asyncio.Task] = None
         self._flush_task: Optional[asyncio.Task] = None
+        self._day_rollover_task: Optional[asyncio.Task] = None
         self._dirty_bucket_starts: set[int] = set()
+        self._day_rollover_cursor_s: Optional[int] = None
+        self._history_restore_status = "disabled" if history_store is None else "pending"
+        self._history_restore_detail: Optional[str] = None
+        self._history_restore_started_at_s: Optional[float] = None
+        self._history_restore_finished_at_s: Optional[float] = None
+        self._history_restore_bucket_count = 0
 
     async def start(self) -> None:
-        await self._restore_history()
         await self.capture_sample()
+        if self.history_store is not None:
+            if self.restore_history_in_background:
+                logger.info("Restoring dashboard history in the background")
+                self._history_restore_status = "running"
+                self._history_restore_detail = "Loading persisted dashboard history"
+                self._restore_task = asyncio.create_task(self._restore_history())
+            else:
+                await self._restore_history()
+        if self._history_store_day_writer() is not None:
+            self._day_rollover_cursor_s = _day_start_epoch_s(self._time_fn())
+            self._day_rollover_task = asyncio.create_task(self._day_rollover_loop())
         self._sample_task = asyncio.create_task(self._sample_loop())
 
     async def stop(self) -> None:
+        if self._restore_task is not None and not self._restore_task.done():
+            self._restore_task.cancel()
+            try:
+                await self._restore_task
+            except asyncio.CancelledError:
+                pass
+            self._restore_task = None
+
         if self._sample_task is not None:
             self._sample_task.cancel()
             try:
@@ -450,6 +532,14 @@ class SwarmDashboard:
             except asyncio.CancelledError:
                 pass
             self._sample_task = None
+
+        if self._day_rollover_task is not None:
+            self._day_rollover_task.cancel()
+            try:
+                await self._day_rollover_task
+            except asyncio.CancelledError:
+                pass
+            self._day_rollover_task = None
 
         if self._flush_task is not None:
             try:
@@ -459,6 +549,7 @@ class SwarmDashboard:
             self._flush_task = None
 
         await self._flush_dirty_buckets(include_open_bucket=True)
+        await self._rollover_completed_days()
 
     async def capture_sample(self) -> SwarmStateSample:
         healthy, detail, snapshot = await self.snapshot_provider()
@@ -516,6 +607,7 @@ class SwarmDashboard:
 
         current = await self.live_sample()
         series = await self.series(window_minutes=window_minutes, resolution=resolved_resolution)
+        rolling_series = await self.rolling_series(window_minutes=window_minutes, resolution=resolved_resolution)
         summary = await self.summary(window_minutes=window_minutes, requested_window=window or "6h")
 
         return {
@@ -528,7 +620,13 @@ class SwarmDashboard:
             "current": current.to_dict(),
             "summary": summary,
             "series": series,
+            "rolling_windows": [
+                {"label": label, "minutes": minutes}
+                for label, minutes in ROLLING_VIEW_WINDOWS
+            ],
+            "rolling_series": rolling_series,
             "retention_minutes": self.retention_minutes,
+            "history_restore": self.history_restore_status(),
         }
 
     async def summary(self, *, window_minutes: int, requested_window: str) -> dict[str, object]:
@@ -549,6 +647,9 @@ class SwarmDashboard:
             "session_disconnects_window": selected["session_disconnected_events"],
             "conversations_started_window": selected["session_connected_events"],
             "conversations_completed_window": selected["completed_conversations"],
+            "active_conversation_minutes_window": selected["active_conversation_minutes"],
+            "active_conversation_hours_window": selected["active_conversation_hours"],
+            "active_conversation_days_window": selected["active_conversation_days"],
             "avg_conversation_duration_window_s": selected["avg_conversation_duration_s"],
             "avg_conversation_duration_window_min": round(selected["avg_conversation_duration_s"] / 60.0, 2),
             "max_conversation_duration_window_s": selected["max_conversation_duration_s"],
@@ -607,14 +708,89 @@ class SwarmDashboard:
 
         return self._aggregate_hourly(minute_map, start_bucket, end_bucket)
 
+    async def rolling_series(self, *, window_minutes: int, resolution: str) -> list[dict[str, object]]:
+        async with self._lock:
+            minute_buckets = list(self._history.values())
+
+        now = self._time_fn()
+        end_bucket = _bucket_start_epoch_s(now, 1)
+        start_bucket = end_bucket - (window_minutes - 1) * 60
+        max_window_minutes = max(minutes for _, minutes in ROLLING_VIEW_WINDOWS)
+        context_start_bucket = start_bucket - (max_window_minutes - 1) * 60
+        minute_map = {
+            bucket.bucket_start_s: bucket
+            for bucket in minute_buckets
+            if context_start_bucket <= bucket.bucket_start_s <= end_bucket
+        }
+
+        minute_starts = list(range(context_start_bucket, end_bucket + 1, 60))
+        bucket_sequence = [minute_map.get(bucket_start_s) for bucket_start_s in minute_starts]
+
+        def range_indices(start_s: int, end_s: int) -> tuple[int, int] | None:
+            if start_s > end_bucket or end_s < context_start_bucket:
+                return None
+            bounded_start_s = max(start_s, context_start_bucket)
+            bounded_end_s = min(end_s, end_bucket)
+            return (
+                int((bounded_start_s - context_start_bucket) // 60),
+                int((bounded_end_s - context_start_bucket) // 60),
+            )
+
+        def range_buckets(start_s: int, end_s: int) -> list[SwarmHistoryBucket]:
+            indices = range_indices(start_s, end_s)
+            if indices is None:
+                return []
+            start_index, end_index = indices
+            return [bucket for bucket in bucket_sequence[start_index : end_index + 1] if bucket is not None]
+
+        step_s = 60 if resolution == "minute" else 3600
+        first_point_s = start_bucket if resolution == "minute" else _bucket_start_epoch_s(start_bucket, 60)
+        points = []
+        for point_start_s in range(first_point_s, end_bucket + 1, step_s):
+            point_end_s = point_start_s if resolution == "minute" else min(point_start_s + 59 * 60, end_bucket)
+            point: dict[str, object] = {"timestamp": _isoformat(point_start_s)}
+            for label, minutes in ROLLING_VIEW_WINDOWS:
+                window_start_s = point_end_s - (minutes - 1) * 60
+                aggregate = SwarmBucketAggregate.from_buckets(range_buckets(window_start_s, point_end_s))
+                point.update(aggregate.as_rolling_fields(label))
+            points.append(point)
+
+        return points
+
     def html(self) -> str:
         return _dashboard_html(history_persisted=self.history_store is not None)
+
+    def history_restore_status(self) -> dict[str, object]:
+        now_s = time.monotonic()
+        started_at_s = self._history_restore_started_at_s
+        finished_at_s = self._history_restore_finished_at_s
+        return {
+            "status": self._history_restore_status,
+            "detail": self._history_restore_detail,
+            "bucket_count": self._history_restore_bucket_count,
+            "background": self.restore_history_in_background,
+            "elapsed_s": (
+                round((finished_at_s or now_s) - started_at_s, 2)
+                if started_at_s is not None
+                else None
+            ),
+        }
 
     async def _sample_loop(self) -> None:
         try:
             while True:
                 await asyncio.sleep(self.sample_interval_s)
                 await self.capture_sample()
+        except asyncio.CancelledError:
+            raise
+
+    async def _day_rollover_loop(self) -> None:
+        try:
+            while True:
+                now_s = self._time_fn()
+                next_day_start_s = _day_start_epoch_s(now_s) + DAY_SECONDS
+                await asyncio.sleep(max(1.0, next_day_start_s + 90 - now_s))
+                await self._rollover_completed_days()
         except asyncio.CancelledError:
             raise
 
@@ -637,6 +813,7 @@ class SwarmDashboard:
                 bucket.completed_conversation_duration_max_s,
                 duration_s,
             )
+            bucket.completed_conversation_duration_samples_s.append(duration_s)
             self._dirty_bucket_starts.add(bucket.bucket_start_s)
             self._prune_unlocked(now)
             self._schedule_flush_unlocked(include_open_bucket=False)
@@ -662,29 +839,7 @@ class SwarmDashboard:
         now = self._time_fn()
         min_bucket = _bucket_start_epoch_s(now, 1) - (window_minutes - 1) * 60
         selected = [bucket for bucket in minute_buckets if bucket.bucket_start_s >= min_bucket]
-        completed_conversations = sum(bucket.completed_conversations for bucket in selected)
-        completed_conversation_duration_total_s = sum(
-            bucket.completed_conversation_duration_total_s for bucket in selected
-        )
-        return {
-            "session_requests": sum(bucket.session_requests for bucket in selected),
-            "session_allocation_successes": sum(bucket.session_allocation_successes for bucket in selected),
-            "session_allocation_failures": sum(bucket.session_allocation_failures for bucket in selected),
-            "session_connected_events": sum(bucket.session_connected_events for bucket in selected),
-            "session_disconnected_events": sum(bucket.session_disconnected_events for bucket in selected),
-            "completed_conversations": completed_conversations,
-            "avg_conversation_duration_s": (
-                round(completed_conversation_duration_total_s / completed_conversations, 2)
-                if completed_conversations
-                else 0.0
-            ),
-            "max_conversation_duration_s": round(
-                max((bucket.completed_conversation_duration_max_s for bucket in selected), default=0.0),
-                2,
-            ),
-            "peak_connected_sessions": max((bucket.connected_sessions_last for bucket in selected), default=0),
-            "peak_running_endpoints": max((bucket.running_endpoints_last for bucket in selected), default=0),
-        }
+        return SwarmBucketAggregate.from_buckets(selected).as_summary_dict()
 
     def _aggregate_hourly(
         self,
@@ -704,132 +859,65 @@ class SwarmDashboard:
             ]
             minute_buckets = [bucket for bucket in minute_buckets if bucket is not None]
 
-            sample_count = sum(bucket.sample_count for bucket in minute_buckets)
-            if sample_count == 0:
-                point = {
-                    "timestamp": _isoformat(current_hour_s),
-                    "running_endpoints": 0.0,
-                    "warming_endpoints": 0.0,
-                    "transitioning_endpoints": 0.0,
-                    "parked_endpoints": 0.0,
-                    "connected_sessions": 0.0,
-                    "pending_sessions": 0.0,
-                    "free_slots": 0.0,
-                    "effective_free_slots": 0.0,
-                    "router_active_sessions": 0.0,
-                    "errors_count": 0.0,
-                    "healthy": False,
-                    "session_requests": 0,
-                    "session_allocation_successes": 0,
-                    "session_allocation_failures": 0,
-                    "session_connected_events": 0,
-                    "session_disconnected_events": 0,
-                    "completed_conversations": 0,
-                    "avg_conversation_duration_s": 0.0,
-                    "avg_conversation_duration_min": 0.0,
-                    "max_conversation_duration_s": 0.0,
-                    "max_conversation_duration_min": 0.0,
-                }
-            else:
-                completed_conversations = sum(bucket.completed_conversations for bucket in minute_buckets)
-                completed_conversation_duration_total_s = sum(
-                    bucket.completed_conversation_duration_total_s for bucket in minute_buckets
-                )
-                point = {
-                    "timestamp": _isoformat(current_hour_s),
-                    "running_endpoints": round(
-                        sum(bucket.running_endpoints_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "warming_endpoints": round(
-                        sum(bucket.warming_endpoints_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "transitioning_endpoints": round(
-                        sum(bucket.transitioning_endpoints_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "parked_endpoints": round(
-                        sum(bucket.parked_endpoints_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "connected_sessions": round(
-                        sum(bucket.connected_sessions_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "pending_sessions": round(
-                        sum(bucket.pending_sessions_sum for bucket in minute_buckets) / sample_count, 2
-                    ),
-                    "free_slots": round(
-                        sum(bucket.free_slots_sum for bucket in minute_buckets) / sample_count,
-                        2,
-                    ),
-                    "effective_free_slots": round(
-                        sum(bucket.effective_free_slots_sum for bucket in minute_buckets) / sample_count,
-                        2,
-                    ),
-                    "router_active_sessions": round(
-                        sum(bucket.router_active_sessions_sum for bucket in minute_buckets) / sample_count,
-                        2,
-                    ),
-                    "errors_count": round(
-                        sum(bucket.errors_count_sum for bucket in minute_buckets) / sample_count,
-                        2,
-                    ),
-                    "healthy": (sum(bucket.healthy_samples for bucket in minute_buckets) / sample_count) >= 0.5,
-                    "session_requests": sum(bucket.session_requests for bucket in minute_buckets),
-                    "session_allocation_successes": sum(
-                        bucket.session_allocation_successes for bucket in minute_buckets
-                    ),
-                    "session_allocation_failures": sum(
-                        bucket.session_allocation_failures for bucket in minute_buckets
-                    ),
-                    "session_connected_events": sum(bucket.session_connected_events for bucket in minute_buckets),
-                    "session_disconnected_events": sum(
-                        bucket.session_disconnected_events for bucket in minute_buckets
-                    ),
-                    "completed_conversations": completed_conversations,
-                    "avg_conversation_duration_s": round(
-                        completed_conversation_duration_total_s / completed_conversations,
-                        2,
-                    ) if completed_conversations else 0.0,
-                    "avg_conversation_duration_min": round(
-                        (completed_conversation_duration_total_s / completed_conversations) / 60.0,
-                        2,
-                    ) if completed_conversations else 0.0,
-                    "max_conversation_duration_s": round(
-                        max((bucket.completed_conversation_duration_max_s for bucket in minute_buckets), default=0.0),
-                        2,
-                    ),
-                    "max_conversation_duration_min": round(
-                        max((bucket.completed_conversation_duration_max_s for bucket in minute_buckets), default=0.0)
-                        / 60.0,
-                        2,
-                    ),
-                }
-            points.append(point)
+            points.append(SwarmBucketAggregate.from_buckets(minute_buckets).as_hourly_point(current_hour_s))
             current_hour_s += 3600
 
         return points
 
     async def _restore_history(self) -> None:
         if self.history_store is None:
+            self._history_restore_status = "disabled"
             return
 
+        started_s = time.monotonic()
+        self._history_restore_started_at_s = started_s
+        self._history_restore_finished_at_s = None
+        self._history_restore_bucket_count = 0
+        self._history_restore_status = "running"
+        self._history_restore_detail = "Loading persisted dashboard history"
         try:
             buckets = await asyncio.to_thread(
                 self.history_store.load_recent,
                 retention_minutes=self.retention_minutes,
                 now_epoch_s=self._time_fn(),
             )
+        except asyncio.CancelledError:
+            self._history_restore_status = "cancelled"
+            self._history_restore_detail = "Dashboard history restore was cancelled"
+            self._history_restore_finished_at_s = time.monotonic()
+            raise
         except Exception as exc:
+            self._history_restore_status = "failed"
+            self._history_restore_detail = str(exc)
+            self._history_restore_finished_at_s = time.monotonic()
             logger.warning("Failed to restore dashboard history from bucket store: %s", exc)
             return
 
         if not buckets:
+            self._history_restore_status = "empty"
+            self._history_restore_detail = "No persisted dashboard history found"
+            self._history_restore_finished_at_s = time.monotonic()
+            logger.info(
+                "No persisted dashboard history restored after %.2fs",
+                time.monotonic() - started_s,
+            )
             return
 
         async with self._lock:
             for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
-                self._history[bucket.bucket_start_s] = bucket
+                if bucket.bucket_start_s not in self._dirty_bucket_starts:
+                    self._history[bucket.bucket_start_s] = bucket
             self._prune_unlocked(self._time_fn())
 
-        logger.info("Restored %s persisted dashboard minute buckets", len(buckets))
+        self._history_restore_status = "complete"
+        self._history_restore_detail = "Persisted dashboard history restored"
+        self._history_restore_bucket_count = len(buckets)
+        self._history_restore_finished_at_s = time.monotonic()
+        logger.info(
+            "Restored %s persisted dashboard minute buckets in %.2fs",
+            len(buckets),
+            time.monotonic() - started_s,
+        )
 
     def _schedule_flush_unlocked(self, *, include_open_bucket: bool) -> None:
         if self.history_store is None:
@@ -857,6 +945,69 @@ class SwarmDashboard:
             async with self._lock:
                 for bucket in buckets:
                     self._dirty_bucket_starts.discard(bucket.bucket_start_s)
+
+    def _history_store_day_writer(self) -> Optional[Callable[..., Optional[str]]]:
+        if self.history_store is None:
+            return None
+        if getattr(self.history_store, "read_only", False):
+            return None
+        writer = getattr(self.history_store, "write_day_buckets", None)
+        return writer if callable(writer) else None
+
+    async def _rollover_completed_days(self) -> None:
+        writer = self._history_store_day_writer()
+        if writer is None:
+            return
+
+        current_task = asyncio.current_task()
+        if self._flush_task is not None and self._flush_task is not current_task and not self._flush_task.done():
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                raise
+
+        await self._flush_dirty_buckets(include_open_bucket=False)
+
+        async with self._lock:
+            current_day_start_s = _day_start_epoch_s(self._time_fn())
+            if self._day_rollover_cursor_s is None:
+                self._day_rollover_cursor_s = current_day_start_s
+                return
+            if self._day_rollover_cursor_s >= current_day_start_s:
+                return
+
+            day_starts = list(range(self._day_rollover_cursor_s, current_day_start_s, DAY_SECONDS))
+            buckets_by_day: dict[int, list[SwarmHistoryBucket]] = {day_start: [] for day_start in day_starts}
+            for bucket in self._history.values():
+                day_start = _day_start_epoch_s(bucket.bucket_start_s)
+                if day_start in buckets_by_day:
+                    buckets_by_day[day_start].append(bucket)
+
+        next_cursor_s = current_day_start_s
+        for day_start in day_starts:
+            day_buckets = sorted(buckets_by_day.get(day_start, []), key=lambda bucket: bucket.bucket_start_s)
+            if not day_buckets:
+                logger.info("Skipping live dashboard day rollover for %s because no minute buckets are in memory", _day_key(day_start))
+                continue
+            if len(day_buckets) < DAY_MINUTES:
+                logger.warning(
+                    "Finalizing partial live dashboard day rollover for %s with only %s of 1440 minute buckets",
+                    _day_key(day_start),
+                    len(day_buckets),
+                )
+
+            try:
+                path = await asyncio.to_thread(writer, day_start_s=day_start, buckets=day_buckets)
+            except Exception as exc:
+                logger.warning("Failed to cache live dashboard history day %s: %s", _day_key(day_start), exc)
+                next_cursor_s = day_start
+                break
+            if path:
+                logger.info("Cached live dashboard history day %s at %s", _day_key(day_start), path)
+
+        async with self._lock:
+            if self._day_rollover_cursor_s is None or self._day_rollover_cursor_s < next_cursor_s:
+                self._day_rollover_cursor_s = next_cursor_s
 
     def _collect_dirty_buckets_unlocked(self, *, include_open_bucket: bool) -> list[SwarmHistoryBucket]:
         current_bucket_start_s = _bucket_start_epoch_s(self._time_fn(), 1)
@@ -1005,6 +1156,11 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       border-color: var(--ink);
     }
 
+    .toggle:disabled {
+      cursor: not-allowed;
+      opacity: 0.42;
+    }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(12, minmax(0, 1fr));
@@ -1029,6 +1185,13 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     .kpis {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .rolling-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 18px;
       margin-bottom: 18px;
     }
@@ -1060,7 +1223,8 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       font-size: 13px;
     }
 
-    .legend span::before {
+    .legend span::before,
+    .legend-toggle::before {
       content: "";
       display: inline-block;
       width: 10px;
@@ -1069,6 +1233,28 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       margin-right: 8px;
       background: currentColor;
       vertical-align: middle;
+    }
+
+    .legend-toggle {
+      display: inline-flex;
+      align-items: center;
+      border: 0;
+      background: transparent;
+      padding: 0;
+      font: inherit;
+      color: inherit;
+      cursor: pointer;
+    }
+
+    .legend-toggle.hidden {
+      opacity: 0.36;
+      text-decoration: line-through;
+    }
+
+    .legend-toggle:focus-visible {
+      outline: 2px solid currentColor;
+      outline-offset: 3px;
+      border-radius: 4px;
     }
 
     canvas {
@@ -1273,7 +1459,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     .footer-note { margin-top: 14px; color: var(--muted); font-size: 13px; }
 
     @media (max-width: 1100px) {
-      .hero, .kpis { grid-template-columns: 1fr; }
+      .hero, .kpis, .rolling-grid { grid-template-columns: 1fr; }
       .span-4, .span-6, .span-8 { grid-column: span 12; }
     }
 
@@ -1305,13 +1491,17 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     </section>
 
     <div class="controls">
-      <button class="toggle active" data-window="1h">1h</button>
-      <button class="toggle" data-window="6h">6h</button>
+      <button class="toggle" data-window="1h">1h</button>
+      <button class="toggle active" data-window="6h">6h</button>
       <button class="toggle" data-window="24h">24h</button>
       <button class="toggle" data-window="7d">7d</button>
+      <button class="toggle" data-window="14d">14d</button>
+      <button class="toggle" data-window="28d">28d</button>
       <button class="toggle" data-resolution="minute">Minute</button>
       <button class="toggle" data-resolution="hour">Hour</button>
     </div>
+
+    <section class="rolling-grid" id="rolling-charts"></section>
 
     <section class="kpis" id="kpis"></section>
 
@@ -1391,6 +1581,70 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     let selectedWindow = '6h';
     let selectedResolution = '';
     let refreshHandle = null;
+    let latestDashboardPayload = null;
+    const hiddenSeries = new Set();
+    const rollingCharts = [
+      {
+        label: 'Rolling / Conversations',
+        title: 'Completed Conversations',
+        canvasId: 'rolling-conversations-chart',
+        series: [
+          { key: 'completed_conversations_1h', label: '1h total', color: '#0b5cab' },
+          { key: 'completed_conversations_6h', label: '6h total', color: '#117a65' },
+          { key: 'completed_conversations_24h', label: '24h total', color: '#d9822b' },
+        ],
+      },
+      {
+        label: 'Rolling / Workload',
+        title: 'Conversation Days Served',
+        canvasId: 'rolling-active-days-chart',
+        series: [
+          { key: 'active_conversation_days_1h', label: '1h sum', color: '#0b5cab' },
+          { key: 'active_conversation_days_6h', label: '6h sum', color: '#117a65' },
+          { key: 'active_conversation_days_24h', label: '24h sum', color: '#d9822b' },
+        ],
+      },
+      {
+        label: 'Rolling / Duration',
+        title: 'Average Duration',
+        canvasId: 'rolling-duration-chart',
+        series: [
+          { key: 'avg_conversation_duration_min_1h', label: '1h avg', color: '#0b5cab' },
+          { key: 'avg_conversation_duration_min_6h', label: '6h avg', color: '#117a65' },
+          { key: 'avg_conversation_duration_min_24h', label: '24h avg', color: '#d9822b' },
+        ],
+      },
+      {
+        label: 'Rolling / Users',
+        title: 'Connected Users',
+        canvasId: 'rolling-users-chart',
+        series: [
+          { key: 'connected_sessions_avg_1h', label: '1h avg', color: '#0b5cab' },
+          { key: 'connected_sessions_avg_6h', label: '6h avg', color: '#117a65' },
+          { key: 'connected_sessions_avg_24h', label: '24h avg', color: '#d9822b' },
+        ],
+      },
+      {
+        label: 'Rolling / Users',
+        title: 'Maximum Connected Users',
+        canvasId: 'rolling-max-users-chart',
+        series: [
+          { key: 'connected_sessions_max_1h', label: '1h max', color: '#0b5cab' },
+          { key: 'connected_sessions_max_6h', label: '6h max', color: '#117a65' },
+          { key: 'connected_sessions_max_24h', label: '24h max', color: '#d9822b' },
+        ],
+      },
+      {
+        label: 'Rolling / Duration',
+        title: 'Median Duration',
+        canvasId: 'rolling-median-duration-chart',
+        series: [
+          { key: 'median_conversation_duration_min_1h', label: '1h median', color: '#0b5cab' },
+          { key: 'median_conversation_duration_min_6h', label: '6h median', color: '#117a65' },
+          { key: 'median_conversation_duration_min_24h', label: '24h median', color: '#d9822b' },
+        ],
+      },
+    ];
 
     function prettyNumber(value) {
       const numeric = Number(value || 0);
@@ -1414,17 +1668,84 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       return `${secs}s`;
     }
 
+    function formatHoursServed(hoursValue) {
+      const totalMinutes = Math.max(0, Math.round(Number(hoursValue || 0) * 60));
+      const days = Math.floor(totalMinutes / (24 * 60));
+      const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+      const minutes = totalMinutes % 60;
+      if (days > 0) {
+        return `${days}d ${hours}h ${minutes}m`;
+      }
+      if (hours > 0) {
+        return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+      }
+      return `${minutes}m`;
+    }
+
     function statusClass(healthy, errors) {
       if (!healthy || errors > 0) return 'bad';
       return 'good';
     }
 
     function setActiveButtons() {
+      const longWindow = isLongWindow(selectedWindow);
+      if (longWindow) {
+        selectedResolution = 'hour';
+      }
       for (const button of windowButtons) {
         button.classList.toggle('active', button.dataset.window === selectedWindow);
       }
       for (const button of resolutionButtons) {
+        button.disabled = longWindow && button.dataset.resolution === 'minute';
         button.classList.toggle('active', button.dataset.resolution === selectedResolution);
+      }
+    }
+
+    function isLongWindow(windowValue) {
+      const match = String(windowValue || '').match(/^(\\d+)d$/);
+      return Boolean(match && Number(match[1]) >= 7);
+    }
+
+    function activeSeries(seriesConfig) {
+      return seriesConfig.filter((series) => !hiddenSeries.has(series.key));
+    }
+
+    function renderRollingChartCards() {
+      document.getElementById('rolling-charts').innerHTML = rollingCharts.map((chart) => `
+        <div class="panel card">
+          <div class="label">${htmlEscape(chart.label)}</div>
+          <h2>${htmlEscape(chart.title)}</h2>
+          <div class="legend">
+            ${chart.series.map((series) => `
+              <button
+                class="legend-toggle"
+                type="button"
+                style="color: ${series.color}"
+                data-series-toggle="${htmlEscape(series.key)}"
+                aria-pressed="true"
+              >${htmlEscape(series.label)}</button>
+            `).join('')}
+          </div>
+          <div class="chart-shell"><canvas id="${htmlEscape(chart.canvasId)}" width="720" height="260"></canvas></div>
+        </div>
+      `).join('');
+    }
+
+    function updateLegendToggles() {
+      for (const button of document.querySelectorAll('[data-series-toggle]')) {
+        const hidden = hiddenSeries.has(button.dataset.seriesToggle);
+        button.classList.toggle('hidden', hidden);
+        button.setAttribute('aria-pressed', hidden ? 'false' : 'true');
+      }
+    }
+
+    function drawRollingCharts(rollingSeries) {
+      for (const chart of rollingCharts) {
+        drawChart(
+          document.getElementById(chart.canvasId),
+          rollingSeries,
+          activeSeries(chart.series),
+        );
       }
     }
 
@@ -1445,7 +1766,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       const stats = [
         ['Running', current.running_endpoints],
         ['Connected', current.connected_sessions],
-        [`Conversations / ${windowLabel}`, summary.conversations_completed_window],
+        [`Time served / ${windowLabel}`, formatHoursServed(summary.active_conversation_hours_window)],
         [`Avg Duration / ${windowLabel}`, formatDuration(summary.avg_conversation_duration_window_s)],
       ];
       document.getElementById('hero-stats').innerHTML = stats.map(([label, value]) => `
@@ -1585,16 +1906,29 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       document.getElementById('endpoint-wall').innerHTML = cards;
     }
 
-    function drawStatePieChart(canvas, counts) {
+    function prepareCanvas(canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const cssWidth = Math.max(1, Math.round(rect.width || canvas.clientWidth || canvas.width));
+      const cssHeight = Math.max(1, Math.round(rect.height || canvas.clientHeight || canvas.height));
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const pixelWidth = Math.round(cssWidth * dpr);
+      const pixelHeight = Math.round(cssHeight * dpr);
+      if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+        canvas.width = pixelWidth;
+        canvas.height = pixelHeight;
+      }
       const ctx = canvas.getContext('2d');
-      const width = canvas.width;
-      const height = canvas.height;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssWidth, cssHeight);
+      return { ctx, width: cssWidth, height: cssHeight };
+    }
+
+    function drawStatePieChart(canvas, counts) {
+      const { ctx, width, height } = prepareCanvas(canvas);
       const radius = Math.min(width, height) * 0.34;
       const centerX = width / 2;
       const centerY = height / 2;
       const total = counts.running + counts.warm + counts.parked + counts.error;
-
-      ctx.clearRect(0, 0, width, height);
 
       const segments = [
         { value: counts.running, color: '#117a65', label: 'Healthy' },
@@ -1655,45 +1989,107 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       `).join('');
     }
 
-    function drawChart(canvas, points, seriesConfig) {
-      const ctx = canvas.getContext('2d');
-      const width = canvas.width;
-      const height = canvas.height;
-      ctx.clearRect(0, 0, width, height);
+    function niceTickSize(value) {
+      if (value <= 0) return 1;
+      const exponent = Math.floor(Math.log10(value));
+      const magnitude = 10 ** exponent;
+      const fraction = value / magnitude;
+      if (fraction <= 1) return magnitude;
+      if (fraction <= 2) return 2 * magnitude;
+      if (fraction <= 5) return 5 * magnitude;
+      return 10 * magnitude;
+    }
 
-      const padding = { top: 18, right: 18, bottom: 28, left: 34 };
+    function chartTickValues(maxValue) {
+      const tickSize = niceTickSize(maxValue / 4);
+      const niceMax = Math.max(tickSize, Math.ceil(maxValue / tickSize) * tickSize);
+      const ticks = [];
+      for (let value = 0; value <= niceMax + tickSize * 0.5; value += tickSize) {
+        ticks.push(Number(value.toFixed(10)));
+      }
+      return ticks;
+    }
+
+    function formatAxisNumber(value) {
+      const numeric = Number(value || 0);
+      if (numeric >= 1000) {
+        return Intl.NumberFormat([], { notation: 'compact', maximumFractionDigits: 1 }).format(numeric);
+      }
+      if (Math.abs(numeric - Math.round(numeric)) < 0.01) {
+        return String(Math.round(numeric));
+      }
+      if (numeric >= 10) return numeric.toFixed(1);
+      return numeric.toFixed(2).replace(/\\.?0+$/, '');
+    }
+
+    function xAxisLabel(timestamp, includeDate) {
+      const date = new Date(timestamp);
+      if (!includeDate) {
+        return {
+          primary: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          secondary: '',
+        };
+      }
+      return {
+        primary: date.toLocaleDateString([], { month: 'short', day: 'numeric' }),
+        secondary: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      };
+    }
+
+    function drawXAxisLabel(ctx, label, x, y, align) {
+      ctx.textAlign = align;
+      ctx.fillText(label.primary, x, y);
+      if (label.secondary) {
+        ctx.fillText(label.secondary, x, y + 14);
+      }
+    }
+
+    function drawChart(canvas, points, seriesConfig) {
+      const { ctx, width, height } = prepareCanvas(canvas);
+      const first = points.length ? new Date(points[0].timestamp) : null;
+      const last = points.length ? new Date(points[points.length - 1].timestamp) : null;
+      const spanMs = first && last ? last.getTime() - first.getTime() : 0;
+      const includeDate = spanMs >= 36 * 3600 * 1000;
+
+      const padding = { top: 18, right: 22, bottom: includeDate ? 52 : 36, left: 50 };
       const plotWidth = width - padding.left - padding.right;
       const plotHeight = height - padding.top - padding.bottom;
-      const values = points.flatMap((point) => seriesConfig.map((series) => Number(point[series.key] || 0)));
+      const values = points
+        .flatMap((point) => seriesConfig.map((series) => Number(point[series.key] || 0)))
+        .filter((value) => Number.isFinite(value));
       const maxValue = Math.max(1, ...values);
+      const ticks = chartTickValues(maxValue);
+      const chartMax = ticks[ticks.length - 1] || 1;
       const xStep = points.length > 1 ? plotWidth / (points.length - 1) : 0;
 
       ctx.strokeStyle = 'rgba(24, 33, 37, 0.12)';
       ctx.lineWidth = 1;
-      for (let i = 0; i <= 4; i += 1) {
-        const y = padding.top + (plotHeight * i) / 4;
+      for (const value of ticks) {
+        const y = padding.top + plotHeight - (plotHeight * value) / chartMax;
         ctx.beginPath();
         ctx.moveTo(padding.left, y);
         ctx.lineTo(width - padding.right, y);
         ctx.stroke();
       }
 
-      ctx.fillStyle = 'rgba(24, 33, 37, 0.55)';
+      ctx.fillStyle = 'rgba(24, 33, 37, 0.74)';
       ctx.font = '12px Menlo, Consolas, monospace';
       ctx.textAlign = 'right';
-      for (let i = 0; i <= 4; i += 1) {
-        const value = maxValue - (maxValue * i) / 4;
-        const y = padding.top + (plotHeight * i) / 4 + 4;
-        ctx.fillText(prettyNumber(value), padding.left - 8, y);
+      ctx.textBaseline = 'middle';
+      for (const value of ticks) {
+        const y = padding.top + plotHeight - (plotHeight * value) / chartMax;
+        ctx.fillText(formatAxisNumber(value), padding.left - 10, y);
       }
 
       seriesConfig.forEach((series) => {
         ctx.strokeStyle = series.color;
         ctx.lineWidth = series.width || 2.5;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
         ctx.beginPath();
         points.forEach((point, index) => {
           const x = padding.left + xStep * index;
-          const y = padding.top + plotHeight - (plotHeight * Number(point[series.key] || 0)) / maxValue;
+          const y = padding.top + plotHeight - (plotHeight * Number(point[series.key] || 0)) / chartMax;
           if (index === 0) {
             ctx.moveTo(x, y);
           } else {
@@ -1704,12 +2100,15 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       });
 
       if (points.length > 1) {
-        ctx.fillStyle = 'rgba(24, 33, 37, 0.55)';
-        ctx.textAlign = 'center';
-        const first = new Date(points[0].timestamp);
-        const last = new Date(points[points.length - 1].timestamp);
-        ctx.fillText(first.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), padding.left, height - 8);
-        ctx.fillText(last.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), width - padding.right, height - 8);
+        ctx.fillStyle = 'rgba(24, 33, 37, 0.74)';
+        ctx.font = '12px Menlo, Consolas, monospace';
+        ctx.textBaseline = 'alphabetic';
+        const middleIndex = Math.floor((points.length - 1) / 2);
+        const middleX = padding.left + xStep * middleIndex;
+        const labelY = includeDate ? height - 24 : height - 12;
+        drawXAxisLabel(ctx, xAxisLabel(points[0].timestamp, includeDate), padding.left, labelY, 'left');
+        drawXAxisLabel(ctx, xAxisLabel(points[middleIndex].timestamp, includeDate), middleX, labelY, 'center');
+        drawXAxisLabel(ctx, xAxisLabel(points[points.length - 1].timestamp, includeDate), width - padding.right, labelY, 'right');
       }
     }
 
@@ -1723,9 +2122,11 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         throw new Error(`Dashboard request failed: ${response.status}`);
       }
       const payload = await response.json();
+      latestDashboardPayload = payload;
       const current = payload.current;
       const summary = payload.summary;
       const series = payload.series;
+      const rollingSeries = payload.rolling_series || [];
 
       document.getElementById('generated-at').textContent =
         `Updated ${new Date(payload.generated_at).toLocaleString()} • ${payload.window.resolution} timeline • last ${payload.window.requested}`;
@@ -1763,6 +2164,8 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         { key: 'avg_conversation_duration_min', color: '#d9822b' },
         { key: 'max_conversation_duration_min', color: '#bb2d3b' },
       ]);
+
+      drawRollingCharts(rollingSeries);
     }
 
     function scheduleRefresh() {
@@ -1777,7 +2180,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     windowButtons.forEach((button) => {
       button.addEventListener('click', () => {
         selectedWindow = button.dataset.window;
-        if (selectedWindow === '7d' && !selectedResolution) {
+        if (isLongWindow(selectedWindow)) {
           selectedResolution = 'hour';
         }
         setActiveButtons();
@@ -1787,13 +2190,34 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
 
     resolutionButtons.forEach((button) => {
       button.addEventListener('click', () => {
+        if (button.disabled) {
+          return;
+        }
         selectedResolution = button.dataset.resolution === selectedResolution ? '' : button.dataset.resolution;
         setActiveButtons();
         loadDashboard().catch((error) => console.error(error));
       });
     });
 
+    renderRollingChartCards();
+
+    document.querySelectorAll('[data-series-toggle]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const key = button.dataset.seriesToggle;
+        if (hiddenSeries.has(key)) {
+          hiddenSeries.delete(key);
+        } else {
+          hiddenSeries.add(key);
+        }
+        updateLegendToggles();
+        if (latestDashboardPayload) {
+          drawRollingCharts(latestDashboardPayload.rolling_series || []);
+        }
+      });
+    });
+
     setActiveButtons();
+    updateLegendToggles();
     loadDashboard().catch((error) => console.error(error));
     scheduleRefresh();
   </script>
