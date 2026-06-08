@@ -49,6 +49,8 @@ def fetch_compute_active_sessions(base_url: str) -> int:
     router = payload.get("router") if isinstance(payload, dict) else None
     if not isinstance(router, dict):
         raise RuntimeError("compute health response did not include router usage")
+    if "active_sessions" in router:
+        return max(int(router.get("active_sessions", 0)), 0)
     return max(int(router.get("ready_busy", 0)), 0)
 
 
