@@ -1,8 +1,17 @@
 import asyncio
+import json
 import time
 import unittest
+from unittest.mock import patch
 
-from app.endpoint_pool_router import EndpointPoolRouter, EndpointSnapshot, ManagedEndpoint, _to_health_url, _to_ws_url
+from app.endpoint_pool_router import (
+    EndpointPoolRouter,
+    EndpointSnapshot,
+    ManagedEndpoint,
+    _to_health_url,
+    _to_ws_url,
+    fetch_compute_active_sessions,
+)
 
 
 class FakeEndpointController:
@@ -59,11 +68,43 @@ class FakeComputeUsageFetcher:
         return self.busy_by_url.get(url, 0)
 
 
+class FakeUrlopenResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
 class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         router = getattr(self, "router", None)
         if router is not None:
             await router.stop()
+
+    def test_fetch_compute_active_sessions_reads_active_sessions_from_health(self):
+        with patch(
+            "app.endpoint_pool_router.urllib.request.urlopen",
+            return_value=FakeUrlopenResponse({"router": {"active_sessions": 2}}),
+        ):
+            active_sessions = fetch_compute_active_sessions("https://compute.example")
+
+        self.assertEqual(active_sessions, 2)
+
+    def test_fetch_compute_active_sessions_supports_legacy_ready_busy(self):
+        with patch(
+            "app.endpoint_pool_router.urllib.request.urlopen",
+            return_value=FakeUrlopenResponse({"router": {"ready_busy": 1}}),
+        ):
+            active_sessions = fetch_compute_active_sessions("https://compute.example")
+
+        self.assertEqual(active_sessions, 1)
 
     async def test_start_ensures_minimum_warm_endpoints(self):
         controller = FakeEndpointController(
