@@ -5,21 +5,7 @@ from unittest.mock import patch
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointLease
 from app.session_tokens import verify_session_token, websocket_host_matches
-
-
-def monotonic_sequence(*values):
-    value_iter = iter(values)
-    last_value = values[-1]
-
-    def fake_monotonic():
-        nonlocal last_value
-        try:
-            last_value = next(value_iter)
-        except StopIteration:
-            pass
-        return last_value
-
-    return fake_monotonic
+from tests.helpers import monotonic_sequence
 
 
 class FakeLeaseRouter:
@@ -211,7 +197,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.endpoint_name, "endpoint-1")
         self.assertEqual(record.slot_id, "endpoint-1")
         self.assertEqual(record.allocation_wait_ms, 1250)
-        self.assertEqual(record.outcome, "client_disconnected")
+        self.assertEqual(record.outcome, "pending_released")
         self.assertTrue(record.waited_for_capacity)
         self.assertIn("endpoint endpoint-1", record.getMessage())
         self.assertIn("allocation_wait_ms=1250", record.getMessage())

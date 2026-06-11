@@ -143,7 +143,7 @@ def _log_session_allocation_outcome(
     outcome: str,
     *,
     allocation: dict[str, object] | None,
-    allocation_wait_ms: int,
+    allocation_wait_ms: int | None,
     allocation_total_ms: int,
     level: int,
     error: str | None = None,
@@ -166,7 +166,7 @@ def _log_session_allocation_outcome(
     }
     message = (
         "Session allocation outcome outcome=%s session_id=%s endpoint_name=%s "
-        "slot_id=%s allocation_wait_ms=%d allocation_total_ms=%d "
+        "slot_id=%s allocation_wait_ms=%s allocation_total_ms=%d "
         "waited_for_capacity=%s"
     )
     args: list[object] = [
@@ -190,6 +190,20 @@ def _allocation_wait_ms(allocation: dict[str, object], *, fallback_ms: int) -> i
     if value is None:
         return fallback_ms
     return max(int(value), 0)
+
+
+def _public_session_allocation(allocation: dict[str, object]) -> dict[str, object]:
+    return {
+        key: allocation[key]
+        for key in (
+            "session_id",
+            "websocket_url",
+            "connect_url",
+            "session_token",
+            "pending_timeout_s",
+        )
+        if key in allocation
+    }
 
 
 @app.get("/")
@@ -242,15 +256,12 @@ async def create_session(request: Request):
         allocation = await session_manager.allocate(public_base_url(request))
     except Exception as exc:
         allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
-        failure_allocation = (
-            {"waited_for_capacity": True}
-            if isinstance(exc, EndpointCapacityTimeoutError)
-            else None
-        )
+        waited_for_capacity = isinstance(exc, EndpointCapacityTimeoutError)
+        failure_allocation = {"waited_for_capacity": waited_for_capacity}
         _log_session_allocation_outcome(
             "allocation_failed",
             allocation=failure_allocation,
-            allocation_wait_ms=allocation_total_ms,
+            allocation_wait_ms=allocation_total_ms if waited_for_capacity else None,
             allocation_total_ms=allocation_total_ms,
             level=logging.WARNING,
             error=str(exc),
@@ -283,7 +294,7 @@ async def create_session(request: Request):
         allocation_total_ms=allocation_total_ms,
         level=logging.INFO,
     )
-    return JSONResponse(allocation)
+    return JSONResponse(_public_session_allocation(allocation))
 
 
 @app.post("/internal/sessions/{session_id}/event")

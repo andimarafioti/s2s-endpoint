@@ -134,7 +134,7 @@ class DirectSessionManager:
             session.lease.slot_id,
             session.allocation_wait_ms,
             session.waited_for_capacity,
-            extra=_session_log_extra(session, outcome="client_disconnected"),
+            extra=_session_log_extra(session, outcome="pending_released"),
         )
 
     async def handle_event(self, session_id: str, session_token: str, event: str) -> dict[str, object]:

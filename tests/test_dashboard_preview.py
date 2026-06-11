@@ -1,3 +1,4 @@
+import json
 import importlib
 import sys
 import unittest
@@ -10,6 +11,7 @@ from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
 from app.endpoint_pool_router import EndpointCapacityTimeoutError
 from app.swarm_dashboard import SwarmHistoryBucket
+from tests.helpers import monotonic_sequence
 
 
 class FakeClock:
@@ -30,21 +32,6 @@ class FakeHistoryStore:
 
     def write_buckets(self, buckets):
         self.write_calls.append(list(buckets))
-
-
-def monotonic_sequence(*values):
-    value_iter = iter(values)
-    last_value = values[-1]
-
-    def fake_monotonic():
-        nonlocal last_value
-        try:
-            last_value = next(value_iter)
-        except StopIteration:
-            pass
-        return last_value
-
-    return fake_monotonic
 
 
 class ReadOnlyDashboardHistoryStoreTests(unittest.TestCase):
@@ -184,6 +171,17 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.allocation_wait_ms, 40)
         self.assertEqual(record.allocation_total_ms, 50)
         self.assertTrue(record.waited_for_capacity)
+        payload = json.loads(response.body)
+        self.assertEqual(
+            payload,
+            {
+                "session_id": "session-123",
+                "websocket_url": "wss://endpoint-a.example/ws",
+                "connect_url": "https://lb.example/ws?session=session-123",
+                "session_token": "session-token",
+                "pending_timeout_s": 60,
+            },
+        )
 
     async def test_failed_session_allocation_logs_outcome(self):
         module = self._import_load_balancer()
@@ -205,9 +203,9 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(record.session_id)
         self.assertIsNone(record.endpoint_name)
         self.assertIsNone(record.slot_id)
-        self.assertEqual(record.allocation_wait_ms, 250)
+        self.assertIsNone(record.allocation_wait_ms)
         self.assertEqual(record.allocation_total_ms, 250)
-        self.assertIsNone(record.waited_for_capacity)
+        self.assertFalse(record.waited_for_capacity)
         self.assertEqual(record.allocation_error, "no capacity")
         self.assertIn("outcome=allocation_failed", record.getMessage())
         self.assertIn("error=no capacity", record.getMessage())
@@ -272,7 +270,10 @@ class FakeSessionManager:
     async def allocate(self, lb_base_url):
         return {
             "session_id": "session-123",
+            "websocket_url": "wss://endpoint-a.example/ws",
             "connect_url": f"{lb_base_url}ws?session=session-123",
+            "session_token": "session-token",
+            "pending_timeout_s": 60,
             "endpoint_name": "endpoint-a",
             "slot_id": "endpoint-a",
             "allocation_wait_ms": self.allocation_wait_ms,
