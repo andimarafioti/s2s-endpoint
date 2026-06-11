@@ -189,12 +189,42 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         await self.router.start()
         lease = await self.router.acquire(timeout_s=0.2)
         self.assertEqual(lease.endpoint_name, "endpoint-a")
+        self.assertFalse(lease.waited_for_capacity)
 
         await asyncio.sleep(0.05)
 
         snapshot = await self.router.snapshot()
         self.assertEqual(snapshot["running_endpoints"], 2)
         self.assertIn("endpoint-b", controller.wake_calls)
+
+    async def test_acquire_marks_lease_when_it_waited_for_capacity(self):
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+
+        await self.router.start()
+        first_lease = await self.router.acquire(timeout_s=0.2)
+        second_acquire = asyncio.create_task(self.router.acquire(timeout_s=0.2))
+        await asyncio.sleep(0.01)
+
+        await self.router.release(first_lease.slot_id, connected=False)
+        second_lease = await second_acquire
+
+        self.assertEqual(second_lease.endpoint_name, "endpoint-a")
+        self.assertTrue(second_lease.waited_for_capacity)
 
     async def test_reconcile_parks_idle_endpoints_above_warm_floor(self):
         controller = FakeEndpointController(

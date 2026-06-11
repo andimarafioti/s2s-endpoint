@@ -20,6 +20,8 @@ class DirectSession:
     session_token: str
     pending_expires_at: Optional[float]
     allocated_at_monotonic: float
+    allocation_wait_ms: int
+    waited_for_capacity: bool
     connected: bool = False
     connected_at_monotonic: Optional[float] = None
 
@@ -71,7 +73,10 @@ class DirectSessionManager:
         await self.endpoint_router.stop()
 
     async def allocate(self, lb_base_url: str) -> dict[str, object]:
+        allocation_started_at = time.monotonic()
         lease = await self.endpoint_router.acquire(timeout_s=self.allocate_timeout_s)
+        allocated_at = time.monotonic()
+        allocation_wait_ms = _elapsed_ms(allocation_started_at, allocated_at)
         session_id = secrets.token_urlsafe(18)
         callback_url = _build_callback_url(lb_base_url, session_id)
         session_token = create_session_token(
@@ -81,14 +86,16 @@ class DirectSessionManager:
             callback_url=callback_url,
             ttl_s=self.session_token_ttl_s,
         )
-        pending_expires_at = time.monotonic() + self.pending_timeout_s
+        pending_expires_at = allocated_at + self.pending_timeout_s
 
         session = DirectSession(
             session_id=session_id,
             lease=lease,
             session_token=session_token,
             pending_expires_at=pending_expires_at,
-            allocated_at_monotonic=time.monotonic(),
+            allocated_at_monotonic=allocated_at,
+            allocation_wait_ms=allocation_wait_ms,
+            waited_for_capacity=lease.waited_for_capacity,
         )
 
         try:
@@ -104,6 +111,10 @@ class DirectSessionManager:
             "connect_url": attach_session_token(lease.ws_url, session_token),
             "session_token": session_token,
             "pending_timeout_s": self.pending_timeout_s,
+            "endpoint_name": lease.endpoint_name,
+            "slot_id": lease.slot_id,
+            "allocation_wait_ms": allocation_wait_ms,
+            "waited_for_capacity": lease.waited_for_capacity,
         }
 
     async def cancel_pending_session(self, session_id: str) -> None:
@@ -113,7 +124,17 @@ class DirectSessionManager:
                 return
             self._sessions.pop(session_id)
         await self.endpoint_router.release(session.lease.slot_id, connected=False)
-        logger.info("Released abandoned pending session %s (client disconnected before response)", session_id)
+        logger.info(
+            "Released abandoned pending session %s for endpoint %s slot_id=%s "
+            "allocation_wait_ms=%d waited_for_capacity=%s "
+            "(client disconnected before response)",
+            session_id,
+            session.lease.endpoint_name,
+            session.lease.slot_id,
+            session.allocation_wait_ms,
+            session.waited_for_capacity,
+            extra=_session_log_extra(session, outcome="client_disconnected"),
+        )
 
     async def handle_event(self, session_id: str, session_token: str, event: str) -> dict[str, object]:
         payload = verify_session_token(session_token, self.session_shared_secret)
@@ -241,9 +262,14 @@ class DirectSessionManager:
         for session in expired:
             await self.endpoint_router.release(session.lease.slot_id, connected=False)
             logger.info(
-                "Released expired pending session %s for endpoint %s",
+                "Released expired pending session %s for endpoint %s slot_id=%s "
+                "allocation_wait_ms=%d waited_for_capacity=%s",
                 session.session_id,
                 session.lease.endpoint_name,
+                session.lease.slot_id,
+                session.allocation_wait_ms,
+                session.waited_for_capacity,
+                extra=_session_log_extra(session, outcome="pending_expired"),
             )
 
     async def _release_sessions_for_endpoint(self, endpoint_name: str) -> None:
@@ -266,3 +292,18 @@ class DirectSessionManager:
 
 def _build_callback_url(lb_base_url: str, session_id: str) -> str:
     return f"{lb_base_url.rstrip('/')}/internal/sessions/{session_id}/event"
+
+
+def _elapsed_ms(start_monotonic: float, end_monotonic: float) -> int:
+    return max(int(round((end_monotonic - start_monotonic) * 1000)), 0)
+
+
+def _session_log_extra(session: DirectSession, *, outcome: str) -> dict[str, object]:
+    return {
+        "session_id": session.session_id,
+        "endpoint_name": session.lease.endpoint_name,
+        "slot_id": session.lease.slot_id,
+        "allocation_wait_ms": session.allocation_wait_ms,
+        "outcome": outcome,
+        "waited_for_capacity": session.waited_for_capacity,
+    }

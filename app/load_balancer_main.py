@@ -1,4 +1,6 @@
+import logging
 import os
+import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
@@ -136,6 +138,52 @@ class LoadBalancerRuntime:
 app = FastAPI(lifespan=build_lifespan(LoadBalancerRuntime()))
 
 
+def _elapsed_ms(start_monotonic: float) -> int:
+    return max(int(round((time.monotonic() - start_monotonic) * 1000)), 0)
+
+
+def _log_session_allocation_outcome(
+    outcome: str,
+    *,
+    allocation: dict[str, object] | None,
+    allocation_wait_ms: int,
+    level: int,
+    error: str | None = None,
+) -> None:
+    allocation = allocation or {}
+    session_id = allocation.get("session_id")
+    endpoint_name = allocation.get("endpoint_name")
+    slot_id = allocation.get("slot_id")
+    waited_for_capacity = allocation.get("waited_for_capacity")
+    extra = {
+        "session_id": session_id,
+        "endpoint_name": endpoint_name,
+        "slot_id": slot_id,
+        "allocation_wait_ms": allocation_wait_ms,
+        "outcome": outcome,
+        "waited_for_capacity": waited_for_capacity,
+        "allocation_error": error,
+        "http_route": "POST /session",
+    }
+    message = (
+        "Session allocation outcome outcome=%s session_id=%s endpoint_name=%s "
+        "slot_id=%s allocation_wait_ms=%d waited_for_capacity=%s"
+    )
+    args: list[object] = [
+        outcome,
+        session_id,
+        endpoint_name,
+        slot_id,
+        allocation_wait_ms,
+        waited_for_capacity,
+    ]
+    if error is not None:
+        message += " error=%s"
+        args.append(error)
+
+    logger.log(level, message, *args, extra=extra)
+
+
 @app.get("/")
 async def root():
     return {
@@ -181,20 +229,43 @@ async def health():
 @app.post("/session")
 async def create_session(request: Request):
     await dashboard.record_session_request()
+    allocation_started_at = time.monotonic()
     try:
         allocation = await session_manager.allocate(public_base_url(request))
     except Exception as exc:
+        allocation_wait_ms = _elapsed_ms(allocation_started_at)
+        _log_session_allocation_outcome(
+            "allocation_failed",
+            allocation=None,
+            allocation_wait_ms=allocation_wait_ms,
+            level=logging.WARNING,
+            error=str(exc),
+        )
         await dashboard.record_session_allocation_failure()
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
+
+    allocation_wait_ms = _elapsed_ms(allocation_started_at)
+    allocation["allocation_wait_ms"] = allocation_wait_ms
 
     if await request.is_disconnected():
         session_id = allocation.get("session_id")
         if session_id and hasattr(session_manager, "cancel_pending_session"):
             await session_manager.cancel_pending_session(session_id)
-        logger.warning("Client disconnected during session allocation, released session %s", session_id)
+        _log_session_allocation_outcome(
+            "client_disconnected",
+            allocation=allocation,
+            allocation_wait_ms=allocation_wait_ms,
+            level=logging.WARNING,
+        )
         raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
 
     await dashboard.record_session_allocation_success()
+    _log_session_allocation_outcome(
+        "success",
+        allocation=allocation,
+        allocation_wait_ms=allocation_wait_ms,
+        level=logging.INFO,
+    )
     return JSONResponse(allocation)
 
 

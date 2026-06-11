@@ -123,12 +123,73 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         request = FakeDisconnectedRequest()
 
-        with self.assertRaises(HTTPException) as raised:
+        with (
+            patch.object(module.time, "monotonic", side_effect=[20.0, 21.5]),
+            self.assertLogs("s2s-endpoint", level="WARNING") as logs,
+            self.assertRaises(HTTPException) as raised,
+        ):
             await module.create_session(request)
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(fake_session_manager.cancelled_session_ids, ["session-123"])
         self.assertEqual(fake_dashboard.calls, ["request"])
+        record = logs.records[0]
+        self.assertEqual(record.outcome, "client_disconnected")
+        self.assertEqual(record.session_id, "session-123")
+        self.assertEqual(record.endpoint_name, "endpoint-a")
+        self.assertEqual(record.slot_id, "endpoint-a")
+        self.assertEqual(record.allocation_wait_ms, 1500)
+        self.assertTrue(record.waited_for_capacity)
+        self.assertIn("outcome=client_disconnected", record.getMessage())
+        self.assertIn("endpoint_name=endpoint-a", record.getMessage())
+        self.assertIn("allocation_wait_ms=1500", record.getMessage())
+
+    async def test_successful_session_allocation_logs_outcome(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeSessionManager()
+
+        with (
+            patch.object(module.time, "monotonic", side_effect=[20.0, 20.05]),
+            self.assertLogs("s2s-endpoint", level="INFO") as logs,
+        ):
+            response = await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_dashboard.calls, ["request", "success"])
+        record = logs.records[0]
+        self.assertEqual(record.outcome, "success")
+        self.assertEqual(record.session_id, "session-123")
+        self.assertEqual(record.endpoint_name, "endpoint-a")
+        self.assertEqual(record.slot_id, "endpoint-a")
+        self.assertEqual(record.allocation_wait_ms, 50)
+        self.assertTrue(record.waited_for_capacity)
+
+    async def test_failed_session_allocation_logs_outcome(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeFailingSessionManager()
+
+        with (
+            patch.object(module.time, "monotonic", side_effect=[20.0, 20.25]),
+            self.assertLogs("s2s-endpoint", level="WARNING") as logs,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(fake_dashboard.calls, ["request", "failure"])
+        record = logs.records[0]
+        self.assertEqual(record.outcome, "allocation_failed")
+        self.assertIsNone(record.session_id)
+        self.assertIsNone(record.endpoint_name)
+        self.assertIsNone(record.slot_id)
+        self.assertEqual(record.allocation_wait_ms, 250)
+        self.assertEqual(record.allocation_error, "no capacity")
+        self.assertIn("outcome=allocation_failed", record.getMessage())
+        self.assertIn("error=no capacity", record.getMessage())
 
     def _import_load_balancer(self):
         sys.modules.pop("app.load_balancer_main", None)
@@ -167,10 +228,18 @@ class FakeSessionManager:
         return {
             "session_id": "session-123",
             "connect_url": f"{lb_base_url}ws?session=session-123",
+            "endpoint_name": "endpoint-a",
+            "slot_id": "endpoint-a",
+            "waited_for_capacity": True,
         }
 
     async def cancel_pending_session(self, session_id):
         self.cancelled_session_ids.append(session_id)
+
+
+class FakeFailingSessionManager:
+    async def allocate(self, lb_base_url):
+        raise RuntimeError("no capacity")
 
 
 class FakeDisconnectedRequest:
@@ -182,6 +251,11 @@ class FakeDisconnectedRequest:
 
     async def is_disconnected(self):
         return True
+
+
+class FakeConnectedRequest(FakeDisconnectedRequest):
+    async def is_disconnected(self):
+        return False
 
 
 if __name__ == "__main__":
