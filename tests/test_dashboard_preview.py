@@ -1,7 +1,10 @@
 import importlib
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
+
+from fastapi import HTTPException
 
 from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
@@ -105,6 +108,80 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
             clear=False,
         ):
             return importlib.import_module("app.load_balancer_main")
+
+
+class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self):
+        sys.modules.pop("app.load_balancer_main", None)
+
+    async def test_disconnected_session_allocation_releases_pending_session(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+
+        request = FakeDisconnectedRequest()
+
+        with self.assertRaises(HTTPException) as raised:
+            await module.create_session(request)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(fake_session_manager.cancelled_session_ids, ["session-123"])
+        self.assertEqual(fake_dashboard.calls, ["request"])
+
+    def _import_load_balancer(self):
+        sys.modules.pop("app.load_balancer_main", None)
+        with patch.dict(
+            "os.environ",
+            {
+                "COMPUTE_ENDPOINT_NAMES": "TEST",
+                "DASHBOARD_BUCKET_ID": "",
+                "DASHBOARD_PREVIEW_MODE": "",
+                "SESSION_SHARED_SECRET": "",
+            },
+            clear=False,
+        ):
+            return importlib.import_module("app.load_balancer_main")
+
+
+class FakeDashboard:
+    def __init__(self):
+        self.calls = []
+
+    async def record_session_request(self):
+        self.calls.append("request")
+
+    async def record_session_allocation_failure(self):
+        self.calls.append("failure")
+
+    async def record_session_allocation_success(self):
+        self.calls.append("success")
+
+
+class FakeSessionManager:
+    def __init__(self):
+        self.cancelled_session_ids = []
+
+    async def allocate(self, lb_base_url):
+        return {
+            "session_id": "session-123",
+            "connect_url": f"{lb_base_url}ws?session=session-123",
+        }
+
+    async def cancel_pending_session(self, session_id):
+        self.cancelled_session_ids.append(session_id)
+
+
+class FakeDisconnectedRequest:
+    headers = {
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "lb.example",
+    }
+    url = SimpleNamespace(scheme="http", netloc="internal.local")
+
+    async def is_disconnected(self):
+        return True
 
 
 if __name__ == "__main__":

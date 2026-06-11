@@ -15,7 +15,7 @@ from app.endpoint_pool_router import (
 )
 from app.swarm_dashboard import SwarmDashboard
 
-setup_logging()
+logger = setup_logging()
 APP_ROLE = "load_balancer"
 
 HF_ENDPOINT_NAMESPACE = os.getenv("HF_ENDPOINT_NAMESPACE", "").strip() or None
