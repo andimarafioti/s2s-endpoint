@@ -1,14 +1,17 @@
+import logging
 import os
+from time import monotonic
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.app_utils import build_lifespan, public_base_url, setup_logging
+from app.app_utils import build_lifespan, elapsed_ms, public_base_url, setup_logging
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import (
+    EndpointCapacityTimeoutError,
     EndpointPoolRouter,
     HuggingFaceEndpointController,
     fetch_compute_active_sessions,
@@ -136,6 +139,73 @@ class LoadBalancerRuntime:
 app = FastAPI(lifespan=build_lifespan(LoadBalancerRuntime()))
 
 
+def _log_session_allocation_outcome(
+    outcome: str,
+    *,
+    allocation: dict[str, object] | None,
+    allocation_wait_ms: int | None,
+    allocation_total_ms: int,
+    level: int,
+    error: str | None = None,
+) -> None:
+    allocation = allocation or {}
+    session_id = allocation.get("session_id")
+    endpoint_name = allocation.get("endpoint_name")
+    slot_id = allocation.get("slot_id")
+    waited_for_capacity = allocation.get("waited_for_capacity")
+    extra = {
+        "session_id": session_id,
+        "endpoint_name": endpoint_name,
+        "slot_id": slot_id,
+        "allocation_wait_ms": allocation_wait_ms,
+        "allocation_total_ms": allocation_total_ms,
+        "outcome": outcome,
+        "waited_for_capacity": waited_for_capacity,
+        "allocation_error": error,
+        "http_route": "POST /session",
+    }
+    message = (
+        "Session allocation outcome outcome=%s session_id=%s endpoint_name=%s "
+        "slot_id=%s allocation_wait_ms=%s allocation_total_ms=%d "
+        "waited_for_capacity=%s"
+    )
+    args: list[object] = [
+        outcome,
+        session_id,
+        endpoint_name,
+        slot_id,
+        allocation_wait_ms,
+        allocation_total_ms,
+        waited_for_capacity,
+    ]
+    if error is not None:
+        message += " error=%s"
+        args.append(error)
+
+    logger.log(level, message, *args, extra=extra)
+
+
+def _allocation_wait_ms(allocation: dict[str, object], *, fallback_ms: int) -> int:
+    value = allocation.get("allocation_wait_ms")
+    if value is None:
+        return fallback_ms
+    return max(int(value), 0)
+
+
+def _public_session_allocation(allocation: dict[str, object]) -> dict[str, object]:
+    return {
+        key: allocation[key]
+        for key in (
+            "session_id",
+            "websocket_url",
+            "connect_url",
+            "session_token",
+            "pending_timeout_s",
+        )
+        if key in allocation
+    }
+
+
 @app.get("/")
 async def root():
     return {
@@ -181,21 +251,50 @@ async def health():
 @app.post("/session")
 async def create_session(request: Request):
     await dashboard.record_session_request()
+    allocation_started_at = monotonic()
     try:
         allocation = await session_manager.allocate(public_base_url(request))
     except Exception as exc:
+        allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
+        waited_for_capacity = isinstance(exc, EndpointCapacityTimeoutError)
+        failure_allocation = {"waited_for_capacity": waited_for_capacity}
+        _log_session_allocation_outcome(
+            "allocation_failed",
+            allocation=failure_allocation,
+            allocation_wait_ms=allocation_total_ms if waited_for_capacity else None,
+            allocation_total_ms=allocation_total_ms,
+            level=logging.WARNING,
+            error=str(exc),
+        )
         await dashboard.record_session_allocation_failure()
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
+
+    allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
+    allocation_wait_ms = _allocation_wait_ms(allocation, fallback_ms=allocation_total_ms)
+    allocation.setdefault("allocation_wait_ms", allocation_wait_ms)
 
     if await request.is_disconnected():
         session_id = allocation.get("session_id")
         if session_id and hasattr(session_manager, "cancel_pending_session"):
             await session_manager.cancel_pending_session(session_id)
-        logger.warning("Client disconnected during session allocation, released session %s", session_id)
+        _log_session_allocation_outcome(
+            "client_disconnected",
+            allocation=allocation,
+            allocation_wait_ms=allocation_wait_ms,
+            allocation_total_ms=allocation_total_ms,
+            level=logging.WARNING,
+        )
         raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
 
     await dashboard.record_session_allocation_success()
-    return JSONResponse(allocation)
+    _log_session_allocation_outcome(
+        "success",
+        allocation=allocation,
+        allocation_wait_ms=allocation_wait_ms,
+        allocation_total_ms=allocation_total_ms,
+        level=logging.INFO,
+    )
+    return JSONResponse(_public_session_allocation(allocation))
 
 
 @app.post("/internal/sessions/{session_id}/event")
