@@ -48,6 +48,10 @@ def build_lifespan(manager: LifecycleManager):
     return lifespan
 
 
+def elapsed_ms(start_monotonic: float, end_monotonic: float) -> int:
+    return max(int(round((end_monotonic - start_monotonic) * 1000)), 0)
+
+
 def public_base_url(request) -> str:
     scheme = request.headers.get("x-forwarded-proto", "").strip() or request.url.scheme
     host = request.headers.get("x-forwarded-host", "").strip() or request.headers.get("host", "").strip()

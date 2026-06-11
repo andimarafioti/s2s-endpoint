@@ -7,6 +7,21 @@ from app.endpoint_pool_router import EndpointLease
 from app.session_tokens import verify_session_token, websocket_host_matches
 
 
+def monotonic_sequence(*values):
+    value_iter = iter(values)
+    last_value = values[-1]
+
+    def fake_monotonic():
+        nonlocal last_value
+        try:
+            last_value = next(value_iter)
+        except StopIteration:
+            pass
+        return last_value
+
+    return fake_monotonic
+
+
 class FakeLeaseRouter:
     def __init__(
         self,
@@ -81,7 +96,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
             websocket_host_matches(payload["ws_url"], "endpoint-1.example.endpoints.huggingface.cloud")
         )
 
-        with patch("app.direct_session_manager.time.monotonic", side_effect=[100.0, 105.0, 112.5]):
+        with patch("app.direct_session_manager.monotonic", new=monotonic_sequence(100.0, 105.0, 112.5)):
             connected = await self.manager.handle_event(
                 allocation["session_id"],
                 allocation["session_token"],
@@ -185,7 +200,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.manager.start()
 
-        with patch("app.direct_session_manager.time.monotonic", side_effect=[10.0, 11.25]):
+        with patch("app.direct_session_manager.monotonic", new=monotonic_sequence(10.0, 11.25)):
             allocation = await self.manager.allocate("https://lb.example")
 
         with self.assertLogs("s2s-endpoint", level="INFO") as logs:

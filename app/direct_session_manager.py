@@ -2,10 +2,11 @@ import asyncio
 import contextlib
 import logging
 import secrets
-import time
 from dataclasses import dataclass
+from time import monotonic
 from typing import Optional
 
+from app.app_utils import elapsed_ms
 from app.endpoint_pool_router import EndpointLease, EndpointPoolRouter
 from app.session_tokens import attach_session_token, create_session_token, verify_session_token
 
@@ -73,10 +74,10 @@ class DirectSessionManager:
         await self.endpoint_router.stop()
 
     async def allocate(self, lb_base_url: str) -> dict[str, object]:
-        allocation_started_at = time.monotonic()
+        allocation_started_at = monotonic()
         lease = await self.endpoint_router.acquire(timeout_s=self.allocate_timeout_s)
-        allocated_at = time.monotonic()
-        allocation_wait_ms = _elapsed_ms(allocation_started_at, allocated_at)
+        allocated_at = monotonic()
+        allocation_wait_ms = elapsed_ms(allocation_started_at, allocated_at)
         session_id = secrets.token_urlsafe(18)
         callback_url = _build_callback_url(lb_base_url, session_id)
         session_token = create_session_token(
@@ -159,7 +160,7 @@ class DirectSessionManager:
                 session.connected = True
                 session.pending_expires_at = None
                 if session.connected_at_monotonic is None:
-                    session.connected_at_monotonic = time.monotonic()
+                    session.connected_at_monotonic = monotonic()
                 if not was_connected:
                     connected_session = session
             else:
@@ -188,7 +189,7 @@ class DirectSessionManager:
         conversation_duration_s = 0.0
         if session_to_release.connected_at_monotonic is not None:
             conversation_duration_s = max(
-                time.monotonic() - session_to_release.connected_at_monotonic,
+                monotonic() - session_to_release.connected_at_monotonic,
                 0.0,
             )
         return {
@@ -217,7 +218,7 @@ class DirectSessionManager:
                     "pending_expires_at_monotonic": session.pending_expires_at,
                     "connected_at_monotonic": session.connected_at_monotonic,
                     "connected_duration_s": (
-                        max(time.monotonic() - session.connected_at_monotonic, 0.0)
+                        max(monotonic() - session.connected_at_monotonic, 0.0)
                         if session.connected_at_monotonic is not None
                         else None
                     ),
@@ -248,7 +249,7 @@ class DirectSessionManager:
             raise
 
     async def _release_expired_pending_sessions(self) -> None:
-        now = time.monotonic()
+        now = monotonic()
         expired: list[DirectSession] = []
 
         async with self._lock:
@@ -292,10 +293,6 @@ class DirectSessionManager:
 
 def _build_callback_url(lb_base_url: str, session_id: str) -> str:
     return f"{lb_base_url.rstrip('/')}/internal/sessions/{session_id}/event"
-
-
-def _elapsed_ms(start_monotonic: float, end_monotonic: float) -> int:
-    return max(int(round((end_monotonic - start_monotonic) * 1000)), 0)
 
 
 def _session_log_extra(session: DirectSession, *, outcome: str) -> dict[str, object]:

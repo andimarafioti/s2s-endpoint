@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
+from app.endpoint_pool_router import EndpointCapacityTimeoutError
 from app.swarm_dashboard import SwarmHistoryBucket
 
 
@@ -29,6 +30,21 @@ class FakeHistoryStore:
 
     def write_buckets(self, buckets):
         self.write_calls.append(list(buckets))
+
+
+def monotonic_sequence(*values):
+    value_iter = iter(values)
+    last_value = values[-1]
+
+    def fake_monotonic():
+        nonlocal last_value
+        try:
+            last_value = next(value_iter)
+        except StopIteration:
+            pass
+        return last_value
+
+    return fake_monotonic
 
 
 class ReadOnlyDashboardHistoryStoreTests(unittest.TestCase):
@@ -124,7 +140,7 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         request = FakeDisconnectedRequest()
 
         with (
-            patch.object(module.time, "monotonic", side_effect=[20.0, 21.5]),
+            patch.object(module, "monotonic", new=monotonic_sequence(20.0, 21.5)),
             self.assertLogs("s2s-endpoint", level="WARNING") as logs,
             self.assertRaises(HTTPException) as raised,
         ):
@@ -138,20 +154,22 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.session_id, "session-123")
         self.assertEqual(record.endpoint_name, "endpoint-a")
         self.assertEqual(record.slot_id, "endpoint-a")
-        self.assertEqual(record.allocation_wait_ms, 1500)
+        self.assertEqual(record.allocation_wait_ms, 1200)
+        self.assertEqual(record.allocation_total_ms, 1500)
         self.assertTrue(record.waited_for_capacity)
         self.assertIn("outcome=client_disconnected", record.getMessage())
         self.assertIn("endpoint_name=endpoint-a", record.getMessage())
-        self.assertIn("allocation_wait_ms=1500", record.getMessage())
+        self.assertIn("allocation_wait_ms=1200", record.getMessage())
+        self.assertIn("allocation_total_ms=1500", record.getMessage())
 
     async def test_successful_session_allocation_logs_outcome(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
         module.dashboard = fake_dashboard
-        module.session_manager = FakeSessionManager()
+        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
 
         with (
-            patch.object(module.time, "monotonic", side_effect=[20.0, 20.05]),
+            patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)),
             self.assertLogs("s2s-endpoint", level="INFO") as logs,
         ):
             response = await module.create_session(FakeConnectedRequest())
@@ -163,7 +181,8 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.session_id, "session-123")
         self.assertEqual(record.endpoint_name, "endpoint-a")
         self.assertEqual(record.slot_id, "endpoint-a")
-        self.assertEqual(record.allocation_wait_ms, 50)
+        self.assertEqual(record.allocation_wait_ms, 40)
+        self.assertEqual(record.allocation_total_ms, 50)
         self.assertTrue(record.waited_for_capacity)
 
     async def test_failed_session_allocation_logs_outcome(self):
@@ -173,7 +192,7 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module.session_manager = FakeFailingSessionManager()
 
         with (
-            patch.object(module.time, "monotonic", side_effect=[20.0, 20.25]),
+            patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.25)),
             self.assertLogs("s2s-endpoint", level="WARNING") as logs,
             self.assertRaises(HTTPException) as raised,
         ):
@@ -187,9 +206,34 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(record.endpoint_name)
         self.assertIsNone(record.slot_id)
         self.assertEqual(record.allocation_wait_ms, 250)
+        self.assertEqual(record.allocation_total_ms, 250)
+        self.assertIsNone(record.waited_for_capacity)
         self.assertEqual(record.allocation_error, "no capacity")
         self.assertIn("outcome=allocation_failed", record.getMessage())
         self.assertIn("error=no capacity", record.getMessage())
+
+    async def test_capacity_timeout_session_allocation_logs_waited_for_capacity(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeFailingSessionManager(
+            EndpointCapacityTimeoutError("timed out waiting for an available compute endpoint")
+        )
+
+        with (
+            patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.25)),
+            self.assertLogs("s2s-endpoint", level="WARNING") as logs,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(fake_dashboard.calls, ["request", "failure"])
+        record = logs.records[0]
+        self.assertEqual(record.outcome, "allocation_failed")
+        self.assertEqual(record.allocation_wait_ms, 250)
+        self.assertEqual(record.allocation_total_ms, 250)
+        self.assertTrue(record.waited_for_capacity)
 
     def _import_load_balancer(self):
         sys.modules.pop("app.load_balancer_main", None)
@@ -221,8 +265,9 @@ class FakeDashboard:
 
 
 class FakeSessionManager:
-    def __init__(self):
+    def __init__(self, *, allocation_wait_ms: int = 1200):
         self.cancelled_session_ids = []
+        self.allocation_wait_ms = allocation_wait_ms
 
     async def allocate(self, lb_base_url):
         return {
@@ -230,6 +275,7 @@ class FakeSessionManager:
             "connect_url": f"{lb_base_url}ws?session=session-123",
             "endpoint_name": "endpoint-a",
             "slot_id": "endpoint-a",
+            "allocation_wait_ms": self.allocation_wait_ms,
             "waited_for_capacity": True,
         }
 
@@ -238,8 +284,11 @@ class FakeSessionManager:
 
 
 class FakeFailingSessionManager:
+    def __init__(self, exc=None):
+        self.exc = exc or RuntimeError("no capacity")
+
     async def allocate(self, lb_base_url):
-        raise RuntimeError("no capacity")
+        raise self.exc
 
 
 class FakeDisconnectedRequest:

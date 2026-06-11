@@ -15,6 +15,10 @@ logger = logging.getLogger("s2s-endpoint")
 ComputeUsageFetcher = Callable[[str], int]
 
 
+class EndpointCapacityTimeoutError(RuntimeError):
+    pass
+
+
 def _normalize_status(status: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(status).lower())
 
@@ -378,11 +382,13 @@ class EndpointPoolRouter:
                 wake_names = self._mark_endpoints_to_wake_unlocked(force=True)
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
-                    raise RuntimeError("timed out waiting for an available compute endpoint")
+                    raise EndpointCapacityTimeoutError("timed out waiting for an available compute endpoint")
                 try:
                     await asyncio.wait_for(self._condition.wait(), timeout=remaining)
                 except asyncio.TimeoutError as exc:
-                    raise RuntimeError("timed out waiting for an available compute endpoint") from exc
+                    raise EndpointCapacityTimeoutError(
+                        "timed out waiting for an available compute endpoint"
+                    ) from exc
                 waited_for_capacity = True
 
             self._spawn_wake_tasks(wake_names)
