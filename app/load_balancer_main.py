@@ -125,8 +125,18 @@ dashboard = SwarmDashboard(
 )
 
 
+async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
+    await dashboard.record_session_event(
+        "disconnected",
+        conversation_duration_s=result.get("conversation_duration_s"),
+        conversation_counted=bool(result.get("conversation_counted")),
+    )
+
+
 class LoadBalancerRuntime:
     async def start(self) -> None:
+        if hasattr(session_manager, "set_abnormal_disconnect_handler"):
+            session_manager.set_abnormal_disconnect_handler(record_abnormal_session_disconnect)
         await session_manager.start()
         await dashboard.start()
 

@@ -571,7 +571,7 @@ class EndpointPoolRouter:
                 if _is_parked_status(endpoint.status):
                     endpoint.parking = False
 
-                if was_running and not endpoint.running and not _is_parked_status(endpoint.status):
+                if was_running and not endpoint.running:
                     endpoint.active_sessions = 0
                     endpoint.connected_sessions = 0
                     endpoint.observed_active_sessions = 0
