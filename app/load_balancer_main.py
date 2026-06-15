@@ -276,20 +276,26 @@ def require_admin_auth(request: Request) -> None:
     if not LB_ADMIN_AUTH_TOKEN:
         raise HTTPException(status_code=503, detail="LB admin auth token is not configured")
 
-    authorization = request.headers.get("authorization", "")
-    if not _authorized_bearer_token(authorization, LB_ADMIN_AUTH_TOKEN):
+    token = _bearer_token(request.headers.get("authorization"))
+    if token is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing admin bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not secrets.compare_digest(token, LB_ADMIN_AUTH_TOKEN):
         raise HTTPException(status_code=403, detail="Invalid admin authorization")
 
 
-def _authorized_bearer_token(authorization: str | None, expected_token: str | None) -> bool:
-    if not expected_token:
-        return False
-
+def _bearer_token(authorization: str | None) -> str | None:
     scheme, separator, token = (authorization or "").partition(" ")
     if not separator or scheme.lower() != "bearer":
-        return False
+        return None
 
-    return secrets.compare_digest(token.strip(), expected_token)
+    token = token.strip()
+    if not token:
+        return None
+    return token
 
 
 @app.websocket("/ws")

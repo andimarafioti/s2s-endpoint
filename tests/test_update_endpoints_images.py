@@ -1,9 +1,11 @@
+from io import BytesIO
 import sys
 import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import httpx
 from huggingface_hub.errors import HfHubHTTPError
@@ -18,6 +20,7 @@ from update_endpoints_images import (  # noqa: E402
     default_compute_prefix,
     discover_load_balancer_compute_names,
     discover_sequential_compute_names,
+    request_json,
     wait_for_compute_endpoint_free,
     resolve_compute_names,
     update_one,
@@ -413,6 +416,45 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual(result["image_after"], "andito/s2s-compute:new")
         self.assertEqual(result["drain"]["active_sessions_before_update"], 0)
         self.assertTrue(result["drain"]["draining_before_update"])
+
+    def test_request_json_parses_expected_http_error_body(self):
+        error = HTTPError(
+            "https://lb.example/health",
+            503,
+            "Service Unavailable",
+            {},
+            BytesIO(b'{"status": "starting"}'),
+        )
+
+        with patch("update_endpoints_images.urlopen", side_effect=error):
+            result = request_json(
+                "https://lb.example/health",
+                token=None,
+                timeout_s=1,
+                allow_http_error_body=True,
+                allowed_http_error_statuses=(503,),
+            )
+
+        self.assertEqual(result, {"status": "starting"})
+
+    def test_request_json_raises_unexpected_http_error_body(self):
+        error = HTTPError(
+            "https://lb.example/health",
+            500,
+            "Internal Server Error",
+            {},
+            BytesIO(b'{"detail": "failed"}'),
+        )
+
+        with patch("update_endpoints_images.urlopen", side_effect=error):
+            with self.assertRaises(HTTPError):
+                request_json(
+                    "https://lb.example/health",
+                    token=None,
+                    timeout_s=1,
+                    allow_http_error_body=True,
+                    allowed_http_error_statuses=(503,),
+                )
 
 
 if __name__ == "__main__":
