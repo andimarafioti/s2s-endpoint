@@ -248,6 +248,7 @@ class DirectSessionManager:
                     to_release.append(self._sessions.pop(session_id))
 
         for session in to_release:
+            # Keep slot cleanup independent from best-effort dashboard accounting.
             await self.endpoint_router.release(session.lease.slot_id, connected=session.connected)
             result = self._release_result(session, release_reason="endpoint_unavailable")
             logger.info(

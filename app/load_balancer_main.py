@@ -135,6 +135,7 @@ async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
 
 class LoadBalancerRuntime:
     async def start(self) -> None:
+        # Dashboard preview mode uses a synthetic manager with no real sessions.
         if hasattr(session_manager, "set_abnormal_disconnect_handler"):
             session_manager.set_abnormal_disconnect_handler(record_abnormal_session_disconnect)
         await session_manager.start()
