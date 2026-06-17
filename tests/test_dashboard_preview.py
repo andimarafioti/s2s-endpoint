@@ -122,7 +122,8 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
             json={"draining": True},
         )
 
-        self.assertEqual(missing_auth.status_code, 403)
+        self.assertEqual(missing_auth.status_code, 401)
+        self.assertEqual(missing_auth.headers["www-authenticate"], "Bearer")
         self.assertEqual(wrong_auth.status_code, 403)
         self.assertEqual(correct_auth.status_code, 404)
         self.assertEqual(correct_auth.json()["detail"], "Endpoint draining is not available")

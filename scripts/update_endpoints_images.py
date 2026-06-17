@@ -702,6 +702,8 @@ def update_one_draining(
         }
         return result
     finally:
+        # With wait=False this reopens the endpoint immediately after submitting
+        # the update; use wait=True when it must stay drained until healthy.
         try:
             set_compute_endpoint_draining(
                 load_balancer_url=load_balancer_url,
@@ -809,6 +811,7 @@ def fetch_load_balancer_health(
         token=token,
         timeout_s=timeout_s,
         allow_http_error_body=True,
+        allowed_http_error_statuses=(503,),
     )
 
 
@@ -838,6 +841,7 @@ def request_json(
     payload: dict[str, object] | None = None,
     timeout_s: float,
     allow_http_error_body: bool = False,
+    allowed_http_error_statuses: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     headers: dict[str, str] = {}
     data = None
@@ -853,7 +857,7 @@ def request_json(
             body = response.read()
     except HTTPError as exc:
         body = exc.read()
-        if allow_http_error_body and body:
+        if allow_http_error_body and exc.code in allowed_http_error_statuses and body:
             return json.loads(body.decode("utf-8"))
         raise
 
