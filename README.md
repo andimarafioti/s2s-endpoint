@@ -265,7 +265,10 @@ session token.
 
 With the current defaults, compute endpoints also need an `HF_TOKEN` or
 `RESPONSES_API_API_KEY` secret at runtime because the speech-to-speech wrapper
-defaults to `LLM=responses-api`.
+defaults to `LLM=chat-completions` with Hugging Face router settings:
+`MODEL_NAME=google/gemma-4-31B-it:cerebras`,
+`RESPONSES_API_BASE_URL=https://router.huggingface.co/v1`, and
+`RESPONSES_API_REASONING_EFFORT=none`.
 
 ## Update Compute Endpoint Env
 

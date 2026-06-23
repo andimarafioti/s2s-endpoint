@@ -182,13 +182,13 @@ def main() -> None:
     env.update(parse_key_value_pairs(args.env))
     secrets.update(parse_key_value_pairs(args.secret))
 
-    llm_backend = str(env.get("LLM", "responses-api")).strip() or "responses-api"
-    if llm_backend == "responses-api" and not (
+    llm_backend = str(env.get("LLM", "chat-completions")).strip() or "chat-completions"
+    if llm_backend in {"chat-completions", "responses-api"} and not (
         secrets.get("RESPONSES_API_API_KEY") or secrets.get("HF_TOKEN") or env.get("RESPONSES_API_API_KEY") or env.get("HF_TOKEN")
     ):
         print(
-            "warning: compute endpoints default to LLM=responses-api, but neither RESPONSES_API_API_KEY nor HF_TOKEN was provided. "
-            "The container will start, but runtime requests will fail when the speech-to-speech pipeline calls the Responses API.",
+            f"warning: compute endpoints use LLM={llm_backend}, but neither RESPONSES_API_API_KEY nor HF_TOKEN was provided. "
+            "The container will start, but runtime requests will fail when the speech-to-speech pipeline calls the chat API.",
             file=sys.stderr,
         )
 
