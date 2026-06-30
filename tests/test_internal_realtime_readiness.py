@@ -1,7 +1,54 @@
+import importlib
+import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from app import compute_main
+
+
+class BuildS2SCommandTests(unittest.TestCase):
+    def build_command_with_env(self, env: dict[str, str]) -> list[str]:
+        with patch.dict(os.environ, env, clear=True):
+            module = importlib.reload(compute_main)
+            command = module.build_s2s_command("127.0.0.1", 9000)
+        importlib.reload(compute_main)
+        return command
+
+    def test_hf_router_model_defaults_to_chat_completions_and_router_url(self):
+        command = self.build_command_with_env(
+            {
+                "MODEL_NAME": "google/gemma-4-31B-it:cerebras",
+                "HF_TOKEN": "hf_token",
+            }
+        )
+
+        self.assertEqual(command[command.index("--llm_backend") + 1], "chat-completions")
+        self.assertEqual(command[command.index("--model_name") + 1], "google/gemma-4-31B-it:cerebras")
+        self.assertEqual(command[command.index("--responses_api_base_url") + 1], "https://router.huggingface.co/v1")
+        self.assertEqual(command[command.index("--responses_api_api_key") + 1], "hf_token")
+
+    def test_chat_completions_forwards_openai_compatible_connection_flags(self):
+        command = self.build_command_with_env(
+            {
+                "LLM": "chat-completions",
+                "MODEL_NAME": "custom-model",
+                "RESPONSES_API_BASE_URL": "https://example.test/v1",
+                "RESPONSES_API_API_KEY": "api-key",
+            }
+        )
+
+        self.assertEqual(command[command.index("--llm_backend") + 1], "chat-completions")
+        self.assertEqual(command[command.index("--responses_api_base_url") + 1], "https://example.test/v1")
+        self.assertEqual(command[command.index("--responses_api_api_key") + 1], "api-key")
+
+    def test_legacy_responses_api_model_name_alias_is_still_supported(self):
+        command = self.build_command_with_env(
+            {
+                "RESPONSES_API_MODEL_NAME": "Qwen/Qwen3.5-72B:together",
+            }
+        )
+
+        self.assertEqual(command[command.index("--model_name") + 1], "Qwen/Qwen3.5-72B:together")
 
 
 class WaitForInternalRealtimeTests(unittest.IsolatedAsyncioTestCase):
