@@ -109,7 +109,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     _add_str_flag(cmd, MODEL_NAME, "--model_name")
     _add_str_flag(cmd, INIT_CHAT_PROMPT, "--init_chat_prompt")
 
-    if LLM == "responses-api":
+    if LLM in {"responses-api", "chat-completions"}:
         if RESPONSES_API_BASE_URL:
             _add_str_flag(cmd, RESPONSES_API_BASE_URL, "--responses_api_base_url")
         if RESPONSES_API_API_KEY:
