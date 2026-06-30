@@ -1,6 +1,7 @@
 # User Preferences
 
 - Never include `codex` in branch names or pull request titles.
+- Always make changes as consecutive commits, with each commit preserving exactly what changed at that step. Do not fold follow-up work into earlier commits unless explicitly asked.
 - For existing/open pull requests, do not amend, squash, rebase-rewrite, or force-push follow-up changes. Make new commits and push normally unless explicitly asked to rewrite history.
 
 # Operational Log Analysis Notes
