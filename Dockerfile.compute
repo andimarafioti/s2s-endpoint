@@ -2,6 +2,8 @@
 FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
 ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
 ARG S2S_REF=main
+ARG QWENTTS_WHEEL_URL=https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/resolve/main/whl/cu128/qwentts_cpp_python-0.3.0%2Bcu128-py3-none-manylinux_2_35_x86_64.whl
+ARG QWENTTS_WHEEL_FILENAME=qwentts_cpp_python-0.3.0+cu128-py3-none-manylinux_2_35_x86_64.whl
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -9,7 +11,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PORT=7860 \
     INTERNAL_WS_HOST=127.0.0.1 \
     INTERNAL_WS_PORT=9000 \
-    S2S_REPO_DIR=/opt/speech-to-speech
+    S2S_REPO_DIR=/opt/speech-to-speech \
+    QWENTTS_WHEELHOUSE_DIR=/opt/qwentts-wheels \
+    UV_FIND_LINKS=/opt/qwentts-wheels
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -27,7 +31,9 @@ RUN pip install --upgrade pip setuptools wheel && \
     pip install uv
 
 # Clone speech-to-speech and install its dependencies the way the repo expects
-RUN git clone --filter=blob:none "${S2S_REPO_URL}" ${S2S_REPO_DIR} && \
+RUN mkdir -p "${QWENTTS_WHEELHOUSE_DIR}" && \
+    curl -L --fail "${QWENTTS_WHEEL_URL}" -o "${QWENTTS_WHEELHOUSE_DIR}/${QWENTTS_WHEEL_FILENAME}" && \
+    git clone --filter=blob:none "${S2S_REPO_URL}" ${S2S_REPO_DIR} && \
     cd ${S2S_REPO_DIR} && \
     git checkout "${S2S_REF}" && \
     uv sync --no-dev && \
