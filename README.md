@@ -279,23 +279,7 @@ session token.
 
 With the current defaults, compute endpoints also need an `HF_TOKEN` or
 `RESPONSES_API_API_KEY` secret at runtime because the speech-to-speech wrapper
-uses an OpenAI-compatible LLM API. `MODEL_NAME` only selects the model; set
-`RESPONSES_API_BASE_URL` when the model is served outside OpenAI.
-
-For a Hugging Face router model on Cerebras, use:
-
-```text
-LLM=chat-completions
-MODEL_NAME=google/gemma-4-31B-it:cerebras
-RESPONSES_API_BASE_URL=https://router.huggingface.co/v1
-HF_TOKEN=<your token>
-```
-
-If `MODEL_NAME` looks like `org/model:provider` and `LLM` /
-`RESPONSES_API_BASE_URL` are not set, the compute launcher defaults to
-`LLM=chat-completions` and `https://router.huggingface.co/v1`. The older
-`RESPONSES_API_MODEL_NAME` env var is still accepted as a fallback alias, but
-new deployments should use `MODEL_NAME`.
+defaults to `LLM=responses-api`.
 
 ## Update Compute Endpoint Env
 
@@ -306,9 +290,7 @@ uv run --with-requirements requirements.txt python scripts/update_compute_endpoi
   --namespace your-org \
   --prefix reachy-s2s \
   --count 8 \
-  --env MODEL_NAME=Qwen/Qwen3.5-72B:together \
-  --env LLM=chat-completions \
-  --env RESPONSES_API_BASE_URL=https://router.huggingface.co/v1 \
+  --env RESPONSES_API_MODEL_NAME=Qwen/Qwen3.5-72B:together \
   --wait
 ```
 
