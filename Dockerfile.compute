@@ -8,6 +8,7 @@ ARG QWENTTS_WHEEL_FILENAME=qwentts_cpp_python-0.3.0+cu128-py3-none-manylinux_2_3
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    LD_LIBRARY_PATH=/opt/conda/lib:/opt/conda/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/opt/conda/lib/python3.11/site-packages/nvidia/cublas/lib:/opt/conda/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:/opt/conda/lib/python3.11/site-packages/nvidia/nvjitlink/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
     PORT=7860 \
     INTERNAL_WS_HOST=127.0.0.1 \
     INTERNAL_WS_PORT=9000 \
