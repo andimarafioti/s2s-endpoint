@@ -88,6 +88,32 @@ The flow is:
 
 This removes the LB from the websocket data path. The LB only handles control-plane allocation and release.
 
+### When every slot is busy: the waiting queue
+
+`POST /session` never blocks. If a slot is free (and no one is already waiting) it
+returns a grant as above, marked `"state": "granted"`. Otherwise the caller joins a
+FIFO waiting queue and gets a **ticket** instead:
+
+```json
+{ "state": "queued", "queue_id": "…", "position": 3, "poll_interval_s": 2, "ticket_ttl_s": 8 }
+```
+
+The client then polls `GET /queue/{queue_id}` every `poll_interval_s`:
+
+- still waiting → `{ "state": "queued", "position": N, … }` (position only ever decreases)
+- reached the front and a slot freed → the same `"state": "granted"` body as `POST /session`
+- unknown/expired ticket → `404`
+
+Only the head of the line claims a freed slot, so admission stays FIFO. A ticket that
+isn't polled within `ticket_ttl_s` is dropped (how an abandoned waiter is detected), and
+everyone behind shifts up. `DELETE /queue/{queue_id}` leaves the line explicitly (used by
+the client's teardown beacon). Waiting reserves no compute and, on the demo Space, no
+usage time — only a live connected session counts. If the queue itself is full the
+`POST /session` returns `503` with `{ "state": "at_capacity" }`.
+
+Tunable via env: `QUEUE_MAX_DEPTH` (default 25), `QUEUE_TICKET_TTL_S` (8),
+`QUEUE_POLL_INTERVAL_S` (2), `QUEUE_REAP_INTERVAL_S` (2).
+
 In load-balancer mode, the app does not guess endpoint hostnames. It asks the
 Hugging Face API for each compute endpoint's canonical HTTPS URL and turns that
 into the direct websocket URL by replacing `https://` with `wss://` and appending

@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from app.direct_session_manager import DirectSessionManager
+from app.direct_session_manager import DirectSessionManager, QueueAtCapacityError
 from app.endpoint_pool_router import EndpointLease
 from app.session_tokens import verify_session_token, websocket_host_matches
 from tests.helpers import monotonic_sequence
@@ -40,6 +40,11 @@ class FakeLeaseRouter:
             waited_for_capacity=self.waited_for_capacity,
         )
 
+    async def try_acquire(self) -> EndpointLease:
+        # The queue owns the waiting now; the manager only ever asks for an
+        # immediately-available slot. The fake always has one.
+        return await self.acquire()
+
     async def mark_connected(self, slot_id: str) -> None:
         self.mark_connected_calls.append(slot_id)
 
@@ -49,6 +54,117 @@ class FakeLeaseRouter:
 
     async def healthcheck(self):
         return True, None, dict(self.health_snapshot)
+
+
+class ToggleCapacityRouter(FakeLeaseRouter):
+    """Fake router whose free capacity can be flipped on/off to drive the queue."""
+
+    def __init__(self, *, has_capacity: bool = False):
+        super().__init__()
+        self.has_capacity = has_capacity
+        self.try_acquire_calls = 0
+
+    async def try_acquire(self):
+        self.try_acquire_calls += 1
+        if not self.has_capacity:
+            return None
+        return await self.acquire()
+
+
+class SessionQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        manager = getattr(self, "manager", None)
+        if manager is not None:
+            await manager.stop()
+
+    def _make(self, router, **kwargs):
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=60,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+            queue_reap_interval_s=3600,  # reap only when we call it explicitly
+            **kwargs,
+        )
+        return self.manager
+
+    async def test_busy_pool_queues_and_head_claims_when_capacity_returns(self):
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = self._make(router, queue_max_depth=5)
+        await manager.start()
+
+        first = await manager.allocate("https://lb.example")
+        second = await manager.allocate("https://lb.example")
+        self.assertEqual(first["state"], "queued")
+        self.assertEqual(first["position"], 1)
+        self.assertEqual(second["position"], 2)
+        self.assertEqual((await manager.snapshot())["queued_sessions"], 2)
+
+        # Still no capacity: the head just gets its position back, no grant.
+        again = await manager.poll(first["queue_id"], "https://lb.example")
+        self.assertEqual(again["state"], "queued")
+        self.assertEqual(again["position"], 1)
+
+        # A non-head ticket never claims, even if capacity exists.
+        router.has_capacity = True
+        held = await manager.poll(second["queue_id"], "https://lb.example")
+        self.assertEqual(held["state"], "queued")
+        self.assertEqual(held["position"], 2)
+
+        # The head claims the freed slot and leaves the queue.
+        granted = await manager.poll(first["queue_id"], "https://lb.example")
+        self.assertEqual(granted["state"], "granted")
+        self.assertTrue(granted["waited_for_capacity"])
+        self.assertTrue(granted["connect_url"].startswith(granted["websocket_url"]))
+
+        snap = await manager.snapshot()
+        self.assertEqual(snap["queued_sessions"], 1)  # only `second` remains
+        self.assertEqual(snap["pending_sessions"], 1)  # the granted, not-yet-connected one
+
+        # `second` is now the head and can claim.
+        promoted = await manager.poll(second["queue_id"], "https://lb.example")
+        self.assertEqual(promoted["state"], "granted")
+
+    async def test_unknown_ticket_raises_keyerror(self):
+        router = ToggleCapacityRouter(has_capacity=True)
+        manager = self._make(router)
+        await manager.start()
+        with self.assertRaises(KeyError):
+            await manager.poll("no-such-ticket", "https://lb.example")
+
+    async def test_leave_removes_ticket(self):
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = self._make(router)
+        await manager.start()
+
+        ticket = await manager.allocate("https://lb.example")
+        self.assertTrue(await manager.leave(ticket["queue_id"]))
+        self.assertEqual((await manager.snapshot())["queued_sessions"], 0)
+        self.assertFalse(await manager.leave(ticket["queue_id"]))  # idempotent
+        with self.assertRaises(KeyError):
+            await manager.poll(ticket["queue_id"], "https://lb.example")
+
+    async def test_queue_at_capacity_raises(self):
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = self._make(router, queue_max_depth=2)
+        await manager.start()
+
+        await manager.allocate("https://lb.example")
+        await manager.allocate("https://lb.example")
+        with self.assertRaises(QueueAtCapacityError):
+            await manager.allocate("https://lb.example")
+
+    async def test_stale_ticket_is_reaped(self):
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = self._make(router, queue_ticket_ttl_s=0.0)
+        await manager.start()
+
+        ticket = await manager.allocate("https://lb.example")
+        await manager._reap_stale_tickets()  # TTL 0 => immediately stale
+        self.assertEqual((await manager.snapshot())["queued_sessions"], 0)
+        with self.assertRaises(KeyError):
+            await manager.poll(ticket["queue_id"], "https://lb.example")
 
 
 class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
