@@ -175,6 +175,7 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             payload,
             {
+                "state": "granted",
                 "session_id": "session-123",
                 "websocket_url": "wss://endpoint-a.example/ws",
                 "connect_url": "https://lb.example/ws?session=session-123",
