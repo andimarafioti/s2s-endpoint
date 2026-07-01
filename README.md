@@ -111,8 +111,18 @@ the client's teardown beacon). Waiting reserves no compute and, on the demo Spac
 usage time — only a live connected session counts. If the queue itself is full the
 `POST /session` returns `503` with `{ "state": "at_capacity" }`.
 
-Tunable via env: `QUEUE_MAX_DEPTH` (default 25), `QUEUE_TICKET_TTL_S` (8),
+Tunable via env: `QUEUE_MAX_DEPTH` (default 100), `QUEUE_TICKET_TTL_S` (8),
 `QUEUE_POLL_INTERVAL_S` (2), `QUEUE_REAP_INTERVAL_S` (2).
+
+Sizing `QUEUE_MAX_DEPTH`: it's a ceiling, not a target. Two things bound how high
+it's worth setting. Poll load scales as `depth / QUEUE_POLL_INTERVAL_S` requests
+per second (on this app, and again on the Space that proxies it), so a very deep
+queue at a 2s cadence puts real request pressure on both small containers. And
+position is only meaningful if the wait is bearable: the last person's wait is
+roughly `depth × avg_session ÷ live_slots`, so past ~10-15 minutes people abandon
+regardless. 100 is comfortable headroom on load and keeps the "at capacity" modal
+rare; if you push it past ~200, raise `QUEUE_POLL_INTERVAL_S` to 3-4s to hold the
+request rate down (the per-poll position lookup is currently O(queue depth)).
 
 In load-balancer mode, the app does not guess endpoint hostnames. It asks the
 Hugging Face API for each compute endpoint's canonical HTTPS URL and turns that

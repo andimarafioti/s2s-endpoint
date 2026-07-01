@@ -53,7 +53,7 @@ class DirectSessionManager:
         session_token_ttl_s: float = 86400.0,
         reap_interval_s: float = 5.0,
         allocate_timeout_s: float = 900.0,
-        queue_max_depth: int = 25,
+        queue_max_depth: int = 100,
         queue_ticket_ttl_s: float = 8.0,
         queue_poll_interval_s: float = 2.0,
         queue_reap_interval_s: float = 2.0,

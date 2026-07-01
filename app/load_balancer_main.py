@@ -52,7 +52,7 @@ SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
 # Waiting queue: when every slot is busy a caller gets a ticket and polls
 # GET /queue/{id} until the head of the line claims a freed slot. Waiting never
 # reserves compute or usage time; an un-polled ticket is reaped after its TTL.
-QUEUE_MAX_DEPTH = int(os.getenv("QUEUE_MAX_DEPTH", "25"))
+QUEUE_MAX_DEPTH = int(os.getenv("QUEUE_MAX_DEPTH", "100"))
 QUEUE_TICKET_TTL_S = float(os.getenv("QUEUE_TICKET_TTL_S", "8"))
 QUEUE_POLL_INTERVAL_S = float(os.getenv("QUEUE_POLL_INTERVAL_S", "2"))
 QUEUE_REAP_INTERVAL_S = float(os.getenv("QUEUE_REAP_INTERVAL_S", "2"))

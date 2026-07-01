@@ -12,7 +12,7 @@ grant (a slot was free) or a **ticket** (`{queue_id, position}`); the client the
 polls `GET /queue/{id}` every ~2s until the ticket is claimed and the poll returns
 the `connect_url`. A ticket is dropped if it is not polled within a short TTL (~8s),
 which is how an abandoned waiter is detected. The queue is FIFO and tier-blind, and
-is bounded (`QUEUE_MAX_DEPTH`, default 25) — a would-be waiter past the cap is told
+is bounded (`QUEUE_MAX_DEPTH`, default 100) — a would-be waiter past the cap is told
 the queue is at capacity rather than admitted to an unbounded line.
 
 Admission is **pull-driven**: the LB keeps an ordered list of waiting ticket ids,
@@ -61,5 +61,9 @@ usage time.
 - Queued time is free — only connected conversation time counts against the daily
   limit, which already falls out of counting `connected_at`→disconnect and reserving
   at claim.
-- `QUEUE_MAX_DEPTH` is a guess until real load is seen; it is an env knob, not a code
-  change, to tune.
+- `QUEUE_MAX_DEPTH` (default 100) is a ceiling, not a target, and an env knob rather
+  than a code change. Two things bound it: poll load grows as `depth / poll_interval`
+  req/s (doubled across the LB and the Space that proxies it), and position only helps
+  while the wait is bearable (`depth × avg_session ÷ live_slots`). 100 is headroom that
+  keeps the at-capacity modal rare; past ~200, raise `QUEUE_POLL_INTERVAL_S` and make
+  the per-poll position lookup O(1) (it is O(depth) today).
