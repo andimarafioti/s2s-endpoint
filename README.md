@@ -112,7 +112,9 @@ usage time — only a live connected session counts. If the queue itself is full
 `POST /session` returns `503` with `{ "state": "at_capacity" }`.
 
 Tunable via env: `QUEUE_MAX_DEPTH` (default 100), `QUEUE_TICKET_TTL_S` (8),
-`QUEUE_POLL_INTERVAL_S` (2), `QUEUE_REAP_INTERVAL_S` (2).
+`QUEUE_POLL_INTERVAL_S` (2), `QUEUE_REAP_INTERVAL_S` (2). Setting `QUEUE_MAX_DEPTH=0`
+disables the waiting room: any caller who can't be granted a slot immediately gets
+`at_capacity` instead of a ticket. The queue is never unbounded.
 
 Sizing `QUEUE_MAX_DEPTH`: it's a ceiling, not a target. Two things bound how high
 it's worth setting. Poll load scales as `depth / QUEUE_POLL_INTERVAL_S` requests
