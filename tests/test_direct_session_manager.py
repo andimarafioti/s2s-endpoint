@@ -71,6 +71,37 @@ class ToggleCapacityRouter(FakeLeaseRouter):
         return await self.acquire()
 
 
+class YieldingToggleRouter(ToggleCapacityRouter):
+    """ToggleCapacityRouter whose ``try_acquire`` yields to the event loop, so two
+    concurrent callers can interleave inside it — the window the old code raced in."""
+
+    async def try_acquire(self):
+        await asyncio.sleep(0)
+        return await super().try_acquire()
+
+
+class GatedCapacityRouter(FakeLeaseRouter):
+    """Router whose first ``try_acquire`` suspends on a gate, so a test can pin one
+    caller mid-acquire and let a second caller arrive before it resumes."""
+
+    def __init__(self):
+        super().__init__()
+        self.free = 0
+        self.gate = asyncio.Event()
+        self.first_entered = asyncio.Event()
+        self._first = True
+
+    async def try_acquire(self):
+        if self._first:
+            self._first = False
+            self.first_entered.set()
+            await self.gate.wait()
+        if self.free > 0:
+            self.free -= 1
+            return await self.acquire()
+        return None
+
+
 class SessionQueueTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         manager = getattr(self, "manager", None)
@@ -125,6 +156,62 @@ class SessionQueueTests(unittest.IsolatedAsyncioTestCase):
         # `second` is now the head and can claim.
         promoted = await manager.poll(second["queue_id"], "https://lb.example")
         self.assertEqual(promoted["state"], "granted")
+
+    async def test_concurrent_polls_of_head_grant_at_most_once(self):
+        # Two overlapping polls for the same head ticket must not both win a slot.
+        router = YieldingToggleRouter(has_capacity=False)
+        manager = self._make(router, queue_max_depth=5)
+        await manager.start()
+
+        ticket = await manager.allocate("https://lb.example")
+        self.assertEqual(ticket["position"], 1)
+
+        router.has_capacity = True
+        results = await asyncio.gather(
+            manager.poll(ticket["queue_id"], "https://lb.example"),
+            manager.poll(ticket["queue_id"], "https://lb.example"),
+            return_exceptions=True,
+        )
+        grants = [r for r in results if isinstance(r, dict) and r.get("state") == "granted"]
+        errors = [r for r in results if isinstance(r, KeyError)]
+        self.assertEqual(len(grants), 1)  # exactly one session, never two
+        self.assertEqual(len(errors), 1)  # the loser sees the ticket already claimed
+        self.assertEqual((await manager.snapshot())["pending_sessions"], 1)
+
+    async def test_concurrent_allocate_keeps_fifo_when_a_slot_frees(self):
+        # The earlier caller that fails to acquire and then enqueues must not be
+        # overtaken by a later caller fast-pathing into a slot that frees meanwhile.
+        router = GatedCapacityRouter()
+        manager = self._make(router, queue_max_depth=5)
+        await manager.start()
+
+        first = asyncio.create_task(manager.allocate("https://lb.example"))
+        await router.first_entered.wait()  # `first` is suspended inside try_acquire
+        router.free = 1  # a slot frees while `first` is mid-acquire
+        second = asyncio.create_task(manager.allocate("https://lb.example"))
+        await asyncio.sleep(0)  # let `second` run as far as it can
+        router.gate.set()
+
+        first_result = await first
+        second_result = await second
+        # The freed slot goes to the earlier caller, not the late arrival.
+        self.assertEqual(first_result["state"], "granted")
+        self.assertEqual(second_result["state"], "queued")
+        self.assertEqual(second_result["position"], 1)
+
+    async def test_zero_depth_disables_waiting_room(self):
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = self._make(router, queue_max_depth=0)
+        await manager.start()
+
+        # No free slot and no waiting room => turned away at capacity, not queued.
+        with self.assertRaises(QueueAtCapacityError):
+            await manager.allocate("https://lb.example")
+
+        # A free slot still grants immediately even with the queue disabled.
+        router.has_capacity = True
+        granted = await manager.allocate("https://lb.example")
+        self.assertEqual(granted["state"], "granted")
 
     async def test_unknown_ticket_raises_keyerror(self):
         router = ToggleCapacityRouter(has_capacity=True)
@@ -367,14 +454,22 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         original_lock = self.manager._lock
 
-        async def failing_lock_acquire():
-            raise RuntimeError("simulated failure after acquire")
-
+        # allocate() takes the lock once to decide + grab a lease, then
+        # _grant_from_lease takes it again to register the session. Let the first
+        # (decision) acquisition through and break the second (registration) one,
+        # so a lease is held when the failure hits and must be released.
         class BrokenLock:
+            def __init__(self):
+                self.entries = 0
+
             async def __aenter__(self):
-                raise RuntimeError("simulated failure after acquire")
+                self.entries += 1
+                if self.entries >= 2:
+                    raise RuntimeError("simulated failure after acquire")
+                return self
+
             async def __aexit__(self, *args):
-                pass
+                return False
 
         self.manager._lock = BrokenLock()
         with self.assertRaises(RuntimeError):

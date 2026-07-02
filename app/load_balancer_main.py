@@ -278,6 +278,7 @@ async def create_session(request: Request):
             level=logging.WARNING,
             error=str(exc),
         )
+        await dashboard.record_session_allocation_failure()
         return JSONResponse({"state": "at_capacity", "detail": str(exc)}, status_code=503)
     except Exception as exc:
         allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())

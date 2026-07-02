@@ -111,31 +111,39 @@ class DirectSessionManager:
         mint a queue ticket. Never blocks — the waiting lives in the queue, polled
         via ``poll``. Raises ``QueueAtCapacityError`` when the queue itself is full."""
         started_at = monotonic()
-        # FIFO: only fast-path a grant when the line is empty. If anyone is
-        # already waiting, a fresh caller joins the back — no queue-jumping.
-        # Reading the queue here needs no lock: it's a synchronous dict check with
-        # no await, so no other coroutine can mutate it mid-read.
-        if not self._queue:
-            lease = await self.endpoint_router.try_acquire()
-            if lease is not None:
-                granted_at = monotonic()
-                return await self._grant_from_lease(
-                    lease,
-                    lb_base_url,
-                    allocated_at=granted_at,
-                    allocation_wait_ms=elapsed_ms(started_at, granted_at),
-                    waited_for_capacity=lease.waited_for_capacity,
-                )
-
-        now = monotonic()
+        lease: Optional[EndpointLease] = None
+        # The empty-line check and the slot grab must be one atomic step, or two
+        # concurrent callers could both see an empty queue and both fast-path into
+        # the same freed capacity, jumping the line. Holding the lock across
+        # ``try_acquire`` is safe: it only touches the router's own lock and never
+        # calls back into this manager, and it never waits for capacity.
         async with self._lock:
-            if self.queue_max_depth and len(self._queue) >= self.queue_max_depth:
-                raise QueueAtCapacityError(
-                    f"queue is full ({self.queue_max_depth} waiting)"
-                )
-            ticket_id = secrets.token_urlsafe(18)
-            self._queue[ticket_id] = QueueTicket(ticket_id, created_at=now, last_seen=now)
-            position = len(self._queue)  # just appended, so it's last in line
+            # FIFO: only fast-path a grant when the line is empty. If anyone is
+            # already waiting, a fresh caller joins the back — no queue-jumping.
+            if not self._queue:
+                lease = await self.endpoint_router.try_acquire()
+            if lease is None:
+                # No slot free (or someone already waiting): join the queue. A
+                # depth of 0 disables the waiting room entirely — every caller
+                # that can't be granted immediately is turned away at capacity.
+                if len(self._queue) >= self.queue_max_depth:
+                    raise QueueAtCapacityError(
+                        f"queue is full ({self.queue_max_depth} waiting)"
+                    )
+                now = monotonic()
+                ticket_id = secrets.token_urlsafe(18)
+                self._queue[ticket_id] = QueueTicket(ticket_id, created_at=now, last_seen=now)
+                position = len(self._queue)  # just appended, so it's last in line
+
+        if lease is not None:
+            granted_at = monotonic()
+            return await self._grant_from_lease(
+                lease,
+                lb_base_url,
+                allocated_at=granted_at,
+                allocation_wait_ms=elapsed_ms(started_at, granted_at),
+                waited_for_capacity=lease.waited_for_capacity,
+            )
 
         logger.info(
             "Queued session request ticket_id=%s position=%d queue_depth=%d",
@@ -151,6 +159,11 @@ class DirectSessionManager:
         — only for the head of the line — claims a free slot if one is available,
         returning a grant. Raises ``KeyError`` for an unknown/expired ticket."""
         now = monotonic()
+        lease: Optional[EndpointLease] = None
+        # Hold the lock across the whole claim — the head check, the slot grab, and
+        # the pop — so two overlapping polls for the same head ticket can't each
+        # grant a session. The loser finds the ticket already gone and 404s. Safe
+        # to await ``try_acquire`` here: it only takes the router's own lock.
         async with self._lock:
             ticket = self._queue.get(ticket_id)
             if ticket is None:
@@ -159,26 +172,25 @@ class DirectSessionManager:
             created_at = ticket.created_at
             position = list(self._queue).index(ticket_id) + 1
 
-        if position == 1:
-            lease = await self.endpoint_router.try_acquire()
-            if lease is not None:
-                async with self._lock:
-                    # A reaper may have dropped it between the read above and now;
-                    # the caller is clearly alive (it just polled), so grant anyway.
+            if position == 1:
+                lease = await self.endpoint_router.try_acquire()
+                if lease is not None:
                     self._queue.pop(ticket_id, None)
-                logger.info(
-                    "Claimed slot for ticket_id=%s wait_ms=%d",
-                    ticket_id,
-                    elapsed_ms(created_at, now),
-                    extra={"ticket_id": ticket_id, "outcome": "claimed"},
-                )
-                return await self._grant_from_lease(
-                    lease,
-                    lb_base_url,
-                    allocated_at=now,
-                    allocation_wait_ms=elapsed_ms(created_at, now),
-                    waited_for_capacity=True,
-                )
+
+        if lease is not None:
+            logger.info(
+                "Claimed slot for ticket_id=%s wait_ms=%d",
+                ticket_id,
+                elapsed_ms(created_at, now),
+                extra={"ticket_id": ticket_id, "outcome": "claimed"},
+            )
+            return await self._grant_from_lease(
+                lease,
+                lb_base_url,
+                allocated_at=now,
+                allocation_wait_ms=elapsed_ms(created_at, now),
+                waited_for_capacity=True,
+            )
 
         return self._ticket_view(ticket_id, position)
 

@@ -66,4 +66,6 @@ usage time.
   req/s (doubled across the LB and the Space that proxies it), and position only helps
   while the wait is bearable (`depth × avg_session ÷ live_slots`). 100 is headroom that
   keeps the at-capacity modal rare; past ~200, raise `QUEUE_POLL_INTERVAL_S` and make
-  the per-poll position lookup O(1) (it is O(depth) today).
+  the per-poll position lookup O(1) (it is O(depth) today). `QUEUE_MAX_DEPTH=0` is a
+  distinct mode, not "unbounded": it disables the waiting room so a caller who can't be
+  granted immediately is turned away at capacity. The queue is never unbounded.
