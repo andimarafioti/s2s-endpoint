@@ -396,6 +396,33 @@ class EndpointPoolRouter:
         self._spawn_wake_tasks(wake_names)
         return lease
 
+    async def try_acquire(self) -> Optional[EndpointLease]:
+        """Single non-blocking attempt to grab a free slot.
+
+        Returns a lease if one is available right now, otherwise ``None``. When
+        nothing is free it nudges a parked endpoint awake (same as ``acquire``'s
+        wait path) so capacity is on its way for the next attempt. Used by the
+        session queue, which owns the waiting instead of blocking here."""
+        lease: Optional[EndpointLease] = None
+        async with self._condition:
+            self._raise_if_closed()
+            endpoint = self._select_endpoint_unlocked()
+            if endpoint is not None and endpoint.ws_url is not None:
+                endpoint.active_sessions += 1
+                endpoint.last_used_at = time.monotonic()
+                wake_names = self._mark_endpoints_to_wake_unlocked()
+                lease = EndpointLease(
+                    slot_id=endpoint.name,
+                    endpoint_name=endpoint.name,
+                    ws_url=endpoint.ws_url,
+                    waited_for_capacity=False,
+                )
+            else:
+                wake_names = self._mark_endpoints_to_wake_unlocked(force=True)
+
+        self._spawn_wake_tasks(wake_names)
+        return lease
+
     async def mark_connected(self, slot_id: str) -> None:
         async with self._condition:
             endpoint = self._endpoints.get(slot_id)
