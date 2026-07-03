@@ -30,7 +30,16 @@ async def proxy_websocket(
     no_capacity_reason: str,
     no_capacity_log: str,
     additional_headers: Optional[list[tuple[str, str]]] = None,
-) -> None:
+    on_lease_acquired: Optional[Callable[[], Awaitable[None]]] = None,
+) -> bool:
+    """Proxy a client websocket to an upstream pipeline slot.
+
+    Returns True if a lease was acquired (whether or not the session then
+    succeeded) and False if the connection was rejected for lack of capacity.
+    ``on_lease_acquired`` runs after capacity is secured but before the client
+    websocket is accepted; if it raises, the lease is released and the client
+    is closed without proxying.
+    """
     lease = None
 
     try:
@@ -52,7 +61,19 @@ async def proxy_websocket(
         except Exception:
             pass
         logger.warning("%s: %s", no_capacity_log, exc)
-        return
+        return False
+
+    if on_lease_acquired is not None:
+        try:
+            await on_lease_acquired()
+        except Exception as exc:
+            logger.error("Lease-acquired callback failed, closing session: %s", exc)
+            try:
+                await client_ws.close(code=1011, reason="Failed to establish reserved session")
+            except Exception:
+                pass
+            await release_lease(lease.slot_id)
+            return True
 
     await client_ws.accept()
     logger.info("Client websocket connected to %s", describe_lease(lease))
@@ -87,6 +108,8 @@ async def proxy_websocket(
     finally:
         if lease is not None:
             await release_lease(lease.slot_id)
+
+    return True
 
 
 async def _client_to_upstream(client_ws: WebSocket, upstream_ws) -> None:

@@ -210,21 +210,25 @@ async def pool():
 @app.websocket("/v1/realtime")
 async def websocket_proxy(client_ws: WebSocket):
     session_payload = _get_session_payload(client_ws)
-    connected_notified = False
 
     if SESSION_SHARED_SECRET and session_payload is None:
         await client_ws.close(code=1008, reason="Missing or invalid session token")
         return
 
-    try:
-        if session_payload is not None:
-            await _notify_lb_session_event(
-                session_payload["callback_url"],
-                session_payload["session_token"],
-                "connected",
-            )
-            connected_notified = True
+    async def _notify_connected() -> None:
+        # Runs only after a pipeline slot is actually secured. Notifying the
+        # LB before acquiring capacity meant a rejected connection produced a
+        # connected/disconnected pair milliseconds apart, which the dashboard
+        # counted as a completed conversation while live users stayed at zero.
+        if session_payload is None:
+            return
+        await _notify_lb_session_event(
+            session_payload["callback_url"],
+            session_payload["session_token"],
+            "connected",
+        )
 
+    try:
         await proxy_websocket(
             client_ws,
             acquire_lease=lambda _: session_router.acquire(),
@@ -232,6 +236,7 @@ async def websocket_proxy(client_ws: WebSocket):
             describe_lease=lambda slot: f"slot {slot.slot_id} at {slot.ws_url}",
             no_capacity_reason="No pipeline capacity available",
             no_capacity_log="Failed to allocate speech-to-speech slot",
+            on_lease_acquired=_notify_connected,
         )
     except Exception as exc:
         logger.warning("Rejected websocket session: %s", exc)
@@ -240,7 +245,12 @@ async def websocket_proxy(client_ws: WebSocket):
         except Exception:
             pass
     finally:
-        if connected_notified and session_payload is not None:
+        if session_payload is not None:
+            # Always tell the LB the session is over. For a normal session this
+            # completes the conversation; for a capacity rejection it releases
+            # the pending lease immediately instead of holding the slot until
+            # the pending reaper fires. The LB treats a disconnect for an
+            # unknown or never-connected session as a no-op release.
             try:
                 await _notify_lb_session_event(
                     session_payload["callback_url"],
