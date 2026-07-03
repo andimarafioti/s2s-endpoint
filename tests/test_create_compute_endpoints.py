@@ -1,13 +1,15 @@
+import io
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from create_compute_endpoints import build_endpoint_env, resolve_names_to_create  # noqa: E402
+from create_compute_endpoints import build_endpoint_env, main, resolve_names_to_create  # noqa: E402
 
 
 class FakeResponse:
@@ -91,13 +93,10 @@ class CreateComputeEndpointsTests(unittest.TestCase):
         env = build_endpoint_env(
             base_env={
                 "SESSION_SHARED_SECRET": "shared",
-                "PIPELINE_MAX_INSTANCES": "2",
-                "PIPELINE_MIN_IDLE_INSTANCES": "2",
                 "OPEN_API_MODEL_NAME": "template-model",
             },
             session_shared_secret=None,
-            pipeline_max_instances=None,
-            pipeline_min_idle_instances=None,
+            num_pipelines=None,
             lb_callback_auth_token=None,
         )
 
@@ -105,8 +104,7 @@ class CreateComputeEndpointsTests(unittest.TestCase):
             env,
             {
                 "SESSION_SHARED_SECRET": "shared",
-                "PIPELINE_MAX_INSTANCES": "2",
-                "PIPELINE_MIN_IDLE_INSTANCES": "2",
+                "NUM_PIPELINES": "1",
                 "OPEN_API_MODEL_NAME": "template-model",
             },
         )
@@ -116,10 +114,45 @@ class CreateComputeEndpointsTests(unittest.TestCase):
             build_endpoint_env(
                 base_env={},
                 session_shared_secret=None,
-                pipeline_max_instances=None,
-                pipeline_min_idle_instances=None,
+                num_pipelines=None,
                 lb_callback_auth_token=None,
             )
+
+
+class CreateEndpointMainTests(unittest.TestCase):
+    def test_main_passes_built_env_to_create_inference_endpoint(self):
+        mock_endpoint = MagicMock()
+        mock_endpoint.name = "test-endpoint"
+        mock_endpoint.status = "pending"
+        mock_endpoint.url = None
+
+        mock_api = MagicMock()
+        mock_api.create_inference_endpoint.return_value = mock_endpoint
+
+        argv = [
+            "create_compute_endpoints",
+            "--names", "test-endpoint",
+            "--vendor", "aws",
+            "--region", "us-east-1",
+            "--instance-size", "x1",
+            "--instance-type", "nvidia-a10g",
+            "--image-url", "registry/myimage:latest",
+            "--num-pipelines", "4",
+            "--session-shared-secret", "my-secret",
+        ]
+
+        with (
+            patch("sys.argv", argv),
+            patch("sys.stdout", io.StringIO()),
+            patch("sys.stderr", io.StringIO()),
+            patch("create_compute_endpoints.HfApi", return_value=mock_api),
+        ):
+            main()
+
+        mock_api.create_inference_endpoint.assert_called_once()
+        env = mock_api.create_inference_endpoint.call_args.kwargs["env"]
+        self.assertEqual(env["NUM_PIPELINES"], "4")
+        self.assertEqual(env["SESSION_SHARED_SECRET"], "my-secret")
 
 
 if __name__ == "__main__":

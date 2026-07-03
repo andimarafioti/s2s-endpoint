@@ -5,10 +5,16 @@ from unittest.mock import patch
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointLease
 from app.session_tokens import verify_session_token, websocket_host_matches
+from tests.helpers import monotonic_sequence
 
 
 class FakeLeaseRouter:
-    def __init__(self, health_snapshot: dict[str, object] | None = None):
+    def __init__(
+        self,
+        health_snapshot: dict[str, object] | None = None,
+        *,
+        waited_for_capacity: bool = False,
+    ):
         self.acquire_calls = 0
         self.release_calls = []
         self.release_connected_calls = []
@@ -16,6 +22,7 @@ class FakeLeaseRouter:
         self.started = False
         self.stopped = False
         self.health_snapshot = health_snapshot or {"running_endpoints": 1}
+        self.waited_for_capacity = waited_for_capacity
 
     async def start(self) -> None:
         self.started = True
@@ -30,6 +37,7 @@ class FakeLeaseRouter:
             slot_id=endpoint_name,
             endpoint_name=endpoint_name,
             ws_url=f"wss://{endpoint_name}.example.endpoints.huggingface.cloud/ws",
+            waited_for_capacity=self.waited_for_capacity,
         )
 
     async def mark_connected(self, slot_id: str) -> None:
@@ -65,12 +73,16 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(allocation["session_id"], payload["sid"])
         self.assertEqual(allocation["websocket_url"], payload["ws_url"])
+        self.assertEqual(allocation["endpoint_name"], "endpoint-1")
+        self.assertEqual(allocation["slot_id"], "endpoint-1")
+        self.assertIsInstance(allocation["allocation_wait_ms"], int)
+        self.assertFalse(allocation["waited_for_capacity"])
         self.assertTrue(allocation["connect_url"].startswith(allocation["websocket_url"]))
         self.assertTrue(
             websocket_host_matches(payload["ws_url"], "endpoint-1.example.endpoints.huggingface.cloud")
         )
 
-        with patch("app.direct_session_manager.time.monotonic", side_effect=[100.0, 105.0, 112.5]):
+        with patch("app.direct_session_manager.monotonic", new=monotonic_sequence(100.0, 105.0, 112.5)):
             connected = await self.manager.handle_event(
                 allocation["session_id"],
                 allocation["session_token"],
@@ -137,6 +149,124 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["pending_sessions"], 1)
         self.assertEqual(snapshot["connected_sessions"], 1)
         self.assertEqual(snapshot["router"], {"running_endpoints": 1, "active_sessions": 2})
+
+
+    async def test_cancel_pending_session_releases_slot_immediately(self):
+        router = FakeLeaseRouter()
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        await self.manager.start()
+
+        allocation = await self.manager.allocate("https://lb.example")
+        session_id = allocation["session_id"]
+
+        self.assertEqual(router.release_calls, [])
+
+        await self.manager.cancel_pending_session(session_id)
+
+        self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual(router.release_connected_calls, [False])
+
+        snapshot = await self.manager.snapshot()
+        self.assertEqual(snapshot["pending_sessions"], 0)
+
+    async def test_cancel_pending_session_logs_endpoint_and_allocation_wait(self):
+        router = FakeLeaseRouter(waited_for_capacity=True)
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        await self.manager.start()
+
+        with patch("app.direct_session_manager.monotonic", new=monotonic_sequence(10.0, 11.25)):
+            allocation = await self.manager.allocate("https://lb.example")
+
+        with self.assertLogs("s2s-endpoint", level="INFO") as logs:
+            await self.manager.cancel_pending_session(allocation["session_id"])
+
+        record = logs.records[0]
+        self.assertEqual(record.session_id, allocation["session_id"])
+        self.assertEqual(record.endpoint_name, "endpoint-1")
+        self.assertEqual(record.slot_id, "endpoint-1")
+        self.assertEqual(record.allocation_wait_ms, 1250)
+        self.assertEqual(record.outcome, "pending_released")
+        self.assertTrue(record.waited_for_capacity)
+        self.assertIn("endpoint endpoint-1", record.getMessage())
+        self.assertIn("allocation_wait_ms=1250", record.getMessage())
+        self.assertIn("waited_for_capacity=True", record.getMessage())
+
+    async def test_cancel_pending_session_ignores_unknown_session_id(self):
+        router = FakeLeaseRouter()
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        await self.manager.start()
+
+        await self.manager.cancel_pending_session("nonexistent-session-id")
+
+        self.assertEqual(router.release_calls, [])
+
+    async def test_cancel_pending_session_ignores_already_connected_session(self):
+        router = FakeLeaseRouter()
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        await self.manager.start()
+
+        allocation = await self.manager.allocate("https://lb.example")
+        await self.manager.handle_event(allocation["session_id"], allocation["session_token"], "connected")
+
+        await self.manager.cancel_pending_session(allocation["session_id"])
+
+        self.assertEqual(router.release_calls, [])
+        snapshot = await self.manager.snapshot()
+        self.assertEqual(snapshot["connected_sessions"], 1)
+
+    async def test_allocate_releases_lease_if_interrupted_after_acquire(self):
+        router = FakeLeaseRouter()
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        await self.manager.start()
+
+        original_lock = self.manager._lock
+
+        async def failing_lock_acquire():
+            raise RuntimeError("simulated failure after acquire")
+
+        class BrokenLock:
+            async def __aenter__(self):
+                raise RuntimeError("simulated failure after acquire")
+            async def __aexit__(self, *args):
+                pass
+
+        self.manager._lock = BrokenLock()
+        with self.assertRaises(RuntimeError):
+            await self.manager.allocate("https://lb.example")
+        self.manager._lock = original_lock
+
+        self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual(router.release_connected_calls, [False])
 
 
 if __name__ == "__main__":

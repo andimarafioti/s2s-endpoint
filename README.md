@@ -187,8 +187,7 @@ minute buckets are present.
 
 ## Compute Env Vars
 
-- `PIPELINE_MAX_INSTANCES`: local `speech-to-speech` pipelines per compute endpoint
-- `PIPELINE_MIN_IDLE_INSTANCES`: warm local pipeline slots to keep ready
+- `NUM_PIPELINES`: concurrent realtime sessions the `speech-to-speech` process handles internally (default `1`)
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
 
@@ -211,8 +210,6 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --instance-type nvidia-a10g \
   --vendor aws \
   --region us-east-1 \
-  --pipeline-max-instances 1 \
-  --pipeline-min-idle-instances 1 \
   --wait
 ```
 
@@ -230,8 +227,6 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --instance-type nvidia-a10g \
   --vendor aws \
   --region us-east-1 \
-  --pipeline-max-instances 1 \
-  --pipeline-min-idle-instances 1 \
   --wait
 ```
 
