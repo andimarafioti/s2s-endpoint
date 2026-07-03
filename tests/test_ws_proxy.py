@@ -109,6 +109,39 @@ class ProxyWebsocketLeaseHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("session_limit_reached" in str(item) for item in client.sent))
         self.assertEqual(client.close_calls[-1][0], 1013)
 
+    async def test_accept_failure_releases_lease(self):
+        # accept() can raise when the client drops before the handshake
+        # completes; the compute lease must be released or the pipeline slot
+        # is permanently lost until the process restarts.
+        class AcceptFailsWS(FakeClientWS):
+            async def accept(self):
+                raise RuntimeError("client went away before accept")
+
+        client = AcceptFailsWS()
+        released = []
+
+        async def acquire(_timeout):
+            return _lease(slot_id=3)
+
+        async def release(slot_id):
+            released.append(slot_id)
+
+        async def on_lease_acquired():
+            pass
+
+        with self.assertRaisesRegex(RuntimeError, "client went away"):
+            await proxy_websocket(
+                client,
+                acquire_lease=acquire,
+                release_lease=release,
+                describe_lease=lambda lease: str(lease.slot_id),
+                no_capacity_reason="No pipeline capacity available",
+                no_capacity_log="no capacity",
+                on_lease_acquired=on_lease_acquired,
+            )
+
+        self.assertEqual(released, [3])
+
     async def test_lease_callback_failure_releases_lease_and_closes_client(self):
         client = FakeClientWS()
         released = []
@@ -215,6 +248,35 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, ["connected", "disconnected"])
         # The session must not proxy after a failed connected notification.
         self.assertEqual(client.close_calls[-1][0], 1011)
+
+    async def test_accept_failure_after_connected_releases_slot_and_notifies_lb(self):
+        # The exact reviewer scenario: LB already told 'connected', then
+        # accept() fails. The pipeline slot must be released and the LB must
+        # still receive 'disconnected' so the session does not leak.
+        class AcceptFailsWS(FakeClientWS):
+            async def accept(self):
+                raise RuntimeError("client went away before accept")
+
+        client = AcceptFailsWS()
+        notify = AsyncMock()
+        released = []
+
+        async def acquire():
+            return _lease(slot_id=0, ws_url="ws://127.0.0.1:9999")
+
+        async def release(slot_id):
+            released.append(slot_id)
+
+        with patch.object(compute_main, "_get_session_payload", return_value=self._payload()), patch.object(
+            compute_main, "_notify_lb_session_event", notify
+        ), patch.object(compute_main.session_router, "acquire", acquire), patch.object(
+            compute_main.session_router, "release", release
+        ):
+            await compute_main.websocket_proxy(client)
+
+        events = [call.args[2] for call in notify.await_args_list]
+        self.assertEqual(events, ["connected", "disconnected"])
+        self.assertEqual(released, [0])
 
 
 if __name__ == "__main__":

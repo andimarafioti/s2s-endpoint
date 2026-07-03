@@ -63,51 +63,54 @@ async def proxy_websocket(
         logger.warning("%s: %s", no_capacity_log, exc)
         return False
 
-    if on_lease_acquired is not None:
-        try:
-            await on_lease_acquired()
-        except Exception as exc:
-            logger.error("Lease-acquired callback failed, closing session: %s", exc)
+    # Everything after a successful acquire runs under a single finally so
+    # the compute lease cannot leak, no matter which step fails. A leaked
+    # lease permanently consumes a pipeline slot until the process restarts
+    # and is invisible to drain-restart recovery.
+    try:
+        if on_lease_acquired is not None:
             try:
-                await client_ws.close(code=1011, reason="Failed to establish reserved session")
+                await on_lease_acquired()
+            except Exception as exc:
+                logger.error("Lease-acquired callback failed, closing session: %s", exc)
+                try:
+                    await client_ws.close(code=1011, reason="Failed to establish reserved session")
+                except Exception:
+                    pass
+                return True
+
+        await client_ws.accept()
+        logger.info("Client websocket connected to %s", describe_lease(lease))
+
+        try:
+            async with websockets.connect(
+                lease.ws_url,
+                additional_headers=additional_headers,
+                open_timeout=30,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=None,
+            ) as upstream_ws:
+                await asyncio.gather(
+                    _client_to_upstream(client_ws, upstream_ws),
+                    _upstream_to_client(client_ws, upstream_ws),
+                )
+        except WebSocketDisconnect:
+            logger.info("Client websocket disconnected")
+        except ConnectionClosed:
+            logger.info("Upstream websocket disconnected")
+            try:
+                await client_ws.close()
             except Exception:
                 pass
-            await release_lease(lease.slot_id)
-            return True
-
-    await client_ws.accept()
-    logger.info("Client websocket connected to %s", describe_lease(lease))
-
-    try:
-        async with websockets.connect(
-            lease.ws_url,
-            additional_headers=additional_headers,
-            open_timeout=30,
-            ping_interval=20,
-            ping_timeout=20,
-            max_size=None,
-        ) as upstream_ws:
-            await asyncio.gather(
-                _client_to_upstream(client_ws, upstream_ws),
-                _upstream_to_client(client_ws, upstream_ws),
-            )
-    except WebSocketDisconnect:
-        logger.info("Client websocket disconnected")
-    except ConnectionClosed:
-        logger.info("Upstream websocket disconnected")
-        try:
-            await client_ws.close()
         except Exception:
-            pass
-    except Exception:
-        logger.exception("Websocket proxy failed")
-        try:
-            await client_ws.close(code=1011, reason="Proxy failure")
-        except Exception:
-            pass
+            logger.exception("Websocket proxy failed")
+            try:
+                await client_ws.close(code=1011, reason="Proxy failure")
+            except Exception:
+                pass
     finally:
-        if lease is not None:
-            await release_lease(lease.slot_id)
+        await release_lease(lease.slot_id)
 
     return True
 
