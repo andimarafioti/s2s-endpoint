@@ -36,10 +36,14 @@ def _to_health_url(base_url: str) -> str:
     return urlunparse(parsed._replace(path=route_path))
 
 
-def fetch_compute_active_sessions(base_url: str) -> int:
+def fetch_compute_active_sessions(base_url: str, token: Optional[str] = None) -> int:
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     request = urllib.request.Request(
         _to_health_url(base_url),
-        headers={"Accept": "application/json"},
+        headers=headers,
         method="GET",
     )
     try:
@@ -225,6 +229,9 @@ class ManagedEndpoint:
     connected_sessions: int = 0
     observed_active_sessions: int = 0
     unobserved_connected_sessions: int = 0
+    compute_usage_known: bool = True
+    usage_synced_at: Optional[float] = None
+    usage_sync_error: Optional[str] = None
     waking: bool = False
     parking: bool = False
     restarting: bool = False
@@ -244,10 +251,14 @@ class ManagedEndpoint:
     def free_slots(self) -> int:
         if not self.running or self.parking or self.drain_restarting:
             return 0
+        if not self.compute_usage_known:
+            return 0
         return max(self.slots - self.busy_sessions, 0)
 
     @property
     def busy_sessions(self) -> int:
+        if self.running and not self.compute_usage_known:
+            return self.slots
         return min(
             self.observed_active_sessions
             + self.pending_sessions
@@ -286,6 +297,7 @@ class EndpointPoolRouter:
         restart_backoff_max_s: float = 300.0,
         restart_stable_running_s: float = 120.0,
         drain_restart_timeout_s: float = 600.0,
+        compute_usage_stale_after_s: Optional[float] = None,
         compute_usage_fetcher: Optional[ComputeUsageFetcher] = None,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
@@ -305,6 +317,8 @@ class EndpointPoolRouter:
             raise ValueError("park_cooldown_s must be >= 0")
         if not endpoint_ws_path.startswith("/"):
             raise ValueError("endpoint_ws_path must start with '/'")
+        if compute_usage_stale_after_s is not None and compute_usage_stale_after_s < 0:
+            raise ValueError("compute_usage_stale_after_s must be >= 0")
 
         self.endpoint_slots = endpoint_slots
         self.endpoint_ws_path = endpoint_ws_path
@@ -321,6 +335,11 @@ class EndpointPoolRouter:
         self.restart_backoff_max_s = restart_backoff_max_s
         self.restart_stable_running_s = restart_stable_running_s
         self.drain_restart_timeout_s = drain_restart_timeout_s
+        self.compute_usage_stale_after_s = (
+            compute_usage_stale_after_s
+            if compute_usage_stale_after_s is not None
+            else max(reconcile_interval_s * 3, 30.0)
+        )
         self.compute_usage_fetcher = compute_usage_fetcher
 
         self._on_endpoint_down: Optional[Callable[[str], Awaitable[None]]] = None
@@ -328,6 +347,9 @@ class EndpointPoolRouter:
             name: ManagedEndpoint(name=name, slots=endpoint_slots, ws_path=endpoint_ws_path)
             for name in names
         }
+        if self.compute_usage_fetcher is not None:
+            for endpoint in self._endpoints.values():
+                endpoint.compute_usage_known = False
         self._lock = asyncio.Lock()
         self._condition = asyncio.Condition(self._lock)
         self._closed = False
@@ -513,6 +535,9 @@ class EndpointPoolRouter:
                     "local_pending_sessions": endpoint.pending_sessions,
                     "observed_active_sessions": endpoint.observed_active_sessions,
                     "unobserved_connected_sessions": endpoint.unobserved_connected_sessions,
+                    "compute_usage_known": endpoint.compute_usage_known,
+                    "usage_synced_at": endpoint.usage_synced_at,
+                    "usage_sync_error": endpoint.usage_sync_error,
                     "free_slots": endpoint.free_slots,
                     "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
                     "url": endpoint.url,
@@ -551,6 +576,9 @@ class EndpointPoolRouter:
                     if not was_running:
                         endpoint.running_since = now
                         endpoint.drain_restarting = False
+                        endpoint.compute_usage_known = self.compute_usage_fetcher is None
+                        endpoint.usage_synced_at = None
+                        endpoint.usage_sync_error = None
                     if (
                         endpoint.restart_attempts > 0
                         and endpoint.running_since is not None
@@ -569,10 +597,16 @@ class EndpointPoolRouter:
                     endpoint.connected_sessions = 0
                     endpoint.observed_active_sessions = 0
                     endpoint.unobserved_connected_sessions = 0
+                    endpoint.compute_usage_known = self.compute_usage_fetcher is None
+                    endpoint.usage_synced_at = None
+                    endpoint.usage_sync_error = None
                     downed_endpoints.append(endpoint.name)
                 elif not endpoint.running:
                     endpoint.observed_active_sessions = 0
                     endpoint.unobserved_connected_sessions = 0
+                    endpoint.compute_usage_known = self.compute_usage_fetcher is None
+                    endpoint.usage_synced_at = None
+                    endpoint.usage_sync_error = None
 
                 if (
                     _is_failed_status(endpoint.status)
@@ -640,7 +674,48 @@ class EndpointPoolRouter:
                 if endpoint is None or endpoint.url != url or not endpoint.running:
                     continue
                 if isinstance(result, Exception):
-                    logger.warning("Failed to sync compute usage for %s: %s", name, result)
+                    error = str(result)
+                    endpoint.usage_sync_error = error
+                    if endpoint.usage_synced_at is None:
+                        endpoint.compute_usage_known = False
+                        endpoint.last_error = (
+                            f"compute usage sync failed before first success: {error}"
+                        )
+                        logger.error(
+                            "Failed to sync compute usage for %s before first success; "
+                            "blocking allocations to this endpoint: %s",
+                            name,
+                            result,
+                        )
+                    else:
+                        age_s = now - endpoint.usage_synced_at
+                        if age_s > self.compute_usage_stale_after_s:
+                            endpoint.compute_usage_known = False
+                            endpoint.last_error = (
+                                "compute usage sync stale after "
+                                f"{age_s:.1f}s; blocking allocations: {error}"
+                            )
+                            logger.error(
+                                "Compute usage for %s is stale after %.1fs; "
+                                "blocking allocations to this endpoint after sync failure: %s",
+                                name,
+                                age_s,
+                                result,
+                            )
+                        else:
+                            endpoint.compute_usage_known = True
+                            remaining_s = self.compute_usage_stale_after_s - age_s
+                            endpoint.last_error = (
+                                "compute usage sync failed; using last known usage for up to "
+                                f"{remaining_s:.1f}s: {error}"
+                            )
+                            logger.warning(
+                                "Failed to sync compute usage for %s; using last known usage "
+                                "for up to %.1fs: %s",
+                                name,
+                                remaining_s,
+                                result,
+                            )
                     continue
 
                 previous_observed_active_sessions = endpoint.observed_active_sessions
@@ -657,6 +732,10 @@ class EndpointPoolRouter:
                         observed_active_sessions,
                     )
                 endpoint.observed_active_sessions = observed_active_sessions
+                endpoint.compute_usage_known = True
+                endpoint.usage_synced_at = now
+                endpoint.usage_sync_error = None
+                endpoint.last_error = None
                 if observed_increase:
                     endpoint.unobserved_connected_sessions = max(
                         endpoint.unobserved_connected_sessions - observed_increase,
@@ -691,9 +770,15 @@ class EndpointPoolRouter:
             endpoint.parking = False
             endpoint.last_error = None
             self._last_error = None
+            if endpoint.running and self.compute_usage_fetcher is not None:
+                endpoint.compute_usage_known = False
+                endpoint.usage_synced_at = None
+                endpoint.usage_sync_error = None
             self._condition.notify_all()
 
         logger.info("Endpoint %s is ready at %s", name, snapshot.url)
+        if snapshot.status == "running" and self.compute_usage_fetcher is not None:
+            await self._sync_compute_usage()
 
     async def _park_endpoint(self, name: str) -> None:
         try:
@@ -793,6 +878,10 @@ class EndpointPoolRouter:
             self._last_error = None
             if endpoint.running:
                 endpoint.running_since = time.monotonic()
+                if self.compute_usage_fetcher is not None:
+                    endpoint.compute_usage_known = False
+                    endpoint.usage_synced_at = None
+                    endpoint.usage_sync_error = None
             self._condition.notify_all()
 
         logger.info(
@@ -800,6 +889,8 @@ class EndpointPoolRouter:
             name,
             snapshot.raw_status,
         )
+        if snapshot.status == "running" and self.compute_usage_fetcher is not None:
+            await self._sync_compute_usage()
 
     async def _schedule_wakes_if_needed(self) -> None:
         async with self._condition:
@@ -873,6 +964,8 @@ class EndpointPoolRouter:
 
     def _should_park_endpoint_unlocked(self, endpoint: ManagedEndpoint) -> bool:
         if not endpoint.running or endpoint.waking or endpoint.parking or endpoint.restarting or endpoint.drain_restarting:
+            return False
+        if not endpoint.compute_usage_known:
             return False
         if endpoint.busy_sessions != 0:
             return False
@@ -1047,9 +1140,15 @@ class EndpointPoolRouter:
             self._last_error = None
             if ep.running:
                 ep.running_since = time.monotonic()
+                if self.compute_usage_fetcher is not None:
+                    ep.compute_usage_known = False
+                    ep.usage_synced_at = None
+                    ep.usage_sync_error = None
             self._condition.notify_all()
 
         logger.info("Drain restart completed for endpoint %s (status: %s)", name, snapshot.raw_status)
+        if snapshot.status == "running" and self.compute_usage_fetcher is not None:
+            await self._sync_compute_usage()
 
     def _raise_if_closed(self) -> None:
         if self._closed:

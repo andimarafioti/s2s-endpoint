@@ -1,5 +1,6 @@
 import logging
 import os
+from functools import partial
 from time import monotonic
 from typing import Any
 
@@ -92,7 +93,7 @@ def build_endpoint_router() -> EndpointPoolRouter:
         restart_backoff_max_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S,
         restart_stable_running_s=COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S,
         drain_restart_timeout_s=COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S,
-        compute_usage_fetcher=fetch_compute_active_sessions,
+        compute_usage_fetcher=partial(fetch_compute_active_sessions, token=HF_CONTROL_TOKEN),
     )
 
 

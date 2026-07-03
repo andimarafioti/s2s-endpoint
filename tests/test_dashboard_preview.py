@@ -99,6 +99,32 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertIs(module.dashboard.history_store, module.dashboard_history_store)
         init_store.assert_called_once()
 
+    def test_build_endpoint_router_passes_control_token_to_compute_usage_fetcher(self):
+        sys.modules.pop("app.load_balancer_main", None)
+        with (
+            patch("app.endpoint_pool_router.HuggingFaceEndpointController"),
+            patch(
+                "app.endpoint_pool_router.fetch_compute_active_sessions",
+                return_value=0,
+            ) as fetcher,
+            patch.dict(
+                "os.environ",
+                {
+                    "COMPUTE_ENDPOINT_NAMES": "endpoint-a",
+                    "DASHBOARD_BUCKET_ID": "",
+                    "DASHBOARD_PREVIEW_MODE": "",
+                    "SESSION_SHARED_SECRET": "shared-secret",
+                    "HF_CONTROL_TOKEN": "control-token",
+                },
+                clear=False,
+            ),
+        ):
+            module = importlib.import_module("app.load_balancer_main")
+
+        router = module.session_manager.endpoint_router
+        self.assertEqual(router.compute_usage_fetcher("https://compute.example"), 0)
+        fetcher.assert_called_once_with("https://compute.example", token="control-token")
+
     def _import_load_balancer(self, env):
         sys.modules.pop("app.load_balancer_main", None)
         with patch.dict(

@@ -65,7 +65,10 @@ class FakeComputeUsageFetcher:
 
     def __call__(self, url: str) -> int:
         self.calls.append(url)
-        return self.busy_by_url.get(url, 0)
+        result = self.busy_by_url.get(url, 0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
 
 class FakeUrlopenResponse:
@@ -105,6 +108,30 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             active_sessions = fetch_compute_active_sessions("https://compute.example")
 
         self.assertEqual(active_sessions, 1)
+
+    def test_fetch_compute_active_sessions_includes_bearer_auth_when_token_is_provided(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return FakeUrlopenResponse({"router": {"active_sessions": 0}})
+
+        with patch(
+            "app.endpoint_pool_router.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            active_sessions = fetch_compute_active_sessions(
+                "https://compute.example",
+                token="hf-control-token",
+            )
+
+        self.assertEqual(active_sessions, 0)
+        self.assertEqual(captured["timeout"], 5)
+        self.assertEqual(
+            captured["request"].get_header("Authorization"),
+            "Bearer hf-control-token",
+        )
 
     async def test_start_ensures_minimum_warm_endpoints(self):
         controller = FakeEndpointController(
@@ -333,6 +360,111 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["free_slots"], 0)
         self.assertEqual(snapshot["endpoints"][0]["active_sessions"], 1)
         self.assertEqual(snapshot["endpoints"][0]["observed_active_sessions"], 1)
+        self.assertTrue(snapshot["endpoints"][0]["compute_usage_known"])
+
+    async def test_start_with_compute_usage_sync_failure_blocks_allocation(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        usage_fetcher = FakeComputeUsageFetcher(
+            {endpoint_url: RuntimeError("compute health returned HTTP 401")}
+        )
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=usage_fetcher,
+        )
+
+        await self.router.start()
+
+        snapshot = await self.router.snapshot()
+        endpoint = snapshot["endpoints"][0]
+        self.assertFalse(endpoint["compute_usage_known"])
+        self.assertEqual(endpoint["observed_active_sessions"], 0)
+        self.assertEqual(endpoint["free_slots"], 0)
+        self.assertIn("HTTP 401", endpoint["usage_sync_error"])
+
+        with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
+            await self.router.acquire(timeout_s=0.01)
+
+    async def test_compute_usage_sync_recovery_makes_endpoint_allocatable(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        usage_fetcher = FakeComputeUsageFetcher(
+            {endpoint_url: RuntimeError("compute health returned HTTP 401")}
+        )
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=usage_fetcher,
+        )
+
+        await self.router.start()
+        usage_fetcher.busy_by_url[endpoint_url] = 0
+        await self.router.refresh()
+
+        snapshot = await self.router.snapshot()
+        endpoint = snapshot["endpoints"][0]
+        self.assertTrue(endpoint["compute_usage_known"])
+        self.assertEqual(endpoint["observed_active_sessions"], 0)
+        self.assertEqual(endpoint["free_slots"], 1)
+
+        lease = await self.router.acquire(timeout_s=0.2)
+        self.assertEqual(lease.endpoint_name, "endpoint-a")
+
+    async def test_acquire_skips_compute_observed_busy_endpoint_after_lb_restart(self):
+        endpoint_a_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        endpoint_b_url = "https://endpoint-b.example.endpoints.huggingface.cloud"
+        usage_fetcher = FakeComputeUsageFetcher({endpoint_a_url: 1, endpoint_b_url: 0})
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_a_url),
+                ("endpoint-b", "running", endpoint_b_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a", "endpoint-b"],
+            endpoint_slots=1,
+            min_warm_endpoints=2,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=usage_fetcher,
+        )
+
+        await self.router.start()
+        lease = await self.router.acquire(timeout_s=0.2)
+
+        self.assertEqual(lease.endpoint_name, "endpoint-b")
+        snapshot = await self.router.snapshot()
+        endpoints = {endpoint["name"]: endpoint for endpoint in snapshot["endpoints"]}
+        self.assertEqual(endpoints["endpoint-a"]["observed_active_sessions"], 1)
+        self.assertEqual(endpoints["endpoint-a"]["free_slots"], 0)
+        self.assertEqual(endpoints["endpoint-b"]["observed_active_sessions"], 0)
 
     async def test_observed_usage_and_local_pending_do_not_oversubscribe_multi_slot_endpoint(self):
         endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
