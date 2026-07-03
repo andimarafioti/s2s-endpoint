@@ -36,10 +36,14 @@ def _to_health_url(base_url: str) -> str:
     return urlunparse(parsed._replace(path=route_path))
 
 
-def fetch_compute_active_sessions(base_url: str) -> int:
+def fetch_compute_active_sessions(base_url: str, token: Optional[str] = None) -> int:
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     request = urllib.request.Request(
         _to_health_url(base_url),
-        headers={"Accept": "application/json"},
+        headers=headers,
         method="GET",
     )
     try:

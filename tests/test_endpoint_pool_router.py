@@ -106,6 +106,30 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(active_sessions, 1)
 
+    def test_fetch_compute_active_sessions_includes_bearer_auth_when_token_is_provided(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return FakeUrlopenResponse({"router": {"active_sessions": 0}})
+
+        with patch(
+            "app.endpoint_pool_router.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            active_sessions = fetch_compute_active_sessions(
+                "https://compute.example",
+                token="hf-control-token",
+            )
+
+        self.assertEqual(active_sessions, 0)
+        self.assertEqual(captured["timeout"], 5)
+        self.assertEqual(
+            captured["request"].get_header("Authorization"),
+            "Bearer hf-control-token",
+        )
+
     async def test_start_ensures_minimum_warm_endpoints(self):
         controller = FakeEndpointController(
             [
