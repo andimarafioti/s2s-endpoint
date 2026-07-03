@@ -254,6 +254,41 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["endpoints"][0]["active_sessions"], 1)
         self.assertEqual(snapshot["endpoints"][0]["observed_active_sessions"], 1)
 
+    async def test_failed_compute_usage_sync_treats_endpoint_as_full(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+
+        def failing_usage_fetcher(url: str) -> int:
+            raise RuntimeError("health probe timed out")
+
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=failing_usage_fetcher,
+        )
+
+        await self.router.start()
+
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["active_sessions"], 1)
+        self.assertEqual(snapshot["observed_active_sessions"], 1)
+        self.assertEqual(snapshot["free_slots"], 0)
+        self.assertIn("failed to sync compute usage", snapshot["errors"][0]["error"])
+
+        with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
+            await self.router.acquire(timeout_s=0.01)
+
     async def test_observed_usage_and_local_pending_do_not_oversubscribe_multi_slot_endpoint(self):
         endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
         usage_fetcher = FakeComputeUsageFetcher({endpoint_url: 1})

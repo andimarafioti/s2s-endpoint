@@ -610,6 +610,10 @@ class EndpointPoolRouter:
                     continue
                 if isinstance(result, Exception):
                     logger.warning("Failed to sync compute usage for %s: %s", name, result)
+                    endpoint.observed_active_sessions = endpoint.slots
+                    endpoint.unobserved_connected_sessions = 0
+                    endpoint.last_error = f"failed to sync compute usage: {result}"
+                    self._last_error = endpoint.last_error
                     continue
 
                 previous_observed_active_sessions = endpoint.observed_active_sessions
