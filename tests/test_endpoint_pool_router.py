@@ -592,6 +592,80 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(snapshot["endpoints"][0]["usage_synced"])
         self.assertEqual(snapshot["free_slots"], 0)
 
+    async def test_unsynced_endpoint_is_never_parked(self):
+        # Blocking review finding: busy_sessions == 0 is meaningless for an
+        # unsynced node. After an LB restart with a broken sync, a node
+        # mid-conversation looks idle, and parking it would kill the live
+        # conversation. Worse than the incident it replays.
+        class AlwaysFailingFetcher:
+            def __call__(self, url: str) -> int:
+                raise RuntimeError("health unreachable")
+
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+                ("endpoint-b", "running", "https://endpoint-b.example.endpoints.huggingface.cloud"),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a", "endpoint-b"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=0,
+            reconcile_interval_s=3600,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=AlwaysFailingFetcher(),
+        )
+
+        await self.router.start()
+        # Both nodes are idle-past-timeout and above the warm floor; the only
+        # thing protecting them is the sync gate.
+        await self.router.refresh()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(controller.park_calls, [])
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["running_endpoints"], 2)
+
+    async def test_schema_error_logs_even_when_never_synced(self):
+        # Review finding: gating the error log on a usage_synced transition
+        # meant a freshly restarted LB (nodes start unsynced) logged nothing,
+        # on every poll, forever. This is the incident-replay case and must
+        # be loud.
+        class SchemaFailingFetcher:
+            def __call__(self, url: str) -> int:
+                raise ComputeUsageSchemaError("no session count in payload")
+
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=SchemaFailingFetcher(),
+        )
+
+        with self.assertLogs("s2s-endpoint", level="ERROR") as first:
+            await self.router.start()
+        self.assertTrue(any("schema error" in line for line in first.output))
+
+        # Still loud on subsequent polls, not just on a state transition.
+        with self.assertLogs("s2s-endpoint", level="ERROR") as second:
+            await self.router.refresh()
+        self.assertTrue(any("schema error" in line for line in second.output))
+
     async def test_fully_busy_but_synced_pool_stays_healthy(self):
         # Known-full is healthy; only unknown capacity is degraded.
         endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"

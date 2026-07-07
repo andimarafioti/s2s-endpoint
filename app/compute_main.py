@@ -49,8 +49,11 @@ SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
 LB_CALLBACK_AUTH_TOKEN = os.getenv("LB_CALLBACK_AUTH_TOKEN", "").strip()
 # Disconnect notifications are retried so a transient LB timeout or 503 does
 # not leave a session counted as connected forever (connected sessions are
-# never reaped by the pending-session reaper).
-LB_CALLBACK_RETRY_ATTEMPTS = max(int(os.getenv("LB_CALLBACK_RETRY_ATTEMPTS", "3")), 1)
+# never reaped by the pending-session reaper). Defaults give backoff waits of
+# 1s/3s/9s/27s, roughly 40s of coverage: enough to ride out an LB redeploy or
+# brief network partition, which is precisely the case sync gating cannot
+# cover (the LB stayed up, so its in-memory session survives).
+LB_CALLBACK_RETRY_ATTEMPTS = max(int(os.getenv("LB_CALLBACK_RETRY_ATTEMPTS", "5")), 1)
 LB_CALLBACK_RETRY_BACKOFF_S = max(float(os.getenv("LB_CALLBACK_RETRY_BACKOFF_S", "1.0")), 0.0)
 
 INTERNAL_SLOT_WS_PATH = "/v1/realtime"

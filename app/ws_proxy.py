@@ -72,7 +72,10 @@ async def proxy_websocket(
             try:
                 await on_lease_acquired()
             except Exception as exc:
-                logger.error("Lease-acquired callback failed, closing session: %s", exc)
+                # The websocket was never accepted, so in Starlette this
+                # close surfaces to the client as a handshake rejection
+                # (HTTP 403); the 1011 code and reason are not delivered.
+                logger.error("Lease-acquired callback failed, refusing session: %s", exc)
                 try:
                     await client_ws.close(code=1011, reason="Failed to establish reserved session")
                 except Exception:

@@ -262,6 +262,7 @@ class ManagedEndpoint:
     require_usage_sync: bool = False
     usage_synced: bool = False
     last_usage_sync_at: Optional[float] = None
+    last_sync_failure_log_at: Optional[float] = None
 
     @property
     def running(self) -> bool:
@@ -454,6 +455,10 @@ class EndpointPoolRouter:
                     ) from exc
                 waited_for_capacity = True
 
+        # Only the success path reaches here: forced wake names are spawned
+        # in-loop before waiting, and wake_names was reassigned by the
+        # non-forced mark on break, so this serves the proactive top-up when
+        # remaining capacity dipped below the wake threshold. No double spawn.
         self._spawn_wake_tasks(wake_names)
         return lease
 
@@ -727,13 +732,16 @@ class EndpointPoolRouter:
                 if isinstance(result, Exception):
                     if isinstance(result, ComputeUsageSchemaError):
                         # Every future poll will fail the same way; stale
-                        # observations must not keep granting capacity.
-                        if endpoint.usage_synced:
-                            logger.error(
-                                "Compute usage schema error for %s, revoking capacity until sync recovers: %s",
-                                name,
-                                result,
-                            )
+                        # observations must not keep granting capacity. Log
+                        # unconditionally: on a freshly restarted LB the node
+                        # was never synced, and gating the log on a state
+                        # transition would replay the original incident's
+                        # silence.
+                        logger.error(
+                            "Compute usage schema error for %s, endpoint offers no capacity until sync recovers: %s",
+                            name,
+                            result,
+                        )
                         endpoint.usage_synced = False
                         endpoint.last_usage_sync_at = None
                     else:
@@ -743,15 +751,22 @@ class EndpointPoolRouter:
                             else now - endpoint.last_usage_sync_at
                         )
                         if stale_for is None or stale_for > self.usage_sync_stale_ttl_s:
-                            if endpoint.usage_synced:
+                            # Rate-limit to one error line per node per minute
+                            # so a prolonged outage stays visible without
+                            # flooding, and a never-synced node is not silent.
+                            if (
+                                endpoint.last_sync_failure_log_at is None
+                                or now - endpoint.last_sync_failure_log_at >= 60.0
+                            ):
                                 logger.error(
-                                    "Compute usage for %s stale for %.1fs (TTL %.1fs), "
-                                    "revoking capacity until sync recovers: %s",
+                                    "Compute usage for %s unavailable (last success: %s, TTL %.1fs), "
+                                    "endpoint offers no capacity until sync recovers: %s",
                                     name,
-                                    stale_for if stale_for is not None else -1.0,
+                                    f"{stale_for:.1f}s ago" if stale_for is not None else "never",
                                     self.usage_sync_stale_ttl_s,
                                     result,
                                 )
+                                endpoint.last_sync_failure_log_at = now
                             endpoint.usage_synced = False
                         else:
                             logger.warning(
@@ -779,6 +794,7 @@ class EndpointPoolRouter:
                 endpoint.observed_active_sessions = observed_active_sessions
                 endpoint.usage_synced = True
                 endpoint.last_usage_sync_at = now
+                endpoint.last_sync_failure_log_at = None
                 if observed_increase:
                     endpoint.unobserved_connected_sessions = max(
                         endpoint.unobserved_connected_sessions - observed_increase,
@@ -1005,6 +1021,16 @@ class EndpointPoolRouter:
         if not endpoint.running or endpoint.waking or endpoint.parking or endpoint.restarting or endpoint.drain_restarting:
             return False
         if endpoint.busy_sessions != 0:
+            return False
+        if endpoint.require_usage_sync and not endpoint.usage_synced:
+            # busy_sessions cannot be trusted for an unsynced endpoint: after
+            # an LB restart with a broken sync, a node mid-conversation has no
+            # local leases and observed_active_sessions = 0, so it looks idle
+            # here. Parking it would kill live conversations, a strictly worse
+            # outcome than the session rejections this gating exists to
+            # prevent. The cost is that a pool stuck unsynced never scales
+            # down, which is acceptable because healthcheck already reports
+            # that state as unhealthy.
             return False
         if self._running_count_unlocked() <= self.min_warm_endpoints:
             return False
