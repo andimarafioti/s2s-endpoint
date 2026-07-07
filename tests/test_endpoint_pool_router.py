@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from app.endpoint_pool_router import (
+    ComputeUsageSchemaError,
     EndpointPoolRouter,
     EndpointSnapshot,
     ManagedEndpoint,
@@ -419,6 +420,177 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         healthy, detail, _ = await self.router.healthcheck()
         self.assertTrue(healthy)
         self.assertIsNone(detail)
+
+    async def test_acquire_wakes_parked_node_when_running_nodes_are_unsynced(self):
+        # Regression: acquire() used to mark parked endpoints as waking, then
+        # suspend on the condition BEFORE spawning the wake task. Nothing else
+        # re-selects an endpoint already marked waking, so the wake was
+        # stranded until an unrelated notify (next reconcile) resumed the
+        # waiter. With unsynced-running being a normal post-restart state,
+        # acquire must wake parked capacity on its own, without the reconcile
+        # loop's help.
+        class AlwaysFailingFetcher:
+            def __call__(self, url: str) -> int:
+                raise RuntimeError("health unreachable")
+
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+                ("endpoint-b", "paused", None),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a", "endpoint-b"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=3600,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=AlwaysFailingFetcher(),
+        )
+
+        await self.router.start()
+
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["free_slots"], 0)
+        self.assertFalse(
+            next(ep for ep in snapshot["endpoints"] if ep["name"] == "endpoint-a")["usage_synced"]
+        )
+
+        # The reconcile loop cannot help within this timeout (interval 3600s):
+        # acquire itself must spawn the wake before suspending.
+        lease = await self.router.acquire(timeout_s=2.0)
+        self.assertEqual(lease.endpoint_name, "endpoint-b")
+        self.assertTrue(lease.waited_for_capacity)
+        await self.router.release(lease.slot_id, connected=False)
+
+    async def test_schema_error_revokes_capacity_after_successful_sync(self):
+        # A node that synced once must go conservative again when the health
+        # schema breaks at runtime, instead of allocating on stale data.
+        class SchemaBreakingFetcher:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, url: str) -> int:
+                self.calls += 1
+                if self.calls <= 1:
+                    return 0
+                raise ComputeUsageSchemaError("no session count in payload")
+
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=2,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=SchemaBreakingFetcher(),
+            usage_sync_stale_ttl_s=3600,
+        )
+
+        await self.router.start()
+        snapshot = await self.router.snapshot()
+        self.assertTrue(snapshot["endpoints"][0]["usage_synced"])
+        self.assertEqual(snapshot["free_slots"], 2)
+
+        await self.router.refresh()
+
+        # The generous staleness TTL must not shield a schema error.
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["usage_synced"])
+        self.assertEqual(snapshot["free_slots"], 0)
+
+        healthy, detail, _ = await self.router.healthcheck()
+        self.assertFalse(healthy)
+        self.assertIn("have not synced usage", detail)
+
+    async def test_transient_sync_failure_keeps_capacity_within_ttl(self):
+        class FailAfterFirstFetcher:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, url: str) -> int:
+                self.calls += 1
+                if self.calls <= 1:
+                    return 1
+                raise RuntimeError("read timeout")
+
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=2,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=FailAfterFirstFetcher(),
+            usage_sync_stale_ttl_s=3600,
+        )
+
+        await self.router.start()
+        await self.router.refresh()
+
+        # Within the TTL a transient failure keeps the last observation.
+        snapshot = await self.router.snapshot()
+        self.assertTrue(snapshot["endpoints"][0]["usage_synced"])
+        self.assertEqual(snapshot["observed_active_sessions"], 1)
+        self.assertEqual(snapshot["free_slots"], 1)
+
+    async def test_transient_sync_failures_revoke_capacity_after_ttl(self):
+        class FailAfterFirstFetcher:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, url: str) -> int:
+                self.calls += 1
+                if self.calls <= 1:
+                    return 0
+                raise RuntimeError("read timeout")
+
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=2,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=FailAfterFirstFetcher(),
+            usage_sync_stale_ttl_s=0.05,
+        )
+
+        await self.router.start()
+        await asyncio.sleep(0.1)
+        await self.router.refresh()
+
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["usage_synced"])
+        self.assertEqual(snapshot["free_slots"], 0)
 
     async def test_fully_busy_but_synced_pool_stays_healthy(self):
         # Known-full is healthy; only unknown capacity is degraded.

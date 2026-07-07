@@ -36,6 +36,15 @@ def _to_health_url(base_url: str) -> str:
     return urlunparse(parsed._replace(path=route_path))
 
 
+class ComputeUsageSchemaError(RuntimeError):
+    """The compute health payload parsed but did not match the expected schema.
+
+    Distinct from transient network failures: a schema mismatch means every
+    future poll of this node will also fail, so the caller should revoke the
+    node's capacity immediately rather than trusting a stale observation.
+    """
+
+
 def fetch_compute_active_sessions(base_url: str) -> int:
     request = urllib.request.Request(
         _to_health_url(base_url),
@@ -52,7 +61,7 @@ def fetch_compute_active_sessions(base_url: str) -> int:
 
     router = payload.get("router") if isinstance(payload, dict) else None
     if not isinstance(router, dict):
-        raise RuntimeError("compute health response did not include router usage")
+        raise ComputeUsageSchemaError("compute health response did not include router usage")
     if "active_sessions" in router:
         return max(int(router.get("active_sessions", 0)), 0)
     if "ready_busy" in router:
@@ -61,7 +70,7 @@ def fetch_compute_active_sessions(base_url: str) -> int:
     # the load balancer treat busy compute nodes as free after a restart
     # (2026-06-07 incident): the compute snapshot had renamed its session count
     # key and this function kept returning 0 without any error or log line.
-    raise RuntimeError(
+    raise ComputeUsageSchemaError(
         "compute health response did not include a session count "
         "(expected 'active_sessions' or 'ready_busy' in router payload); "
         "refusing to report 0 to avoid treating a busy node as free"
@@ -252,6 +261,7 @@ class ManagedEndpoint:
     # conversations that survived the restart.
     require_usage_sync: bool = False
     usage_synced: bool = False
+    last_usage_sync_at: Optional[float] = None
 
     @property
     def running(self) -> bool:
@@ -306,6 +316,7 @@ class EndpointPoolRouter:
         restart_stable_running_s: float = 120.0,
         drain_restart_timeout_s: float = 600.0,
         compute_usage_fetcher: Optional[ComputeUsageFetcher] = None,
+        usage_sync_stale_ttl_s: float = 60.0,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
         if not names:
@@ -341,6 +352,7 @@ class EndpointPoolRouter:
         self.restart_stable_running_s = restart_stable_running_s
         self.drain_restart_timeout_s = drain_restart_timeout_s
         self.compute_usage_fetcher = compute_usage_fetcher
+        self.usage_sync_stale_ttl_s = max(usage_sync_stale_ttl_s, 0.0)
 
         self._on_endpoint_down: Optional[Callable[[str], Awaitable[None]]] = None
         self._endpoints = {
@@ -422,6 +434,15 @@ class EndpointPoolRouter:
                     break
 
                 wake_names = self._mark_endpoints_to_wake_unlocked(force=True)
+                # Spawn the wake tasks BEFORE suspending on the condition.
+                # The endpoints are already marked waking, so no other path
+                # will pick them up; waiting first would strand them until an
+                # unrelated notify (e.g. the next reconcile sync) resumed this
+                # coroutine, adding up to a full reconcile interval of delay
+                # or a hard timeout. create_task does not await, and
+                # Condition.wait() releases the lock, so the wake task can
+                # make progress while we wait.
+                self._spawn_wake_tasks(wake_names)
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
                     raise EndpointCapacityTimeoutError("timed out waiting for an available compute endpoint")
@@ -432,8 +453,6 @@ class EndpointPoolRouter:
                         "timed out waiting for an available compute endpoint"
                     ) from exc
                 waited_for_capacity = True
-
-            self._spawn_wake_tasks(wake_names)
 
         self._spawn_wake_tasks(wake_names)
         return lease
@@ -632,11 +651,13 @@ class EndpointPoolRouter:
                     endpoint.observed_active_sessions = 0
                     endpoint.unobserved_connected_sessions = 0
                     endpoint.usage_synced = False
+                    endpoint.last_usage_sync_at = None
                     downed_endpoints.append(endpoint.name)
                 elif not endpoint.running:
                     endpoint.observed_active_sessions = 0
                     endpoint.unobserved_connected_sessions = 0
                     endpoint.usage_synced = False
+                    endpoint.last_usage_sync_at = None
 
                 if (
                     _is_failed_status(endpoint.status)
@@ -704,7 +725,42 @@ class EndpointPoolRouter:
                 if endpoint is None or endpoint.url != url or not endpoint.running:
                     continue
                 if isinstance(result, Exception):
-                    logger.warning("Failed to sync compute usage for %s: %s", name, result)
+                    if isinstance(result, ComputeUsageSchemaError):
+                        # Every future poll will fail the same way; stale
+                        # observations must not keep granting capacity.
+                        if endpoint.usage_synced:
+                            logger.error(
+                                "Compute usage schema error for %s, revoking capacity until sync recovers: %s",
+                                name,
+                                result,
+                            )
+                        endpoint.usage_synced = False
+                        endpoint.last_usage_sync_at = None
+                    else:
+                        stale_for = (
+                            None
+                            if endpoint.last_usage_sync_at is None
+                            else now - endpoint.last_usage_sync_at
+                        )
+                        if stale_for is None or stale_for > self.usage_sync_stale_ttl_s:
+                            if endpoint.usage_synced:
+                                logger.error(
+                                    "Compute usage for %s stale for %.1fs (TTL %.1fs), "
+                                    "revoking capacity until sync recovers: %s",
+                                    name,
+                                    stale_for if stale_for is not None else -1.0,
+                                    self.usage_sync_stale_ttl_s,
+                                    result,
+                                )
+                            endpoint.usage_synced = False
+                        else:
+                            logger.warning(
+                                "Failed to sync compute usage for %s (last success %.1fs ago, TTL %.1fs): %s",
+                                name,
+                                stale_for,
+                                self.usage_sync_stale_ttl_s,
+                                result,
+                            )
                     continue
 
                 previous_observed_active_sessions = endpoint.observed_active_sessions
@@ -722,6 +778,7 @@ class EndpointPoolRouter:
                     )
                 endpoint.observed_active_sessions = observed_active_sessions
                 endpoint.usage_synced = True
+                endpoint.last_usage_sync_at = now
                 if observed_increase:
                     endpoint.unobserved_connected_sessions = max(
                         endpoint.unobserved_connected_sessions - observed_increase,
@@ -759,6 +816,7 @@ class EndpointPoolRouter:
             # usage of this endpoint is known without polling /health.
             endpoint.observed_active_sessions = 0
             endpoint.usage_synced = True
+            endpoint.last_usage_sync_at = time.monotonic()
             self._last_error = None
             self._condition.notify_all()
 
@@ -864,6 +922,7 @@ class EndpointPoolRouter:
                 endpoint.running_since = time.monotonic()
                 endpoint.observed_active_sessions = 0
                 endpoint.usage_synced = True
+                endpoint.last_usage_sync_at = time.monotonic()
             self._condition.notify_all()
 
         logger.info(
@@ -1120,6 +1179,7 @@ class EndpointPoolRouter:
                 ep.running_since = time.monotonic()
                 ep.observed_active_sessions = 0
                 ep.usage_synced = True
+                ep.last_usage_sync_at = time.monotonic()
             self._condition.notify_all()
 
         logger.info("Drain restart completed for endpoint %s (status: %s)", name, snapshot.raw_status)
