@@ -93,6 +93,12 @@ def build_endpoint_router() -> EndpointPoolRouter:
         restart_stable_running_s=COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S,
         drain_restart_timeout_s=COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S,
         compute_usage_fetcher=fetch_compute_active_sessions,
+        # How long a previously observed usage count stays trusted when
+        # health polls fail transiently. Must be comfortably above the
+        # reconcile interval (10s): the default 60s means roughly six
+        # consecutive failed polls before a synced node loses capacity.
+        # Setting it below the reconcile interval revokes on a single blip.
+        usage_sync_stale_ttl_s=float(os.getenv("COMPUTE_USAGE_STALE_TTL_S", "60")),
     )
 
 
