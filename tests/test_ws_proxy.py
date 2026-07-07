@@ -227,7 +227,7 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
         client = FakeClientWS()
         calls = []
 
-        async def notify(callback_url, token, event):
+        async def notify(callback_url, token, event, **kwargs):
             calls.append(event)
             if event == "connected":
                 raise RuntimeError("LB unreachable")
@@ -277,6 +277,77 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
         events = [call.args[2] for call in notify.await_args_list]
         self.assertEqual(events, ["connected", "disconnected"])
         self.assertEqual(released, [0])
+
+class NotifyLbRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retries_until_success(self):
+        calls = []
+
+        def post(url, payload):
+            calls.append(payload["event"])
+            if len(calls) < 3:
+                raise RuntimeError("LB callback failed with HTTP 503")
+
+        with patch.object(compute_main, "_post_json", post):
+            await compute_main._notify_lb_session_event(
+                "https://lb.example/internal/sessions/abc/event",
+                "token-abc",
+                "disconnected",
+                attempts=3,
+                backoff_s=0,
+            )
+
+        self.assertEqual(calls, ["disconnected"] * 3)
+
+    async def test_raises_after_exhausting_attempts(self):
+        calls = []
+
+        def post(url, payload):
+            calls.append(payload["event"])
+            raise RuntimeError("LB callback failed: read timeout")
+
+        with patch.object(compute_main, "_post_json", post):
+            with self.assertRaisesRegex(RuntimeError, "read timeout"):
+                await compute_main._notify_lb_session_event(
+                    "https://lb.example/internal/sessions/abc/event",
+                    "token-abc",
+                    "disconnected",
+                    attempts=3,
+                    backoff_s=0,
+                )
+
+        self.assertEqual(len(calls), 3)
+
+    async def test_disconnect_survives_transient_lb_failure_end_to_end(self):
+        # The demo swarm stale-session scenario: the first disconnected POST
+        # times out, but the retry lands and the LB releases the session.
+        client = FakeClientWS()
+        posted = []
+
+        def post(url, payload):
+            posted.append(payload["event"])
+            if payload["event"] == "disconnected" and posted.count("disconnected") == 1:
+                raise RuntimeError("LB callback failed: read timeout")
+
+        async def acquire():
+            return _lease(slot_id=0, ws_url="ws://127.0.0.1:9999")
+
+        async def release(slot_id):
+            pass
+
+        payload = {
+            "callback_url": "https://lb.example/internal/sessions/abc/event",
+            "session_token": "token-abc",
+        }
+        with patch.object(compute_main, "_get_session_payload", return_value=payload), patch.object(
+            compute_main, "_post_json", post
+        ), patch.object(compute_main, "LB_CALLBACK_RETRY_BACKOFF_S", 0.0), patch.object(
+            compute_main.session_router, "acquire", acquire
+        ), patch.object(
+            compute_main.session_router, "release", release
+        ), patch("app.ws_proxy.websockets.connect", _FakeConnectCtx):
+            await compute_main.websocket_proxy(client)
+
+        self.assertEqual(posted, ["connected", "disconnected", "disconnected"])
 
 
 if __name__ == "__main__":
