@@ -477,6 +477,18 @@ class EndpointPoolRouter:
     async def healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
         snapshot = await self.snapshot()
         if snapshot["running_endpoints"]:
+            # A running endpoint is not necessarily usable: with a usage
+            # fetcher configured it offers zero capacity until its true
+            # session count has been observed. A pool where every running
+            # node is unsynced cannot allocate (schema drift or a compute
+            # health outage), which is different from a pool that is merely
+            # full: known-full is healthy, unknown capacity is not.
+            if snapshot["unsynced_running_endpoints"] == snapshot["running_endpoints"]:
+                return (
+                    False,
+                    "running compute endpoints have not synced usage yet",
+                    snapshot,
+                )
             return True, None, snapshot
         if snapshot["waking_endpoints"]:
             return False, "compute endpoints are still waking", snapshot
@@ -492,6 +504,11 @@ class EndpointPoolRouter:
             endpoints = list(self._endpoints.values())
 
         running = sum(1 for endpoint in endpoints if endpoint.running)
+        unsynced_running = sum(
+            1
+            for endpoint in endpoints
+            if endpoint.running and endpoint.require_usage_sync and not endpoint.usage_synced
+        )
         waking = sum(1 for endpoint in endpoints if endpoint.waking)
         parking = sum(1 for endpoint in endpoints if endpoint.parking)
         restarting = sum(1 for endpoint in endpoints if endpoint.restarting)
@@ -527,6 +544,7 @@ class EndpointPoolRouter:
             "auto_restart": self.auto_restart,
             "max_restart_attempts": self.max_restart_attempts,
             "running_endpoints": running,
+            "unsynced_running_endpoints": unsynced_running,
             "waking_endpoints": waking,
             "parking_endpoints": parking,
             "restarting_endpoints": restarting,

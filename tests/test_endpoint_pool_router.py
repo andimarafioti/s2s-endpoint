@@ -359,6 +359,13 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
             await self.router.acquire(timeout_s=0.05)
 
+        # Health must not report green while allocation is impossible for
+        # lack of usage knowledge (as opposed to known-full, which is fine).
+        healthy, detail, health_snapshot = await self.router.healthcheck()
+        self.assertFalse(healthy)
+        self.assertIn("have not synced usage", detail)
+        self.assertEqual(health_snapshot["unsynced_running_endpoints"], 1)
+
     async def test_capacity_unlocks_once_usage_sync_succeeds(self):
         endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
 
@@ -408,6 +415,41 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         lease = await self.router.acquire(timeout_s=0.2)
         self.assertEqual(lease.endpoint_name, "endpoint-a")
         await self.router.release(lease.slot_id, connected=False)
+
+        healthy, detail, _ = await self.router.healthcheck()
+        self.assertTrue(healthy)
+        self.assertIsNone(detail)
+
+    async def test_fully_busy_but_synced_pool_stays_healthy(self):
+        # Known-full is healthy; only unknown capacity is degraded.
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=lambda url: 1,
+        )
+
+        await self.router.start()
+
+        snapshot = await self.router.snapshot()
+        self.assertTrue(snapshot["endpoints"][0]["usage_synced"])
+        self.assertEqual(snapshot["free_slots"], 0)
+
+        healthy, detail, _ = await self.router.healthcheck()
+        self.assertTrue(healthy)
+        self.assertIsNone(detail)
 
     async def test_start_retries_failed_initial_usage_sync(self):
         endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
