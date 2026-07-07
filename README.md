@@ -102,6 +102,44 @@ The flow is:
 
 This removes the LB from the websocket data path. The LB only handles control-plane allocation and release.
 
+### When every slot is busy: the waiting queue
+
+`POST /session` never blocks. If a slot is free (and no one is already waiting) it
+returns a grant as above, marked `"state": "granted"`. Otherwise the caller joins a
+FIFO waiting queue and gets a **ticket** instead:
+
+```json
+{ "state": "queued", "queue_id": "…", "position": 3, "poll_interval_s": 2, "ticket_ttl_s": 8 }
+```
+
+The client then polls `GET /queue/{queue_id}` every `poll_interval_s`:
+
+- still waiting → `{ "state": "queued", "position": N, … }` (position only ever decreases)
+- reached the front and a slot freed → the same `"state": "granted"` body as `POST /session`
+- unknown/expired ticket → `404`
+
+Only the head of the line claims a freed slot, so admission stays FIFO. A ticket that
+isn't polled within `ticket_ttl_s` is dropped (how an abandoned waiter is detected), and
+everyone behind shifts up. `DELETE /queue/{queue_id}` leaves the line explicitly (used by
+the client's teardown beacon). Waiting reserves no compute and, on the demo Space, no
+usage time — only a live connected session counts. If the queue itself is full the
+`POST /session` returns `503` with `{ "state": "at_capacity" }`.
+
+Tunable via env: `QUEUE_MAX_DEPTH` (default 100), `QUEUE_TICKET_TTL_S` (8),
+`QUEUE_POLL_INTERVAL_S` (2), `QUEUE_REAP_INTERVAL_S` (2). Setting `QUEUE_MAX_DEPTH=0`
+disables the waiting room: any caller who can't be granted a slot immediately gets
+`at_capacity` instead of a ticket. The queue is never unbounded.
+
+Sizing `QUEUE_MAX_DEPTH`: it's a ceiling, not a target. Two things bound how high
+it's worth setting. Poll load scales as `depth / QUEUE_POLL_INTERVAL_S` requests
+per second (on this app, and again on the Space that proxies it), so a very deep
+queue at a 2s cadence puts real request pressure on both small containers. And
+position is only meaningful if the wait is bearable: the last person's wait is
+roughly `depth × avg_session ÷ live_slots`, so past ~10-15 minutes people abandon
+regardless. 100 is comfortable headroom on load and keeps the "at capacity" modal
+rare; if you push it past ~200, raise `QUEUE_POLL_INTERVAL_S` to 3-4s to hold the
+request rate down (the per-poll position lookup is currently O(queue depth)).
+
 In load-balancer mode, the app does not guess endpoint hostnames. It asks the
 Hugging Face API for each compute endpoint's canonical HTTPS URL and turns that
 into the direct websocket URL by replacing `https://` with `wss://` and appending
@@ -279,7 +317,10 @@ session token.
 
 With the current defaults, compute endpoints also need an `HF_TOKEN` or
 `RESPONSES_API_API_KEY` secret at runtime because the speech-to-speech wrapper
-defaults to `LLM=responses-api`.
+defaults to `LLM=chat-completions` with Hugging Face router settings:
+`MODEL_NAME=google/gemma-4-31B-it:cerebras`,
+`RESPONSES_API_BASE_URL=https://router.huggingface.co/v1`, and
+`RESPONSES_API_REASONING_EFFORT=none`.
 
 ## Update Compute Endpoint Env
 

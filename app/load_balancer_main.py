@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from app.app_utils import build_lifespan, elapsed_ms, public_base_url, setup_logging
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
-from app.direct_session_manager import DirectSessionManager
+from app.direct_session_manager import DirectSessionManager, QueueAtCapacityError
 from app.endpoint_pool_router import (
     EndpointCapacityTimeoutError,
     EndpointPoolRouter,
@@ -49,6 +49,13 @@ SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
 SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
 SESSION_TOKEN_TTL_S = float(os.getenv("SESSION_TOKEN_TTL_S", "86400"))
 SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
+# Waiting queue: when every slot is busy a caller gets a ticket and polls
+# GET /queue/{id} until the head of the line claims a freed slot. Waiting never
+# reserves compute or usage time; an un-polled ticket is reaped after its TTL.
+QUEUE_MAX_DEPTH = int(os.getenv("QUEUE_MAX_DEPTH", "100"))
+QUEUE_TICKET_TTL_S = float(os.getenv("QUEUE_TICKET_TTL_S", "8"))
+QUEUE_POLL_INTERVAL_S = float(os.getenv("QUEUE_POLL_INTERVAL_S", "2"))
+QUEUE_REAP_INTERVAL_S = float(os.getenv("QUEUE_REAP_INTERVAL_S", "2"))
 DASHBOARD_SAMPLE_INTERVAL_S = float(os.getenv("DASHBOARD_SAMPLE_INTERVAL_S", "15"))
 DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(28 * 24 * 60)))
 DASHBOARD_BUCKET_ID = os.getenv("DASHBOARD_BUCKET_ID", "").strip() or None
@@ -111,6 +118,10 @@ else:
         pending_timeout_s=SESSION_PENDING_TIMEOUT_S,
         session_token_ttl_s=SESSION_TOKEN_TTL_S,
         reap_interval_s=SESSION_REAP_INTERVAL_S,
+        queue_max_depth=QUEUE_MAX_DEPTH,
+        queue_ticket_ttl_s=QUEUE_TICKET_TTL_S,
+        queue_poll_interval_s=QUEUE_POLL_INTERVAL_S,
+        queue_reap_interval_s=QUEUE_REAP_INTERVAL_S,
     )
 
 dashboard_history_store = None
@@ -256,10 +267,25 @@ async def health():
 
 @app.post("/session")
 async def create_session(request: Request):
+    """Grant a session if a slot is free and the line is empty, otherwise return a
+    queue ticket the caller polls via GET /queue/{id}. 503 with {state:"at_capacity"}
+    when the queue itself is full; 503 otherwise when the pool can't allocate."""
     await dashboard.record_session_request()
     allocation_started_at = monotonic()
     try:
         allocation = await session_manager.allocate(public_base_url(request))
+    except QueueAtCapacityError as exc:
+        allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
+        _log_session_allocation_outcome(
+            "queue_at_capacity",
+            allocation=None,
+            allocation_wait_ms=None,
+            allocation_total_ms=allocation_total_ms,
+            level=logging.WARNING,
+            error=str(exc),
+        )
+        await dashboard.record_session_allocation_failure()
+        return JSONResponse({"state": "at_capacity", "detail": str(exc)}, status_code=503)
     except Exception as exc:
         allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
         waited_for_capacity = isinstance(exc, EndpointCapacityTimeoutError)
@@ -275,7 +301,48 @@ async def create_session(request: Request):
         await dashboard.record_session_allocation_failure()
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
 
-    allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
+    # No slot free (and/or others waiting): the caller joined the queue.
+    if allocation.get("state") == "queued":
+        return JSONResponse(allocation)
+
+    return await _deliver_grant(request, allocation, allocation_started_at)
+
+
+@app.get("/queue/{queue_id}")
+async def queue_status(queue_id: str, request: Request):
+    """Advance a waiting ticket: report position, or — for the head of the line —
+    hand back a session grant once a slot frees. 404 for an unknown/expired ticket."""
+    if not hasattr(session_manager, "poll"):
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    poll_started_at = monotonic()
+    try:
+        result = await session_manager.poll(queue_id, public_base_url(request))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown or expired ticket.") from None
+
+    if result.get("state") == "queued":
+        return JSONResponse(result)
+
+    # Head of line claimed a slot — same delivery path as a fast-path grant.
+    return await _deliver_grant(request, result, poll_started_at)
+
+
+@app.delete("/queue/{queue_id}")
+async def queue_leave(queue_id: str):
+    """Leave the queue early (explicit button / teardown beacon). Idempotent."""
+    if not hasattr(session_manager, "leave"):
+        raise HTTPException(status_code=404, detail="Not found.")
+    left = await session_manager.leave(queue_id)
+    return JSONResponse({"status": "ok", "state": "left", "removed": left})
+
+
+async def _deliver_grant(
+    request: Request, allocation: dict[str, object], started_at: float
+) -> JSONResponse:
+    """Shared tail for a granted session (fast path or queue claim): guard against a
+    client that vanished, record the success, and return the public grant fields."""
+    allocation_total_ms = elapsed_ms(started_at, monotonic())
     allocation_wait_ms = _allocation_wait_ms(allocation, fallback_ms=allocation_total_ms)
     allocation.setdefault("allocation_wait_ms", allocation_wait_ms)
 
@@ -300,7 +367,9 @@ async def create_session(request: Request):
         allocation_total_ms=allocation_total_ms,
         level=logging.INFO,
     )
-    return JSONResponse(_public_session_allocation(allocation))
+    payload = _public_session_allocation(allocation)
+    payload["state"] = "granted"
+    return JSONResponse(payload)
 
 
 @app.post("/internal/sessions/{session_id}/event")
