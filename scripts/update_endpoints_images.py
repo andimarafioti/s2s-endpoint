@@ -74,7 +74,7 @@ def main() -> None:
         "--load-balancer-request-timeout-s",
         type=float,
         default=30,
-        help="HTTP timeout for load-balancer drain and health requests.",
+        help="HTTP timeout for load-balancer drain and status requests.",
     )
     parser.add_argument(
         "--wait",

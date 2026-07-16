@@ -18,6 +18,7 @@ from update_endpoints_images import (  # noqa: E402
     default_compute_prefix,
     discover_load_balancer_compute_names,
     discover_sequential_compute_names,
+    fetch_compute_endpoint_snapshot,
     main,
     wait_for_compute_endpoint_free,
     resolve_compute_names,
@@ -387,6 +388,31 @@ class UpdateEndpointImagesTests(unittest.TestCase):
 
         self.assertEqual(endpoint["active_sessions"], 0)
         sleep.assert_called_once_with(5)
+
+    def test_fetch_compute_endpoint_snapshot_uses_authenticated_status_route(self):
+        expected = {
+            "name": "reachy/s2s 01",
+            "active_sessions": 0,
+            "draining": True,
+        }
+
+        with patch(
+            "update_endpoints_images.request_json",
+            return_value={"status": "ok", "endpoint": expected},
+        ) as request:
+            endpoint = fetch_compute_endpoint_snapshot(
+                load_balancer_url="https://lb.example/",
+                token="admin-secret",
+                name="reachy/s2s 01",
+                timeout_s=3,
+            )
+
+        self.assertEqual(endpoint, expected)
+        request.assert_called_once_with(
+            "https://lb.example/internal/endpoints/reachy%2Fs2s%2001",
+            token="admin-secret",
+            timeout_s=3,
+        )
 
     def test_wait_for_compute_endpoint_free_rejects_lost_drain_state(self):
         endpoint = {
