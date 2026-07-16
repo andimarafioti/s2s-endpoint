@@ -608,6 +608,7 @@ def update_one(
     wait_refresh_every_s: int,
     dry_run: bool,
     pre_update_check: Callable[[], None] | None = None,
+    on_update_submission_started: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     endpoint = api.get_inference_endpoint(name, namespace=namespace)
     status_before = str(endpoint.status)
@@ -649,6 +650,8 @@ def update_one(
         )
     if pre_update_check is not None:
         pre_update_check()
+    if on_update_submission_started is not None:
+        on_update_submission_started()
     endpoint = api.update_inference_endpoint(
         name,
         namespace=namespace,
@@ -682,6 +685,7 @@ def update_one_draining(
 ) -> dict[str, object]:
     result: dict[str, object] | None = None
     pre_update_snapshot: dict[str, object] | None = None
+    update_may_have_started = False
 
     def recheck_drain_before_update() -> None:
         nonlocal pre_update_snapshot
@@ -700,6 +704,10 @@ def update_one_draining(
                 f"Compute endpoint {name} is no longer safe to update immediately "
                 f"before submission ({detail}). Refusing to update."
             )
+
+    def mark_update_submission_started() -> None:
+        nonlocal update_may_have_started
+        update_may_have_started = True
 
     try:
         set_compute_endpoint_draining_with_retries(
@@ -728,6 +736,7 @@ def update_one_draining(
             wait_refresh_every_s=wait_refresh_every_s,
             dry_run=False,
             pre_update_check=recheck_drain_before_update,
+            on_update_submission_started=mark_update_submission_started,
         )
         final_drain_snapshot = pre_update_snapshot or drain_snapshot
         result["drain"] = {
@@ -739,20 +748,27 @@ def update_one_draining(
         }
         return result
     finally:
-        # CLI drain rollouts wait for the update to reach its target state
-        # before reopening the endpoint.
-        try:
-            set_compute_endpoint_draining_with_retries(
-                load_balancer_url=load_balancer_url,
-                token=token,
-                name=name,
-                draining=False,
-                timeout_s=request_timeout_s,
+        if update_may_have_started and result is None:
+            log_progress(
+                f"Update may have started for {name}, but completion was not confirmed; "
+                "leaving the endpoint drained. Verify its Hugging Face endpoint state, "
+                "then manually clear the drain when safe."
             )
-        except Exception as exc:
-            log_progress(f"Failed to clear drain on {name}: {exc}")
-            if result is not None:
-                raise
+        else:
+            # CLI drain rollouts wait for the update to reach its target state
+            # before reopening the endpoint.
+            try:
+                set_compute_endpoint_draining_with_retries(
+                    load_balancer_url=load_balancer_url,
+                    token=token,
+                    name=name,
+                    draining=False,
+                    timeout_s=request_timeout_s,
+                )
+            except Exception as exc:
+                log_progress(f"Failed to clear drain on {name}: {exc}")
+                if result is not None:
+                    raise
 
 
 def wait_for_endpoint_update(

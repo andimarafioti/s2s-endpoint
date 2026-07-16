@@ -757,6 +757,134 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 2)
         wait_for_free.assert_not_called()
 
+    def test_update_one_draining_leaves_drain_after_ambiguous_submission_failure(self):
+        tracker = ParallelTracker()
+        endpoint = FakeTransitionEndpoint(
+            "reachy-s2s-01",
+            "andito/s2s-compute:old",
+            tracker,
+            status="running",
+            fetch_statuses=[],
+        )
+        api = FakeTransitionUpdateApi(endpoint)
+        drain_calls: list[bool] = []
+
+        def fake_set_draining(**kwargs):
+            drain_calls.append(kwargs["draining"])
+            return {"status": "ok"}
+
+        def accepted_but_response_lost(name, namespace=None, custom_image=None):
+            api.update_calls += 1
+            endpoint.status = "updating"
+            endpoint._image_url = custom_image["url"]
+            raise TimeoutError("update response was lost")
+
+        api.update_inference_endpoint = accepted_but_response_lost
+        ready_endpoint = {
+            "name": "reachy-s2s-01",
+            "status": "running",
+            "running": True,
+            "active_sessions": 0,
+            "draining": True,
+            "require_usage_sync": True,
+            "usage_synced": True,
+        }
+
+        with patch(
+            "update_endpoints_images.set_compute_endpoint_draining",
+            side_effect=fake_set_draining,
+        ), patch(
+            "update_endpoints_images.wait_for_compute_endpoint_free",
+            return_value=ready_endpoint,
+        ), patch(
+            "update_endpoints_images.fetch_compute_endpoint_snapshot",
+            return_value=ready_endpoint,
+        ), patch("update_endpoints_images.log_progress") as log_progress:
+            with self.assertRaisesRegex(TimeoutError, "response was lost"):
+                update_one_draining(
+                    api=api,
+                    namespace="HuggingFaceM4",
+                    name="reachy-s2s-01",
+                    image_url="andito/s2s-compute:new",
+                    load_balancer_url="https://lb.example",
+                    token="token",
+                    wait=True,
+                    wait_timeout_s=60,
+                    wait_refresh_every_s=1,
+                    drain_timeout_s=60,
+                    drain_refresh_every_s=5,
+                    request_timeout_s=1,
+                )
+
+        self.assertEqual(drain_calls, [True])
+        self.assertEqual(api.update_calls, 1)
+        self.assertEqual(endpoint._image_url, "andito/s2s-compute:new")
+        self.assertTrue(
+            any("leaving the endpoint drained" in str(call) for call in log_progress.call_args_list)
+        )
+
+    def test_update_one_draining_leaves_drain_when_update_wait_fails(self):
+        tracker = ParallelTracker()
+        endpoint = FakeTransitionEndpoint(
+            "reachy-s2s-01",
+            "andito/s2s-compute:old",
+            tracker,
+            status="running",
+            fetch_statuses=[],
+        )
+        api = FakeTransitionUpdateApi(endpoint)
+        drain_calls: list[bool] = []
+
+        def fake_set_draining(**kwargs):
+            drain_calls.append(kwargs["draining"])
+            return {"status": "ok"}
+
+        def failed_wait(timeout=None, refresh_every=None):
+            raise TimeoutError("update completion was not confirmed")
+
+        endpoint.wait = failed_wait
+        ready_endpoint = {
+            "name": "reachy-s2s-01",
+            "status": "running",
+            "running": True,
+            "active_sessions": 0,
+            "draining": True,
+            "require_usage_sync": True,
+            "usage_synced": True,
+        }
+
+        with patch(
+            "update_endpoints_images.set_compute_endpoint_draining",
+            side_effect=fake_set_draining,
+        ), patch(
+            "update_endpoints_images.wait_for_compute_endpoint_free",
+            return_value=ready_endpoint,
+        ), patch(
+            "update_endpoints_images.fetch_compute_endpoint_snapshot",
+            return_value=ready_endpoint,
+        ), patch("update_endpoints_images.log_progress") as log_progress:
+            with self.assertRaisesRegex(TimeoutError, "completion was not confirmed"):
+                update_one_draining(
+                    api=api,
+                    namespace="HuggingFaceM4",
+                    name="reachy-s2s-01",
+                    image_url="andito/s2s-compute:new",
+                    load_balancer_url="https://lb.example",
+                    token="token",
+                    wait=True,
+                    wait_timeout_s=60,
+                    wait_refresh_every_s=1,
+                    drain_timeout_s=60,
+                    drain_refresh_every_s=5,
+                    request_timeout_s=1,
+                )
+
+        self.assertEqual(drain_calls, [True])
+        self.assertEqual(api.update_calls, 1)
+        self.assertTrue(
+            any("leaving the endpoint drained" in str(call) for call in log_progress.call_args_list)
+        )
+
     def test_update_one_draining_retries_transient_drain_clear_failures(self):
         tracker = ParallelTracker()
         endpoint = FakeTransitionEndpoint(
