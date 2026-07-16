@@ -273,6 +273,88 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.manager.snapshot()
         self.assertEqual(snapshot["connected_sessions"], 1)
 
+    async def test_endpoint_down_records_connected_session_as_abnormal_disconnect(self):
+        router = FakeLeaseRouter()
+        recorded_disconnects = []
+
+        async def record_disconnect(result):
+            recorded_disconnects.append(result)
+
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        self.manager.set_abnormal_disconnect_handler(record_disconnect)
+        await self.manager.start()
+
+        allocation = await self.manager.allocate("https://lb.example")
+
+        with patch("app.direct_session_manager.monotonic", return_value=100.0):
+            await self.manager.handle_event(
+                allocation["session_id"],
+                allocation["session_token"],
+                "connected",
+            )
+
+        with patch("app.direct_session_manager.monotonic", return_value=160.0):
+            await router._on_endpoint_down("endpoint-1")
+
+        self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual(router.release_connected_calls, [True])
+        self.assertEqual(len(recorded_disconnects), 1)
+        self.assertEqual(recorded_disconnects[0]["event"], "disconnected")
+        self.assertEqual(recorded_disconnects[0]["release_reason"], "endpoint_unavailable")
+        self.assertTrue(recorded_disconnects[0]["conversation_counted"])
+        self.assertAlmostEqual(recorded_disconnects[0]["conversation_duration_s"], 60.0, places=3)
+
+        snapshot = await self.manager.snapshot()
+        self.assertEqual(snapshot["connected_sessions"], 0)
+
+    async def test_endpoint_down_after_clean_disconnect_records_no_abnormal_disconnect(self):
+        router = FakeLeaseRouter()
+        recorded_disconnects = []
+
+        async def record_disconnect(result):
+            recorded_disconnects.append(result)
+
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            pending_timeout_s=3600,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        self.manager.set_abnormal_disconnect_handler(record_disconnect)
+        await self.manager.start()
+
+        allocation = await self.manager.allocate("https://lb.example")
+
+        with patch("app.direct_session_manager.monotonic", side_effect=[100.0, 140.0]):
+            await self.manager.handle_event(
+                allocation["session_id"],
+                allocation["session_token"],
+                "connected",
+            )
+            released = await self.manager.handle_event(
+                allocation["session_id"],
+                allocation["session_token"],
+                "disconnected",
+            )
+
+        with patch("app.direct_session_manager.monotonic", return_value=180.0):
+            await router._on_endpoint_down("endpoint-1")
+
+        self.assertEqual(released["release_reason"], "client_disconnected")
+        self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual(router.release_connected_calls, [True])
+        self.assertEqual(recorded_disconnects, [])
+
+        snapshot = await self.manager.snapshot()
+        self.assertEqual(snapshot["connected_sessions"], 0)
+
     async def test_allocate_releases_lease_if_interrupted_after_acquire(self):
         router = FakeLeaseRouter()
         self.manager = DirectSessionManager(

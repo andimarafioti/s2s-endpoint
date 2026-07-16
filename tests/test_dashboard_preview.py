@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
@@ -99,6 +100,39 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertIs(module.dashboard.history_store, module.dashboard_history_store)
         init_store.assert_called_once()
 
+    def test_drain_route_requires_admin_authorization(self):
+        module = self._import_load_balancer(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "TEST",
+                "SESSION_SHARED_SECRET": "",
+                "HF_CONTROL_TOKEN": "",
+                "HF_TOKEN": "",
+                "LB_ADMIN_AUTH_TOKEN": "admin-secret",
+            }
+        )
+        client = TestClient(module.app)
+
+        missing_auth = client.post(
+            "/internal/endpoints/preview-compute-01/drain",
+            json={"draining": True},
+        )
+        wrong_auth = client.post(
+            "/internal/endpoints/preview-compute-01/drain",
+            headers={"Authorization": "Bearer wrong-secret"},
+            json={"draining": True},
+        )
+        correct_auth = client.post(
+            "/internal/endpoints/preview-compute-01/drain",
+            headers={"Authorization": "Bearer admin-secret"},
+            json={"draining": True},
+        )
+
+        self.assertEqual(missing_auth.status_code, 401)
+        self.assertEqual(missing_auth.headers["www-authenticate"], "Bearer")
+        self.assertEqual(wrong_auth.status_code, 403)
+        self.assertEqual(correct_auth.status_code, 404)
+        self.assertEqual(correct_auth.json()["detail"], "Endpoint draining is not available")
+
     def _import_load_balancer(self, env):
         sys.modules.pop("app.load_balancer_main", None)
         with patch.dict(
@@ -106,6 +140,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
             {
                 "DASHBOARD_BUCKET_ID": "",
                 "DASHBOARD_PREVIEW_MODE": "",
+                "LB_ADMIN_AUTH_TOKEN": "",
                 **env,
             },
             clear=False,

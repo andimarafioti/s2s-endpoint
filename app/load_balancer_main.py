@@ -1,5 +1,6 @@
 import logging
 import os
+import secrets
 from time import monotonic
 from typing import Any
 
@@ -44,6 +45,7 @@ COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S = float(os.getenv("COMPUTE_ENDPOINT_RESTA
 COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S", "120"))
 COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S", "600"))
 HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TOKEN", "").strip() or None
+LB_ADMIN_AUTH_TOKEN = os.getenv("LB_ADMIN_AUTH_TOKEN", "").strip() or HF_CONTROL_TOKEN
 
 SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
 SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
@@ -132,8 +134,19 @@ dashboard = SwarmDashboard(
 )
 
 
+async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
+    await dashboard.record_session_event(
+        "disconnected",
+        conversation_duration_s=result.get("conversation_duration_s"),
+        conversation_counted=bool(result.get("conversation_counted")),
+    )
+
+
 class LoadBalancerRuntime:
     async def start(self) -> None:
+        # Dashboard preview mode uses a synthetic manager with no real sessions.
+        if hasattr(session_manager, "set_abnormal_disconnect_handler"):
+            session_manager.set_abnormal_disconnect_handler(record_abnormal_session_disconnect)
         await session_manager.start()
         await dashboard.start()
 
@@ -327,6 +340,68 @@ async def session_event(session_id: str, payload: dict[str, Any]):
         conversation_counted=bool(result.get("conversation_counted")),
     )
     return JSONResponse(result)
+
+
+@app.post("/internal/endpoints/{endpoint_name}/drain")
+async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str, Any]):
+    require_admin_auth(request)
+
+    endpoint_router = getattr(session_manager, "endpoint_router", None)
+    if endpoint_router is None:
+        raise HTTPException(status_code=404, detail="Endpoint draining is not available")
+
+    draining = bool(payload.get("draining", True))
+    try:
+        await endpoint_router.set_draining(endpoint_name, draining)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown endpoint") from None
+
+    _, _, snapshot = await session_manager.healthcheck()
+    router_snapshot = snapshot.get("router", {})
+    endpoints = router_snapshot.get("endpoints", []) if isinstance(router_snapshot, dict) else []
+    endpoint_snapshot = next(
+        (
+            endpoint
+            for endpoint in endpoints
+            if isinstance(endpoint, dict) and endpoint.get("name") == endpoint_name
+        ),
+        None,
+    )
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "endpoint_name": endpoint_name,
+            "draining": draining,
+            "endpoint": endpoint_snapshot,
+        }
+    )
+
+
+def require_admin_auth(request: Request) -> None:
+    if not LB_ADMIN_AUTH_TOKEN:
+        raise HTTPException(status_code=503, detail="LB admin auth token is not configured")
+
+    token = _bearer_token(request.headers.get("authorization"))
+    if token is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing admin bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not secrets.compare_digest(token, LB_ADMIN_AUTH_TOKEN):
+        raise HTTPException(status_code=403, detail="Invalid admin authorization")
+
+
+def _bearer_token(authorization: str | None) -> str | None:
+    scheme, separator, token = (authorization or "").partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return None
+
+    token = token.strip()
+    if not token:
+        return None
+    return token
 
 
 @app.websocket("/ws")

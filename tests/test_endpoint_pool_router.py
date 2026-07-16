@@ -209,6 +209,36 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["running_endpoints"], 2)
         self.assertIn("endpoint-b", controller.wake_calls)
 
+    async def test_draining_endpoint_is_not_selected_for_new_sessions(self):
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+                ("endpoint-b", "running", "https://endpoint-b.example.endpoints.huggingface.cloud"),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a", "endpoint-b"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+
+        await self.router.start()
+        await self.router.set_draining("endpoint-a", True)
+
+        lease = await self.router.acquire(timeout_s=0.2)
+        snapshot = await self.router.snapshot()
+        endpoint_a = next(endpoint for endpoint in snapshot["endpoints"] if endpoint["name"] == "endpoint-a")
+
+        self.assertEqual(lease.endpoint_name, "endpoint-b")
+        self.assertTrue(endpoint_a["draining"])
+        self.assertEqual(endpoint_a["free_slots"], 0)
+
     async def test_acquire_marks_lease_when_it_waited_for_capacity(self):
         controller = FakeEndpointController(
             [
@@ -263,6 +293,44 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.router.snapshot()
         self.assertEqual(snapshot["running_endpoints"], 1)
         self.assertEqual(len(controller.park_calls), 1)
+
+    async def test_refresh_after_idle_park_with_no_sessions_does_not_report_endpoint_down(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        downed_endpoints = []
+
+        async def record_endpoint_down(endpoint_name: str) -> None:
+            downed_endpoints.append(endpoint_name)
+
+        await self.router.start()
+        self.router._on_endpoint_down = record_endpoint_down
+
+        async with self.router._condition:
+            self.router._endpoints["endpoint-a"].parking = True
+
+        controller.states["endpoint-a"] = {"status": "paused", "url": None}
+        await self.router.refresh()
+
+        self.assertEqual(downed_endpoints, [])
+        snapshot = await self.router.snapshot()
+        endpoint = snapshot["endpoints"][0]
+        self.assertEqual(snapshot["active_sessions"], 0)
+        self.assertFalse(endpoint["parking"])
 
     async def test_reconcile_does_not_wake_endpoints_without_load_when_min_warm_is_zero(self):
         controller = FakeEndpointController(
@@ -921,6 +989,43 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["observed_active_sessions"], 0)
         self.assertEqual(snapshot["free_slots"], 1)
 
+    async def test_refresh_reports_busy_endpoint_when_it_becomes_paused(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        downed_endpoints = []
+
+        async def record_endpoint_down(endpoint_name: str) -> None:
+            downed_endpoints.append(endpoint_name)
+
+        await self.router.start()
+        lease = await self.router.acquire(timeout_s=0.2)
+        await self.router.mark_connected(lease.slot_id)
+        self.router._on_endpoint_down = record_endpoint_down
+
+        controller.states["endpoint-a"] = {"status": "paused", "url": None}
+        await self.router.refresh()
+
+        self.assertEqual(downed_endpoints, ["endpoint-a"])
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["active_sessions"], 0)
+        self.assertEqual(snapshot["local_active_sessions"], 0)
+        self.assertEqual(snapshot["local_connected_sessions"], 0)
+
     async def test_reconcile_does_not_park_observed_busy_endpoint(self):
         endpoint_a_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
         endpoint_b_url = "https://endpoint-b.example.endpoints.huggingface.cloud"
@@ -953,6 +1058,41 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         endpoints = {endpoint["name"]: endpoint for endpoint in snapshot["endpoints"]}
         self.assertEqual(endpoints["endpoint-a"]["active_sessions"], 1)
         self.assertEqual(endpoints["endpoint-a"]["observed_active_sessions"], 1)
+
+    async def test_reconcile_does_not_park_local_connected_endpoint(self):
+        endpoint_a_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        endpoint_b_url = "https://endpoint-b.example.endpoints.huggingface.cloud"
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_a_url),
+                ("endpoint-b", "running", endpoint_b_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a", "endpoint-b"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=0,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+
+        await self.router.start()
+        lease = await self.router.acquire(timeout_s=0.2)
+        await self.router.mark_connected(lease.slot_id)
+
+        await self.router._schedule_parks_if_needed()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(lease.endpoint_name, "endpoint-a")
+        self.assertEqual(controller.park_calls, ["endpoint-b"])
+        snapshot = await self.router.snapshot()
+        endpoints = {endpoint["name"]: endpoint for endpoint in snapshot["endpoints"]}
+        self.assertEqual(endpoints["endpoint-a"]["local_connected_sessions"], 1)
+        self.assertEqual(endpoints["endpoint-a"]["active_sessions"], 1)
 
     async def test_warming_endpoint_counts_as_capacity_until_timeout(self):
         controller = FakeEndpointController(
