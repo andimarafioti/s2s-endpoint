@@ -1,11 +1,9 @@
-from io import BytesIO
 import sys
 import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from urllib.error import HTTPError
 
 import httpx
 from huggingface_hub.errors import HfHubHTTPError
@@ -20,7 +18,6 @@ from update_endpoints_images import (  # noqa: E402
     default_compute_prefix,
     discover_load_balancer_compute_names,
     discover_sequential_compute_names,
-    request_json,
     wait_for_compute_endpoint_free,
     resolve_compute_names,
     update_one,
@@ -173,16 +170,6 @@ class FakeHealthRouteUpdateApi:
         self.last_custom_image = dict(custom_image or {})
         self.endpoint.status = "running"
         return self.endpoint
-
-
-def health_snapshot(endpoints: list[dict[str, object]]) -> dict[str, object]:
-    return {
-        "sessions": {
-            "router": {
-                "endpoints": endpoints,
-            }
-        }
-    }
 
 
 class UpdateEndpointImagesTests(unittest.TestCase):
@@ -340,30 +327,26 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual(api.last_custom_image["health_route"], "/ready")
 
     def test_wait_for_compute_endpoint_free_polls_until_zero_active_sessions(self):
-        health_responses = [
-            health_snapshot(
-                [
-                    {
-                        "name": "reachy-s2s-01",
-                        "active_sessions": 1,
-                        "draining": True,
-                    }
-                ]
-            ),
-            health_snapshot(
-                [
-                    {
-                        "name": "reachy-s2s-01",
-                        "active_sessions": 0,
-                        "draining": True,
-                    }
-                ]
-            ),
+        endpoint_snapshots = [
+            {
+                "name": "reachy-s2s-01",
+                "active_sessions": 1,
+                "draining": True,
+                "require_usage_sync": True,
+                "usage_synced": True,
+            },
+            {
+                "name": "reachy-s2s-01",
+                "active_sessions": 0,
+                "draining": True,
+                "require_usage_sync": True,
+                "usage_synced": True,
+            },
         ]
 
         with patch(
-            "update_endpoints_images.fetch_load_balancer_health",
-            side_effect=health_responses,
+            "update_endpoints_images.fetch_compute_endpoint_snapshot",
+            side_effect=endpoint_snapshots,
         ), patch("update_endpoints_images.time.sleep") as sleep:
             endpoint = wait_for_compute_endpoint_free(
                 load_balancer_url="https://lb.example",
@@ -375,6 +358,65 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             )
 
         self.assertEqual(endpoint["active_sessions"], 0)
+        sleep.assert_called_once_with(5)
+
+    def test_wait_for_compute_endpoint_free_rejects_lost_drain_state(self):
+        endpoint = {
+            "name": "reachy-s2s-01",
+            "active_sessions": 0,
+            "draining": False,
+            "require_usage_sync": True,
+            "usage_synced": True,
+        }
+
+        with patch(
+            "update_endpoints_images.fetch_compute_endpoint_snapshot",
+            return_value=endpoint,
+        ), patch("update_endpoints_images.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "no longer draining"):
+                wait_for_compute_endpoint_free(
+                    load_balancer_url="https://lb.example",
+                    token="token",
+                    name="reachy-s2s-01",
+                    timeout_s=60,
+                    refresh_every_s=5,
+                    request_timeout_s=1,
+                )
+
+        sleep.assert_not_called()
+
+    def test_wait_for_compute_endpoint_free_requires_trustworthy_usage_sync(self):
+        endpoint_snapshots = [
+            {
+                "name": "reachy-s2s-01",
+                "active_sessions": 0,
+                "draining": True,
+                "require_usage_sync": True,
+                "usage_synced": False,
+            },
+            {
+                "name": "reachy-s2s-01",
+                "active_sessions": 0,
+                "draining": True,
+                "require_usage_sync": True,
+                "usage_synced": True,
+            },
+        ]
+
+        with patch(
+            "update_endpoints_images.fetch_compute_endpoint_snapshot",
+            side_effect=endpoint_snapshots,
+        ), patch("update_endpoints_images.time.sleep") as sleep:
+            endpoint = wait_for_compute_endpoint_free(
+                load_balancer_url="https://lb.example",
+                token="token",
+                name="reachy-s2s-01",
+                timeout_s=60,
+                refresh_every_s=5,
+                request_timeout_s=1,
+            )
+
+        self.assertTrue(endpoint["usage_synced"])
         sleep.assert_called_once_with(5)
 
     def test_update_one_draining_sets_and_clears_drain_around_update(self):
@@ -416,46 +458,6 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual(result["image_after"], "andito/s2s-compute:new")
         self.assertEqual(result["drain"]["active_sessions_before_update"], 0)
         self.assertTrue(result["drain"]["draining_before_update"])
-
-    def test_request_json_parses_expected_http_error_body(self):
-        error = HTTPError(
-            "https://lb.example/health",
-            503,
-            "Service Unavailable",
-            {},
-            BytesIO(b'{"status": "starting"}'),
-        )
-
-        with patch("update_endpoints_images.urlopen", side_effect=error):
-            result = request_json(
-                "https://lb.example/health",
-                token=None,
-                timeout_s=1,
-                allow_http_error_body=True,
-                allowed_http_error_statuses=(503,),
-            )
-
-        self.assertEqual(result, {"status": "starting"})
-
-    def test_request_json_raises_unexpected_http_error_body(self):
-        error = HTTPError(
-            "https://lb.example/health",
-            500,
-            "Internal Server Error",
-            {},
-            BytesIO(b'{"detail": "failed"}'),
-        )
-
-        with patch("update_endpoints_images.urlopen", side_effect=error):
-            with self.assertRaises(HTTPError):
-                request_json(
-                    "https://lb.example/health",
-                    token=None,
-                    timeout_s=1,
-                    allow_http_error_body=True,
-                    allowed_http_error_statuses=(503,),
-                )
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,6 @@ import os
 import sys
 import time
 from typing import Any
-from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -762,57 +761,67 @@ def wait_for_compute_endpoint_free(
 ) -> dict[str, object]:
     start = time.time()
     while True:
-        health = fetch_load_balancer_health(
+        endpoint = fetch_compute_endpoint_snapshot(
             load_balancer_url=load_balancer_url,
             token=token,
+            name=name,
             timeout_s=request_timeout_s,
         )
-        endpoint = find_compute_endpoint_snapshot(health, name)
+        if endpoint.get("draining") is not True:
+            raise RuntimeError(
+                f"Compute endpoint {name} is no longer draining; "
+                "the load balancer may have restarted. Refusing to update."
+            )
+
         active_sessions = int(endpoint.get("active_sessions", 0) or 0)
-        if active_sessions == 0:
+        require_usage_sync = bool(endpoint.get("require_usage_sync", False))
+        usage_synced = bool(endpoint.get("usage_synced", False))
+        usage_trustworthy = not require_usage_sync or usage_synced
+        if usage_trustworthy and active_sessions == 0:
             return endpoint
 
         elapsed = time.time() - start
         if timeout_s is not None and elapsed > timeout_s:
+            detail = (
+                "usage sync is not trustworthy"
+                if not usage_trustworthy
+                else f"{active_sessions} active session(s) remain"
+            )
             raise TimeoutError(
                 f"Timed out waiting for compute endpoint {name} to become free "
-                f"({active_sessions} active session(s) remain)."
+                f"({detail})."
             )
 
-        log_progress(
-            f"{name} still has {active_sessions} active session(s); "
-            f"waiting {refresh_every_s}s before checking again"
-        )
+        if not usage_trustworthy:
+            log_progress(
+                f"{name} reports zero sessions but usage sync is not trustworthy; "
+                f"waiting {refresh_every_s}s before checking again"
+            )
+        else:
+            log_progress(
+                f"{name} still has {active_sessions} active session(s); "
+                f"waiting {refresh_every_s}s before checking again"
+            )
         time.sleep(refresh_every_s)
 
 
-def find_compute_endpoint_snapshot(health: dict[str, Any], name: str) -> dict[str, object]:
-    sessions = health.get("sessions")
-    router = sessions.get("router") if isinstance(sessions, dict) else None
-    endpoints = router.get("endpoints") if isinstance(router, dict) else None
-    if not isinstance(endpoints, list):
-        raise ValueError("Load-balancer health response does not include router endpoint snapshots")
-
-    for endpoint in endpoints:
-        if isinstance(endpoint, dict) and endpoint.get("name") == name:
-            return endpoint
-
-    raise ValueError(f"Load-balancer health response does not include compute endpoint {name!r}")
-
-
-def fetch_load_balancer_health(
+def fetch_compute_endpoint_snapshot(
     *,
     load_balancer_url: str,
     token: str | None,
+    name: str,
     timeout_s: float,
-) -> dict[str, Any]:
-    return request_json(
-        f"{load_balancer_url.rstrip('/')}/health",
+) -> dict[str, object]:
+    escaped_name = quote(name, safe="")
+    payload = request_json(
+        f"{load_balancer_url.rstrip('/')}/internal/endpoints/{escaped_name}",
         token=token,
         timeout_s=timeout_s,
-        allow_http_error_body=True,
-        allowed_http_error_statuses=(503,),
     )
+    endpoint = payload.get("endpoint")
+    if not isinstance(endpoint, dict):
+        raise ValueError("Load-balancer endpoint status response does not include an endpoint snapshot")
+    return endpoint
 
 
 def set_compute_endpoint_draining(
@@ -840,8 +849,6 @@ def request_json(
     token: str | None,
     payload: dict[str, object] | None = None,
     timeout_s: float,
-    allow_http_error_body: bool = False,
-    allowed_http_error_statuses: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     headers: dict[str, str] = {}
     data = None
@@ -852,14 +859,8 @@ def request_json(
         data = json.dumps(payload).encode("utf-8")
 
     request = Request(url, data=data, headers=headers, method=method)
-    try:
-        with urlopen(request, timeout=timeout_s) as response:
-            body = response.read()
-    except HTTPError as exc:
-        body = exc.read()
-        if allow_http_error_body and exc.code in allowed_http_error_statuses and body:
-            return json.loads(body.decode("utf-8"))
-        raise
+    with urlopen(request, timeout=timeout_s) as response:
+        body = response.read()
 
     return json.loads(body.decode("utf-8"))
 
