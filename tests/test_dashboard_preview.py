@@ -133,6 +133,54 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertEqual(correct_auth.status_code, 404)
         self.assertEqual(correct_auth.json()["detail"], "Endpoint draining is not available")
 
+    def test_endpoint_status_returns_snapshot_when_health_is_unready(self):
+        module = self._import_load_balancer(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "TEST",
+                "SESSION_SHARED_SECRET": "",
+                "HF_CONTROL_TOKEN": "",
+                "HF_TOKEN": "",
+                "LB_ADMIN_AUTH_TOKEN": "admin-secret",
+            }
+        )
+
+        class UnhealthySessionManager:
+            endpoint_router = object()
+
+            async def healthcheck(self):
+                return (
+                    False,
+                    "no running endpoint has synced usage",
+                    {
+                        "router": {
+                            "endpoints": [
+                                {
+                                    "name": "reachy-s2s-01",
+                                    "active_sessions": 0,
+                                    "draining": True,
+                                    "require_usage_sync": True,
+                                    "usage_synced": False,
+                                }
+                            ]
+                        }
+                    },
+                )
+
+        module.session_manager = UnhealthySessionManager()
+        client = TestClient(module.app)
+
+        health = client.get("/health")
+        endpoint_status = client.get(
+            "/internal/endpoints/reachy-s2s-01",
+            headers={"Authorization": "Bearer admin-secret"},
+        )
+
+        self.assertEqual(health.status_code, 503)
+        self.assertEqual(endpoint_status.status_code, 200)
+        endpoint = endpoint_status.json()["endpoint"]
+        self.assertEqual(endpoint["name"], "reachy-s2s-01")
+        self.assertFalse(endpoint["usage_synced"])
+
     def _import_load_balancer(self, env):
         sys.modules.pop("app.load_balancer_main", None)
         with patch.dict(

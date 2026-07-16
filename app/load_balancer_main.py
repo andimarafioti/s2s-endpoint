@@ -342,6 +342,20 @@ async def session_event(session_id: str, payload: dict[str, Any]):
     return JSONResponse(result)
 
 
+@app.get("/internal/endpoints/{endpoint_name}")
+async def endpoint_status(endpoint_name: str, request: Request):
+    require_admin_auth(request)
+
+    endpoint_snapshot = await get_endpoint_snapshot(endpoint_name)
+    return JSONResponse(
+        {
+            "status": "ok",
+            "endpoint_name": endpoint_name,
+            "endpoint": endpoint_snapshot,
+        }
+    )
+
+
 @app.post("/internal/endpoints/{endpoint_name}/drain")
 async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str, Any]):
     require_admin_auth(request)
@@ -356,6 +370,23 @@ async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str
     except KeyError:
         raise HTTPException(status_code=404, detail="Unknown endpoint") from None
 
+    endpoint_snapshot = await get_endpoint_snapshot(endpoint_name)
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "endpoint_name": endpoint_name,
+            "draining": draining,
+            "endpoint": endpoint_snapshot,
+        }
+    )
+
+
+async def get_endpoint_snapshot(endpoint_name: str) -> dict[str, object]:
+    endpoint_router = getattr(session_manager, "endpoint_router", None)
+    if endpoint_router is None:
+        raise HTTPException(status_code=404, detail="Endpoint status is not available")
+
     _, _, snapshot = await session_manager.healthcheck()
     router_snapshot = snapshot.get("router", {})
     endpoints = router_snapshot.get("endpoints", []) if isinstance(router_snapshot, dict) else []
@@ -367,15 +398,9 @@ async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str
         ),
         None,
     )
-
-    return JSONResponse(
-        {
-            "status": "ok",
-            "endpoint_name": endpoint_name,
-            "draining": draining,
-            "endpoint": endpoint_snapshot,
-        }
-    )
+    if endpoint_snapshot is None:
+        raise HTTPException(status_code=404, detail="Unknown endpoint")
+    return endpoint_snapshot
 
 
 def require_admin_auth(request: Request) -> None:
