@@ -150,11 +150,15 @@ class FakeParallelUpdateApi:
 class FakeTransitionUpdateApi:
     def __init__(self, endpoint: FakeTransitionEndpoint):
         self.endpoint = endpoint
+        self.get_calls = 0
+        self.update_calls = 0
 
     def get_inference_endpoint(self, name: str, namespace: str | None = None):
+        self.get_calls += 1
         return self.endpoint
 
     def update_inference_endpoint(self, name: str, namespace: str | None = None, custom_image=None):
+        self.update_calls += 1
         self.endpoint.status = "updating"
         self.endpoint._image_url = custom_image["url"]
         return self.endpoint
@@ -551,6 +555,17 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         with patch("update_endpoints_images.set_compute_endpoint_draining", fake_set_draining), patch(
             "update_endpoints_images.wait_for_compute_endpoint_free",
             return_value={"name": "reachy-s2s-01", "active_sessions": 0, "draining": True},
+        ), patch(
+            "update_endpoints_images.fetch_compute_endpoint_snapshot",
+            return_value={
+                "name": "reachy-s2s-01",
+                "status": "running",
+                "running": True,
+                "active_sessions": 0,
+                "draining": True,
+                "require_usage_sync": True,
+                "usage_synced": True,
+            },
         ):
             result = update_one_draining(
                 api=api,
@@ -571,6 +586,68 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual(result["image_after"], "andito/s2s-compute:new")
         self.assertEqual(result["drain"]["active_sessions_before_update"], 0)
         self.assertTrue(result["drain"]["draining_before_update"])
+        self.assertEqual(api.get_calls, 1)
+        self.assertEqual(api.update_calls, 1)
+
+    def test_update_one_draining_rechecks_drain_immediately_before_submission(self):
+        tracker = ParallelTracker()
+        endpoint = FakeTransitionEndpoint(
+            "reachy-s2s-01",
+            "andito/s2s-compute:old",
+            tracker,
+            status="running",
+            fetch_statuses=[],
+        )
+        api = FakeTransitionUpdateApi(endpoint)
+        drain_calls: list[bool] = []
+
+        def fake_set_draining(**kwargs):
+            drain_calls.append(kwargs["draining"])
+            return {"status": "ok"}
+
+        def fetch_after_endpoint_read(**kwargs):
+            self.assertEqual(api.get_calls, 1)
+            self.assertEqual(api.update_calls, 0)
+            return {
+                "name": "reachy-s2s-01",
+                "status": "running",
+                "running": True,
+                "active_sessions": 0,
+                "draining": False,
+                "require_usage_sync": True,
+                "usage_synced": True,
+            }
+
+        with patch(
+            "update_endpoints_images.set_compute_endpoint_draining",
+            side_effect=fake_set_draining,
+        ), patch(
+            "update_endpoints_images.wait_for_compute_endpoint_free",
+            return_value={"name": "reachy-s2s-01", "active_sessions": 0, "draining": True},
+        ), patch(
+            "update_endpoints_images.fetch_compute_endpoint_snapshot",
+            side_effect=fetch_after_endpoint_read,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no longer draining"):
+                update_one_draining(
+                    api=api,
+                    namespace="HuggingFaceM4",
+                    name="reachy-s2s-01",
+                    image_url="andito/s2s-compute:new",
+                    load_balancer_url="https://lb.example",
+                    token="token",
+                    wait=True,
+                    wait_timeout_s=60,
+                    wait_refresh_every_s=1,
+                    drain_timeout_s=60,
+                    drain_refresh_every_s=5,
+                    request_timeout_s=1,
+                )
+
+        self.assertEqual(drain_calls, [True, False])
+        self.assertEqual(api.get_calls, 1)
+        self.assertEqual(api.update_calls, 0)
+        self.assertEqual(endpoint._image_url, "andito/s2s-compute:old")
 
     def test_update_one_draining_clears_drain_after_lost_initial_response(self):
         tracker = ParallelTracker()

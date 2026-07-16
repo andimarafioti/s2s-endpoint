@@ -490,11 +490,13 @@ uv run --with-requirements requirements.txt python scripts/update_endpoints_imag
 ```
 
 Drain mode asks the load balancer to stop assigning new sessions to one compute
-endpoint, waits until that endpoint has trustworthy synced usage and zero active
-sessions, updates the image, and then makes the endpoint available again. The
-dedicated admin token must match `LB_ADMIN_AUTH_TOKEN` on the deployed load
-balancer. Drain mode aborts rather than updating if the LB loses the drain state,
-for example after an LB restart.
+endpoint, then waits until it is either parked with zero active sessions or
+running with trustworthy synced usage and zero active sessions. It rechecks that
+state immediately before submitting the image update, then makes the endpoint
+available again after the update. The dedicated admin token must match
+`LB_ADMIN_AUTH_TOKEN` on the deployed load balancer. This recheck narrows the
+restart race, but the drain remains in-memory; a persistent server-side drain
+lease or TTL is still needed to eliminate the race entirely.
 
 Behavior:
 
@@ -508,8 +510,9 @@ Behavior:
   `-01`, `-02`, ... until the first missing endpoint
 - compute endpoint updates now run in parallel by default; use `--compute-parallelism 1` if you want the old sequential rollout behavior
 - with `--compute-drain`, compute endpoint updates run one at a time by default
-  and only after the load balancer reports a still-active drain, trustworthy
-  usage sync, and zero active sessions for that endpoint
+  and only after the load balancer reports a still-active drain and either a
+  parked endpoint with zero sessions or a running endpoint with trustworthy
+  usage sync and zero active sessions
 - `--compute-drain` requires waiting for the endpoint update to finish and cannot
   be combined with `--no-wait`
 - with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately

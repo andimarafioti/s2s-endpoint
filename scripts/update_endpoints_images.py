@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import json
 import os
@@ -601,6 +602,7 @@ def update_one(
     wait_timeout_s: int,
     wait_refresh_every_s: int,
     dry_run: bool,
+    pre_update_check: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     endpoint = api.get_inference_endpoint(name, namespace=namespace)
     status_before = str(endpoint.status)
@@ -640,6 +642,8 @@ def update_one(
             f"Waiting for {name} to finish updating "
             f"and return to {target_status} (timeout {wait_timeout_s}s, poll every {wait_refresh_every_s}s)"
         )
+    if pre_update_check is not None:
+        pre_update_check()
     endpoint = api.update_inference_endpoint(
         name,
         namespace=namespace,
@@ -672,7 +676,24 @@ def update_one_draining(
     request_timeout_s: float,
 ) -> dict[str, object]:
     result: dict[str, object] | None = None
+    pre_update_snapshot: dict[str, object] | None = None
     drain_attempted = False
+
+    def recheck_drain_before_update() -> None:
+        nonlocal pre_update_snapshot
+        pre_update_snapshot = fetch_compute_endpoint_snapshot(
+            load_balancer_url=load_balancer_url,
+            token=token,
+            name=name,
+            timeout_s=request_timeout_s,
+        )
+        ready, detail = compute_endpoint_ready_for_update(pre_update_snapshot, name=name)
+        if not ready:
+            raise RuntimeError(
+                f"Compute endpoint {name} is no longer safe to update immediately "
+                f"before submission ({detail}). Refusing to update."
+            )
+
     try:
         drain_attempted = True
         set_compute_endpoint_draining(
@@ -700,17 +721,21 @@ def update_one_draining(
             wait_timeout_s=wait_timeout_s,
             wait_refresh_every_s=wait_refresh_every_s,
             dry_run=False,
+            pre_update_check=recheck_drain_before_update,
         )
+        final_drain_snapshot = pre_update_snapshot or drain_snapshot
         result["drain"] = {
             "load_balancer_url": load_balancer_url,
-            "active_sessions_before_update": int(drain_snapshot.get("active_sessions", 0) or 0),
-            "draining_before_update": bool(drain_snapshot.get("draining", False)),
+            "active_sessions_before_update": int(
+                final_drain_snapshot.get("active_sessions", 0) or 0
+            ),
+            "draining_before_update": bool(final_drain_snapshot.get("draining", False)),
         }
         return result
     finally:
         if drain_attempted:
-            # With wait=False this reopens the endpoint immediately after submitting
-            # the update; use wait=True when it must stay drained until healthy.
+            # CLI drain rollouts wait for the update to reach its target state
+            # before reopening the endpoint.
             try:
                 set_compute_endpoint_draining(
                     load_balancer_url=load_balancer_url,
