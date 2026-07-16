@@ -6,9 +6,12 @@ from unittest.mock import patch
 
 from app.endpoint_pool_router import (
     ComputeUsageSchemaError,
+    EndpointDrainLeaseConflictError,
     EndpointPoolRouter,
     EndpointSnapshot,
+    EndpointTransitionConflictError,
     ManagedEndpoint,
+    drain_lease_owner_fingerprint,
     _to_health_url,
     _to_ws_url,
     fetch_compute_active_sessions,
@@ -229,7 +232,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await self.router.start()
-        await self.router.set_draining("endpoint-a", True)
+        await self.router.set_draining("endpoint-a", True, lease_id="rollout-a")
 
         lease = await self.router.acquire(timeout_s=0.2)
         snapshot = await self.router.snapshot()
@@ -238,6 +241,259 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lease.endpoint_name, "endpoint-b")
         self.assertTrue(endpoint_a["draining"])
         self.assertEqual(endpoint_a["free_slots"], 0)
+
+    async def test_set_draining_rejects_existing_drain_restart(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        await self.router.start()
+        async with self.router._condition:
+            self.router._endpoints["endpoint-a"].drain_restarting = True
+
+        with self.assertRaisesRegex(EndpointTransitionConflictError, "drain_restarting"):
+            await self.router.set_draining("endpoint-a", True, lease_id="rollout-a")
+
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["draining"])
+
+    async def test_set_draining_rejects_existing_parking_transition(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        await self.router.start()
+        async with self.router._condition:
+            self.router._endpoints["endpoint-a"].parking = True
+
+        with self.assertRaisesRegex(EndpointTransitionConflictError, "parking"):
+            await self.router.set_draining("endpoint-a", True, lease_id="rollout-a")
+
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["draining"])
+
+    async def test_drain_lease_owner_fences_other_rollout_clients(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        await self.router.start()
+
+        await self.router.set_draining(
+            "endpoint-a",
+            True,
+            lease_ttl_s=60,
+            lease_id="rollout-a-secret",
+        )
+        await self.router.set_draining(
+            "endpoint-a",
+            True,
+            lease_ttl_s=120,
+            lease_id="rollout-a-secret",
+        )
+
+        with self.assertRaisesRegex(EndpointDrainLeaseConflictError, "another rollout"):
+            await self.router.set_draining(
+                "endpoint-a",
+                True,
+                lease_ttl_s=120,
+                lease_id="rollout-b-secret",
+            )
+        with self.assertRaisesRegex(EndpointDrainLeaseConflictError, "another rollout"):
+            await self.router.set_draining(
+                "endpoint-a",
+                False,
+                lease_id="rollout-b-secret",
+            )
+
+        snapshot = await self.router.snapshot()
+        endpoint = snapshot["endpoints"][0]
+        self.assertTrue(endpoint["draining"])
+        self.assertEqual(
+            endpoint["drain_lease_owner"],
+            drain_lease_owner_fingerprint("rollout-a-secret"),
+        )
+        self.assertNotIn("rollout-a-secret", str(endpoint))
+
+        await self.router.set_draining(
+            "endpoint-a",
+            False,
+            lease_id="rollout-a-secret",
+        )
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["draining"])
+
+    async def test_drain_requires_usage_request_started_after_acquisition(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", endpoint_url)]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=lambda url: 0,
+        )
+        await self.router.start()
+
+        async def acquire_drain_after_request_started(function, *args):
+            await self.router.set_draining("endpoint-a", True, lease_id="rollout-a")
+            return function(*args)
+
+        # _sync_compute_usage captures the current drain generation before it
+        # starts the request. Acquiring the drain while that request is in
+        # flight must leave its result ineligible for rollout safety.
+        with patch(
+            "app.endpoint_pool_router.asyncio.to_thread",
+            new=acquire_drain_after_request_started,
+        ):
+            await self.router._sync_compute_usage()
+
+        snapshot = await self.router.snapshot()
+        endpoint = snapshot["endpoints"][0]
+        self.assertTrue(endpoint["usage_synced"])
+        self.assertFalse(endpoint["usage_synced_after_drain"])
+
+        await self.router._sync_compute_usage()
+        snapshot = await self.router.snapshot()
+        self.assertTrue(snapshot["endpoints"][0]["usage_synced_after_drain"])
+
+        # Retrying an idempotent drain request after a lost response must not
+        # reset the generation and force another usage synchronization.
+        async with self.router._condition:
+            managed_endpoint = self.router._endpoints["endpoint-a"]
+            drain_generation = managed_endpoint.drain_generation
+            draining_since = managed_endpoint.draining_since
+            managed_endpoint.drain_expires_at = time.monotonic() + 1
+            previous_expiry = managed_endpoint.drain_expires_at
+        await self.router.set_draining(
+            "endpoint-a",
+            True,
+            lease_ttl_s=60,
+            lease_id="rollout-a",
+        )
+        snapshot = await self.router.snapshot()
+        self.assertTrue(snapshot["endpoints"][0]["usage_synced_after_drain"])
+        async with self.router._condition:
+            managed_endpoint = self.router._endpoints["endpoint-a"]
+            self.assertEqual(managed_endpoint.drain_generation, drain_generation)
+            self.assertEqual(managed_endpoint.draining_since, draining_since)
+            self.assertGreater(managed_endpoint.drain_expires_at, previous_expiry)
+
+        await self.router.set_draining("endpoint-a", False, lease_id="rollout-a")
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["usage_synced_after_drain"])
+        self.assertIsNone(snapshot["endpoints"][0]["drain_lease_remaining_s"])
+
+    async def test_expired_drain_lease_clears_automatically(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        await self.router.start()
+        await self.router.set_draining(
+            "endpoint-a",
+            True,
+            lease_ttl_s=60,
+            lease_id="rollout-a",
+        )
+        async with self.router._condition:
+            endpoint = self.router._endpoints["endpoint-a"]
+            endpoint.draining_since = time.monotonic() - 120
+            endpoint.drain_expires_at = time.monotonic() - 1
+
+        with self.assertLogs("s2s-endpoint", level="ERROR") as logs:
+            await self.router._maintain_drain_leases()
+
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["draining"])
+        self.assertTrue(any("lease expired" in line for line in logs.output))
+
+    async def test_long_running_drain_logs_recurring_warning(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            drain_warning_after_s=60,
+            drain_warning_interval_s=300,
+        )
+        await self.router.start()
+        await self.router.set_draining(
+            "endpoint-a",
+            True,
+            lease_ttl_s=3600,
+            lease_id="rollout-a",
+        )
+        async with self.router._condition:
+            endpoint = self.router._endpoints["endpoint-a"]
+            endpoint.draining_since = time.monotonic() - 120
+
+        with self.assertLogs("s2s-endpoint", level="WARNING") as first_warning:
+            await self.router._maintain_drain_leases()
+        self.assertTrue(any("allocator-drained" in line for line in first_warning.output))
+
+        async with self.router._condition:
+            self.router._endpoints["endpoint-a"].last_drain_warning_at = (
+                time.monotonic() - 301
+            )
+        with self.assertLogs("s2s-endpoint", level="WARNING") as recurring_warning:
+            await self.router._maintain_drain_leases()
+        self.assertTrue(any("allocator-drained" in line for line in recurring_warning.output))
 
     async def test_acquire_marks_lease_when_it_waited_for_capacity(self):
         controller = FakeEndpointController(
@@ -1306,6 +1562,50 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
             self.router._endpoints["endpoint-a"].drain_restarting = True
 
         await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(controller.force_restart_calls, [])
+
+    async def test_drain_restart_skips_allocator_draining_endpoint(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=0,
+        )
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "draining", "draining_for_s": 999}
+        ]
+
+        await self.router.start()
+        await self.router.set_draining("endpoint-a", True, lease_id="rollout-a")
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(controller.force_restart_calls, [])
+
+    async def test_drain_restart_rechecks_allocator_drain_after_pool_poll(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=0,
+        )
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "draining", "draining_for_s": 999}
+        ]
+        await self.router.start()
+
+        async def mark_draining_during_poll(function, *args):
+            await self.router.set_draining("endpoint-a", True, lease_id="rollout-a")
+            return function(*args)
+
+        with patch("app.endpoint_pool_router.asyncio.to_thread", new=mark_draining_during_poll):
+            await self.router._check_drain_restarts()
         await asyncio.sleep(0.05)
 
         self.assertEqual(controller.force_restart_calls, [])
