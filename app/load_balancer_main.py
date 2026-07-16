@@ -14,6 +14,7 @@ from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import (
     EndpointCapacityTimeoutError,
     EndpointPoolRouter,
+    EndpointTransitionConflictError,
     HuggingFaceEndpointController,
     fetch_compute_active_sessions,
 )
@@ -370,6 +371,8 @@ async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str
         await endpoint_router.set_draining(endpoint_name, draining)
     except KeyError:
         raise HTTPException(status_code=503, detail="Endpoint became unavailable") from None
+    except EndpointTransitionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     endpoint_snapshot = {**endpoint_snapshot, "draining": draining}
 
     return JSONResponse(

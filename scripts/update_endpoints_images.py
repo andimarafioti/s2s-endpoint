@@ -853,7 +853,14 @@ def compute_endpoint_ready_for_update(
     snapshot fields or a lost allocator drain raise instead of being interpreted
     optimistically.
     """
-    boolean_fields = ("draining", "running", "require_usage_sync", "usage_synced")
+    transition_fields = ("waking", "parking", "restarting", "drain_restarting")
+    boolean_fields = (
+        "draining",
+        "running",
+        "require_usage_sync",
+        "usage_synced",
+        *transition_fields,
+    )
     for field in boolean_fields:
         if type(endpoint.get(field)) is not bool:
             raise ValueError(
@@ -878,6 +885,13 @@ def compute_endpoint_ready_for_update(
         raise RuntimeError(
             f"Compute endpoint {name} is no longer draining; "
             "the load balancer may have restarted. Refusing to update."
+        )
+
+    active_transitions = [field for field in transition_fields if endpoint[field] is True]
+    if active_transitions:
+        raise RuntimeError(
+            f"Compute endpoint {name} has an active control-plane transition: "
+            f"{', '.join(active_transitions)}. Refusing to update."
         )
 
     status = str(endpoint.get("status", ""))

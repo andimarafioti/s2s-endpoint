@@ -8,6 +8,7 @@ from app.endpoint_pool_router import (
     ComputeUsageSchemaError,
     EndpointPoolRouter,
     EndpointSnapshot,
+    EndpointTransitionConflictError,
     ManagedEndpoint,
     _to_health_url,
     _to_ws_url,
@@ -238,6 +239,56 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lease.endpoint_name, "endpoint-b")
         self.assertTrue(endpoint_a["draining"])
         self.assertEqual(endpoint_a["free_slots"], 0)
+
+    async def test_set_draining_rejects_existing_drain_restart(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        await self.router.start()
+        async with self.router._condition:
+            self.router._endpoints["endpoint-a"].drain_restarting = True
+
+        with self.assertRaisesRegex(EndpointTransitionConflictError, "drain_restarting"):
+            await self.router.set_draining("endpoint-a", True)
+
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["draining"])
+
+    async def test_set_draining_rejects_existing_parking_transition(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        await self.router.start()
+        async with self.router._condition:
+            self.router._endpoints["endpoint-a"].parking = True
+
+        with self.assertRaisesRegex(EndpointTransitionConflictError, "parking"):
+            await self.router.set_draining("endpoint-a", True)
+
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["draining"])
 
     async def test_acquire_marks_lease_when_it_waited_for_capacity(self):
         controller = FakeEndpointController(

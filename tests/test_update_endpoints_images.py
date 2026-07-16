@@ -180,6 +180,23 @@ class FakeHealthRouteUpdateApi:
         return self.endpoint
 
 
+def drain_snapshot(**overrides):
+    snapshot = {
+        "name": "reachy-s2s-01",
+        "status": "running",
+        "running": True,
+        "waking": False,
+        "parking": False,
+        "restarting": False,
+        "drain_restarting": False,
+        "active_sessions": 0,
+        "draining": True,
+        "require_usage_sync": True,
+        "usage_synced": True,
+    }
+    return {**snapshot, **overrides}
+
+
 class UpdateEndpointImagesTests(unittest.TestCase):
     def test_main_requires_dedicated_admin_token_for_compute_drain(self):
         argv = [
@@ -363,24 +380,8 @@ class UpdateEndpointImagesTests(unittest.TestCase):
 
     def test_wait_for_compute_endpoint_free_polls_until_zero_active_sessions(self):
         endpoint_snapshots = [
-            {
-                "name": "reachy-s2s-01",
-                "status": "running",
-                "running": True,
-                "active_sessions": 1,
-                "draining": True,
-                "require_usage_sync": True,
-                "usage_synced": True,
-            },
-            {
-                "name": "reachy-s2s-01",
-                "status": "running",
-                "running": True,
-                "active_sessions": 0,
-                "draining": True,
-                "require_usage_sync": True,
-                "usage_synced": True,
-            },
+            drain_snapshot(active_sessions=1),
+            drain_snapshot(active_sessions=0),
         ]
 
         with patch(
@@ -407,15 +408,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             None,
             None,
         )
-        ready_endpoint = {
-            "name": "reachy-s2s-01",
-            "status": "running",
-            "running": True,
-            "active_sessions": 0,
-            "draining": True,
-            "require_usage_sync": True,
-            "usage_synced": True,
-        }
+        ready_endpoint = drain_snapshot()
 
         with patch(
             "update_endpoints_images.fetch_compute_endpoint_snapshot",
@@ -434,43 +427,42 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         sleep.assert_called_once_with(1.0)
 
     def test_wait_for_compute_endpoint_free_does_not_retry_fatal_status_failure(self):
-        auth_error = HTTPError(
-            "https://lb.example/internal/endpoints/reachy-s2s-01",
-            403,
-            "Forbidden",
-            None,
-            None,
-        )
-
-        with patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            side_effect=auth_error,
-        ), patch("update_endpoints_images.time.sleep") as sleep:
-            with self.assertRaises(HTTPError):
-                wait_for_compute_endpoint_free(
-                    load_balancer_url="https://lb.example",
-                    token="token",
-                    name="reachy-s2s-01",
-                    timeout_s=60,
-                    refresh_every_s=5,
-                    request_timeout_s=1,
+        for status_code in (401, 403, 404, 409):
+            with self.subTest(status_code=status_code):
+                fatal_error = HTTPError(
+                    "https://lb.example/internal/endpoints/reachy-s2s-01",
+                    status_code,
+                    "Fatal status",
+                    None,
+                    None,
                 )
 
-        sleep.assert_not_called()
+                with patch(
+                    "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                    side_effect=fatal_error,
+                ), patch("update_endpoints_images.time.sleep") as sleep:
+                    with self.assertRaises(HTTPError):
+                        wait_for_compute_endpoint_free(
+                            load_balancer_url="https://lb.example",
+                            token="token",
+                            name="reachy-s2s-01",
+                            timeout_s=60,
+                            refresh_every_s=5,
+                            request_timeout_s=1,
+                        )
+
+                sleep.assert_not_called()
 
     def test_wait_for_compute_endpoint_free_accepts_parked_unsynced_endpoint(self):
         for status in ("paused", "scaledToZero"):
             with self.subTest(status=status), patch(
                 "update_endpoints_images.fetch_compute_endpoint_snapshot",
-                return_value={
-                    "name": "reachy-s2s-01",
-                    "status": status,
-                    "running": False,
-                    "draining": True,
-                    "active_sessions": 0,
-                    "require_usage_sync": True,
-                    "usage_synced": False,
-                },
+                return_value=drain_snapshot(
+                    status=status,
+                    running=False,
+                    require_usage_sync=True,
+                    usage_synced=False,
+                ),
             ), patch("update_endpoints_images.time.sleep") as sleep:
                 endpoint = wait_for_compute_endpoint_free(
                     load_balancer_url="https://lb.example",
@@ -486,15 +478,12 @@ class UpdateEndpointImagesTests(unittest.TestCase):
 
     def test_compute_endpoint_ready_accepts_parked_endpoint_without_usage_sync(self):
         ready, detail = compute_endpoint_ready_for_update(
-            {
-                "name": "reachy-s2s-01",
-                "status": "paused",
-                "running": False,
-                "draining": True,
-                "active_sessions": 0,
-                "require_usage_sync": False,
-                "usage_synced": False,
-            },
+            drain_snapshot(
+                status="paused",
+                running=False,
+                require_usage_sync=False,
+                usage_synced=False,
+            ),
             name="reachy-s2s-01",
         )
 
@@ -502,17 +491,18 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertIn("parked", detail)
 
     def test_compute_endpoint_ready_rejects_invalid_boolean_fields(self):
-        valid_endpoint = {
-            "name": "reachy-s2s-01",
-            "status": "running",
-            "running": True,
-            "draining": True,
-            "active_sessions": 0,
-            "require_usage_sync": True,
-            "usage_synced": True,
-        }
+        valid_endpoint = drain_snapshot()
 
-        for field in ("draining", "running", "require_usage_sync", "usage_synced"):
+        for field in (
+            "draining",
+            "running",
+            "require_usage_sync",
+            "usage_synced",
+            "waking",
+            "parking",
+            "restarting",
+            "drain_restarting",
+        ):
             for value in (None, "false", 1):
                 with self.subTest(field=field, value=value):
                     endpoint = {**valid_endpoint, field: value}
@@ -522,15 +512,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                         compute_endpoint_ready_for_update(endpoint, name="reachy-s2s-01")
 
     def test_compute_endpoint_ready_rejects_invalid_active_session_counts(self):
-        valid_endpoint = {
-            "name": "reachy-s2s-01",
-            "status": "running",
-            "running": True,
-            "draining": True,
-            "active_sessions": 0,
-            "require_usage_sync": True,
-            "usage_synced": True,
-        }
+        valid_endpoint = drain_snapshot()
 
         invalid_counts = (None, -1, True, "0")
         for value in invalid_counts:
@@ -544,28 +526,25 @@ class UpdateEndpointImagesTests(unittest.TestCase):
     def test_compute_endpoint_ready_rejects_running_without_required_usage_sync(self):
         with self.assertRaisesRegex(RuntimeError, "does not require usage sync"):
             compute_endpoint_ready_for_update(
-                {
-                    "name": "reachy-s2s-01",
-                    "status": "running",
-                    "running": True,
-                    "draining": True,
-                    "active_sessions": 0,
-                    "require_usage_sync": False,
-                    "usage_synced": False,
-                },
+                drain_snapshot(require_usage_sync=False, usage_synced=False),
                 name="reachy-s2s-01",
             )
 
+    def test_compute_endpoint_ready_rejects_active_control_plane_transition(self):
+        for field in ("waking", "parking", "restarting", "drain_restarting"):
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, field):
+                compute_endpoint_ready_for_update(
+                    drain_snapshot(**{field: True}),
+                    name="reachy-s2s-01",
+                )
+
     def test_wait_for_compute_endpoint_free_waits_for_stale_parked_sessions_to_clear(self):
-        parked_with_stale_session = {
-            "name": "reachy-s2s-01",
-            "status": "paused",
-            "running": False,
-            "draining": True,
-            "active_sessions": 1,
-            "require_usage_sync": True,
-            "usage_synced": False,
-        }
+        parked_with_stale_session = drain_snapshot(
+            status="paused",
+            running=False,
+            active_sessions=1,
+            usage_synced=False,
+        )
         parked_and_clear = {**parked_with_stale_session, "active_sessions": 0}
 
         with patch(
@@ -610,15 +589,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         )
 
     def test_wait_for_compute_endpoint_free_rejects_lost_drain_state(self):
-        endpoint = {
-            "name": "reachy-s2s-01",
-            "status": "running",
-            "running": True,
-            "active_sessions": 0,
-            "draining": False,
-            "require_usage_sync": True,
-            "usage_synced": True,
-        }
+        endpoint = drain_snapshot(draining=False)
 
         with patch(
             "update_endpoints_images.fetch_compute_endpoint_snapshot",
@@ -638,24 +609,8 @@ class UpdateEndpointImagesTests(unittest.TestCase):
 
     def test_wait_for_compute_endpoint_free_requires_trustworthy_usage_sync(self):
         endpoint_snapshots = [
-            {
-                "name": "reachy-s2s-01",
-                "status": "running",
-                "running": True,
-                "active_sessions": 0,
-                "draining": True,
-                "require_usage_sync": True,
-                "usage_synced": False,
-            },
-            {
-                "name": "reachy-s2s-01",
-                "status": "running",
-                "running": True,
-                "active_sessions": 0,
-                "draining": True,
-                "require_usage_sync": True,
-                "usage_synced": True,
-            },
+            drain_snapshot(usage_synced=False),
+            drain_snapshot(usage_synced=True),
         ]
 
         with patch(
@@ -695,15 +650,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             return_value={"name": "reachy-s2s-01", "active_sessions": 0, "draining": True},
         ), patch(
             "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            return_value={
-                "name": "reachy-s2s-01",
-                "status": "running",
-                "running": True,
-                "active_sessions": 0,
-                "draining": True,
-                "require_usage_sync": True,
-                "usage_synced": True,
-            },
+            return_value=drain_snapshot(),
         ):
             result = update_one_draining(
                 api=api,
@@ -746,15 +693,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         def fetch_after_endpoint_read(**kwargs):
             self.assertEqual(api.get_calls, 1)
             self.assertEqual(api.update_calls, 0)
-            return {
-                "name": "reachy-s2s-01",
-                "status": "running",
-                "running": True,
-                "active_sessions": 0,
-                "draining": False,
-                "require_usage_sync": True,
-                "usage_synced": True,
-            }
+            return drain_snapshot(draining=False)
 
         with patch(
             "update_endpoints_images.set_compute_endpoint_draining",
@@ -855,15 +794,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             raise TimeoutError("update response was lost")
 
         api.update_inference_endpoint = accepted_but_response_lost
-        ready_endpoint = {
-            "name": "reachy-s2s-01",
-            "status": "running",
-            "running": True,
-            "active_sessions": 0,
-            "draining": True,
-            "require_usage_sync": True,
-            "usage_synced": True,
-        }
+        ready_endpoint = drain_snapshot()
 
         with patch(
             "update_endpoints_images.set_compute_endpoint_draining",
@@ -918,15 +849,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             raise TimeoutError("update completion was not confirmed")
 
         endpoint.wait = failed_wait
-        ready_endpoint = {
-            "name": "reachy-s2s-01",
-            "status": "running",
-            "running": True,
-            "active_sessions": 0,
-            "draining": True,
-            "require_usage_sync": True,
-            "usage_synced": True,
-        }
+        ready_endpoint = drain_snapshot()
 
         with patch(
             "update_endpoints_images.set_compute_endpoint_draining",
@@ -982,15 +905,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 raise URLError("temporary proxy failure")
             return {"status": "ok"}
 
-        ready_endpoint = {
-            "name": "reachy-s2s-01",
-            "status": "running",
-            "running": True,
-            "active_sessions": 0,
-            "draining": True,
-            "require_usage_sync": True,
-            "usage_synced": True,
-        }
+        ready_endpoint = drain_snapshot()
         with patch(
             "update_endpoints_images.set_compute_endpoint_draining",
             side_effect=fake_set_draining,

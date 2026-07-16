@@ -19,6 +19,10 @@ class EndpointCapacityTimeoutError(RuntimeError):
     pass
 
 
+class EndpointTransitionConflictError(RuntimeError):
+    pass
+
+
 def _normalize_status(status: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(status).lower())
 
@@ -505,6 +509,18 @@ class EndpointPoolRouter:
             endpoint = self._endpoints.get(name)
             if endpoint is None:
                 raise KeyError(name)
+
+            if draining:
+                active_transitions = [
+                    flag
+                    for flag in ("waking", "parking", "restarting", "drain_restarting")
+                    if getattr(endpoint, flag)
+                ]
+                if active_transitions:
+                    raise EndpointTransitionConflictError(
+                        f"Endpoint {name} has an active control-plane transition: "
+                        f"{', '.join(active_transitions)}"
+                    )
 
             endpoint.draining = draining
             if draining:

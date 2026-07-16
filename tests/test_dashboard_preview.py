@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
-from app.endpoint_pool_router import EndpointCapacityTimeoutError
+from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointTransitionConflictError
 from app.swarm_dashboard import SwarmHistoryBucket
 from tests.helpers import monotonic_sequence
 
@@ -178,6 +178,51 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["detail"], "Unknown endpoint")
         self.assertEqual(session_manager.endpoint_router.calls, [])
+
+    def test_drain_route_reports_transition_conflict(self):
+        module = self._import_load_balancer(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "TEST",
+                "SESSION_SHARED_SECRET": "",
+                "HF_CONTROL_TOKEN": "",
+                "HF_TOKEN": "",
+                "LB_ADMIN_AUTH_TOKEN": "admin-secret",
+            }
+        )
+
+        class ConflictingRouter:
+            async def set_draining(self, endpoint_name, draining):
+                raise EndpointTransitionConflictError(
+                    f"Endpoint {endpoint_name} has an active control-plane transition: parking"
+                )
+
+        class ConflictingSessionManager:
+            endpoint_router = ConflictingRouter()
+
+            async def healthcheck(self):
+                return True, None, {
+                    "router": {
+                        "endpoints": [
+                            {
+                                "name": "reachy-s2s-01",
+                                "status": "running",
+                                "draining": False,
+                            }
+                        ]
+                    }
+                }
+
+        module.session_manager = ConflictingSessionManager()
+        client = TestClient(module.app)
+
+        response = client.post(
+            "/internal/endpoints/reachy-s2s-01/drain",
+            headers={"Authorization": "Bearer admin-secret"},
+            json={"draining": True},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("parking", response.json()["detail"])
 
     def test_endpoint_status_returns_snapshot_when_health_is_unready(self):
         module = self._import_load_balancer(
