@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -21,6 +22,14 @@ class EndpointCapacityTimeoutError(RuntimeError):
 
 class EndpointTransitionConflictError(RuntimeError):
     pass
+
+
+class EndpointDrainLeaseConflictError(RuntimeError):
+    pass
+
+
+def drain_lease_owner_fingerprint(lease_id: str) -> str:
+    return hashlib.sha256(lease_id.encode("utf-8")).hexdigest()
 
 
 def _normalize_status(status: object) -> str:
@@ -274,6 +283,7 @@ class ManagedEndpoint:
     usage_sync_drain_generation: Optional[int] = None
     draining_since: Optional[float] = None
     drain_expires_at: Optional[float] = None
+    drain_lease_id: Optional[str] = None
     last_drain_warning_at: Optional[float] = None
     last_sync_failure_log_at: Optional[float] = None
 
@@ -533,15 +543,26 @@ class EndpointPoolRouter:
         draining: bool,
         *,
         lease_ttl_s: Optional[float] = None,
+        lease_id: Optional[str] = None,
+        force: bool = False,
     ) -> None:
         if draining and lease_ttl_s is not None and lease_ttl_s <= 0:
             raise ValueError("lease_ttl_s must be > 0")
+        if draining and force:
+            raise ValueError("force is only valid when clearing a drain")
+        if not force and not lease_id:
+            raise ValueError("lease_id is required unless force-clearing a drain")
 
         wake_names: list[str] = []
         async with self._condition:
             endpoint = self._endpoints.get(name)
             if endpoint is None:
                 raise KeyError(name)
+
+            if endpoint.draining and not force and endpoint.drain_lease_id != lease_id:
+                raise EndpointDrainLeaseConflictError(
+                    f"Endpoint {name} has an active drain lease owned by another rollout"
+                )
 
             if draining:
                 active_transitions = [
@@ -561,6 +582,7 @@ class EndpointPoolRouter:
                     endpoint.drain_generation += 1
                     endpoint.draining_since = now
                     endpoint.last_drain_warning_at = None
+                    endpoint.drain_lease_id = lease_id
                 endpoint.draining = True
                 endpoint.drain_expires_at = now + (
                     lease_ttl_s if lease_ttl_s is not None else self.drain_lease_ttl_s
@@ -569,6 +591,7 @@ class EndpointPoolRouter:
                 endpoint.draining = False
                 endpoint.draining_since = None
                 endpoint.drain_expires_at = None
+                endpoint.drain_lease_id = None
                 endpoint.last_drain_warning_at = None
             if draining:
                 deficit = self.min_warm_endpoints - self._running_or_waking_count_unlocked()
@@ -679,6 +702,11 @@ class EndpointPoolRouter:
                     "drain_lease_remaining_s": (
                         max(endpoint.drain_expires_at - now, 0.0)
                         if endpoint.draining and endpoint.drain_expires_at is not None
+                        else None
+                    ),
+                    "drain_lease_owner": (
+                        drain_lease_owner_fingerprint(endpoint.drain_lease_id)
+                        if endpoint.draining and endpoint.drain_lease_id is not None
                         else None
                     ),
                     "drain_restarting": endpoint.drain_restarting,
@@ -997,6 +1025,7 @@ class EndpointPoolRouter:
                     endpoint.draining = False
                     endpoint.draining_since = None
                     endpoint.drain_expires_at = None
+                    endpoint.drain_lease_id = None
                     endpoint.last_drain_warning_at = None
                     expired.append((endpoint.name, draining_for_s))
                     continue

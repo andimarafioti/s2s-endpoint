@@ -2,8 +2,10 @@
 import argparse
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import os
+import secrets
 import sys
 import time
 from typing import Any, TypeVar
@@ -721,6 +723,8 @@ def update_one_draining(
     result: dict[str, object] | None = None
     pre_update_snapshot: dict[str, object] | None = None
     update_submission_state = "not_started"
+    lease_id = secrets.token_urlsafe(32)
+    expected_lease_owner = drain_lease_owner_fingerprint(lease_id)
     drain_lease_ttl_s = max(
         DRAIN_LEASE_MIN_TTL_S,
         float(wait_timeout_s) + DRAIN_LEASE_SAFETY_MARGIN_S,
@@ -735,6 +739,7 @@ def update_one_draining(
             draining=True,
             timeout_s=request_timeout_s,
             lease_ttl_s=drain_lease_ttl_s,
+            lease_id=lease_id,
         )
 
     def recheck_drain_before_update() -> None:
@@ -749,7 +754,11 @@ def update_one_draining(
             ),
             description=f"fetch endpoint status for {name} before update",
         )
-        ready, detail = compute_endpoint_ready_for_update(pre_update_snapshot, name=name)
+        ready, detail = compute_endpoint_ready_for_update(
+            pre_update_snapshot,
+            name=name,
+            expected_lease_owner=expected_lease_owner,
+        )
         if not ready:
             raise RuntimeError(
                 f"Compute endpoint {name} is no longer safe to update immediately "
@@ -779,6 +788,7 @@ def update_one_draining(
             refresh_every_s=drain_refresh_every_s,
             request_timeout_s=request_timeout_s,
             renew_drain=renew_drain,
+            expected_lease_owner=expected_lease_owner,
         )
         result = update_one(
             api=api,
@@ -822,6 +832,7 @@ def update_one_draining(
                     name=name,
                     draining=False,
                     timeout_s=request_timeout_s,
+                    lease_id=lease_id,
                 )
             except Exception as exc:
                 log_progress(f"Failed to clear drain on {name}: {exc}")
@@ -882,6 +893,7 @@ def wait_for_compute_endpoint_free(
     timeout_s: int,
     refresh_every_s: int,
     request_timeout_s: float,
+    expected_lease_owner: str,
     renew_drain: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     start = time.time()
@@ -897,7 +909,11 @@ def wait_for_compute_endpoint_free(
             ),
             description=f"fetch endpoint status for {name}",
         )
-        ready, detail = compute_endpoint_ready_for_update(endpoint, name=name)
+        ready, detail = compute_endpoint_ready_for_update(
+            endpoint,
+            name=name,
+            expected_lease_owner=expected_lease_owner,
+        )
         if ready:
             return endpoint
 
@@ -919,6 +935,7 @@ def compute_endpoint_ready_for_update(
     endpoint: dict[str, object],
     *,
     name: str,
+    expected_lease_owner: str,
 ) -> tuple[bool, str]:
     """Classify a drained endpoint snapshot for update safety.
 
@@ -949,6 +966,13 @@ def compute_endpoint_ready_for_update(
             "must be a present non-negative integer"
         )
 
+    draining = endpoint["draining"]
+    if draining is not True:
+        raise RuntimeError(
+            f"Compute endpoint {name} is no longer draining; "
+            "the load balancer may have restarted. Refusing to update."
+        )
+
     drain_lease_remaining_value = endpoint.get("drain_lease_remaining_s")
     if (
         type(drain_lease_remaining_value) not in (int, float)
@@ -959,18 +983,23 @@ def compute_endpoint_ready_for_update(
             "'drain_lease_remaining_s' must be a present positive number"
         )
 
-    draining = endpoint["draining"]
+    drain_lease_owner = endpoint.get("drain_lease_owner")
+    if not isinstance(drain_lease_owner, str) or not drain_lease_owner:
+        raise ValueError(
+            f"Compute endpoint {name} status snapshot field 'drain_lease_owner' "
+            "must be a present non-empty string"
+        )
+    if drain_lease_owner != expected_lease_owner:
+        raise RuntimeError(
+            f"Compute endpoint {name} drain lease is owned by another rollout; "
+            "refusing to update"
+        )
+
     running = endpoint["running"]
     require_usage_sync = endpoint["require_usage_sync"]
     usage_synced = endpoint["usage_synced"]
     usage_synced_after_drain = endpoint["usage_synced_after_drain"]
     active_sessions = active_sessions_value
-
-    if draining is not True:
-        raise RuntimeError(
-            f"Compute endpoint {name} is no longer draining; "
-            "the load balancer may have restarted. Refusing to update."
-        )
 
     active_transitions = [field for field in transition_fields if endpoint[field] is True]
     if active_transitions:
@@ -1037,6 +1066,7 @@ def set_compute_endpoint_draining(
     draining: bool,
     timeout_s: float,
     lease_ttl_s: float | None = None,
+    lease_id: str | None = None,
 ) -> dict[str, Any]:
     escaped_name = quote(name, safe="")
     return request_json(
@@ -1046,6 +1076,7 @@ def set_compute_endpoint_draining(
         payload={
             "draining": draining,
             **({"lease_ttl_s": lease_ttl_s} if draining and lease_ttl_s is not None else {}),
+            **({"lease_id": lease_id} if lease_id is not None else {}),
         },
         timeout_s=timeout_s,
     )
@@ -1059,6 +1090,7 @@ def set_compute_endpoint_draining_with_retries(
     draining: bool,
     timeout_s: float,
     lease_ttl_s: float | None = None,
+    lease_id: str | None = None,
 ) -> dict[str, Any]:
     action = "enable" if draining else "clear"
     return retry_transient_load_balancer_request(
@@ -1069,6 +1101,7 @@ def set_compute_endpoint_draining_with_retries(
             draining=draining,
             timeout_s=timeout_s,
             lease_ttl_s=lease_ttl_s,
+            lease_id=lease_id,
         ),
         description=f"{action} drain for {name}",
     )
@@ -1138,6 +1171,10 @@ def request_json(
         raise
 
     return json.loads(body.decode("utf-8"))
+
+
+def drain_lease_owner_fingerprint(lease_id: str) -> str:
+    return hashlib.sha256(lease_id.encode("utf-8")).hexdigest()
 
 
 if __name__ == "__main__":

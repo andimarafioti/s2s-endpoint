@@ -518,7 +518,7 @@ endpoint is safe to reopen:
 curl --fail-with-body -X POST \
   -H "Authorization: Bearer $LB_ADMIN_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
-  --data '{"draining": false}' \
+  --data '{"draining": false, "force": true}' \
   "$LOAD_BALANCER_URL/internal/endpoints/reachy-s2s-01/drain"
 ```
 

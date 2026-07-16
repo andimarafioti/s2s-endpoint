@@ -13,6 +13,7 @@ from app.dashboard_preview import DashboardPreviewSessionManager
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import (
     EndpointCapacityTimeoutError,
+    EndpointDrainLeaseConflictError,
     EndpointPoolRouter,
     EndpointTransitionConflictError,
     HuggingFaceEndpointController,
@@ -380,15 +381,30 @@ async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str
         type(lease_ttl_s) not in (int, float) or lease_ttl_s <= 0
     ):
         raise HTTPException(status_code=422, detail="lease_ttl_s must be a positive number")
+    lease_id = payload.get("lease_id")
+    force = payload.get("force", False)
+    if type(force) is not bool:
+        raise HTTPException(status_code=422, detail="force must be a boolean")
+    if draining and force:
+        raise HTTPException(status_code=422, detail="force is only valid when clearing a drain")
+    if not force and (not isinstance(lease_id, str) or not lease_id.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail="lease_id is required unless force-clearing a drain",
+        )
     try:
         await endpoint_router.set_draining(
             endpoint_name,
             draining,
             lease_ttl_s=float(lease_ttl_s) if lease_ttl_s is not None else None,
+            lease_id=lease_id.strip() if isinstance(lease_id, str) else None,
+            force=force,
         )
     except KeyError:
         raise HTTPException(status_code=503, detail="Endpoint became unavailable") from None
     except EndpointTransitionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except EndpointDrainLeaseConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     endpoint_snapshot = await get_endpoint_snapshot(endpoint_name)
 

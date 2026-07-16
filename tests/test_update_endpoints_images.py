@@ -21,6 +21,7 @@ from update_endpoints_images import (  # noqa: E402
     default_compute_prefix,
     discover_load_balancer_compute_names,
     discover_sequential_compute_names,
+    drain_lease_owner_fingerprint,
     fetch_compute_endpoint_snapshot,
     is_definitive_hf_update_rejection,
     main,
@@ -33,6 +34,10 @@ from update_endpoints_images import (  # noqa: E402
     update_one_draining,
     update_many,
 )
+
+
+TEST_LEASE_ID = "test-rollout-lease-id"
+TEST_LEASE_OWNER = drain_lease_owner_fingerprint(TEST_LEASE_ID)
 
 
 class FakeApi:
@@ -197,6 +202,7 @@ def drain_snapshot(**overrides):
         "active_sessions": 0,
         "draining": True,
         "drain_lease_remaining_s": 2100.0,
+        "drain_lease_owner": TEST_LEASE_OWNER,
         "require_usage_sync": True,
         "usage_synced": True,
         "usage_synced_after_drain": True,
@@ -205,6 +211,14 @@ def drain_snapshot(**overrides):
 
 
 class UpdateEndpointImagesTests(unittest.TestCase):
+    def setUp(self):
+        lease_id_patcher = patch(
+            "update_endpoints_images.secrets.token_urlsafe",
+            return_value=TEST_LEASE_ID,
+        )
+        self.lease_id_generator = lease_id_patcher.start()
+        self.addCleanup(lease_id_patcher.stop)
+
     def test_main_requires_dedicated_admin_token_for_compute_drain(self):
         argv = [
             "update_endpoints_images.py",
@@ -402,6 +416,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 timeout_s=60,
                 refresh_every_s=5,
                 request_timeout_s=1,
+                expected_lease_owner=TEST_LEASE_OWNER,
             )
 
         self.assertEqual(endpoint["active_sessions"], 0)
@@ -428,6 +443,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 timeout_s=60,
                 refresh_every_s=5,
                 request_timeout_s=1,
+                expected_lease_owner=TEST_LEASE_OWNER,
             )
 
         self.assertEqual(endpoint, ready_endpoint)
@@ -456,6 +472,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                             timeout_s=60,
                             refresh_every_s=5,
                             request_timeout_s=1,
+                            expected_lease_owner=TEST_LEASE_OWNER,
                         )
 
                 sleep.assert_not_called()
@@ -504,6 +521,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                     timeout_s=60,
                     refresh_every_s=5,
                     request_timeout_s=1,
+                    expected_lease_owner=TEST_LEASE_OWNER,
                 )
 
             self.assertEqual(endpoint["status"], status)
@@ -519,6 +537,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 usage_synced_after_drain=False,
             ),
             name="reachy-s2s-01",
+            expected_lease_owner=TEST_LEASE_OWNER,
         )
 
         self.assertTrue(ready)
@@ -544,7 +563,11 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                     if value is None:
                         endpoint.pop(field)
                     with self.assertRaisesRegex(ValueError, field):
-                        compute_endpoint_ready_for_update(endpoint, name="reachy-s2s-01")
+                        compute_endpoint_ready_for_update(
+                            endpoint,
+                            name="reachy-s2s-01",
+                            expected_lease_owner=TEST_LEASE_OWNER,
+                        )
 
     def test_compute_endpoint_ready_rejects_invalid_active_session_counts(self):
         valid_endpoint = drain_snapshot()
@@ -556,7 +579,11 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 if value is None:
                     endpoint.pop("active_sessions")
                 with self.assertRaisesRegex(ValueError, "active_sessions"):
-                    compute_endpoint_ready_for_update(endpoint, name="reachy-s2s-01")
+                    compute_endpoint_ready_for_update(
+                        endpoint,
+                        name="reachy-s2s-01",
+                        expected_lease_owner=TEST_LEASE_OWNER,
+                    )
 
     def test_compute_endpoint_ready_requires_active_drain_lease(self):
         for value in (None, 0, -1, True, "900"):
@@ -565,13 +592,28 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 if value is None:
                     endpoint.pop("drain_lease_remaining_s")
                 with self.assertRaisesRegex(ValueError, "drain_lease_remaining_s"):
-                    compute_endpoint_ready_for_update(endpoint, name="reachy-s2s-01")
+                    compute_endpoint_ready_for_update(
+                        endpoint,
+                        name="reachy-s2s-01",
+                        expected_lease_owner=TEST_LEASE_OWNER,
+                    )
+
+    def test_compute_endpoint_ready_rejects_another_rollout_lease(self):
+        with self.assertRaisesRegex(RuntimeError, "owned by another rollout"):
+            compute_endpoint_ready_for_update(
+                drain_snapshot(
+                    drain_lease_owner=drain_lease_owner_fingerprint("other-rollout")
+                ),
+                name="reachy-s2s-01",
+                expected_lease_owner=TEST_LEASE_OWNER,
+            )
 
     def test_compute_endpoint_ready_rejects_running_without_required_usage_sync(self):
         with self.assertRaisesRegex(RuntimeError, "no compute usage fetcher configured"):
             compute_endpoint_ready_for_update(
                 drain_snapshot(require_usage_sync=False, usage_synced=False),
                 name="reachy-s2s-01",
+                expected_lease_owner=TEST_LEASE_OWNER,
             )
 
     def test_compute_endpoint_ready_rejects_active_control_plane_transition(self):
@@ -580,6 +622,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 compute_endpoint_ready_for_update(
                     drain_snapshot(**{field: True}),
                     name="reachy-s2s-01",
+                    expected_lease_owner=TEST_LEASE_OWNER,
                 )
 
     def test_wait_for_compute_endpoint_free_waits_for_stale_parked_sessions_to_clear(self):
@@ -603,6 +646,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 timeout_s=60,
                 refresh_every_s=5,
                 request_timeout_s=1,
+                expected_lease_owner=TEST_LEASE_OWNER,
             )
 
         self.assertEqual(endpoint, parked_and_clear)
@@ -645,13 +689,18 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 draining=True,
                 timeout_s=3,
                 lease_ttl_s=2100,
+                lease_id=TEST_LEASE_ID,
             )
 
         request.assert_called_once_with(
             "https://lb.example/internal/endpoints/reachy-s2s-01/drain",
             method="POST",
             token="admin-secret",
-            payload={"draining": True, "lease_ttl_s": 2100},
+            payload={
+                "draining": True,
+                "lease_ttl_s": 2100,
+                "lease_id": TEST_LEASE_ID,
+            },
             timeout_s=3,
         )
 
@@ -670,6 +719,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                     timeout_s=60,
                     refresh_every_s=5,
                     request_timeout_s=1,
+                    expected_lease_owner=TEST_LEASE_OWNER,
                 )
 
         sleep.assert_not_called()
@@ -691,6 +741,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 timeout_s=60,
                 refresh_every_s=5,
                 request_timeout_s=1,
+                expected_lease_owner=TEST_LEASE_OWNER,
             )
 
         self.assertTrue(endpoint["usage_synced"])
@@ -714,6 +765,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 timeout_s=60,
                 refresh_every_s=5,
                 request_timeout_s=1,
+                expected_lease_owner=TEST_LEASE_OWNER,
                 renew_drain=lambda: renewals.append(True),
             )
 
@@ -736,6 +788,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 timeout_s=60,
                 refresh_every_s=5,
                 request_timeout_s=1,
+                expected_lease_owner=TEST_LEASE_OWNER,
             )
 
         self.assertTrue(endpoint["usage_synced_after_drain"])
@@ -785,6 +838,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertTrue(result["drain"]["draining_before_update"])
         self.assertEqual(api.get_calls, 2)
         self.assertEqual(api.update_calls, 1)
+        self.lease_id_generator.assert_called_once_with(32)
 
     def test_update_one_draining_skips_matching_image_before_drain(self):
         tracker = ParallelTracker()
