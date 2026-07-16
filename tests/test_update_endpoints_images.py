@@ -483,30 +483,33 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             self.assertEqual(endpoint["status"], status)
             sleep.assert_not_called()
 
-    def test_wait_for_compute_endpoint_free_rejects_active_parked_endpoint(self):
+    def test_wait_for_compute_endpoint_free_waits_for_stale_parked_sessions_to_clear(self):
+        parked_with_stale_session = {
+            "name": "reachy-s2s-01",
+            "status": "paused",
+            "running": False,
+            "draining": True,
+            "active_sessions": 1,
+            "require_usage_sync": True,
+            "usage_synced": False,
+        }
+        parked_and_clear = {**parked_with_stale_session, "active_sessions": 0}
+
         with patch(
             "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            return_value={
-                "name": "reachy-s2s-01",
-                "status": "paused",
-                "running": False,
-                "draining": True,
-                "active_sessions": 1,
-                "require_usage_sync": True,
-                "usage_synced": False,
-            },
+            side_effect=[parked_with_stale_session, parked_and_clear],
         ), patch("update_endpoints_images.time.sleep") as sleep:
-            with self.assertRaisesRegex(RuntimeError, "unexpectedly reports 1 active session"):
-                wait_for_compute_endpoint_free(
-                    load_balancer_url="https://lb.example",
-                    token="token",
-                    name="reachy-s2s-01",
-                    timeout_s=60,
-                    refresh_every_s=5,
-                    request_timeout_s=1,
-                )
+            endpoint = wait_for_compute_endpoint_free(
+                load_balancer_url="https://lb.example",
+                token="token",
+                name="reachy-s2s-01",
+                timeout_s=60,
+                refresh_every_s=5,
+                request_timeout_s=1,
+            )
 
-        sleep.assert_not_called()
+        self.assertEqual(endpoint, parked_and_clear)
+        sleep.assert_called_once_with(5)
 
     def test_fetch_compute_endpoint_snapshot_uses_authenticated_status_route(self):
         expected = {

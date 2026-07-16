@@ -844,9 +844,9 @@ def compute_endpoint_ready_for_update(
     active_sessions = int(endpoint.get("active_sessions", 0) or 0)
     if status in PARKED_STATUSES:
         if active_sessions != 0:
-            raise RuntimeError(
-                f"Parked compute endpoint {name} unexpectedly reports "
-                f"{active_sessions} active session(s). Refusing to update."
+            return (
+                False,
+                f"parked endpoint still reports {active_sessions} active session(s)",
             )
         return True, "endpoint is parked with zero active sessions"
 
