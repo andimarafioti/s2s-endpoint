@@ -725,6 +725,7 @@ def update_one_draining(
     update_submission_state = "not_started"
     lease_id = secrets.token_urlsafe(32)
     expected_lease_owner = drain_lease_owner_fingerprint(lease_id)
+    drain_deadline = time.monotonic() + drain_timeout_s
     drain_lease_ttl_s = max(
         DRAIN_LEASE_MIN_TTL_S,
         float(wait_timeout_s) + DRAIN_LEASE_SAFETY_MARGIN_S,
@@ -778,7 +779,12 @@ def update_one_draining(
         update_submission_state = "submitted"
 
     try:
-        renew_drain()
+        acquire_compute_endpoint_drain(
+            renew_drain,
+            name=name,
+            deadline=drain_deadline,
+            refresh_every_s=drain_refresh_every_s,
+        )
 
         drain_snapshot = wait_for_compute_endpoint_free(
             load_balancer_url=load_balancer_url,
@@ -789,6 +795,7 @@ def update_one_draining(
             request_timeout_s=request_timeout_s,
             renew_drain=renew_drain,
             expected_lease_owner=expected_lease_owner,
+            deadline=drain_deadline,
         )
         result = update_one(
             api=api,
@@ -895,8 +902,10 @@ def wait_for_compute_endpoint_free(
     request_timeout_s: float,
     expected_lease_owner: str,
     renew_drain: Callable[[], None] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, object]:
-    start = time.time()
+    if deadline is None:
+        deadline = time.monotonic() + timeout_s
     while True:
         if renew_drain is not None:
             renew_drain()
@@ -917,8 +926,7 @@ def wait_for_compute_endpoint_free(
         if ready:
             return endpoint
 
-        elapsed = time.time() - start
-        if timeout_s is not None and elapsed > timeout_s:
+        if time.monotonic() >= deadline:
             raise TimeoutError(
                 f"Timed out waiting for compute endpoint {name} to become free "
                 f"({detail})."
@@ -929,6 +937,46 @@ def wait_for_compute_endpoint_free(
             f"waiting {refresh_every_s}s before checking again"
         )
         time.sleep(refresh_every_s)
+
+
+def acquire_compute_endpoint_drain(
+    operation: Callable[[], None],
+    *,
+    name: str,
+    deadline: float,
+    refresh_every_s: int,
+) -> None:
+    while True:
+        try:
+            operation()
+            return
+        except HTTPError as exc:
+            if not is_waitable_drain_acquisition_conflict(exc):
+                raise
+
+            detail = str(getattr(exc, "load_balancer_detail", "409 Conflict"))
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise TimeoutError(
+                    f"Timed out acquiring drain for compute endpoint {name}; "
+                    f"last load-balancer conflict: {detail}"
+                ) from exc
+
+            delay_s = min(float(refresh_every_s), remaining_s)
+            log_progress(
+                f"{name} drain acquisition is temporarily blocked ({detail}); "
+                f"waiting {delay_s:g}s before trying again"
+            )
+            time.sleep(delay_s)
+
+
+def is_waitable_drain_acquisition_conflict(exc: HTTPError) -> bool:
+    detail = getattr(exc, "load_balancer_detail", None)
+    return (
+        exc.code == 409
+        and isinstance(detail, str)
+        and "active control-plane transition:" in detail
+    )
 
 
 def compute_endpoint_ready_for_update(

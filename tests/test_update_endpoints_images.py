@@ -16,6 +16,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from update_endpoints_images import (  # noqa: E402
+    acquire_compute_endpoint_drain,
     build_compute_summary,
     compute_endpoint_ready_for_update,
     default_compute_prefix,
@@ -30,6 +31,7 @@ from update_endpoints_images import (  # noqa: E402
     retry_transient_load_balancer_request,
     request_json,
     set_compute_endpoint_draining,
+    set_compute_endpoint_draining_with_retries,
     update_one,
     update_one_draining,
     update_many,
@@ -38,6 +40,18 @@ from update_endpoints_images import (  # noqa: E402
 
 TEST_LEASE_ID = "test-rollout-lease-id"
 TEST_LEASE_OWNER = drain_lease_owner_fingerprint(TEST_LEASE_ID)
+
+
+def load_balancer_conflict(detail: str) -> HTTPError:
+    error = HTTPError(
+        "https://lb.example/internal/endpoints/reachy-s2s-01/drain",
+        409,
+        "Conflict",
+        None,
+        None,
+    )
+    error.load_balancer_detail = detail
+    return error
 
 
 class FakeApi:
@@ -450,7 +464,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         sleep.assert_called_once_with(1.0)
 
     def test_wait_for_compute_endpoint_free_does_not_retry_fatal_status_failure(self):
-        for status_code in (401, 403, 404, 409):
+        for status_code in (401, 403, 404):
             with self.subTest(status_code=status_code):
                 fatal_error = HTTPError(
                     "https://lb.example/internal/endpoints/reachy-s2s-01",
@@ -476,6 +490,101 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                         )
 
                 sleep.assert_not_called()
+
+    def test_status_poll_keeps_409_fatal(self):
+        conflict = load_balancer_conflict(
+            "Endpoint reachy-s2s-01 has an active control-plane transition: parking"
+        )
+
+        with patch(
+            "update_endpoints_images.fetch_compute_endpoint_snapshot",
+            side_effect=conflict,
+        ), patch("update_endpoints_images.time.sleep") as sleep:
+            with self.assertRaises(HTTPError):
+                wait_for_compute_endpoint_free(
+                    load_balancer_url="https://lb.example",
+                    token="token",
+                    name="reachy-s2s-01",
+                    timeout_s=60,
+                    refresh_every_s=5,
+                    request_timeout_s=1,
+                    expected_lease_owner=TEST_LEASE_OWNER,
+                )
+
+        sleep.assert_not_called()
+
+    def test_initial_drain_acquisition_waits_for_transition_conflict(self):
+        conflict = load_balancer_conflict(
+            "Endpoint reachy-s2s-01 has an active control-plane transition: parking"
+        )
+        attempts = [conflict, None]
+
+        def operation():
+            result = attempts.pop(0)
+            if result is not None:
+                raise result
+
+        with patch("update_endpoints_images.time.monotonic", return_value=0), patch(
+            "update_endpoints_images.time.sleep"
+        ) as sleep, patch("update_endpoints_images.log_progress") as log_progress:
+            acquire_compute_endpoint_drain(
+                operation,
+                name="reachy-s2s-01",
+                deadline=60,
+                refresh_every_s=5,
+            )
+
+        self.assertEqual(attempts, [])
+        sleep.assert_called_once_with(5.0)
+        self.assertIn("parking", str(log_progress.call_args))
+
+    def test_initial_drain_acquisition_times_out_on_persistent_conflict(self):
+        conflict = load_balancer_conflict(
+            "Endpoint reachy-s2s-01 has an active control-plane transition: restarting"
+        )
+
+        def always_conflicted():
+            raise conflict
+
+        with patch(
+            "update_endpoints_images.time.monotonic",
+            side_effect=[0, 5],
+        ), patch("update_endpoints_images.time.sleep") as sleep:
+            with self.assertRaisesRegex(
+                TimeoutError,
+                "Timed out acquiring drain.*restarting",
+            ):
+                acquire_compute_endpoint_drain(
+                    always_conflicted,
+                    name="reachy-s2s-01",
+                    deadline=5,
+                    refresh_every_s=5,
+                )
+
+        sleep.assert_called_once_with(5.0)
+
+    def test_drain_renewal_keeps_ownership_409_fatal(self):
+        conflict = load_balancer_conflict(
+            "Endpoint reachy-s2s-01 has an active drain lease owned by another rollout"
+        )
+
+        with patch(
+            "update_endpoints_images.set_compute_endpoint_draining",
+            side_effect=conflict,
+        ) as set_draining, patch("update_endpoints_images.time.sleep") as sleep:
+            with self.assertRaises(HTTPError):
+                set_compute_endpoint_draining_with_retries(
+                    load_balancer_url="https://lb.example",
+                    token="token",
+                    name="reachy-s2s-01",
+                    draining=True,
+                    timeout_s=1,
+                    lease_ttl_s=900,
+                    lease_id=TEST_LEASE_ID,
+                )
+
+        self.assertEqual(set_draining.call_count, 1)
+        sleep.assert_not_called()
 
     def test_permanent_load_balancer_503_is_not_retried(self):
         error = HTTPError(
