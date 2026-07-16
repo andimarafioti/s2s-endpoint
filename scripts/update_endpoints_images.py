@@ -6,7 +6,8 @@ import json
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, TypeVar
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -26,6 +27,10 @@ DEFAULT_COMPUTE_INDEX_START = 1
 DEFAULT_COMPUTE_INDEX_WIDTH = 2
 FAILED_UPDATE_STATUSES = {"failed", "updateFailed"}
 PARKED_STATUSES = {"paused", "scaledToZero"}
+TRANSIENT_LOAD_BALANCER_HTTP_STATUSES = {502, 503, 504}
+LOAD_BALANCER_REQUEST_ATTEMPTS = 3
+LOAD_BALANCER_RETRY_DELAY_S = 1.0
+RequestResult = TypeVar("RequestResult")
 
 
 def log_progress(message: str) -> None:
@@ -681,11 +686,14 @@ def update_one_draining(
 
     def recheck_drain_before_update() -> None:
         nonlocal pre_update_snapshot
-        pre_update_snapshot = fetch_compute_endpoint_snapshot(
-            load_balancer_url=load_balancer_url,
-            token=token,
-            name=name,
-            timeout_s=request_timeout_s,
+        pre_update_snapshot = retry_transient_load_balancer_request(
+            lambda: fetch_compute_endpoint_snapshot(
+                load_balancer_url=load_balancer_url,
+                token=token,
+                name=name,
+                timeout_s=request_timeout_s,
+            ),
+            description=f"fetch endpoint status for {name} before update",
         )
         ready, detail = compute_endpoint_ready_for_update(pre_update_snapshot, name=name)
         if not ready:
@@ -696,7 +704,7 @@ def update_one_draining(
 
     try:
         drain_attempted = True
-        set_compute_endpoint_draining(
+        set_compute_endpoint_draining_with_retries(
             load_balancer_url=load_balancer_url,
             token=token,
             name=name,
@@ -737,7 +745,7 @@ def update_one_draining(
             # CLI drain rollouts wait for the update to reach its target state
             # before reopening the endpoint.
             try:
-                set_compute_endpoint_draining(
+                set_compute_endpoint_draining_with_retries(
                     load_balancer_url=load_balancer_url,
                     token=token,
                     name=name,
@@ -794,11 +802,14 @@ def wait_for_compute_endpoint_free(
 ) -> dict[str, object]:
     start = time.time()
     while True:
-        endpoint = fetch_compute_endpoint_snapshot(
-            load_balancer_url=load_balancer_url,
-            token=token,
-            name=name,
-            timeout_s=request_timeout_s,
+        endpoint = retry_transient_load_balancer_request(
+            lambda: fetch_compute_endpoint_snapshot(
+                load_balancer_url=load_balancer_url,
+                token=token,
+                name=name,
+                timeout_s=request_timeout_s,
+            ),
+            description=f"fetch endpoint status for {name}",
         )
         ready, detail = compute_endpoint_ready_for_update(endpoint, name=name)
         if ready:
@@ -886,6 +897,55 @@ def set_compute_endpoint_draining(
         payload={"draining": draining},
         timeout_s=timeout_s,
     )
+
+
+def set_compute_endpoint_draining_with_retries(
+    *,
+    load_balancer_url: str,
+    token: str | None,
+    name: str,
+    draining: bool,
+    timeout_s: float,
+) -> dict[str, Any]:
+    action = "enable" if draining else "clear"
+    return retry_transient_load_balancer_request(
+        lambda: set_compute_endpoint_draining(
+            load_balancer_url=load_balancer_url,
+            token=token,
+            name=name,
+            draining=draining,
+            timeout_s=timeout_s,
+        ),
+        description=f"{action} drain for {name}",
+    )
+
+
+def retry_transient_load_balancer_request(
+    operation: Callable[[], RequestResult],
+    *,
+    description: str,
+    attempts: int = LOAD_BALANCER_REQUEST_ATTEMPTS,
+    retry_delay_s: float = LOAD_BALANCER_RETRY_DELAY_S,
+) -> RequestResult:
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if not is_transient_load_balancer_error(exc) or attempt >= attempts:
+                raise
+            log_progress(
+                f"Transient failure while trying to {description} "
+                f"(attempt {attempt}/{attempts}): {exc}; retrying in {retry_delay_s}s"
+            )
+            time.sleep(retry_delay_s)
+
+    raise AssertionError("load-balancer retry loop exhausted without returning or raising")
+
+
+def is_transient_load_balancer_error(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError):
+        return exc.code in TRANSIENT_LOAD_BALANCER_HTTP_STATUSES
+    return isinstance(exc, (URLError, TimeoutError))
 
 
 def request_json(
