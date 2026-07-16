@@ -1310,6 +1310,50 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(controller.force_restart_calls, [])
 
+    async def test_drain_restart_skips_allocator_draining_endpoint(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=0,
+        )
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "draining", "draining_for_s": 999}
+        ]
+
+        await self.router.start()
+        await self.router.set_draining("endpoint-a", True)
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(controller.force_restart_calls, [])
+
+    async def test_drain_restart_rechecks_allocator_drain_after_pool_poll(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=0,
+        )
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "draining", "draining_for_s": 999}
+        ]
+        await self.router.start()
+
+        async def mark_draining_during_poll(function, *args):
+            await self.router.set_draining("endpoint-a", True)
+            return function(*args)
+
+        with patch("app.endpoint_pool_router.asyncio.to_thread", new=mark_draining_during_poll):
+            await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(controller.force_restart_calls, [])
+
     async def test_drain_restarting_cleared_after_force_restart_completes(self):
         controller = FakeEndpointController(
             [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]

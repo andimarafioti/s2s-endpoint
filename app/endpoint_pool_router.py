@@ -1173,6 +1173,7 @@ class EndpointPoolRouter:
                 and not ep.parking
                 and not ep.restarting
                 and not ep.drain_restarting
+                and not ep.draining
                 and ep.url is not None
             ]
 
@@ -1213,7 +1214,14 @@ class EndpointPoolRouter:
 
             async with self._condition:
                 ep = self._endpoints.get(name)
-                if ep is None or ep.drain_restarting or ep.restarting or ep.parking or ep.waking:
+                if (
+                    ep is None
+                    or ep.drain_restarting
+                    or ep.restarting
+                    or ep.parking
+                    or ep.waking
+                    or ep.draining
+                ):
                     continue
                 ep.drain_restarting = True
                 self._condition.notify_all()
