@@ -185,6 +185,12 @@ minute buckets are present.
 - `HF_CONTROL_TOKEN`: token used to call the Inference Endpoints API
 - `LB_ADMIN_AUTH_TOKEN`: dedicated bearer token required by the internal endpoint
   status and drain routes; do not reuse `HF_CONTROL_TOKEN`
+- `COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S`: default allocator-drain lease lifetime
+  for admin clients that do not request one explicitly (defaults to 3,600 seconds)
+- `COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S`: age at which the LB starts warning
+  about a continuously drained endpoint (defaults to 600 seconds)
+- `COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S`: interval between repeated
+  long-running drain warnings (defaults to 300 seconds)
 - `SESSION_SHARED_SECRET`: shared secret used to mint and validate direct session tokens
 - `SESSION_PENDING_TIMEOUT_S`: how long an unused reservation stays alive
 - `SESSION_TOKEN_TTL_S`: lifetime of the signed session token
@@ -496,12 +502,33 @@ started after the drain was acquired. Drain acquisition returns a conflict if
 the endpoint is already waking, parking, restarting, or undergoing stuck-pipeline
 recovery. It rechecks the drain, transition flags, and safe-idle state immediately
 before submitting the image update, then makes the endpoint available again
-after a confirmed update. If update submission or completion is ambiguous, the
-command fails closed and leaves the endpoint drained until an operator verifies
-its Hugging Face state and manually clears the drain. The dedicated admin token
-must match `LB_ADMIN_AUTH_TOKEN` on the deployed load balancer. This recheck
-narrows the restart race, but the drain remains in-memory; a persistent
-server-side drain lease or TTL is still needed to eliminate the race entirely.
+after a confirmed update. The updater renews a server-side drain lease while it
+waits for idle and again immediately before submission. An explicit HF 4xx
+rejection proves that the update did not start, so the drain is cleared. Network
+errors, timeouts, and HF 5xx responses remain fail-closed, but their drains
+expire automatically instead of removing capacity indefinitely. The requested
+lease is at least 900 seconds and at least five minutes longer than the endpoint
+update wait timeout. The LB logs recurring warnings for drains older than its
+configured warning threshold.
+
+To clear a drain sooner after verifying that no update is active and the
+endpoint is safe to reopen:
+
+```bash
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer $LB_ADMIN_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"draining": false}' \
+  "$LOAD_BALANCER_URL/internal/endpoints/reachy-s2s-01/drain"
+```
+
+The dedicated admin token must match `LB_ADMIN_AUTH_TOKEN` on the deployed load
+balancer. For the first deployment of drain support, configure that secret and
+deploy the new load-balancer image before running a compute drain rollout. Verify
+the authenticated endpoint-status route returns a snapshot containing
+`drain_lease_remaining_s`; this ensures the status route, dedicated auth, and
+lease-capable router are live. Do not use the combined compute-plus-LB command
+for that first rollout because it intentionally updates compute endpoints first.
 
 Behavior:
 
@@ -518,11 +545,17 @@ Behavior:
   and only after the load balancer reports a still-active drain and either a
   parked endpoint with zero sessions or a transition-free running endpoint with
   a post-drain usage observation and zero active sessions
+- matching compute images are detected before drain acquisition, so no-op
+  rollouts do not temporarily remove capacity
+- explicit `--compute-parallelism N` permits up to `N` simultaneous drains;
+  on systemic ambiguous HF failures those leases remain until they expire, so
+  keep the default sequential behavior unless parallel draining is intentional
 - `--compute-drain` requires waiting for the endpoint update to finish and cannot
   be combined with `--no-wait`
 - malformed safety snapshots fail closed; running endpoints must explicitly
   report required and completed usage synchronization after drain acquisition,
-  and all control-plane transition flags must be false
+  all control-plane transition flags must be false, and an active drain lease
+  must be present
 - with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately
 - completion lines are printed as each endpoint finishes, so parked endpoints are reported immediately even if a few running endpoints are still becoming healthy
 - paused or scale-to-zero compute endpoints keep their parked state after the image update, and the script now waits for them to return to that original parked state instead of incorrectly waiting for `running`
