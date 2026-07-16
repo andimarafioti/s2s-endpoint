@@ -290,6 +290,57 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.router.snapshot()
         self.assertFalse(snapshot["endpoints"][0]["draining"])
 
+    async def test_drain_requires_usage_request_started_after_acquisition(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", endpoint_url)]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=lambda url: 0,
+        )
+        await self.router.start()
+
+        async def acquire_drain_after_request_started(function, *args):
+            await self.router.set_draining("endpoint-a", True)
+            return function(*args)
+
+        # _sync_compute_usage captures the current drain generation before it
+        # starts the request. Acquiring the drain while that request is in
+        # flight must leave its result ineligible for rollout safety.
+        with patch(
+            "app.endpoint_pool_router.asyncio.to_thread",
+            new=acquire_drain_after_request_started,
+        ):
+            await self.router._sync_compute_usage()
+
+        snapshot = await self.router.snapshot()
+        endpoint = snapshot["endpoints"][0]
+        self.assertTrue(endpoint["usage_synced"])
+        self.assertFalse(endpoint["usage_synced_after_drain"])
+
+        await self.router._sync_compute_usage()
+        snapshot = await self.router.snapshot()
+        self.assertTrue(snapshot["endpoints"][0]["usage_synced_after_drain"])
+
+        # Retrying an idempotent drain request after a lost response must not
+        # reset the generation and force another usage synchronization.
+        await self.router.set_draining("endpoint-a", True)
+        snapshot = await self.router.snapshot()
+        self.assertTrue(snapshot["endpoints"][0]["usage_synced_after_drain"])
+
+        await self.router.set_draining("endpoint-a", False)
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["usage_synced_after_drain"])
+
     async def test_acquire_marks_lease_when_it_waited_for_capacity(self):
         controller = FakeEndpointController(
             [

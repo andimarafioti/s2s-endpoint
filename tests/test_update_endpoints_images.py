@@ -193,6 +193,7 @@ def drain_snapshot(**overrides):
         "draining": True,
         "require_usage_sync": True,
         "usage_synced": True,
+        "usage_synced_after_drain": True,
     }
     return {**snapshot, **overrides}
 
@@ -462,6 +463,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                     running=False,
                     require_usage_sync=True,
                     usage_synced=False,
+                    usage_synced_after_drain=False,
                 ),
             ), patch("update_endpoints_images.time.sleep") as sleep:
                 endpoint = wait_for_compute_endpoint_free(
@@ -483,6 +485,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 running=False,
                 require_usage_sync=False,
                 usage_synced=False,
+                usage_synced_after_drain=False,
             ),
             name="reachy-s2s-01",
         )
@@ -498,6 +501,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             "running",
             "require_usage_sync",
             "usage_synced",
+            "usage_synced_after_drain",
             "waking",
             "parking",
             "restarting",
@@ -544,6 +548,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             running=False,
             active_sessions=1,
             usage_synced=False,
+            usage_synced_after_drain=False,
         )
         parked_and_clear = {**parked_with_stale_session, "active_sessions": 0}
 
@@ -627,6 +632,28 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             )
 
         self.assertTrue(endpoint["usage_synced"])
+        sleep.assert_called_once_with(5)
+
+    def test_wait_for_compute_endpoint_free_requires_usage_sync_after_drain(self):
+        endpoint_snapshots = [
+            drain_snapshot(usage_synced_after_drain=False),
+            drain_snapshot(usage_synced_after_drain=True),
+        ]
+
+        with patch(
+            "update_endpoints_images.fetch_compute_endpoint_snapshot",
+            side_effect=endpoint_snapshots,
+        ), patch("update_endpoints_images.time.sleep") as sleep:
+            endpoint = wait_for_compute_endpoint_free(
+                load_balancer_url="https://lb.example",
+                token="token",
+                name="reachy-s2s-01",
+                timeout_s=60,
+                refresh_every_s=5,
+                request_timeout_s=1,
+            )
+
+        self.assertTrue(endpoint["usage_synced_after_drain"])
         sleep.assert_called_once_with(5)
 
     def test_update_one_draining_sets_and_clears_drain_around_update(self):

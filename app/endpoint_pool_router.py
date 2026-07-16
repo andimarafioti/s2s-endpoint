@@ -267,6 +267,11 @@ class ManagedEndpoint:
     require_usage_sync: bool = False
     usage_synced: bool = False
     last_usage_sync_at: Optional[float] = None
+    # A successful usage request records the drain generation that was active
+    # when the request started. This prevents a request already in flight when
+    # a drain is acquired from being mistaken for a post-drain observation.
+    drain_generation: int = 0
+    usage_sync_drain_generation: Optional[int] = None
     last_sync_failure_log_at: Optional[float] = None
 
     @property
@@ -280,6 +285,14 @@ class ManagedEndpoint:
         if self.require_usage_sync and not self.usage_synced:
             return 0
         return max(self.slots - self.busy_sessions, 0)
+
+    @property
+    def usage_synced_after_drain(self) -> bool:
+        return (
+            self.draining
+            and self.usage_synced
+            and self.usage_sync_drain_generation == self.drain_generation
+        )
 
     @property
     def busy_sessions(self) -> int:
@@ -522,6 +535,8 @@ class EndpointPoolRouter:
                         f"{', '.join(active_transitions)}"
                     )
 
+            if draining and not endpoint.draining:
+                endpoint.drain_generation += 1
             endpoint.draining = draining
             if draining:
                 deficit = self.min_warm_endpoints - self._running_or_waking_count_unlocked()
@@ -633,6 +648,7 @@ class EndpointPoolRouter:
                     "observed_active_sessions": endpoint.observed_active_sessions,
                     "unobserved_connected_sessions": endpoint.unobserved_connected_sessions,
                     "usage_synced": endpoint.usage_synced,
+                    "usage_synced_after_drain": endpoint.usage_synced_after_drain,
                     "require_usage_sync": endpoint.require_usage_sync,
                     "free_slots": endpoint.free_slots,
                     "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
@@ -693,6 +709,7 @@ class EndpointPoolRouter:
                     endpoint.unobserved_connected_sessions = 0
                     endpoint.usage_synced = False
                     endpoint.last_usage_sync_at = None
+                    endpoint.usage_sync_drain_generation = None
                     if local_active_sessions > 0:
                         downed_endpoints.append(endpoint.name)
                 elif not endpoint.running:
@@ -700,6 +717,7 @@ class EndpointPoolRouter:
                     endpoint.unobserved_connected_sessions = 0
                     endpoint.usage_synced = False
                     endpoint.last_usage_sync_at = None
+                    endpoint.usage_sync_drain_generation = None
 
                 if (
                     _is_failed_status(endpoint.status)
@@ -744,7 +762,7 @@ class EndpointPoolRouter:
 
         async with self._condition:
             targets = [
-                (endpoint.name, endpoint.url)
+                (endpoint.name, endpoint.url, endpoint.drain_generation)
                 for endpoint in self._endpoints.values()
                 if endpoint.running and endpoint.url is not None
             ]
@@ -755,14 +773,14 @@ class EndpointPoolRouter:
         results = await asyncio.gather(
             *(
                 asyncio.to_thread(self.compute_usage_fetcher, url)
-                for _, url in targets
+                for _, url, _ in targets
             ),
             return_exceptions=True,
         )
 
         now = time.monotonic()
         async with self._condition:
-            for (name, url), result in zip(targets, results):
+            for (name, url, drain_generation), result in zip(targets, results):
                 endpoint = self._endpoints.get(name)
                 if endpoint is None or endpoint.url != url or not endpoint.running:
                     continue
@@ -781,6 +799,7 @@ class EndpointPoolRouter:
                         )
                         endpoint.usage_synced = False
                         endpoint.last_usage_sync_at = None
+                        endpoint.usage_sync_drain_generation = None
                     else:
                         stale_for = (
                             None
@@ -805,6 +824,7 @@ class EndpointPoolRouter:
                                 )
                                 endpoint.last_sync_failure_log_at = now
                             endpoint.usage_synced = False
+                            endpoint.usage_sync_drain_generation = None
                         else:
                             logger.warning(
                                 "Failed to sync compute usage for %s (last success %.1fs ago, TTL %.1fs): %s",
@@ -831,6 +851,7 @@ class EndpointPoolRouter:
                 endpoint.observed_active_sessions = observed_active_sessions
                 endpoint.usage_synced = True
                 endpoint.last_usage_sync_at = now
+                endpoint.usage_sync_drain_generation = drain_generation
                 endpoint.last_sync_failure_log_at = None
                 if observed_increase:
                     endpoint.unobserved_connected_sessions = max(

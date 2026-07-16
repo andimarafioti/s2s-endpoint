@@ -859,6 +859,7 @@ def compute_endpoint_ready_for_update(
         "running",
         "require_usage_sync",
         "usage_synced",
+        "usage_synced_after_drain",
         *transition_fields,
     )
     for field in boolean_fields:
@@ -879,6 +880,7 @@ def compute_endpoint_ready_for_update(
     running = endpoint["running"]
     require_usage_sync = endpoint["require_usage_sync"]
     usage_synced = endpoint["usage_synced"]
+    usage_synced_after_drain = endpoint["usage_synced_after_drain"]
     active_sessions = active_sessions_value
 
     if draining is not True:
@@ -918,8 +920,10 @@ def compute_endpoint_ready_for_update(
         )
     if usage_synced is not True:
         return False, "usage sync is not trustworthy"
+    if usage_synced_after_drain is not True:
+        return False, "usage has not been synchronized since drain acquisition"
     if active_sessions == 0:
-        return True, "running endpoint has trustworthy zero active sessions"
+        return True, "running endpoint has fresh, trustworthy zero active sessions"
     return False, f"{active_sessions} active session(s) remain"
 
 
