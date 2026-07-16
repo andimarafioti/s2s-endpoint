@@ -28,6 +28,11 @@ DEFAULT_COMPUTE_INDEX_WIDTH = 2
 FAILED_UPDATE_STATUSES = {"failed", "updateFailed"}
 PARKED_STATUSES = {"paused", "scaledToZero"}
 TRANSIENT_LOAD_BALANCER_HTTP_STATUSES = {502, 503, 504}
+PERMANENT_LOAD_BALANCER_503_DETAILS = {
+    "LB admin auth token is not configured",
+    "Endpoint draining is not available",
+    "Endpoint status is not available",
+}
 LOAD_BALANCER_REQUEST_ATTEMPTS = 3
 LOAD_BALANCER_RETRY_DELAY_S = 1.0
 DRAIN_LEASE_MIN_TTL_S = 900.0
@@ -1093,6 +1098,12 @@ def retry_transient_load_balancer_request(
 
 def is_transient_load_balancer_error(exc: Exception) -> bool:
     if isinstance(exc, HTTPError):
+        if (
+            exc.code == 503
+            and getattr(exc, "load_balancer_detail", None)
+            in PERMANENT_LOAD_BALANCER_503_DETAILS
+        ):
+            return False
         return exc.code in TRANSIENT_LOAD_BALANCER_HTTP_STATUSES
     return isinstance(exc, (URLError, TimeoutError))
 
@@ -1114,8 +1125,17 @@ def request_json(
         data = json.dumps(payload).encode("utf-8")
 
     request = Request(url, data=data, headers=headers, method=method)
-    with urlopen(request, timeout=timeout_s) as response:
-        body = response.read()
+    try:
+        with urlopen(request, timeout=timeout_s) as response:
+            body = response.read()
+    except HTTPError as exc:
+        try:
+            error_payload = json.loads(exc.read().decode("utf-8"))
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+            error_payload = None
+        if isinstance(error_payload, dict) and isinstance(error_payload.get("detail"), str):
+            exc.load_balancer_detail = error_payload["detail"]
+        raise
 
     return json.loads(body.decode("utf-8"))
 

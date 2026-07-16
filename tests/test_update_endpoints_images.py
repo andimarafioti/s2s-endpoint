@@ -2,6 +2,7 @@ import sys
 import threading
 import time
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
@@ -25,6 +26,8 @@ from update_endpoints_images import (  # noqa: E402
     main,
     wait_for_compute_endpoint_free,
     resolve_compute_names,
+    retry_transient_load_balancer_request,
+    request_json,
     set_compute_endpoint_draining,
     update_one,
     update_one_draining,
@@ -456,6 +459,31 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                         )
 
                 sleep.assert_not_called()
+
+    def test_permanent_load_balancer_503_is_not_retried(self):
+        error = HTTPError(
+            "https://lb.example/internal/endpoints/reachy-s2s-01",
+            503,
+            "Service Unavailable",
+            None,
+            BytesIO(b'{"detail":"LB admin auth token is not configured"}'),
+        )
+
+        with patch("update_endpoints_images.urlopen", side_effect=error) as urlopen, patch(
+            "update_endpoints_images.time.sleep"
+        ) as sleep:
+            with self.assertRaises(HTTPError):
+                retry_transient_load_balancer_request(
+                    lambda: request_json(
+                        "https://lb.example/internal/endpoints/reachy-s2s-01",
+                        token="token",
+                        timeout_s=1,
+                    ),
+                    description="fetch endpoint status",
+                )
+
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
 
     def test_wait_for_compute_endpoint_free_accepts_parked_unsynced_endpoint(self):
         for status in ("paused", "scaledToZero"):
