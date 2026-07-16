@@ -491,15 +491,17 @@ uv run --with-requirements requirements.txt python scripts/update_endpoints_imag
 
 Drain mode asks the load balancer to stop assigning new sessions to one compute
 endpoint, then waits until it is either parked with zero active sessions or
-running with trustworthy synced usage and zero active sessions. It rechecks that
-state immediately before submitting the image update, then makes the endpoint
-available again after a confirmed update. If update submission or completion is
-ambiguous, the command fails closed and leaves the endpoint drained until an
-operator verifies its Hugging Face state and manually clears the drain. The
-dedicated admin token must match `LB_ADMIN_AUTH_TOKEN` on the deployed load
-balancer. This recheck narrows the restart race, but the drain remains in-memory;
-a persistent server-side drain lease or TTL is still needed to eliminate the
-race entirely.
+running with zero active sessions from a successful compute usage request that
+started after the drain was acquired. Drain acquisition returns a conflict if
+the endpoint is already waking, parking, restarting, or undergoing stuck-pipeline
+recovery. It rechecks the drain, transition flags, and safe-idle state immediately
+before submitting the image update, then makes the endpoint available again
+after a confirmed update. If update submission or completion is ambiguous, the
+command fails closed and leaves the endpoint drained until an operator verifies
+its Hugging Face state and manually clears the drain. The dedicated admin token
+must match `LB_ADMIN_AUTH_TOKEN` on the deployed load balancer. This recheck
+narrows the restart race, but the drain remains in-memory; a persistent
+server-side drain lease or TTL is still needed to eliminate the race entirely.
 
 Behavior:
 
@@ -514,12 +516,13 @@ Behavior:
 - compute endpoint updates now run in parallel by default; use `--compute-parallelism 1` if you want the old sequential rollout behavior
 - with `--compute-drain`, compute endpoint updates run one at a time by default
   and only after the load balancer reports a still-active drain and either a
-  parked endpoint with zero sessions or a running endpoint with trustworthy
-  usage sync and zero active sessions
+  parked endpoint with zero sessions or a transition-free running endpoint with
+  a post-drain usage observation and zero active sessions
 - `--compute-drain` requires waiting for the endpoint update to finish and cannot
   be combined with `--no-wait`
 - malformed safety snapshots fail closed; running endpoints must explicitly
-  report required and completed usage synchronization
+  report required and completed usage synchronization after drain acquisition,
+  and all control-plane transition flags must be false
 - with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately
 - completion lines are printed as each endpoint finishes, so parked endpoints are reported immediately even if a few running endpoints are still becoming healthy
 - paused or scale-to-zero compute endpoints keep their parked state after the image update, and the script now waits for them to return to that original parked state instead of incorrectly waiting for `running`
