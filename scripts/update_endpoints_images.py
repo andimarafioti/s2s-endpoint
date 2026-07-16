@@ -682,7 +682,6 @@ def update_one_draining(
 ) -> dict[str, object]:
     result: dict[str, object] | None = None
     pre_update_snapshot: dict[str, object] | None = None
-    drain_attempted = False
 
     def recheck_drain_before_update() -> None:
         nonlocal pre_update_snapshot
@@ -703,7 +702,6 @@ def update_one_draining(
             )
 
     try:
-        drain_attempted = True
         set_compute_endpoint_draining_with_retries(
             load_balancer_url=load_balancer_url,
             token=token,
@@ -741,21 +739,20 @@ def update_one_draining(
         }
         return result
     finally:
-        if drain_attempted:
-            # CLI drain rollouts wait for the update to reach its target state
-            # before reopening the endpoint.
-            try:
-                set_compute_endpoint_draining_with_retries(
-                    load_balancer_url=load_balancer_url,
-                    token=token,
-                    name=name,
-                    draining=False,
-                    timeout_s=request_timeout_s,
-                )
-            except Exception as exc:
-                log_progress(f"Failed to clear drain on {name}: {exc}")
-                if result is not None:
-                    raise
+        # CLI drain rollouts wait for the update to reach its target state
+        # before reopening the endpoint.
+        try:
+            set_compute_endpoint_draining_with_retries(
+                load_balancer_url=load_balancer_url,
+                token=token,
+                name=name,
+                draining=False,
+                timeout_s=request_timeout_s,
+            )
+        except Exception as exc:
+            log_progress(f"Failed to clear drain on {name}: {exc}")
+            if result is not None:
+                raise
 
 
 def wait_for_endpoint_update(
@@ -834,6 +831,11 @@ def compute_endpoint_ready_for_update(
     *,
     name: str,
 ) -> tuple[bool, str]:
+    """Classify a drained endpoint snapshot for update safety.
+
+    The boolean is false for states that may become safe through polling. Losing
+    the allocator drain raises because waiting could allow a new allocation.
+    """
     if endpoint.get("draining") is not True:
         raise RuntimeError(
             f"Compute endpoint {name} is no longer draining; "

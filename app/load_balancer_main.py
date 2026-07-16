@@ -362,15 +362,15 @@ async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str
 
     endpoint_router = getattr(session_manager, "endpoint_router", None)
     if endpoint_router is None:
-        raise HTTPException(status_code=404, detail="Endpoint draining is not available")
+        raise HTTPException(status_code=503, detail="Endpoint draining is not available")
 
+    endpoint_snapshot = await get_endpoint_snapshot(endpoint_name)
     draining = bool(payload.get("draining", True))
     try:
         await endpoint_router.set_draining(endpoint_name, draining)
     except KeyError:
-        raise HTTPException(status_code=404, detail="Unknown endpoint") from None
-
-    endpoint_snapshot = await get_endpoint_snapshot(endpoint_name)
+        raise HTTPException(status_code=503, detail="Endpoint became unavailable") from None
+    endpoint_snapshot = {**endpoint_snapshot, "draining": draining}
 
     return JSONResponse(
         {
@@ -385,7 +385,7 @@ async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str
 async def get_endpoint_snapshot(endpoint_name: str) -> dict[str, object]:
     endpoint_router = getattr(session_manager, "endpoint_router", None)
     if endpoint_router is None:
-        raise HTTPException(status_code=404, detail="Endpoint status is not available")
+        raise HTTPException(status_code=503, detail="Endpoint status is not available")
 
     _, _, snapshot = await session_manager.healthcheck()
     router_snapshot = snapshot.get("router", {})

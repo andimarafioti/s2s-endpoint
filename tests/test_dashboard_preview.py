@@ -130,8 +130,54 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertEqual(missing_auth.status_code, 401)
         self.assertEqual(missing_auth.headers["www-authenticate"], "Bearer")
         self.assertEqual(wrong_auth.status_code, 403)
-        self.assertEqual(correct_auth.status_code, 404)
+        self.assertEqual(correct_auth.status_code, 503)
         self.assertEqual(correct_auth.json()["detail"], "Endpoint draining is not available")
+
+        status = client.get(
+            "/internal/endpoints/preview-compute-01",
+            headers={"Authorization": "Bearer admin-secret"},
+        )
+        self.assertEqual(status.status_code, 503)
+        self.assertEqual(status.json()["detail"], "Endpoint status is not available")
+
+    def test_drain_route_validates_endpoint_before_mutating(self):
+        module = self._import_load_balancer(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "TEST",
+                "SESSION_SHARED_SECRET": "",
+                "HF_CONTROL_TOKEN": "",
+                "HF_TOKEN": "",
+                "LB_ADMIN_AUTH_TOKEN": "admin-secret",
+            }
+        )
+
+        class RecordingRouter:
+            def __init__(self):
+                self.calls = []
+
+            async def set_draining(self, endpoint_name, draining):
+                self.calls.append((endpoint_name, draining))
+
+        class MissingEndpointSessionManager:
+            def __init__(self):
+                self.endpoint_router = RecordingRouter()
+
+            async def healthcheck(self):
+                return True, None, {"router": {"endpoints": []}}
+
+        session_manager = MissingEndpointSessionManager()
+        module.session_manager = session_manager
+        client = TestClient(module.app)
+
+        response = client.post(
+            "/internal/endpoints/unknown/drain",
+            headers={"Authorization": "Bearer admin-secret"},
+            json={"draining": True},
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"], "Unknown endpoint")
+        self.assertEqual(session_manager.endpoint_router.calls, [])
 
     def test_endpoint_status_returns_snapshot_when_health_is_unready(self):
         module = self._import_load_balancer(
