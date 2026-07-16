@@ -775,42 +775,55 @@ def wait_for_compute_endpoint_free(
             name=name,
             timeout_s=request_timeout_s,
         )
-        if endpoint.get("draining") is not True:
-            raise RuntimeError(
-                f"Compute endpoint {name} is no longer draining; "
-                "the load balancer may have restarted. Refusing to update."
-            )
-
-        active_sessions = int(endpoint.get("active_sessions", 0) or 0)
-        require_usage_sync = bool(endpoint.get("require_usage_sync", False))
-        usage_synced = bool(endpoint.get("usage_synced", False))
-        usage_trustworthy = not require_usage_sync or usage_synced
-        if usage_trustworthy and active_sessions == 0:
+        ready, detail = compute_endpoint_ready_for_update(endpoint, name=name)
+        if ready:
             return endpoint
 
         elapsed = time.time() - start
         if timeout_s is not None and elapsed > timeout_s:
-            detail = (
-                "usage sync is not trustworthy"
-                if not usage_trustworthy
-                else f"{active_sessions} active session(s) remain"
-            )
             raise TimeoutError(
                 f"Timed out waiting for compute endpoint {name} to become free "
                 f"({detail})."
             )
 
-        if not usage_trustworthy:
-            log_progress(
-                f"{name} reports zero sessions but usage sync is not trustworthy; "
-                f"waiting {refresh_every_s}s before checking again"
-            )
-        else:
-            log_progress(
-                f"{name} still has {active_sessions} active session(s); "
-                f"waiting {refresh_every_s}s before checking again"
-            )
+        log_progress(
+            f"{name} is not yet safe to update ({detail}); "
+            f"waiting {refresh_every_s}s before checking again"
+        )
         time.sleep(refresh_every_s)
+
+
+def compute_endpoint_ready_for_update(
+    endpoint: dict[str, object],
+    *,
+    name: str,
+) -> tuple[bool, str]:
+    if endpoint.get("draining") is not True:
+        raise RuntimeError(
+            f"Compute endpoint {name} is no longer draining; "
+            "the load balancer may have restarted. Refusing to update."
+        )
+
+    status = str(endpoint.get("status", ""))
+    active_sessions = int(endpoint.get("active_sessions", 0) or 0)
+    if status in PARKED_STATUSES:
+        if active_sessions != 0:
+            raise RuntimeError(
+                f"Parked compute endpoint {name} unexpectedly reports "
+                f"{active_sessions} active session(s). Refusing to update."
+            )
+        return True, "endpoint is parked with zero active sessions"
+
+    if endpoint.get("running") is not True:
+        return False, f"status {status!r} is neither stably running nor parked"
+
+    require_usage_sync = bool(endpoint.get("require_usage_sync", False))
+    usage_synced = bool(endpoint.get("usage_synced", False))
+    if require_usage_sync and not usage_synced:
+        return False, "usage sync is not trustworthy"
+    if active_sessions == 0:
+        return True, "running endpoint has trustworthy zero active sessions"
+    return False, f"{active_sessions} active session(s) remain"
 
 
 def fetch_compute_endpoint_snapshot(
