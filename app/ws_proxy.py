@@ -30,7 +30,16 @@ async def proxy_websocket(
     no_capacity_reason: str,
     no_capacity_log: str,
     additional_headers: Optional[list[tuple[str, str]]] = None,
-) -> None:
+    on_lease_acquired: Optional[Callable[[], Awaitable[None]]] = None,
+) -> bool:
+    """Proxy a client websocket to an upstream pipeline slot.
+
+    Returns True if a lease was acquired (whether or not the session then
+    succeeded) and False if the connection was rejected for lack of capacity.
+    ``on_lease_acquired`` runs after capacity is secured but before the client
+    websocket is accepted; if it raises, the lease is released and the client
+    is closed without proxying.
+    """
     lease = None
 
     try:
@@ -52,41 +61,61 @@ async def proxy_websocket(
         except Exception:
             pass
         logger.warning("%s: %s", no_capacity_log, exc)
-        return
+        return False
 
-    await client_ws.accept()
-    logger.info("Client websocket connected to %s", describe_lease(lease))
-
+    # Everything after a successful acquire runs under a single finally so
+    # the compute lease cannot leak, no matter which step fails. A leaked
+    # lease permanently consumes a pipeline slot until the process restarts
+    # and is invisible to drain-restart recovery.
     try:
-        async with websockets.connect(
-            lease.ws_url,
-            additional_headers=additional_headers,
-            open_timeout=30,
-            ping_interval=20,
-            ping_timeout=20,
-            max_size=None,
-        ) as upstream_ws:
-            await asyncio.gather(
-                _client_to_upstream(client_ws, upstream_ws),
-                _upstream_to_client(client_ws, upstream_ws),
-            )
-    except WebSocketDisconnect:
-        logger.info("Client websocket disconnected")
-    except ConnectionClosed:
-        logger.info("Upstream websocket disconnected")
+        if on_lease_acquired is not None:
+            try:
+                await on_lease_acquired()
+            except Exception as exc:
+                # The websocket was never accepted, so in Starlette this
+                # close surfaces to the client as a handshake rejection
+                # (HTTP 403); the 1011 code and reason are not delivered.
+                logger.error("Lease-acquired callback failed, refusing session: %s", exc)
+                try:
+                    await client_ws.close(code=1011, reason="Failed to establish reserved session")
+                except Exception:
+                    pass
+                return True
+
+        await client_ws.accept()
+        logger.info("Client websocket connected to %s", describe_lease(lease))
+
         try:
-            await client_ws.close()
+            async with websockets.connect(
+                lease.ws_url,
+                additional_headers=additional_headers,
+                open_timeout=30,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=None,
+            ) as upstream_ws:
+                await asyncio.gather(
+                    _client_to_upstream(client_ws, upstream_ws),
+                    _upstream_to_client(client_ws, upstream_ws),
+                )
+        except WebSocketDisconnect:
+            logger.info("Client websocket disconnected")
+        except ConnectionClosed:
+            logger.info("Upstream websocket disconnected")
+            try:
+                await client_ws.close()
+            except Exception:
+                pass
         except Exception:
-            pass
-    except Exception:
-        logger.exception("Websocket proxy failed")
-        try:
-            await client_ws.close(code=1011, reason="Proxy failure")
-        except Exception:
-            pass
+            logger.exception("Websocket proxy failed")
+            try:
+                await client_ws.close(code=1011, reason="Proxy failure")
+            except Exception:
+                pass
     finally:
-        if lease is not None:
-            await release_lease(lease.slot_id)
+        await release_lease(lease.slot_id)
+
+    return True
 
 
 async def _client_to_upstream(client_ws: WebSocket, upstream_ws) -> None:

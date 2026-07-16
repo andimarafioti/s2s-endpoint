@@ -45,6 +45,20 @@ docker build --platform linux/amd64 -f Dockerfile.compute \
   -t your-registry/s2s-endpoint-compute:realtime .
 ```
 
+The compute image uses CUDA 12.8 and Qwen3-TTS defaults to the GGML backend in
+`speech-to-speech`. `Dockerfile.compute` downloads the CUDA 12.8
+`qwentts-cpp-python` Hugging Face wheel into a local wheelhouse before running
+`uv sync`, because the PyPI wheel may require a newer manylinux tag than the
+base image exposes. For a different CUDA target and a compatible base image,
+override the wheel URL and filename:
+
+```bash
+docker build --platform linux/amd64 -f Dockerfile.compute \
+  --build-arg QWENTTS_WHEEL_URL=https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/resolve/main/whl/cu130/qwentts_cpp_python-0.3.0%2Bcu130-py3-none-manylinux_2_39_x86_64.whl \
+  --build-arg QWENTTS_WHEEL_FILENAME=qwentts_cpp_python-0.3.0+cu130-py3-none-manylinux_2_39_x86_64.whl \
+  -t your-registry/s2s-endpoint-compute:cuda13 .
+```
+
 To build against the temporary llama.cpp compatibility fix before it lands upstream, use:
 
 ```bash

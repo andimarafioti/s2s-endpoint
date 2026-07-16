@@ -47,6 +47,14 @@ EXTRA_S2S_ARGS = os.getenv("EXTRA_S2S_ARGS", "").strip()
 
 SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
 LB_CALLBACK_AUTH_TOKEN = os.getenv("LB_CALLBACK_AUTH_TOKEN", "").strip()
+# Disconnect notifications are retried so a transient LB timeout or 503 does
+# not leave a session counted as connected forever (connected sessions are
+# never reaped by the pending-session reaper). Defaults give backoff waits of
+# 1s/3s/9s/27s, roughly 40s of coverage: enough to ride out an LB redeploy or
+# brief network partition, which is precisely the case sync gating cannot
+# cover (the LB stayed up, so its in-memory session survives).
+LB_CALLBACK_RETRY_ATTEMPTS = max(int(os.getenv("LB_CALLBACK_RETRY_ATTEMPTS", "5")), 1)
+LB_CALLBACK_RETRY_BACKOFF_S = max(float(os.getenv("LB_CALLBACK_RETRY_BACKOFF_S", "1.0")), 0.0)
 
 INTERNAL_SLOT_WS_PATH = "/v1/realtime"
 PUBLIC_WS_PATH = "/v1/realtime"
@@ -210,21 +218,25 @@ async def pool():
 @app.websocket("/v1/realtime")
 async def websocket_proxy(client_ws: WebSocket):
     session_payload = _get_session_payload(client_ws)
-    connected_notified = False
 
     if SESSION_SHARED_SECRET and session_payload is None:
         await client_ws.close(code=1008, reason="Missing or invalid session token")
         return
 
-    try:
-        if session_payload is not None:
-            await _notify_lb_session_event(
-                session_payload["callback_url"],
-                session_payload["session_token"],
-                "connected",
-            )
-            connected_notified = True
+    async def _notify_connected() -> None:
+        # Runs only after a pipeline slot is actually secured. Notifying the
+        # LB before acquiring capacity meant a rejected connection produced a
+        # connected/disconnected pair milliseconds apart, which the dashboard
+        # counted as a completed conversation while live users stayed at zero.
+        if session_payload is None:
+            return
+        await _notify_lb_session_event(
+            session_payload["callback_url"],
+            session_payload["session_token"],
+            "connected",
+        )
 
+    try:
         await proxy_websocket(
             client_ws,
             acquire_lease=lambda _: session_router.acquire(),
@@ -232,6 +244,7 @@ async def websocket_proxy(client_ws: WebSocket):
             describe_lease=lambda slot: f"slot {slot.slot_id} at {slot.ws_url}",
             no_capacity_reason="No pipeline capacity available",
             no_capacity_log="Failed to allocate speech-to-speech slot",
+            on_lease_acquired=_notify_connected,
         )
     except Exception as exc:
         logger.warning("Rejected websocket session: %s", exc)
@@ -240,12 +253,18 @@ async def websocket_proxy(client_ws: WebSocket):
         except Exception:
             pass
     finally:
-        if connected_notified and session_payload is not None:
+        if session_payload is not None:
+            # Always tell the LB the session is over. For a normal session this
+            # completes the conversation; for a capacity rejection it releases
+            # the pending lease immediately instead of holding the slot until
+            # the pending reaper fires. The LB treats a disconnect for an
+            # unknown or never-connected session as a no-op release.
             try:
                 await _notify_lb_session_event(
                     session_payload["callback_url"],
                     session_payload["session_token"],
                     "disconnected",
+                    attempts=LB_CALLBACK_RETRY_ATTEMPTS,
                 )
             except Exception:
                 logger.exception("Failed to notify LB that session ended")
@@ -286,12 +305,46 @@ def _extract_session_token(client_ws: WebSocket) -> Optional[str]:
     return None
 
 
-async def _notify_lb_session_event(callback_url: str, session_token: str, event: str) -> None:
+async def _notify_lb_session_event(
+    callback_url: str,
+    session_token: str,
+    event: str,
+    *,
+    attempts: int = 1,
+    backoff_s: Optional[float] = None,
+) -> None:
+    """Post a session lifecycle event to the LB callback URL.
+
+    Retries with exponential backoff when attempts > 1. The LB endpoint is
+    idempotent for our purposes: a disconnect for an unknown or already
+    released session returns 200 already_released, so repeating a request
+    whose response was lost is safe.
+    """
     payload = {
         "session_token": session_token,
         "event": event,
     }
-    await asyncio.to_thread(_post_json, callback_url, payload)
+    if backoff_s is None:
+        backoff_s = LB_CALLBACK_RETRY_BACKOFF_S
+    attempts = max(attempts, 1)
+    delay = backoff_s
+    for attempt in range(1, attempts + 1):
+        try:
+            await asyncio.to_thread(_post_json, callback_url, payload)
+            return
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            logger.warning(
+                "LB '%s' notification failed (attempt %d/%d), retrying in %.1fs: %s",
+                event,
+                attempt,
+                attempts,
+                delay,
+                exc,
+            )
+            await asyncio.sleep(delay)
+            delay *= 3
 
 
 def _http_get_json(url: str) -> dict[str, object]:
