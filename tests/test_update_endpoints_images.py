@@ -21,6 +21,7 @@ from update_endpoints_images import (  # noqa: E402
     discover_load_balancer_compute_names,
     discover_sequential_compute_names,
     fetch_compute_endpoint_snapshot,
+    is_definitive_hf_update_rejection,
     main,
     wait_for_compute_endpoint_free,
     resolve_compute_names,
@@ -854,6 +855,72 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual(endpoint._image_url, "andito/s2s-compute:new")
         self.assertTrue(
             any("leaving the endpoint drained" in str(call) for call in log_progress.call_args_list)
+        )
+
+    def test_update_one_draining_clears_drain_after_hf_rejects_update(self):
+        tracker = ParallelTracker()
+        endpoint = FakeTransitionEndpoint(
+            "reachy-s2s-01",
+            "andito/s2s-compute:old",
+            tracker,
+            status="running",
+            fetch_statuses=[],
+        )
+        ready_endpoint = drain_snapshot()
+
+        for status_code in (401, 403, 404, 429):
+            with self.subTest(status_code=status_code):
+                api = FakeTransitionUpdateApi(endpoint)
+                drain_calls: list[bool] = []
+                request = httpx.Request("PUT", "https://api.endpoints.huggingface.cloud/update")
+                response = httpx.Response(status_code, request=request)
+
+                def rejected_update(name, namespace=None, custom_image=None):
+                    api.update_calls += 1
+                    raise HfHubHTTPError("update rejected", response=response)
+
+                api.update_inference_endpoint = rejected_update
+
+                def fake_set_draining(**kwargs):
+                    drain_calls.append(kwargs["draining"])
+                    return {"status": "ok"}
+
+                with patch(
+                    "update_endpoints_images.set_compute_endpoint_draining",
+                    side_effect=fake_set_draining,
+                ), patch(
+                    "update_endpoints_images.wait_for_compute_endpoint_free",
+                    return_value=ready_endpoint,
+                ), patch(
+                    "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                    return_value=ready_endpoint,
+                ):
+                    with self.assertRaises(HfHubHTTPError):
+                        update_one_draining(
+                            api=api,
+                            namespace="HuggingFaceM4",
+                            name="reachy-s2s-01",
+                            image_url="andito/s2s-compute:new",
+                            load_balancer_url="https://lb.example",
+                            token="token",
+                            wait=True,
+                            wait_timeout_s=60,
+                            wait_refresh_every_s=1,
+                            drain_timeout_s=60,
+                            drain_refresh_every_s=5,
+                            request_timeout_s=1,
+                        )
+
+                self.assertEqual(drain_calls, [True, False])
+
+    def test_hf_server_error_is_not_a_definitive_rejection(self):
+        request = httpx.Request("PUT", "https://api.endpoints.huggingface.cloud/update")
+        response = httpx.Response(503, request=request)
+
+        self.assertFalse(
+            is_definitive_hf_update_rejection(
+                HfHubHTTPError("update failed", response=response)
+            )
         )
 
     def test_update_one_draining_leaves_drain_when_update_wait_fails(self):

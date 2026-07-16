@@ -609,6 +609,8 @@ def update_one(
     dry_run: bool,
     pre_update_check: Callable[[], None] | None = None,
     on_update_submission_started: Callable[[], None] | None = None,
+    on_update_submission_rejected: Callable[[], None] | None = None,
+    on_update_submitted: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     endpoint = api.get_inference_endpoint(name, namespace=namespace)
     status_before = str(endpoint.status)
@@ -652,11 +654,21 @@ def update_one(
         pre_update_check()
     if on_update_submission_started is not None:
         on_update_submission_started()
-    endpoint = api.update_inference_endpoint(
-        name,
-        namespace=namespace,
-        custom_image=updated_image,
-    )
+    try:
+        endpoint = api.update_inference_endpoint(
+            name,
+            namespace=namespace,
+            custom_image=updated_image,
+        )
+    except Exception as exc:
+        if (
+            on_update_submission_rejected is not None
+            and is_definitive_hf_update_rejection(exc)
+        ):
+            on_update_submission_rejected()
+        raise
+    if on_update_submitted is not None:
+        on_update_submitted()
     if wait:
         wait_for_endpoint_update(
             endpoint,
@@ -685,7 +697,7 @@ def update_one_draining(
 ) -> dict[str, object]:
     result: dict[str, object] | None = None
     pre_update_snapshot: dict[str, object] | None = None
-    update_may_have_started = False
+    update_submission_state = "not_started"
 
     def recheck_drain_before_update() -> None:
         nonlocal pre_update_snapshot
@@ -706,8 +718,16 @@ def update_one_draining(
             )
 
     def mark_update_submission_started() -> None:
-        nonlocal update_may_have_started
-        update_may_have_started = True
+        nonlocal update_submission_state
+        update_submission_state = "may_have_started"
+
+    def mark_update_submission_rejected() -> None:
+        nonlocal update_submission_state
+        update_submission_state = "not_started"
+
+    def mark_update_submitted() -> None:
+        nonlocal update_submission_state
+        update_submission_state = "submitted"
 
     try:
         set_compute_endpoint_draining_with_retries(
@@ -737,6 +757,8 @@ def update_one_draining(
             dry_run=False,
             pre_update_check=recheck_drain_before_update,
             on_update_submission_started=mark_update_submission_started,
+            on_update_submission_rejected=mark_update_submission_rejected,
+            on_update_submitted=mark_update_submitted,
         )
         final_drain_snapshot = pre_update_snapshot or drain_snapshot
         result["drain"] = {
@@ -748,9 +770,10 @@ def update_one_draining(
         }
         return result
     finally:
-        if update_may_have_started and result is None:
+        if update_submission_state != "not_started" and result is None:
             log_progress(
-                f"Update may have started for {name}, but completion was not confirmed; "
+                f"Update submission state for {name} is {update_submission_state}, "
+                "but completion was not confirmed; "
                 "leaving the endpoint drained. Verify its Hugging Face endpoint state, "
                 "then manually clear the drain when safe."
             )
@@ -769,6 +792,14 @@ def update_one_draining(
                 log_progress(f"Failed to clear drain on {name}: {exc}")
                 if result is not None:
                     raise
+
+
+def is_definitive_hf_update_rejection(exc: Exception) -> bool:
+    """Return true only when HF explicitly rejected the update before starting it."""
+    if not isinstance(exc, HfHubHTTPError):
+        return False
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    return isinstance(status_code, int) and 400 <= status_code < 500
 
 
 def wait_for_endpoint_update(
