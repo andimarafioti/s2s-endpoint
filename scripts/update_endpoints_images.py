@@ -613,8 +613,10 @@ def update_one(
     on_update_submission_started: Callable[[], None] | None = None,
     on_update_submission_rejected: Callable[[], None] | None = None,
     on_update_submitted: Callable[[], None] | None = None,
+    endpoint=None,
 ) -> dict[str, object]:
-    endpoint = api.get_inference_endpoint(name, namespace=namespace)
+    if endpoint is None:
+        endpoint = api.get_inference_endpoint(name, namespace=namespace)
     status_before = str(endpoint.status)
     current_image = current_custom_image(endpoint.raw)
     updated_image = dict(current_image)
@@ -697,6 +699,20 @@ def update_one_draining(
     drain_refresh_every_s: int,
     request_timeout_s: float,
 ) -> dict[str, object]:
+    preflight_endpoint = api.get_inference_endpoint(name, namespace=namespace)
+    if endpoint_image_update_is_noop(preflight_endpoint, image_url=image_url):
+        return update_one(
+            api=api,
+            namespace=namespace,
+            name=name,
+            image_url=image_url,
+            wait=wait,
+            wait_timeout_s=wait_timeout_s,
+            wait_refresh_every_s=wait_refresh_every_s,
+            dry_run=False,
+            endpoint=preflight_endpoint,
+        )
+
     result: dict[str, object] | None = None
     pre_update_snapshot: dict[str, object] | None = None
     update_submission_state = "not_started"
@@ -814,6 +830,10 @@ def is_definitive_hf_update_rejection(exc: Exception) -> bool:
         return False
     status_code = getattr(getattr(exc, "response", None), "status_code", None)
     return isinstance(status_code, int) and 400 <= status_code < 500
+
+
+def endpoint_image_update_is_noop(endpoint, *, image_url: str) -> bool:
+    return current_custom_image(endpoint.raw)["url"] == image_url
 
 
 def wait_for_endpoint_update(
