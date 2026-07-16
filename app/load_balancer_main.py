@@ -45,6 +45,9 @@ COMPUTE_ENDPOINT_RESTART_BACKOFF_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_B
 COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S", "300"))
 COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S", "120"))
 COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S", "600"))
+COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S", "3600"))
+COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S", "600"))
+COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S", "300"))
 HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TOKEN", "").strip() or None
 LB_ADMIN_AUTH_TOKEN = os.getenv("LB_ADMIN_AUTH_TOKEN", "").strip() or None
 
@@ -95,6 +98,9 @@ def build_endpoint_router() -> EndpointPoolRouter:
         restart_backoff_max_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S,
         restart_stable_running_s=COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S,
         drain_restart_timeout_s=COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S,
+        drain_lease_ttl_s=COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S,
+        drain_warning_after_s=COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S,
+        drain_warning_interval_s=COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S,
         compute_usage_fetcher=fetch_compute_active_sessions,
         # How long a previously observed usage count stays trusted when
         # health polls fail transiently. Must be comfortably above the
@@ -366,20 +372,31 @@ async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str
         raise HTTPException(status_code=503, detail="Endpoint draining is not available")
 
     endpoint_snapshot = await get_endpoint_snapshot(endpoint_name)
-    draining = bool(payload.get("draining", True))
+    draining = payload.get("draining", True)
+    if type(draining) is not bool:
+        raise HTTPException(status_code=422, detail="draining must be a boolean")
+    lease_ttl_s = payload.get("lease_ttl_s")
+    if lease_ttl_s is not None and (
+        type(lease_ttl_s) not in (int, float) or lease_ttl_s <= 0
+    ):
+        raise HTTPException(status_code=422, detail="lease_ttl_s must be a positive number")
     try:
-        await endpoint_router.set_draining(endpoint_name, draining)
+        await endpoint_router.set_draining(
+            endpoint_name,
+            draining,
+            lease_ttl_s=float(lease_ttl_s) if lease_ttl_s is not None else None,
+        )
     except KeyError:
         raise HTTPException(status_code=503, detail="Endpoint became unavailable") from None
     except EndpointTransitionConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    endpoint_snapshot = {**endpoint_snapshot, "draining": draining}
+    endpoint_snapshot = await get_endpoint_snapshot(endpoint_name)
 
     return JSONResponse(
         {
             "status": "ok",
             "endpoint_name": endpoint_name,
-            "draining": draining,
+            "draining": endpoint_snapshot.get("draining"),
             "endpoint": endpoint_snapshot,
         }
     )

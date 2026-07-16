@@ -25,6 +25,7 @@ from update_endpoints_images import (  # noqa: E402
     main,
     wait_for_compute_endpoint_free,
     resolve_compute_names,
+    set_compute_endpoint_draining,
     update_one,
     update_one_draining,
     update_many,
@@ -192,6 +193,7 @@ def drain_snapshot(**overrides):
         "drain_restarting": False,
         "active_sessions": 0,
         "draining": True,
+        "drain_lease_remaining_s": 2100.0,
         "require_usage_sync": True,
         "usage_synced": True,
         "usage_synced_after_drain": True,
@@ -528,6 +530,15 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "active_sessions"):
                     compute_endpoint_ready_for_update(endpoint, name="reachy-s2s-01")
 
+    def test_compute_endpoint_ready_requires_active_drain_lease(self):
+        for value in (None, 0, -1, True, "900"):
+            with self.subTest(value=value):
+                endpoint = drain_snapshot(drain_lease_remaining_s=value)
+                if value is None:
+                    endpoint.pop("drain_lease_remaining_s")
+                with self.assertRaisesRegex(ValueError, "drain_lease_remaining_s"):
+                    compute_endpoint_ready_for_update(endpoint, name="reachy-s2s-01")
+
     def test_compute_endpoint_ready_rejects_running_without_required_usage_sync(self):
         with self.assertRaisesRegex(RuntimeError, "does not require usage sync"):
             compute_endpoint_ready_for_update(
@@ -594,6 +605,28 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             timeout_s=3,
         )
 
+    def test_set_compute_endpoint_draining_sends_lease_ttl(self):
+        with patch(
+            "update_endpoints_images.request_json",
+            return_value={"status": "ok"},
+        ) as request:
+            set_compute_endpoint_draining(
+                load_balancer_url="https://lb.example",
+                token="admin-secret",
+                name="reachy-s2s-01",
+                draining=True,
+                timeout_s=3,
+                lease_ttl_s=2100,
+            )
+
+        request.assert_called_once_with(
+            "https://lb.example/internal/endpoints/reachy-s2s-01/drain",
+            method="POST",
+            token="admin-secret",
+            payload={"draining": True, "lease_ttl_s": 2100},
+            timeout_s=3,
+        )
+
     def test_wait_for_compute_endpoint_free_rejects_lost_drain_state(self):
         endpoint = drain_snapshot(draining=False)
 
@@ -634,6 +667,29 @@ class UpdateEndpointImagesTests(unittest.TestCase):
 
         self.assertTrue(endpoint["usage_synced"])
         sleep.assert_called_once_with(5)
+
+    def test_wait_for_compute_endpoint_free_renews_drain_lease_before_each_poll(self):
+        endpoint_snapshots = [
+            drain_snapshot(active_sessions=1),
+            drain_snapshot(active_sessions=0),
+        ]
+        renewals: list[bool] = []
+
+        with patch(
+            "update_endpoints_images.fetch_compute_endpoint_snapshot",
+            side_effect=endpoint_snapshots,
+        ), patch("update_endpoints_images.time.sleep"):
+            wait_for_compute_endpoint_free(
+                load_balancer_url="https://lb.example",
+                token="token",
+                name="reachy-s2s-01",
+                timeout_s=60,
+                refresh_every_s=5,
+                request_timeout_s=1,
+                renew_drain=lambda: renewals.append(True),
+            )
+
+        self.assertEqual(renewals, [True, True])
 
     def test_wait_for_compute_endpoint_free_requires_usage_sync_after_drain(self):
         endpoint_snapshots = [
@@ -695,7 +751,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 request_timeout_s=1,
             )
 
-        self.assertEqual(drain_calls, [True, False])
+        self.assertEqual(drain_calls, [True, True, False])
         self.assertEqual(result["image_after"], "andito/s2s-compute:new")
         self.assertEqual(result["drain"]["active_sessions_before_update"], 0)
         self.assertTrue(result["drain"]["draining_before_update"])
@@ -749,7 +805,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                     request_timeout_s=1,
                 )
 
-        self.assertEqual(drain_calls, [True, False])
+        self.assertEqual(drain_calls, [True, True, False])
         self.assertEqual(api.get_calls, 1)
         self.assertEqual(api.update_calls, 0)
         self.assertEqual(endpoint._image_url, "andito/s2s-compute:old")
@@ -850,7 +906,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                     request_timeout_s=1,
                 )
 
-        self.assertEqual(drain_calls, [True])
+        self.assertEqual(drain_calls, [True, True])
         self.assertEqual(api.update_calls, 1)
         self.assertEqual(endpoint._image_url, "andito/s2s-compute:new")
         self.assertTrue(
@@ -911,7 +967,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                             request_timeout_s=1,
                         )
 
-                self.assertEqual(drain_calls, [True, False])
+                self.assertEqual(drain_calls, [True, True, False])
 
     def test_hf_server_error_is_not_a_definitive_rejection(self):
         request = httpx.Request("PUT", "https://api.endpoints.huggingface.cloud/update")
@@ -971,7 +1027,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                     request_timeout_s=1,
                 )
 
-        self.assertEqual(drain_calls, [True])
+        self.assertEqual(drain_calls, [True, True])
         self.assertEqual(api.update_calls, 1)
         self.assertTrue(
             any("leaving the endpoint drained" in str(call) for call in log_progress.call_args_list)
@@ -1026,7 +1082,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             )
 
         self.assertEqual(result["image_after"], "andito/s2s-compute:new")
-        self.assertEqual(drain_calls, [True, False, False, False])
+        self.assertEqual(drain_calls, [True, True, False, False, False])
         self.assertEqual(sleep.call_count, 2)
 
 if __name__ == "__main__":

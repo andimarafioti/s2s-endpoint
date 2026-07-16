@@ -333,13 +333,89 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         # Retrying an idempotent drain request after a lost response must not
         # reset the generation and force another usage synchronization.
-        await self.router.set_draining("endpoint-a", True)
+        async with self.router._condition:
+            managed_endpoint = self.router._endpoints["endpoint-a"]
+            drain_generation = managed_endpoint.drain_generation
+            draining_since = managed_endpoint.draining_since
+            managed_endpoint.drain_expires_at = time.monotonic() + 1
+            previous_expiry = managed_endpoint.drain_expires_at
+        await self.router.set_draining("endpoint-a", True, lease_ttl_s=60)
         snapshot = await self.router.snapshot()
         self.assertTrue(snapshot["endpoints"][0]["usage_synced_after_drain"])
+        async with self.router._condition:
+            managed_endpoint = self.router._endpoints["endpoint-a"]
+            self.assertEqual(managed_endpoint.drain_generation, drain_generation)
+            self.assertEqual(managed_endpoint.draining_since, draining_since)
+            self.assertGreater(managed_endpoint.drain_expires_at, previous_expiry)
 
         await self.router.set_draining("endpoint-a", False)
         snapshot = await self.router.snapshot()
         self.assertFalse(snapshot["endpoints"][0]["usage_synced_after_drain"])
+        self.assertIsNone(snapshot["endpoints"][0]["drain_lease_remaining_s"])
+
+    async def test_expired_drain_lease_clears_automatically(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        await self.router.start()
+        await self.router.set_draining("endpoint-a", True, lease_ttl_s=60)
+        async with self.router._condition:
+            endpoint = self.router._endpoints["endpoint-a"]
+            endpoint.draining_since = time.monotonic() - 120
+            endpoint.drain_expires_at = time.monotonic() - 1
+
+        with self.assertLogs("s2s-endpoint", level="ERROR") as logs:
+            await self.router._maintain_drain_leases()
+
+        snapshot = await self.router.snapshot()
+        self.assertFalse(snapshot["endpoints"][0]["draining"])
+        self.assertTrue(any("lease expired" in line for line in logs.output))
+
+    async def test_long_running_drain_logs_recurring_warning(self):
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            drain_warning_after_s=60,
+            drain_warning_interval_s=300,
+        )
+        await self.router.start()
+        await self.router.set_draining("endpoint-a", True, lease_ttl_s=3600)
+        async with self.router._condition:
+            endpoint = self.router._endpoints["endpoint-a"]
+            endpoint.draining_since = time.monotonic() - 120
+
+        with self.assertLogs("s2s-endpoint", level="WARNING") as first_warning:
+            await self.router._maintain_drain_leases()
+        self.assertTrue(any("allocator-drained" in line for line in first_warning.output))
+
+        async with self.router._condition:
+            self.router._endpoints["endpoint-a"].last_drain_warning_at = (
+                time.monotonic() - 301
+            )
+        with self.assertLogs("s2s-endpoint", level="WARNING") as recurring_warning:
+            await self.router._maintain_drain_leases()
+        self.assertTrue(any("allocator-drained" in line for line in recurring_warning.output))
 
     async def test_acquire_marks_lease_when_it_waited_for_capacity(self):
         controller = FakeEndpointController(

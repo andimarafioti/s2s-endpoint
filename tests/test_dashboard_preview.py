@@ -155,7 +155,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            async def set_draining(self, endpoint_name, draining):
+            async def set_draining(self, endpoint_name, draining, *, lease_ttl_s=None):
                 self.calls.append((endpoint_name, draining))
 
         class MissingEndpointSessionManager:
@@ -191,7 +191,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         )
 
         class ConflictingRouter:
-            async def set_draining(self, endpoint_name, draining):
+            async def set_draining(self, endpoint_name, draining, *, lease_ttl_s=None):
                 raise EndpointTransitionConflictError(
                     f"Endpoint {endpoint_name} has an active control-plane transition: parking"
                 )
@@ -223,6 +223,58 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertIn("parking", response.json()["detail"])
+
+    def test_drain_route_returns_fresh_post_mutation_snapshot(self):
+        module = self._import_load_balancer(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "TEST",
+                "SESSION_SHARED_SECRET": "",
+                "HF_CONTROL_TOKEN": "",
+                "HF_TOKEN": "",
+                "LB_ADMIN_AUTH_TOKEN": "admin-secret",
+            }
+        )
+
+        class RecordingRouter:
+            def __init__(self):
+                self.draining = False
+                self.lease_ttl_s = None
+
+            async def set_draining(self, endpoint_name, draining, *, lease_ttl_s=None):
+                self.draining = draining
+                self.lease_ttl_s = lease_ttl_s
+
+        class RecordingSessionManager:
+            def __init__(self):
+                self.endpoint_router = RecordingRouter()
+
+            async def healthcheck(self):
+                return True, None, {
+                    "router": {
+                        "endpoints": [
+                            {
+                                "name": "reachy-s2s-01",
+                                "status": "running",
+                                "draining": self.endpoint_router.draining,
+                                "drain_lease_remaining_s": self.endpoint_router.lease_ttl_s,
+                            }
+                        ]
+                    }
+                }
+
+        session_manager = RecordingSessionManager()
+        module.session_manager = session_manager
+        client = TestClient(module.app)
+
+        response = client.post(
+            "/internal/endpoints/reachy-s2s-01/drain",
+            headers={"Authorization": "Bearer admin-secret"},
+            json={"draining": True, "lease_ttl_s": 900},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["endpoint"]["draining"])
+        self.assertEqual(response.json()["endpoint"]["drain_lease_remaining_s"], 900.0)
 
     def test_endpoint_status_returns_snapshot_when_health_is_unready(self):
         module = self._import_load_balancer(

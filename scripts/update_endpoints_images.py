@@ -30,6 +30,8 @@ PARKED_STATUSES = {"paused", "scaledToZero"}
 TRANSIENT_LOAD_BALANCER_HTTP_STATUSES = {502, 503, 504}
 LOAD_BALANCER_REQUEST_ATTEMPTS = 3
 LOAD_BALANCER_RETRY_DELAY_S = 1.0
+DRAIN_LEASE_MIN_TTL_S = 900.0
+DRAIN_LEASE_SAFETY_MARGIN_S = 300.0
 RequestResult = TypeVar("RequestResult")
 
 
@@ -698,9 +700,25 @@ def update_one_draining(
     result: dict[str, object] | None = None
     pre_update_snapshot: dict[str, object] | None = None
     update_submission_state = "not_started"
+    drain_lease_ttl_s = max(
+        DRAIN_LEASE_MIN_TTL_S,
+        float(wait_timeout_s) + DRAIN_LEASE_SAFETY_MARGIN_S,
+        float(drain_refresh_every_s) * 3,
+    )
+
+    def renew_drain() -> None:
+        set_compute_endpoint_draining_with_retries(
+            load_balancer_url=load_balancer_url,
+            token=token,
+            name=name,
+            draining=True,
+            timeout_s=request_timeout_s,
+            lease_ttl_s=drain_lease_ttl_s,
+        )
 
     def recheck_drain_before_update() -> None:
         nonlocal pre_update_snapshot
+        renew_drain()
         pre_update_snapshot = retry_transient_load_balancer_request(
             lambda: fetch_compute_endpoint_snapshot(
                 load_balancer_url=load_balancer_url,
@@ -730,13 +748,7 @@ def update_one_draining(
         update_submission_state = "submitted"
 
     try:
-        set_compute_endpoint_draining_with_retries(
-            load_balancer_url=load_balancer_url,
-            token=token,
-            name=name,
-            draining=True,
-            timeout_s=request_timeout_s,
-        )
+        renew_drain()
 
         drain_snapshot = wait_for_compute_endpoint_free(
             load_balancer_url=load_balancer_url,
@@ -745,6 +757,7 @@ def update_one_draining(
             timeout_s=drain_timeout_s,
             refresh_every_s=drain_refresh_every_s,
             request_timeout_s=request_timeout_s,
+            renew_drain=renew_drain,
         )
         result = update_one(
             api=api,
@@ -774,8 +787,9 @@ def update_one_draining(
             log_progress(
                 f"Update submission state for {name} is {update_submission_state}, "
                 "but completion was not confirmed; "
-                "leaving the endpoint drained. Verify its Hugging Face endpoint state, "
-                "then manually clear the drain when safe."
+                f"leaving the endpoint drained until its lease expires in at most "
+                f"{drain_lease_ttl_s:.0f}s. Verify its Hugging Face endpoint state, "
+                "then clear the drain sooner when safe."
             )
         else:
             # CLI drain rollouts wait for the update to reach its target state
@@ -843,9 +857,12 @@ def wait_for_compute_endpoint_free(
     timeout_s: int,
     refresh_every_s: int,
     request_timeout_s: float,
+    renew_drain: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     start = time.time()
     while True:
+        if renew_drain is not None:
+            renew_drain()
         endpoint = retry_transient_load_balancer_request(
             lambda: fetch_compute_endpoint_snapshot(
                 load_balancer_url=load_balancer_url,
@@ -905,6 +922,16 @@ def compute_endpoint_ready_for_update(
         raise ValueError(
             f"Compute endpoint {name} status snapshot field 'active_sessions' "
             "must be a present non-negative integer"
+        )
+
+    drain_lease_remaining_value = endpoint.get("drain_lease_remaining_s")
+    if (
+        type(drain_lease_remaining_value) not in (int, float)
+        or drain_lease_remaining_value <= 0
+    ):
+        raise ValueError(
+            f"Compute endpoint {name} status snapshot field "
+            "'drain_lease_remaining_s' must be a present positive number"
         )
 
     draining = endpoint["draining"]
@@ -984,13 +1011,17 @@ def set_compute_endpoint_draining(
     name: str,
     draining: bool,
     timeout_s: float,
+    lease_ttl_s: float | None = None,
 ) -> dict[str, Any]:
     escaped_name = quote(name, safe="")
     return request_json(
         f"{load_balancer_url.rstrip('/')}/internal/endpoints/{escaped_name}/drain",
         method="POST",
         token=token,
-        payload={"draining": draining},
+        payload={
+            "draining": draining,
+            **({"lease_ttl_s": lease_ttl_s} if draining and lease_ttl_s is not None else {}),
+        },
         timeout_s=timeout_s,
     )
 
@@ -1002,6 +1033,7 @@ def set_compute_endpoint_draining_with_retries(
     name: str,
     draining: bool,
     timeout_s: float,
+    lease_ttl_s: float | None = None,
 ) -> dict[str, Any]:
     action = "enable" if draining else "clear"
     return retry_transient_load_balancer_request(
@@ -1011,6 +1043,7 @@ def set_compute_endpoint_draining_with_retries(
             name=name,
             draining=draining,
             timeout_s=timeout_s,
+            lease_ttl_s=lease_ttl_s,
         ),
         description=f"{action} drain for {name}",
     )
