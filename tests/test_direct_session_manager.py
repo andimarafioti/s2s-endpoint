@@ -292,14 +292,14 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         allocation = await self.manager.allocate("https://lb.example")
 
-        with patch("app.direct_session_manager.time.monotonic", return_value=100.0):
+        with patch("app.direct_session_manager.monotonic", return_value=100.0):
             await self.manager.handle_event(
                 allocation["session_id"],
                 allocation["session_token"],
                 "connected",
             )
 
-        with patch("app.direct_session_manager.time.monotonic", return_value=160.0):
+        with patch("app.direct_session_manager.monotonic", return_value=160.0):
             await router._on_endpoint_down("endpoint-1")
 
         self.assertEqual(router.release_calls, ["endpoint-1"])
@@ -332,7 +332,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         allocation = await self.manager.allocate("https://lb.example")
 
-        with patch("app.direct_session_manager.time.monotonic", side_effect=[100.0, 140.0]):
+        with patch("app.direct_session_manager.monotonic", side_effect=[100.0, 140.0]):
             await self.manager.handle_event(
                 allocation["session_id"],
                 allocation["session_token"],
@@ -344,7 +344,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
                 "disconnected",
             )
 
-        with patch("app.direct_session_manager.time.monotonic", return_value=180.0):
+        with patch("app.direct_session_manager.monotonic", return_value=180.0):
             await router._on_endpoint_down("endpoint-1")
 
         self.assertEqual(released["release_reason"], "client_disconnected")
