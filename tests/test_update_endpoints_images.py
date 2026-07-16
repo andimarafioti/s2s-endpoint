@@ -16,6 +16,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from update_endpoints_images import (  # noqa: E402
     build_compute_summary,
+    compute_endpoint_ready_for_update,
     default_compute_prefix,
     discover_load_balancer_compute_names,
     discover_sequential_compute_names,
@@ -483,6 +484,78 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             self.assertEqual(endpoint["status"], status)
             sleep.assert_not_called()
 
+    def test_compute_endpoint_ready_accepts_parked_endpoint_without_usage_sync(self):
+        ready, detail = compute_endpoint_ready_for_update(
+            {
+                "name": "reachy-s2s-01",
+                "status": "paused",
+                "running": False,
+                "draining": True,
+                "active_sessions": 0,
+                "require_usage_sync": False,
+                "usage_synced": False,
+            },
+            name="reachy-s2s-01",
+        )
+
+        self.assertTrue(ready)
+        self.assertIn("parked", detail)
+
+    def test_compute_endpoint_ready_rejects_invalid_boolean_fields(self):
+        valid_endpoint = {
+            "name": "reachy-s2s-01",
+            "status": "running",
+            "running": True,
+            "draining": True,
+            "active_sessions": 0,
+            "require_usage_sync": True,
+            "usage_synced": True,
+        }
+
+        for field in ("draining", "running", "require_usage_sync", "usage_synced"):
+            for value in (None, "false", 1):
+                with self.subTest(field=field, value=value):
+                    endpoint = {**valid_endpoint, field: value}
+                    if value is None:
+                        endpoint.pop(field)
+                    with self.assertRaisesRegex(ValueError, field):
+                        compute_endpoint_ready_for_update(endpoint, name="reachy-s2s-01")
+
+    def test_compute_endpoint_ready_rejects_invalid_active_session_counts(self):
+        valid_endpoint = {
+            "name": "reachy-s2s-01",
+            "status": "running",
+            "running": True,
+            "draining": True,
+            "active_sessions": 0,
+            "require_usage_sync": True,
+            "usage_synced": True,
+        }
+
+        invalid_counts = (None, -1, True, "0")
+        for value in invalid_counts:
+            with self.subTest(value=value):
+                endpoint = {**valid_endpoint, "active_sessions": value}
+                if value is None:
+                    endpoint.pop("active_sessions")
+                with self.assertRaisesRegex(ValueError, "active_sessions"):
+                    compute_endpoint_ready_for_update(endpoint, name="reachy-s2s-01")
+
+    def test_compute_endpoint_ready_rejects_running_without_required_usage_sync(self):
+        with self.assertRaisesRegex(RuntimeError, "does not require usage sync"):
+            compute_endpoint_ready_for_update(
+                {
+                    "name": "reachy-s2s-01",
+                    "status": "running",
+                    "running": True,
+                    "draining": True,
+                    "active_sessions": 0,
+                    "require_usage_sync": False,
+                    "usage_synced": False,
+                },
+                name="reachy-s2s-01",
+            )
+
     def test_wait_for_compute_endpoint_free_waits_for_stale_parked_sessions_to_clear(self):
         parked_with_stale_session = {
             "name": "reachy-s2s-01",
@@ -539,6 +612,8 @@ class UpdateEndpointImagesTests(unittest.TestCase):
     def test_wait_for_compute_endpoint_free_rejects_lost_drain_state(self):
         endpoint = {
             "name": "reachy-s2s-01",
+            "status": "running",
+            "running": True,
             "active_sessions": 0,
             "draining": False,
             "require_usage_sync": True,

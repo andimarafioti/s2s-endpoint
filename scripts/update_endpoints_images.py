@@ -849,18 +849,44 @@ def compute_endpoint_ready_for_update(
 ) -> tuple[bool, str]:
     """Classify a drained endpoint snapshot for update safety.
 
-    The boolean is false for states that may become safe through polling. Losing
-    the allocator drain raises because waiting could allow a new allocation.
+    The boolean is false for states that may become safe through polling. Invalid
+    snapshot fields or a lost allocator drain raise instead of being interpreted
+    optimistically.
     """
-    if endpoint.get("draining") is not True:
+    boolean_fields = ("draining", "running", "require_usage_sync", "usage_synced")
+    for field in boolean_fields:
+        if type(endpoint.get(field)) is not bool:
+            raise ValueError(
+                f"Compute endpoint {name} status snapshot field {field!r} "
+                "must be a present boolean"
+            )
+
+    active_sessions_value = endpoint.get("active_sessions")
+    if type(active_sessions_value) is not int or active_sessions_value < 0:
+        raise ValueError(
+            f"Compute endpoint {name} status snapshot field 'active_sessions' "
+            "must be a present non-negative integer"
+        )
+
+    draining = endpoint["draining"]
+    running = endpoint["running"]
+    require_usage_sync = endpoint["require_usage_sync"]
+    usage_synced = endpoint["usage_synced"]
+    active_sessions = active_sessions_value
+
+    if draining is not True:
         raise RuntimeError(
             f"Compute endpoint {name} is no longer draining; "
             "the load balancer may have restarted. Refusing to update."
         )
 
     status = str(endpoint.get("status", ""))
-    active_sessions = int(endpoint.get("active_sessions", 0) or 0)
     if status in PARKED_STATUSES:
+        if running is not False:
+            raise ValueError(
+                f"Compute endpoint {name} status snapshot is inconsistent: "
+                f"status is {status!r} but running is true"
+            )
         if active_sessions != 0:
             return (
                 False,
@@ -868,12 +894,15 @@ def compute_endpoint_ready_for_update(
             )
         return True, "endpoint is parked with zero active sessions"
 
-    if endpoint.get("running") is not True:
+    if running is not True:
         return False, f"status {status!r} is neither stably running nor parked"
 
-    require_usage_sync = bool(endpoint.get("require_usage_sync", False))
-    usage_synced = bool(endpoint.get("usage_synced", False))
-    if require_usage_sync and not usage_synced:
+    if require_usage_sync is not True:
+        raise RuntimeError(
+            f"Running compute endpoint {name} does not require usage sync; "
+            "refusing to trust its session count"
+        )
+    if usage_synced is not True:
         return False, "usage sync is not trustworthy"
     if active_sessions == 0:
         return True, "running endpoint has trustworthy zero active sessions"
