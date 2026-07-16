@@ -993,8 +993,8 @@ def compute_endpoint_ready_for_update(
 
     if require_usage_sync is not True:
         raise RuntimeError(
-            f"Running compute endpoint {name} does not require usage sync; "
-            "refusing to trust its session count"
+            f"Running compute endpoint {name} reports no compute usage fetcher "
+            "configured on the load balancer; refusing to trust its session count"
         )
     if usage_synced is not True:
         return False, "usage sync is not trustworthy"

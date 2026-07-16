@@ -540,7 +540,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                     compute_endpoint_ready_for_update(endpoint, name="reachy-s2s-01")
 
     def test_compute_endpoint_ready_rejects_running_without_required_usage_sync(self):
-        with self.assertRaisesRegex(RuntimeError, "does not require usage sync"):
+        with self.assertRaisesRegex(RuntimeError, "no compute usage fetcher configured"):
             compute_endpoint_ready_for_update(
                 drain_snapshot(require_usage_sync=False, usage_synced=False),
                 name="reachy-s2s-01",
