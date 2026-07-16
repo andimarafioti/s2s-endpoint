@@ -666,16 +666,18 @@ def update_one_draining(
     drain_refresh_every_s: int,
     request_timeout_s: float,
 ) -> dict[str, object]:
-    set_compute_endpoint_draining(
-        load_balancer_url=load_balancer_url,
-        token=token,
-        name=name,
-        draining=True,
-        timeout_s=request_timeout_s,
-    )
-
     result: dict[str, object] | None = None
+    drain_attempted = False
     try:
+        drain_attempted = True
+        set_compute_endpoint_draining(
+            load_balancer_url=load_balancer_url,
+            token=token,
+            name=name,
+            draining=True,
+            timeout_s=request_timeout_s,
+        )
+
         drain_snapshot = wait_for_compute_endpoint_free(
             load_balancer_url=load_balancer_url,
             token=token,
@@ -701,20 +703,21 @@ def update_one_draining(
         }
         return result
     finally:
-        # With wait=False this reopens the endpoint immediately after submitting
-        # the update; use wait=True when it must stay drained until healthy.
-        try:
-            set_compute_endpoint_draining(
-                load_balancer_url=load_balancer_url,
-                token=token,
-                name=name,
-                draining=False,
-                timeout_s=request_timeout_s,
-            )
-        except Exception as exc:
-            log_progress(f"Failed to clear drain on {name}: {exc}")
-            if result is not None:
-                raise
+        if drain_attempted:
+            # With wait=False this reopens the endpoint immediately after submitting
+            # the update; use wait=True when it must stay drained until healthy.
+            try:
+                set_compute_endpoint_draining(
+                    load_balancer_url=load_balancer_url,
+                    token=token,
+                    name=name,
+                    draining=False,
+                    timeout_s=request_timeout_s,
+                )
+            except Exception as exc:
+                log_progress(f"Failed to clear drain on {name}: {exc}")
+                if result is not None:
+                    raise
 
 
 def wait_for_endpoint_update(

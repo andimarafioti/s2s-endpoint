@@ -459,5 +459,47 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual(result["drain"]["active_sessions_before_update"], 0)
         self.assertTrue(result["drain"]["draining_before_update"])
 
+    def test_update_one_draining_clears_drain_after_lost_initial_response(self):
+        tracker = ParallelTracker()
+        endpoint = FakeTransitionEndpoint(
+            "reachy-s2s-01",
+            "andito/s2s-compute:old",
+            tracker,
+            status="running",
+            fetch_statuses=[],
+        )
+        api = FakeTransitionUpdateApi(endpoint)
+        drain_calls: list[bool] = []
+
+        def fake_set_draining(**kwargs):
+            draining = kwargs["draining"]
+            drain_calls.append(draining)
+            if draining:
+                raise TimeoutError("drain response was lost")
+            return {"status": "ok"}
+
+        with patch(
+            "update_endpoints_images.set_compute_endpoint_draining",
+            side_effect=fake_set_draining,
+        ), patch("update_endpoints_images.wait_for_compute_endpoint_free") as wait_for_free:
+            with self.assertRaisesRegex(TimeoutError, "response was lost"):
+                update_one_draining(
+                    api=api,
+                    namespace="HuggingFaceM4",
+                    name="reachy-s2s-01",
+                    image_url="andito/s2s-compute:new",
+                    load_balancer_url="https://lb.example",
+                    token="token",
+                    wait=True,
+                    wait_timeout_s=60,
+                    wait_refresh_every_s=1,
+                    drain_timeout_s=60,
+                    drain_refresh_every_s=5,
+                    request_timeout_s=1,
+                )
+
+        self.assertEqual(drain_calls, [True, False])
+        wait_for_free.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()
