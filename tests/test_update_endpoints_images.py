@@ -18,6 +18,7 @@ from update_endpoints_images import (  # noqa: E402
     default_compute_prefix,
     discover_load_balancer_compute_names,
     discover_sequential_compute_names,
+    main,
     wait_for_compute_endpoint_free,
     resolve_compute_names,
     update_one,
@@ -173,6 +174,33 @@ class FakeHealthRouteUpdateApi:
 
 
 class UpdateEndpointImagesTests(unittest.TestCase):
+    def test_main_requires_dedicated_admin_token_for_compute_drain(self):
+        argv = [
+            "update_endpoints_images.py",
+            "--compute",
+            "andito/s2s-compute:new",
+            "--compute-drain",
+        ]
+
+        with patch.dict("os.environ", {"LB_ADMIN_AUTH_TOKEN": ""}), patch.object(sys, "argv", argv):
+            with self.assertRaisesRegex(ValueError, "requires --load-balancer-admin-token"):
+                main()
+
+    def test_main_rejects_compute_drain_without_wait(self):
+        argv = [
+            "update_endpoints_images.py",
+            "--compute",
+            "andito/s2s-compute:new",
+            "--compute-drain",
+            "--load-balancer-admin-token",
+            "admin-secret",
+            "--no-wait",
+        ]
+
+        with patch.object(sys, "argv", argv):
+            with self.assertRaisesRegex(ValueError, "cannot be combined with --no-wait"):
+                main()
+
     def test_default_compute_prefix_strips_lb_suffix(self):
         self.assertEqual(default_compute_prefix("reachy-s2s-lb"), "reachy-s2s")
         self.assertEqual(default_compute_prefix("custom-router"), "custom-router")

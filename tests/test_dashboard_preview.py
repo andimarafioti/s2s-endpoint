@@ -181,6 +181,27 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertEqual(endpoint["name"], "reachy-s2s-01")
         self.assertFalse(endpoint["usage_synced"])
 
+    def test_admin_routes_do_not_fall_back_to_hf_control_token(self):
+        module = self._import_load_balancer(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "TEST",
+                "SESSION_SHARED_SECRET": "",
+                "HF_CONTROL_TOKEN": "hf-control-token",
+                "HF_TOKEN": "",
+                "LB_ADMIN_AUTH_TOKEN": "",
+            }
+        )
+        client = TestClient(module.app)
+
+        response = client.post(
+            "/internal/endpoints/preview-compute-01/drain",
+            headers={"Authorization": "Bearer hf-control-token"},
+            json={"draining": True},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "LB admin auth token is not configured")
+
     def _import_load_balancer(self, env):
         sys.modules.pop("app.load_balancer_main", None)
         with patch.dict(

@@ -99,13 +99,19 @@ def main() -> None:
     parser.add_argument(
         "--load-balancer-admin-token",
         default=os.getenv("LB_ADMIN_AUTH_TOKEN"),
-        help="Bearer token for load-balancer admin routes. Defaults to LB_ADMIN_AUTH_TOKEN, then --token.",
+        help="Dedicated bearer token for load-balancer admin routes. Defaults only to LB_ADMIN_AUTH_TOKEN.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print planned updates without applying them")
     args = parser.parse_args()
 
     if not args.compute and not args.load_balancer:
         raise ValueError("Provide at least one of --compute or --load_balancer")
+    if args.compute_drain and not args.wait:
+        raise ValueError("--compute-drain cannot be combined with --no-wait")
+    if args.compute_drain and not args.dry_run and not args.load_balancer_admin_token:
+        raise ValueError(
+            "--compute-drain requires --load-balancer-admin-token or LB_ADMIN_AUTH_TOKEN"
+        )
 
     api = HfApi(token=args.token or None)
     results: dict[str, object] = {}
@@ -128,7 +134,6 @@ def main() -> None:
         if args.compute_drain and compute_parallelism <= 0:
             compute_parallelism = 1
         if args.compute_drain:
-            load_balancer_admin_token = args.load_balancer_admin_token or args.token
             load_balancer_url = resolve_load_balancer_url(
                 api=api,
                 namespace=args.namespace,
@@ -142,7 +147,7 @@ def main() -> None:
                 names=compute_names,
                 image_url=args.compute,
                 load_balancer_url=load_balancer_url,
-                token=load_balancer_admin_token,
+                token=args.load_balancer_admin_token,
                 wait=args.wait,
                 wait_timeout_s=args.wait_timeout_s,
                 wait_refresh_every_s=args.wait_refresh_every_s,

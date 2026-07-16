@@ -183,6 +183,8 @@ minute buckets are present.
 - `COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S`: background refresh interval
 - `COMPUTE_ENDPOINT_PARK_STRATEGY`: `pause` or `scale_to_zero`
 - `HF_CONTROL_TOKEN`: token used to call the Inference Endpoints API
+- `LB_ADMIN_AUTH_TOKEN`: dedicated bearer token required by the internal endpoint
+  status and drain routes; do not reuse `HF_CONTROL_TOKEN`
 - `SESSION_SHARED_SECRET`: shared secret used to mint and validate direct session tokens
 - `SESSION_PENDING_TIMEOUT_S`: how long an unused reservation stays alive
 - `SESSION_TOKEN_TTL_S`: lifetime of the signed session token
@@ -353,6 +355,7 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --image-port 7860 \
   --session-shared-secret your-shared-secret \
   --secret HF_CONTROL_TOKEN=$HF_TOKEN \
+  --secret LB_ADMIN_AUTH_TOKEN=$LB_ADMIN_AUTH_TOKEN \
   --instance-size x2 \
   --instance-type intel-icl \
   --vendor aws \
@@ -482,12 +485,16 @@ updating it:
 uv run --with-requirements requirements.txt python scripts/update_endpoints_images.py \
   --namespace HuggingFaceM4 \
   --compute andito/s2s-compute:v0.4 \
-  --compute-drain
+  --compute-drain \
+  --load-balancer-admin-token "$LB_ADMIN_AUTH_TOKEN"
 ```
 
 Drain mode asks the load balancer to stop assigning new sessions to one compute
-endpoint, waits until that endpoint has zero active sessions, updates the image,
-and then makes the endpoint available again.
+endpoint, waits until that endpoint has trustworthy synced usage and zero active
+sessions, updates the image, and then makes the endpoint available again. The
+dedicated admin token must match `LB_ADMIN_AUTH_TOKEN` on the deployed load
+balancer. Drain mode aborts rather than updating if the LB loses the drain state,
+for example after an LB restart.
 
 Behavior:
 
@@ -501,7 +508,10 @@ Behavior:
   `-01`, `-02`, ... until the first missing endpoint
 - compute endpoint updates now run in parallel by default; use `--compute-parallelism 1` if you want the old sequential rollout behavior
 - with `--compute-drain`, compute endpoint updates run one at a time by default
-  and only after the load balancer reports zero active sessions for that endpoint
+  and only after the load balancer reports a still-active drain, trustworthy
+  usage sync, and zero active sessions for that endpoint
+- `--compute-drain` requires waiting for the endpoint update to finish and cannot
+  be combined with `--no-wait`
 - with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately
 - completion lines are printed as each endpoint finishes, so parked endpoints are reported immediately even if a few running endpoints are still becoming healthy
 - paused or scale-to-zero compute endpoints keep their parked state after the image update, and the script now waits for them to return to that original parked state instead of incorrectly waiting for `running`
@@ -517,6 +527,7 @@ Useful options:
 - `--compute-parallelism 1`
 - `--compute-drain`
 - `--compute-drain-timeout-s 7200`
+- `--load-balancer-admin-token "$LB_ADMIN_AUTH_TOKEN"`
 - `--no-wait`
 - `--dry-run`
 
