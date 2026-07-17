@@ -36,7 +36,10 @@ Build the compute image:
 docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
-Today `Dockerfile.compute` defaults `S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and `S2S_REF=main`, because the realtime server path now lives on upstream `main`. If you need to override that repo/ref explicitly, use:
+`Dockerfile.compute` defaults to
+`S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and
+`S2S_REF=v0.2.11` so compute images use the published release. To build from a
+different repo or ref, override them explicitly:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
@@ -54,8 +57,8 @@ override the wheel URL and filename:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
-  --build-arg QWENTTS_WHEEL_URL=https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/resolve/main/whl/cu130/qwentts_cpp_python-0.3.0%2Bcu130-py3-none-manylinux_2_39_x86_64.whl \
-  --build-arg QWENTTS_WHEEL_FILENAME=qwentts_cpp_python-0.3.0+cu130-py3-none-manylinux_2_39_x86_64.whl \
+  --build-arg QWENTTS_WHEEL_URL=https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/resolve/main/whl/cu130/qwentts_cpp_python-0.3.1%2Bcu130-py3-none-manylinux_2_39_x86_64.whl \
+  --build-arg QWENTTS_WHEEL_FILENAME=qwentts_cpp_python-0.3.1+cu130-py3-none-manylinux_2_39_x86_64.whl \
   -t your-registry/s2s-endpoint-compute:cuda13 .
 ```
 
