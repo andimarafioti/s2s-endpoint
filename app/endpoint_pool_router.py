@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -17,6 +18,18 @@ ComputeUsageFetcher = Callable[[str], int]
 
 class EndpointCapacityTimeoutError(RuntimeError):
     pass
+
+
+class EndpointTransitionConflictError(RuntimeError):
+    pass
+
+
+class EndpointDrainLeaseConflictError(RuntimeError):
+    pass
+
+
+def drain_lease_owner_fingerprint(lease_id: str) -> str:
+    return hashlib.sha256(lease_id.encode("utf-8")).hexdigest()
 
 
 def _normalize_status(status: object) -> str:
@@ -263,6 +276,15 @@ class ManagedEndpoint:
     require_usage_sync: bool = False
     usage_synced: bool = False
     last_usage_sync_at: Optional[float] = None
+    # A successful usage request records the drain generation that was active
+    # when the request started. This prevents a request already in flight when
+    # a drain is acquired from being mistaken for a post-drain observation.
+    drain_generation: int = 0
+    usage_sync_drain_generation: Optional[int] = None
+    draining_since: Optional[float] = None
+    drain_expires_at: Optional[float] = None
+    drain_lease_id: Optional[str] = None
+    last_drain_warning_at: Optional[float] = None
     last_sync_failure_log_at: Optional[float] = None
 
     @property
@@ -276,6 +298,14 @@ class ManagedEndpoint:
         if self.require_usage_sync and not self.usage_synced:
             return 0
         return max(self.slots - self.busy_sessions, 0)
+
+    @property
+    def usage_synced_after_drain(self) -> bool:
+        return (
+            self.draining
+            and self.usage_synced
+            and self.usage_sync_drain_generation == self.drain_generation
+        )
 
     @property
     def busy_sessions(self) -> int:
@@ -317,6 +347,9 @@ class EndpointPoolRouter:
         restart_backoff_max_s: float = 300.0,
         restart_stable_running_s: float = 120.0,
         drain_restart_timeout_s: float = 600.0,
+        drain_lease_ttl_s: float = 3600.0,
+        drain_warning_after_s: float = 600.0,
+        drain_warning_interval_s: float = 300.0,
         compute_usage_fetcher: Optional[ComputeUsageFetcher] = None,
         usage_sync_stale_ttl_s: float = 60.0,
     ) -> None:
@@ -337,6 +370,8 @@ class EndpointPoolRouter:
             raise ValueError("park_cooldown_s must be >= 0")
         if not endpoint_ws_path.startswith("/"):
             raise ValueError("endpoint_ws_path must start with '/'")
+        if drain_lease_ttl_s <= 0:
+            raise ValueError("drain_lease_ttl_s must be > 0")
 
         self.endpoint_slots = endpoint_slots
         self.endpoint_ws_path = endpoint_ws_path
@@ -353,6 +388,9 @@ class EndpointPoolRouter:
         self.restart_backoff_max_s = restart_backoff_max_s
         self.restart_stable_running_s = restart_stable_running_s
         self.drain_restart_timeout_s = drain_restart_timeout_s
+        self.drain_lease_ttl_s = drain_lease_ttl_s
+        self.drain_warning_after_s = max(drain_warning_after_s, 0.0)
+        self.drain_warning_interval_s = max(drain_warning_interval_s, 0.0)
         self.compute_usage_fetcher = compute_usage_fetcher
         self.usage_sync_stale_ttl_s = max(usage_sync_stale_ttl_s, 0.0)
 
@@ -499,14 +537,62 @@ class EndpointPoolRouter:
 
             self._condition.notify_all()
 
-    async def set_draining(self, name: str, draining: bool) -> None:
+    async def set_draining(
+        self,
+        name: str,
+        draining: bool,
+        *,
+        lease_ttl_s: Optional[float] = None,
+        lease_id: Optional[str] = None,
+        force: bool = False,
+    ) -> None:
+        if draining and lease_ttl_s is not None and lease_ttl_s <= 0:
+            raise ValueError("lease_ttl_s must be > 0")
+        if draining and force:
+            raise ValueError("force is only valid when clearing a drain")
+        if not force and not lease_id:
+            raise ValueError("lease_id is required unless force-clearing a drain")
+
         wake_names: list[str] = []
         async with self._condition:
             endpoint = self._endpoints.get(name)
             if endpoint is None:
                 raise KeyError(name)
 
-            endpoint.draining = draining
+            if endpoint.draining and not force and endpoint.drain_lease_id != lease_id:
+                raise EndpointDrainLeaseConflictError(
+                    f"Endpoint {name} has an active drain lease owned by another rollout"
+                )
+
+            if draining:
+                active_transitions = [
+                    flag
+                    for flag in ("waking", "parking", "restarting", "drain_restarting")
+                    if getattr(endpoint, flag)
+                ]
+                if active_transitions:
+                    raise EndpointTransitionConflictError(
+                        f"Endpoint {name} has an active control-plane transition: "
+                        f"{', '.join(active_transitions)}"
+                    )
+
+            now = time.monotonic()
+            if draining:
+                if not endpoint.draining:
+                    endpoint.drain_generation += 1
+                    endpoint.draining_since = now
+                    endpoint.last_drain_warning_at = None
+                    endpoint.drain_lease_id = lease_id
+                endpoint.draining = True
+                endpoint.drain_expires_at = now + (
+                    lease_ttl_s if lease_ttl_s is not None else self.drain_lease_ttl_s
+                )
+            else:
+                endpoint.draining = False
+                endpoint.draining_since = None
+                endpoint.drain_expires_at = None
+                endpoint.drain_lease_id = None
+                endpoint.last_drain_warning_at = None
             if draining:
                 deficit = self.min_warm_endpoints - self._running_or_waking_count_unlocked()
                 if deficit > 0:
@@ -608,6 +694,21 @@ class EndpointPoolRouter:
                     "parking": endpoint.parking,
                     "restarting": endpoint.restarting,
                     "draining": endpoint.draining,
+                    "draining_for_s": (
+                        max(now - endpoint.draining_since, 0.0)
+                        if endpoint.draining and endpoint.draining_since is not None
+                        else None
+                    ),
+                    "drain_lease_remaining_s": (
+                        max(endpoint.drain_expires_at - now, 0.0)
+                        if endpoint.draining and endpoint.drain_expires_at is not None
+                        else None
+                    ),
+                    "drain_lease_owner": (
+                        drain_lease_owner_fingerprint(endpoint.drain_lease_id)
+                        if endpoint.draining and endpoint.drain_lease_id is not None
+                        else None
+                    ),
                     "drain_restarting": endpoint.drain_restarting,
                     "restart_attempts": endpoint.restart_attempts,
                     "active_sessions": endpoint.busy_sessions,
@@ -617,6 +718,7 @@ class EndpointPoolRouter:
                     "observed_active_sessions": endpoint.observed_active_sessions,
                     "unobserved_connected_sessions": endpoint.unobserved_connected_sessions,
                     "usage_synced": endpoint.usage_synced,
+                    "usage_synced_after_drain": endpoint.usage_synced_after_drain,
                     "require_usage_sync": endpoint.require_usage_sync,
                     "free_slots": endpoint.free_slots,
                     "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
@@ -677,6 +779,7 @@ class EndpointPoolRouter:
                     endpoint.unobserved_connected_sessions = 0
                     endpoint.usage_synced = False
                     endpoint.last_usage_sync_at = None
+                    endpoint.usage_sync_drain_generation = None
                     if local_active_sessions > 0:
                         downed_endpoints.append(endpoint.name)
                 elif not endpoint.running:
@@ -684,6 +787,7 @@ class EndpointPoolRouter:
                     endpoint.unobserved_connected_sessions = 0
                     endpoint.usage_synced = False
                     endpoint.last_usage_sync_at = None
+                    endpoint.usage_sync_drain_generation = None
 
                 if (
                     _is_failed_status(endpoint.status)
@@ -728,7 +832,7 @@ class EndpointPoolRouter:
 
         async with self._condition:
             targets = [
-                (endpoint.name, endpoint.url)
+                (endpoint.name, endpoint.url, endpoint.drain_generation)
                 for endpoint in self._endpoints.values()
                 if endpoint.running and endpoint.url is not None
             ]
@@ -739,14 +843,14 @@ class EndpointPoolRouter:
         results = await asyncio.gather(
             *(
                 asyncio.to_thread(self.compute_usage_fetcher, url)
-                for _, url in targets
+                for _, url, _ in targets
             ),
             return_exceptions=True,
         )
 
         now = time.monotonic()
         async with self._condition:
-            for (name, url), result in zip(targets, results):
+            for (name, url, drain_generation), result in zip(targets, results):
                 endpoint = self._endpoints.get(name)
                 if endpoint is None or endpoint.url != url or not endpoint.running:
                     continue
@@ -765,6 +869,7 @@ class EndpointPoolRouter:
                         )
                         endpoint.usage_synced = False
                         endpoint.last_usage_sync_at = None
+                        endpoint.usage_sync_drain_generation = None
                     else:
                         stale_for = (
                             None
@@ -789,6 +894,7 @@ class EndpointPoolRouter:
                                 )
                                 endpoint.last_sync_failure_log_at = now
                             endpoint.usage_synced = False
+                            endpoint.usage_sync_drain_generation = None
                         else:
                             logger.warning(
                                 "Failed to sync compute usage for %s (last success %.1fs ago, TTL %.1fs): %s",
@@ -815,6 +921,7 @@ class EndpointPoolRouter:
                 endpoint.observed_active_sessions = observed_active_sessions
                 endpoint.usage_synced = True
                 endpoint.last_usage_sync_at = now
+                endpoint.usage_sync_drain_generation = drain_generation
                 endpoint.last_sync_failure_log_at = None
                 if observed_increase:
                     endpoint.unobserved_connected_sessions = max(
@@ -889,6 +996,7 @@ class EndpointPoolRouter:
             while True:
                 await asyncio.sleep(self.reconcile_interval_s)
                 await self.refresh()
+                await self._maintain_drain_leases()
                 await self._schedule_restarts_if_needed()
                 await self._check_drain_restarts()
                 await self.ensure_min_warm()
@@ -896,6 +1004,60 @@ class EndpointPoolRouter:
                 await self._schedule_parks_if_needed()
         except asyncio.CancelledError:
             raise
+
+    async def _maintain_drain_leases(self) -> None:
+        now = time.monotonic()
+        expired: list[tuple[str, float]] = []
+        warnings: list[tuple[str, float, float]] = []
+
+        async with self._condition:
+            for endpoint in self._endpoints.values():
+                if not endpoint.draining or endpoint.draining_since is None:
+                    continue
+
+                draining_for_s = max(now - endpoint.draining_since, 0.0)
+                remaining_s = (
+                    max(endpoint.drain_expires_at - now, 0.0)
+                    if endpoint.drain_expires_at is not None
+                    else 0.0
+                )
+                if endpoint.drain_expires_at is None or now >= endpoint.drain_expires_at:
+                    endpoint.draining = False
+                    endpoint.draining_since = None
+                    endpoint.drain_expires_at = None
+                    endpoint.drain_lease_id = None
+                    endpoint.last_drain_warning_at = None
+                    expired.append((endpoint.name, draining_for_s))
+                    continue
+
+                warning_due = (
+                    draining_for_s >= self.drain_warning_after_s
+                    and (
+                        endpoint.last_drain_warning_at is None
+                        or now - endpoint.last_drain_warning_at
+                        >= self.drain_warning_interval_s
+                    )
+                )
+                if warning_due:
+                    endpoint.last_drain_warning_at = now
+                    warnings.append((endpoint.name, draining_for_s, remaining_s))
+
+            if expired:
+                self._condition.notify_all()
+
+        for name, draining_for_s, remaining_s in warnings:
+            logger.warning(
+                "Endpoint %s has been allocator-drained for %.0fs; lease expires in %.0fs",
+                name,
+                draining_for_s,
+                remaining_s,
+            )
+        for name, draining_for_s in expired:
+            logger.error(
+                "Allocator drain lease expired for endpoint %s after %.0fs; clearing drain automatically",
+                name,
+                draining_for_s,
+            )
 
     async def _schedule_restarts_if_needed(self) -> None:
         if not self.auto_restart:
@@ -1176,6 +1338,7 @@ class EndpointPoolRouter:
                 and not ep.parking
                 and not ep.restarting
                 and not ep.drain_restarting
+                and not ep.draining
                 and ep.url is not None
             ]
 
@@ -1222,7 +1385,14 @@ class EndpointPoolRouter:
 
             async with self._condition:
                 ep = self._endpoints.get(name)
-                if ep is None or ep.drain_restarting or ep.restarting or ep.parking or ep.waking:
+                if (
+                    ep is None
+                    or ep.drain_restarting
+                    or ep.restarting
+                    or ep.parking
+                    or ep.waking
+                    or ep.draining
+                ):
                     continue
                 ep.drain_restarting = True
                 self._condition.notify_all()

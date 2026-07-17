@@ -54,8 +54,8 @@ override the wheel URL and filename:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
-  --build-arg QWENTTS_WHEEL_URL=https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/resolve/main/whl/cu130/qwentts_cpp_python-0.3.0%2Bcu130-py3-none-manylinux_2_39_x86_64.whl \
-  --build-arg QWENTTS_WHEEL_FILENAME=qwentts_cpp_python-0.3.0+cu130-py3-none-manylinux_2_39_x86_64.whl \
+  --build-arg QWENTTS_WHEEL_URL=https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/resolve/main/whl/cu130/qwentts_cpp_python-0.3.1%2Bcu130-py3-none-manylinux_2_39_x86_64.whl \
+  --build-arg QWENTTS_WHEEL_FILENAME=qwentts_cpp_python-0.3.1+cu130-py3-none-manylinux_2_39_x86_64.whl \
   -t your-registry/s2s-endpoint-compute:cuda13 .
 ```
 
@@ -183,6 +183,14 @@ minute buckets are present.
 - `COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S`: background refresh interval
 - `COMPUTE_ENDPOINT_PARK_STRATEGY`: `pause` or `scale_to_zero`
 - `HF_CONTROL_TOKEN`: token used to call the Inference Endpoints API
+- `LB_ADMIN_AUTH_TOKEN`: dedicated bearer token required by the internal endpoint
+  status and drain routes; do not reuse `HF_CONTROL_TOKEN`
+- `COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S`: default allocator-drain lease lifetime
+  for admin clients that do not request one explicitly (defaults to 3,600 seconds)
+- `COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S`: age at which the LB starts warning
+  about a continuously drained endpoint (defaults to 600 seconds)
+- `COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S`: interval between repeated
+  long-running drain warnings (defaults to 300 seconds)
 - `SESSION_SHARED_SECRET`: shared secret used to mint and validate direct session tokens
 - `SESSION_PENDING_TIMEOUT_S`: how long an unused reservation stays alive
 - `SESSION_TOKEN_TTL_S`: lifetime of the signed session token
@@ -353,6 +361,7 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --image-port 7860 \
   --session-shared-secret your-shared-secret \
   --secret HF_CONTROL_TOKEN=$HF_TOKEN \
+  --secret LB_ADMIN_AUTH_TOKEN=$LB_ADMIN_AUTH_TOKEN \
   --instance-size x2 \
   --instance-type intel-icl \
   --vendor aws \
@@ -482,12 +491,44 @@ updating it:
 uv run --with-requirements requirements.txt python scripts/update_endpoints_images.py \
   --namespace HuggingFaceM4 \
   --compute andito/s2s-compute:v0.4 \
-  --compute-drain
+  --compute-drain \
+  --load-balancer-admin-token "$LB_ADMIN_AUTH_TOKEN"
 ```
 
 Drain mode asks the load balancer to stop assigning new sessions to one compute
-endpoint, waits until that endpoint has zero active sessions, updates the image,
-and then makes the endpoint available again.
+endpoint, then waits until it is either parked with zero active sessions or
+running with zero active sessions from a successful compute usage request that
+started after the drain was acquired. Drain acquisition returns a conflict if
+the endpoint is already waking, parking, restarting, or undergoing stuck-pipeline
+recovery. It rechecks the drain, transition flags, and safe-idle state immediately
+before submitting the image update, then makes the endpoint available again
+after a confirmed update. The updater renews a server-side drain lease while it
+waits for idle and again immediately before submission. An explicit HF 4xx
+rejection proves that the update did not start, so the drain is cleared. Network
+errors, timeouts, and HF 5xx responses remain fail-closed, but their drains
+expire automatically instead of removing capacity indefinitely. The requested
+lease is at least 900 seconds and at least five minutes longer than the endpoint
+update wait timeout. The LB logs recurring warnings for drains older than its
+configured warning threshold.
+
+To clear a drain sooner after verifying that no update is active and the
+endpoint is safe to reopen:
+
+```bash
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer $LB_ADMIN_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"draining": false, "force": true}' \
+  "$LOAD_BALANCER_URL/internal/endpoints/reachy-s2s-01/drain"
+```
+
+The dedicated admin token must match `LB_ADMIN_AUTH_TOKEN` on the deployed load
+balancer. For the first deployment of drain support, configure that secret and
+deploy the new load-balancer image before running a compute drain rollout. Verify
+the authenticated endpoint-status route returns a snapshot containing
+`drain_lease_remaining_s`; this ensures the status route, dedicated auth, and
+lease-capable router are live. Do not use the combined compute-plus-LB command
+for that first rollout because it intentionally updates compute endpoints first.
 
 Behavior:
 
@@ -501,7 +542,20 @@ Behavior:
   `-01`, `-02`, ... until the first missing endpoint
 - compute endpoint updates now run in parallel by default; use `--compute-parallelism 1` if you want the old sequential rollout behavior
 - with `--compute-drain`, compute endpoint updates run one at a time by default
-  and only after the load balancer reports zero active sessions for that endpoint
+  and only after the load balancer reports a still-active drain and either a
+  parked endpoint with zero sessions or a transition-free running endpoint with
+  a post-drain usage observation and zero active sessions
+- matching compute images are detected before drain acquisition, so no-op
+  rollouts do not temporarily remove capacity
+- explicit `--compute-parallelism N` permits up to `N` simultaneous drains;
+  on systemic ambiguous HF failures those leases remain until they expire, so
+  keep the default sequential behavior unless parallel draining is intentional
+- `--compute-drain` requires waiting for the endpoint update to finish and cannot
+  be combined with `--no-wait`
+- malformed safety snapshots fail closed; running endpoints must explicitly
+  report required and completed usage synchronization after drain acquisition,
+  all control-plane transition flags must be false, and an active drain lease
+  must be present
 - with `--wait` (the default), the command waits for all selected endpoint updates to finish before returning; use `--no-wait` if you want to submit the updates and return immediately
 - completion lines are printed as each endpoint finishes, so parked endpoints are reported immediately even if a few running endpoints are still becoming healthy
 - paused or scale-to-zero compute endpoints keep their parked state after the image update, and the script now waits for them to return to that original parked state instead of incorrectly waiting for `running`
@@ -517,6 +571,7 @@ Useful options:
 - `--compute-parallelism 1`
 - `--compute-drain`
 - `--compute-drain-timeout-s 7200`
+- `--load-balancer-admin-token "$LB_ADMIN_AUTH_TOKEN"`
 - `--no-wait`
 - `--dry-run`
 
