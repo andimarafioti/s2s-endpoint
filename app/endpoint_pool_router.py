@@ -1322,9 +1322,12 @@ class EndpointPoolRouter:
 
     async def _check_drain_restarts(self) -> None:
         """Poll /v1/pool on each running endpoint and force-restart (pause → resume) when:
+        - any unit reports state "stuck" (the s2s server quarantined it after its own
+          drain timeout — it will not recover without a restart), OR
         - any unit has been draining for >= drain_restart_timeout_s, OR
         - all units are simultaneously draining (pool fully wedged — restart immediately).
-        Uses draining_for_s from the pool response as the authoritative drain duration.
+        Uses draining_for_s from the pool response as the authoritative drain duration;
+        the draining threshold is kept for s2s servers that predate the "stuck" state.
         """
         async with self._lock:
             to_poll = [
@@ -1355,13 +1358,19 @@ class EndpointPoolRouter:
                 continue
 
             draining = [u for u in units if u.get("state") == "draining"]
-            if not draining:
+            stuck = [u for u in units if u.get("state") == "stuck"]
+            if not draining and not stuck:
                 continue
 
             all_draining = len(draining) == len(units)
-            max_draining_s = max(float(u.get("draining_for_s", 0)) for u in draining)
+            max_draining_s = max((float(u.get("draining_for_s", 0)) for u in draining), default=0.0)
 
-            if max_draining_s >= self.drain_restart_timeout_s:
+            if stuck:
+                # The s2s server already waited out its own quarantine timeout
+                # before reporting "stuck" — restart without further debounce.
+                max_stuck_s = max(float(u.get("stuck_for_s", 0)) for u in stuck)
+                reason = f"{len(stuck)}/{len(units)} pipeline unit(s) quarantined as stuck for {max_stuck_s:.0f}s"
+            elif max_draining_s >= self.drain_restart_timeout_s:
                 if all_draining:
                     reason = f"all {len(units)} pipeline unit(s) stuck draining for {max_draining_s:.0f}s"
                 else:

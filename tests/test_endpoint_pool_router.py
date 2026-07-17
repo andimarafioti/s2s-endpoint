@@ -1546,6 +1546,50 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(controller.force_restart_calls, [])
 
+    async def test_stuck_unit_triggers_restart_immediately(self):
+        """A unit the s2s server quarantined ("stuck") restarts the endpoint without
+        waiting for drain_restart_timeout_s — the server already debounced it with
+        its own quarantine timeout."""
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=600,
+        )
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "active"},
+            {"state": "stuck", "draining_for_s": 200, "stuck_for_s": 20},
+        ]
+
+        await self.router.start()
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertIn("endpoint-a", controller.force_restart_calls)
+
+    async def test_stuck_unit_triggers_restart_even_without_draining_units(self):
+        """Regression: a quarantined unit stops reporting state "draining", so the
+        old draining-only filter would never see it cross the restart threshold."""
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=600,
+        )
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "stuck", "draining_for_s": 700, "stuck_for_s": 520},
+        ]
+
+        await self.router.start()
+        await self.router._check_drain_restarts()
+        await asyncio.sleep(0.05)
+
+        self.assertIn("endpoint-a", controller.force_restart_calls)
+
     async def test_drain_restart_skips_already_drain_restarting_endpoint(self):
         controller = FakeEndpointController(
             [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
