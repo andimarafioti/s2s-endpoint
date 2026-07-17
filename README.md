@@ -54,8 +54,8 @@ override the wheel URL and filename:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
-  --build-arg QWENTTS_WHEEL_URL=https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/resolve/main/whl/cu130/qwentts_cpp_python-0.3.0%2Bcu130-py3-none-manylinux_2_39_x86_64.whl \
-  --build-arg QWENTTS_WHEEL_FILENAME=qwentts_cpp_python-0.3.0+cu130-py3-none-manylinux_2_39_x86_64.whl \
+  --build-arg QWENTTS_WHEEL_URL=https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/resolve/main/whl/cu130/qwentts_cpp_python-0.3.1%2Bcu130-py3-none-manylinux_2_39_x86_64.whl \
+  --build-arg QWENTTS_WHEEL_FILENAME=qwentts_cpp_python-0.3.1+cu130-py3-none-manylinux_2_39_x86_64.whl \
   -t your-registry/s2s-endpoint-compute:cuda13 .
 ```
 
