@@ -36,10 +36,7 @@ Build the compute image:
 docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
-`Dockerfile.compute` defaults to
-`S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and
-`S2S_REF=v0.2.11` so compute images use the published release. To build from a
-different repo or ref, override them explicitly:
+Today `Dockerfile.compute` defaults `S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and `S2S_REF=main`, because the realtime server path now lives on upstream `main`. If you need to override that repo/ref explicitly, use:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
