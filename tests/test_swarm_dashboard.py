@@ -813,10 +813,12 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["finalized"], True)
         self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["minute_bucket_count"], 2)
 
-    def test_load_recent_uses_finalized_partial_day_without_minute_download(self):
+    def test_load_recent_merges_late_minutes_into_finalized_partial_day(self):
         day_start = _day_start(2026, 5, 18)
-        bucket = SwarmHistoryBucket(bucket_start_s=day_start)
-        bucket.running_endpoints_last = 2
+        first_bucket = SwarmHistoryBucket(bucket_start_s=day_start)
+        first_bucket.running_endpoints_last = 2
+        second_bucket = SwarmHistoryBucket(bucket_start_s=day_start + 60)
+        second_bucket.running_endpoints_last = 4
         api = FakeBucketApi(
             {
                 "reachy-s2s-lb/days/2026-05-18.json": {
@@ -829,21 +831,25 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
                     "expected_minute_bucket_count": 24 * 60,
                     "missing_minute_bucket_count": (24 * 60) - 1,
                     "incomplete_reason": "missing_minute_buckets",
-                    "buckets": [bucket.to_dict()],
+                    "buckets": [first_bucket.to_dict()],
                 },
                 f"reachy-s2s-lb/minutes/2026-05-18/{day_start + 60}.json": {
                     "version": 1,
-                    "bucket": SwarmHistoryBucket(bucket_start_s=day_start + 60).to_dict(),
+                    "bucket": second_bucket.to_dict(),
                 },
             }
         )
         store = _bucket_store(api)
 
-        loaded = store.load_recent(retention_minutes=3, now_epoch_s=day_start + 2 * 60)
+        loaded = store.load_recent(
+            retention_minutes=24 * 60 + 3,
+            now_epoch_s=day_start + 24 * 60 * 60 + 2 * 60,
+        )
 
-        self.assertEqual([bucket.bucket_start_s for bucket in loaded], [day_start])
-        self.assertEqual(api.list_prefixes, ["reachy-s2s-lb/days"])
-        self.assertEqual(api.batch_adds, [])
+        self.assertEqual([bucket.bucket_start_s for bucket in loaded], [day_start, day_start + 60])
+        self.assertEqual([bucket.running_endpoints_last for bucket in loaded], [2, 4])
+        self.assertIn("reachy-s2s-lb/minutes/2026-05-18", api.list_prefixes)
+        self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["minute_bucket_count"], 2)
 
     def test_load_recent_backfills_complete_day_file_from_minutes(self):
         day_start = _day_start(2026, 5, 18)

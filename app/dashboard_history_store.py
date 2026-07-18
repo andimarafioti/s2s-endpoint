@@ -32,7 +32,7 @@ class _LoadedDayFiles:
 
     @property
     def authoritative_day_starts(self) -> set[int]:
-        return self.complete_day_starts | self.finalized_partial_day_starts
+        return self.complete_day_starts
 
 
 class HuggingFaceBucketHistoryStore:

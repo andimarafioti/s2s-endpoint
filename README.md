@@ -139,10 +139,11 @@ minute buckets for a completed day. While the load balancer stays running, it
 also rolls over each completed UTC day from in-memory history into
 `days/YYYY-MM-DD.json` shortly after midnight UTC. If the day is missing minute
 buckets, the rollover still writes a finalized partial day file with
-`complete: false`, `finalized: true`, and a missing-minute count so later
-restores do not redownload the same minutes forever. Older/open partial day
-files without `finalized: true` are still allowed to merge newly appeared minute
-files and then become finalized.
+`complete: false`, `finalized: true`, and a missing-minute count. Restores treat
+only complete day files as authoritative: partial day files are merged with any
+minute files that appeared later and the partial cache is refreshed. This lets a
+new load balancer recover minute files written late by the previous replica
+during a rolling replacement.
 
 You can precompute day files without running the load balancer:
 
