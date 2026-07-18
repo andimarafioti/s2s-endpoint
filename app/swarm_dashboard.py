@@ -509,12 +509,15 @@ class SwarmDashboard:
         self._restore_task: Optional[asyncio.Task] = None
         self._startup_merge_task: Optional[asyncio.Task] = None
         self._flush_task: Optional[asyncio.Task] = None
+        self._flush_write_task: Optional[asyncio.Task] = None
         self._day_rollover_task: Optional[asyncio.Task] = None
         self._dirty_bucket_starts: set[int] = set()
         self._flush_task_started_at_monotonic_s: Optional[float] = None
         self._last_flush_started_at_s: Optional[float] = None
         self._last_flush_finished_at_s: Optional[float] = None
         self._last_flush_error: Optional[str] = None
+        self._flush_stalled_started_at_s: Optional[float] = None
+        self._flush_stalled_started_at_monotonic_s: Optional[float] = None
         self._last_dirty_bucket_warning_at_monotonic_s: Optional[float] = None
         self._day_rollover_cursor_s: Optional[int] = None
         self._history_restore_status = "disabled" if history_store is None else "pending"
@@ -827,10 +830,17 @@ class SwarmDashboard:
         now_epoch_s = self._time_fn()
         oldest_dirty_bucket_start_s = min(self._dirty_bucket_starts, default=None)
         flush_task_running = self._flush_task is not None and not self._flush_task.done()
+        flush_write_in_flight = self._flush_write_task is not None and not self._flush_write_task.done()
         flush_task_age_s = None
         if flush_task_running and self._flush_task_started_at_monotonic_s is not None:
             flush_task_age_s = round(
                 max(time.monotonic() - self._flush_task_started_at_monotonic_s, 0.0),
+                2,
+            )
+        flush_stalled_age_s = None
+        if self._flush_stalled_started_at_monotonic_s is not None:
+            flush_stalled_age_s = round(
+                max(time.monotonic() - self._flush_stalled_started_at_monotonic_s, 0.0),
                 2,
             )
         return {
@@ -854,6 +864,14 @@ class SwarmDashboard:
             ),
             "last_flush_error": self._last_flush_error,
             "flush_task_age_s": flush_task_age_s,
+            "flush_write_in_flight": flush_write_in_flight,
+            "flush_stalled": self._flush_stalled_started_at_monotonic_s is not None,
+            "flush_stalled_since_at": (
+                _isoformat(self._flush_stalled_started_at_s)
+                if self._flush_stalled_started_at_s is not None
+                else None
+            ),
+            "flush_stalled_age_s": flush_stalled_age_s,
             "flush_batch_size": self.flush_batch_size,
             "flush_timeout_s": self.flush_timeout_s,
             "dirty_bucket_warning_age_s": self.dirty_bucket_warning_age_s,
@@ -1094,6 +1112,8 @@ class SwarmDashboard:
         if self.history_store is None:
             return
         self._warn_if_dirty_buckets_stale_unlocked()
+        if self._flush_write_task is not None and not self._flush_write_task.done():
+            return
         if self._flush_task is not None and not self._flush_task.done():
             return
         if not self._has_flushable_dirty_buckets_unlocked(include_open_bucket=include_open_bucket):
@@ -1121,27 +1141,7 @@ class SwarmDashboard:
                     self._last_flush_finished_at_s = None
                     self._last_flush_error = None
 
-                try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(self.history_store.write_buckets, buckets),
-                        timeout=self.flush_timeout_s,
-                    )
-                except asyncio.TimeoutError:
-                    self._last_flush_error = (
-                        f"Dashboard history flush timed out after {self.flush_timeout_s:g}s"
-                    )
-                    self._last_flush_finished_at_s = self._time_fn()
-                    logger.error(
-                        "%s while persisting %s buckets; %s dirty buckets remain for retry",
-                        self._last_flush_error,
-                        len(buckets),
-                        len(self._dirty_bucket_starts),
-                    )
-                    return
-                except Exception as exc:
-                    self._last_flush_error = str(exc)
-                    self._last_flush_finished_at_s = self._time_fn()
-                    logger.warning("Failed to persist dashboard history to bucket store: %s", exc)
+                if not await self._write_bucket_batch(buckets):
                     return
 
                 async with self._lock:
@@ -1152,6 +1152,56 @@ class SwarmDashboard:
         finally:
             if asyncio.current_task() is self._flush_task:
                 self._flush_task_started_at_monotonic_s = None
+
+    async def _write_bucket_batch(self, buckets: list[SwarmHistoryBucket]) -> bool:
+        if self.history_store is None:
+            return False
+
+        write_task = asyncio.create_task(
+            asyncio.to_thread(self.history_store.write_buckets, buckets)
+        )
+        self._flush_write_task = write_task
+        timed_out = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(write_task),
+                    timeout=self.flush_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                timed_out = True
+                self._last_flush_error = (
+                    f"Dashboard history flush stalled after {self.flush_timeout_s:g}s"
+                )
+                self._flush_stalled_started_at_s = self._time_fn()
+                self._flush_stalled_started_at_monotonic_s = time.monotonic()
+                logger.error(
+                    "%s while persisting %s buckets; the single writer remains in flight",
+                    self._last_flush_error,
+                    len(buckets),
+                )
+                await asyncio.shield(write_task)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(write_task)
+            except Exception as exc:
+                logger.warning("Dashboard history write failed during cancellation: %s", exc)
+            raise
+        except Exception as exc:
+            self._last_flush_error = str(exc)
+            self._last_flush_finished_at_s = self._time_fn()
+            logger.warning("Failed to persist dashboard history to bucket store: %s", exc)
+            return False
+        finally:
+            if self._flush_write_task is write_task:
+                self._flush_write_task = None
+            self._flush_stalled_started_at_s = None
+            self._flush_stalled_started_at_monotonic_s = None
+
+        if timed_out:
+            logger.info("Stalled dashboard history flush completed; persistence can resume")
+        self._last_flush_error = None
+        return True
 
     def _has_flushable_dirty_buckets_unlocked(self, *, include_open_bucket: bool) -> bool:
         current_bucket_start_s = _bucket_start_epoch_s(self._time_fn(), 1)

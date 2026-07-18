@@ -203,8 +203,9 @@ minute buckets are present.
   (defaults to 28 days so the 14d/28d dashboard windows can load persisted history)
 - `DASHBOARD_FLUSH_BATCH_SIZE`: maximum minute files written in one storage call
   (defaults to 100)
-- `DASHBOARD_FLUSH_TIMEOUT_S`: timeout for each dashboard storage write batch
-  before its dirty buckets are left for a later retry (defaults to 60 seconds)
+- `DASHBOARD_FLUSH_TIMEOUT_S`: age at which an in-flight dashboard storage write
+  is reported as stalled (defaults to 60 seconds). The single writer remains in
+  flight until it resolves, preventing overlapping writes and stale overwrites.
 - `DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S`: age at which the load balancer warns
   that dashboard minute persistence is falling behind (defaults to 300 seconds)
 - `DASHBOARD_STARTUP_MERGE_DELAY_S`: delay before a second startup history read
