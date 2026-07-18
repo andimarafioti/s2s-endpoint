@@ -706,6 +706,57 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(dashboard.persistence_status()["flush_stalled"])
         self.assertIsNone(dashboard.persistence_status()["last_flush_error"])
 
+    async def test_merge_does_not_overwrite_clean_locally_sampled_bucket(self):
+        clock = FakeClock(0)
+        store = FakeHistoryStore()
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            retention_minutes=60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+        await dashboard.record_sample(
+            SwarmStateSample(
+                captured_at_s=0,
+                healthy=True,
+                detail=None,
+                total_endpoints=1,
+                running_endpoints=1,
+                warming_endpoints=0,
+                transitioning_endpoints=0,
+                parked_endpoints=0,
+                connected_sessions=0,
+                pending_sessions=0,
+                free_slots=1,
+                effective_free_slots=1,
+                router_active_sessions=0,
+                errors_count=0,
+                endpoints=[],
+            )
+        )
+        clock.set(60)
+        await dashboard._flush_dirty_buckets(include_open_bucket=False)
+        stale_bucket = SwarmHistoryBucket(
+            bucket_start_s=0,
+            sample_count=1,
+            running_endpoints_last=99,
+            running_endpoints_sum=99,
+        )
+
+        updated_bucket_count = await dashboard._merge_persisted_history_buckets([stale_bucket])
+
+        self.assertNotIn(0, dashboard._dirty_bucket_starts)
+        self.assertIn(0, dashboard._locally_sampled_bucket_starts)
+        self.assertEqual(updated_bucket_count, 0)
+        self.assertEqual(dashboard._history[0].running_endpoints_last, 1)
+
     async def test_warns_when_dirty_dashboard_buckets_are_stale(self):
         clock = FakeClock(10 * 60)
         dashboard = SwarmDashboard(

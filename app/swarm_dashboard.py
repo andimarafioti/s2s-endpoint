@@ -512,6 +512,7 @@ class SwarmDashboard:
         self._flush_write_task: Optional[asyncio.Task] = None
         self._day_rollover_task: Optional[asyncio.Task] = None
         self._dirty_bucket_starts: set[int] = set()
+        self._locally_sampled_bucket_starts: set[int] = set()
         self._flush_task_started_at_monotonic_s: Optional[float] = None
         self._last_flush_started_at_s: Optional[float] = None
         self._last_flush_finished_at_s: Optional[float] = None
@@ -946,6 +947,7 @@ class SwarmDashboard:
         return bucket
 
     def _mark_bucket_dirty_unlocked(self, bucket_start_s: int) -> None:
+        self._locally_sampled_bucket_starts.add(bucket_start_s)
         if self.history_store is not None:
             self._dirty_bucket_starts.add(bucket_start_s)
 
@@ -957,6 +959,7 @@ class SwarmDashboard:
                 break
             self._history.popitem(last=False)
             self._dirty_bucket_starts.discard(oldest_key)
+            self._locally_sampled_bucket_starts.discard(oldest_key)
 
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()
@@ -1098,7 +1101,10 @@ class SwarmDashboard:
         updated_bucket_count = 0
         async with self._lock:
             for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
-                if bucket.bucket_start_s in self._dirty_bucket_starts:
+                if (
+                    bucket.bucket_start_s in self._dirty_bucket_starts
+                    or bucket.bucket_start_s in self._locally_sampled_bucket_starts
+                ):
                     continue
                 current_bucket = self._history.get(bucket.bucket_start_s)
                 if current_bucket is None or current_bucket.to_dict() != bucket.to_dict():
