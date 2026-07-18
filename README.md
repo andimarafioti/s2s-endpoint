@@ -129,7 +129,9 @@ If you want the dashboard history to survive LB restarts, you can configure it t
 Persisted history is restored in the background during load-balancer startup, so
 the endpoint can become ready before older dashboard buckets finish loading. The
 `/dashboard/data` response includes a `history_restore` object with the restore
-status, elapsed time, and restored bucket count.
+status, elapsed time, and restored bucket count. After the initial restore, the
+load balancer performs one delayed merge by default so it also sees files that
+the previous replica wrote while shutting down.
 
 The dashboard store keeps minute files under `minutes/YYYY-MM-DD/` and also
 uses `days/YYYY-MM-DD.json` files as a compact cache for UTC days. On restore it
@@ -205,6 +207,9 @@ minute buckets are present.
   before its dirty buckets are left for a later retry (defaults to 60 seconds)
 - `DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S`: age at which the load balancer warns
   that dashboard minute persistence is falling behind (defaults to 300 seconds)
+- `DASHBOARD_STARTUP_MERGE_DELAY_S`: delay before a second startup history read
+  merges files written late by the previous LB replica (defaults to 60 seconds;
+  set to 0 to disable)
 - `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
   endpoint/session data instead of connecting to real compute endpoints. You can
   also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.

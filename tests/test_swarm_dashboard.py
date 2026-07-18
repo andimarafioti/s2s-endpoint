@@ -854,6 +854,52 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await dashboard.stop()
 
+    async def test_delayed_startup_merge_recovers_late_history_without_overwriting_live_bucket(self):
+        late_bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600)
+        late_bucket.running_endpoints_last = 3
+        late_bucket.running_endpoints_sum = 3
+        late_bucket.sample_count = 1
+        stale_live_bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600 + 60)
+        stale_live_bucket.running_endpoints_last = 99
+        stale_live_bucket.running_endpoints_sum = 99
+        stale_live_bucket.sample_count = 1
+
+        clock = FakeClock(4 * 3600 + 60)
+        store = FakeHistoryStore()
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            sample_interval_s=3600,
+            retention_minutes=24 * 60,
+            history_store=store,
+            restore_history_in_background=True,
+            startup_merge_delay_s=0.01,
+            time_fn=clock.now,
+        )
+
+        await dashboard.start()
+        try:
+            await dashboard._restore_task
+            store.saved[late_bucket.bucket_start_s] = late_bucket.to_dict()
+            store.saved[stale_live_bucket.bucket_start_s] = stale_live_bucket.to_dict()
+            await dashboard._startup_merge_task
+            series = await dashboard.series(window_minutes=2, resolution="minute")
+            status = dashboard.startup_merge_status()
+        finally:
+            await dashboard.stop()
+
+        self.assertEqual(store.load_calls, 2)
+        self.assertEqual([point["running_endpoints"] for point in series], [3, 1])
+        self.assertEqual(status["status"], "complete")
+        self.assertEqual(status["bucket_count"], 2)
+        self.assertEqual(status["updated_bucket_count"], 1)
+
 
 class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
     def test_load_recent_prefers_day_files_over_minute_files(self):
