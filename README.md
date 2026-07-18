@@ -199,6 +199,12 @@ minute buckets are present.
 - `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
 - `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
   (defaults to 28 days so the 14d/28d dashboard windows can load persisted history)
+- `DASHBOARD_FLUSH_BATCH_SIZE`: maximum minute files written in one storage call
+  (defaults to 100)
+- `DASHBOARD_FLUSH_TIMEOUT_S`: timeout for each dashboard storage write batch
+  before its dirty buckets are left for a later retry (defaults to 60 seconds)
+- `DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S`: age at which the load balancer warns
+  that dashboard minute persistence is falling behind (defaults to 300 seconds)
 - `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
   endpoint/session data instead of connecting to real compute endpoints. You can
   also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.

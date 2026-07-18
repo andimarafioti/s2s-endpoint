@@ -85,6 +85,19 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertIsInstance(module.session_manager, DashboardPreviewSessionManager)
         self.assertEqual(module.COMPUTE_ENDPOINT_NAMES[0], "preview-compute-01")
 
+    def test_health_exposes_dashboard_persistence_status(self):
+        module = self._import_load_balancer(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "TEST",
+                "SESSION_SHARED_SECRET": "",
+            }
+        )
+
+        response = TestClient(module.app).get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["dashboard_history"]["enabled"])
+
     @patch("app.dashboard_history_store.HuggingFaceBucketHistoryStore.__init__", return_value=None)
     def test_preview_mode_uses_dashboard_bucket_persistence_read_only(self, init_store):
         module = self._import_load_balancer(

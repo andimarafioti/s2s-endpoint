@@ -473,18 +473,30 @@ class SwarmDashboard:
         retention_minutes: int = 28 * 24 * 60,
         history_store: Optional[DashboardHistoryStore] = None,
         restore_history_in_background: bool = False,
+        flush_batch_size: int = 100,
+        flush_timeout_s: float = 60.0,
+        dirty_bucket_warning_age_s: float = 300.0,
         time_fn: Callable[[], float] = time.time,
     ) -> None:
         if sample_interval_s <= 0:
             raise ValueError("sample_interval_s must be > 0")
         if retention_minutes < 60:
             raise ValueError("retention_minutes must be >= 60")
+        if flush_batch_size < 1:
+            raise ValueError("flush_batch_size must be >= 1")
+        if flush_timeout_s <= 0:
+            raise ValueError("flush_timeout_s must be > 0")
+        if dirty_bucket_warning_age_s <= 0:
+            raise ValueError("dirty_bucket_warning_age_s must be > 0")
 
         self.snapshot_provider = snapshot_provider
         self.sample_interval_s = sample_interval_s
         self.retention_minutes = retention_minutes
         self.history_store = history_store
         self.restore_history_in_background = restore_history_in_background
+        self.flush_batch_size = flush_batch_size
+        self.flush_timeout_s = flush_timeout_s
+        self.dirty_bucket_warning_age_s = dirty_bucket_warning_age_s
         self._time_fn = time_fn
         self._lock = asyncio.Lock()
         self._history: "OrderedDict[int, SwarmHistoryBucket]" = OrderedDict()
@@ -494,6 +506,11 @@ class SwarmDashboard:
         self._flush_task: Optional[asyncio.Task] = None
         self._day_rollover_task: Optional[asyncio.Task] = None
         self._dirty_bucket_starts: set[int] = set()
+        self._flush_task_started_at_monotonic_s: Optional[float] = None
+        self._last_flush_started_at_s: Optional[float] = None
+        self._last_flush_finished_at_s: Optional[float] = None
+        self._last_flush_error: Optional[str] = None
+        self._last_dirty_bucket_warning_at_monotonic_s: Optional[float] = None
         self._day_rollover_cursor_s: Optional[int] = None
         self._history_restore_status = "disabled" if history_store is None else "pending"
         self._history_restore_detail: Optional[str] = None
@@ -567,7 +584,7 @@ class SwarmDashboard:
             bucket = self._get_bucket_unlocked(sample.captured_at_s)
             bucket.record_sample(sample)
             self._latest_sample = sample
-            self._dirty_bucket_starts.add(bucket.bucket_start_s)
+            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(sample.captured_at_s)
             self._schedule_flush_unlocked(include_open_bucket=False)
 
@@ -627,6 +644,7 @@ class SwarmDashboard:
             "rolling_series": rolling_series,
             "retention_minutes": self.retention_minutes,
             "history_restore": self.history_restore_status(),
+            "history_persistence": self.persistence_status(),
         }
 
     async def summary(self, *, window_minutes: int, requested_window: str) -> dict[str, object]:
@@ -776,6 +794,42 @@ class SwarmDashboard:
             ),
         }
 
+    def persistence_status(self) -> dict[str, object]:
+        now_epoch_s = self._time_fn()
+        oldest_dirty_bucket_start_s = min(self._dirty_bucket_starts, default=None)
+        flush_task_running = self._flush_task is not None and not self._flush_task.done()
+        flush_task_age_s = None
+        if flush_task_running and self._flush_task_started_at_monotonic_s is not None:
+            flush_task_age_s = round(
+                max(time.monotonic() - self._flush_task_started_at_monotonic_s, 0.0),
+                2,
+            )
+        return {
+            "enabled": self.history_store is not None,
+            "read_only": bool(getattr(self.history_store, "read_only", False)),
+            "dirty_bucket_count": len(self._dirty_bucket_starts),
+            "oldest_dirty_bucket_age_s": (
+                round(max(now_epoch_s - oldest_dirty_bucket_start_s, 0.0), 2)
+                if oldest_dirty_bucket_start_s is not None
+                else None
+            ),
+            "last_flush_started_at": (
+                _isoformat(self._last_flush_started_at_s)
+                if self._last_flush_started_at_s is not None
+                else None
+            ),
+            "last_flush_finished_at": (
+                _isoformat(self._last_flush_finished_at_s)
+                if self._last_flush_finished_at_s is not None
+                else None
+            ),
+            "last_flush_error": self._last_flush_error,
+            "flush_task_age_s": flush_task_age_s,
+            "flush_batch_size": self.flush_batch_size,
+            "flush_timeout_s": self.flush_timeout_s,
+            "dirty_bucket_warning_age_s": self.dirty_bucket_warning_age_s,
+        }
+
     async def _sample_loop(self) -> None:
         try:
             while True:
@@ -799,7 +853,7 @@ class SwarmDashboard:
         async with self._lock:
             bucket = self._get_bucket_unlocked(now)
             setattr(bucket, field_name, getattr(bucket, field_name) + 1)
-            self._dirty_bucket_starts.add(bucket.bucket_start_s)
+            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(now)
             self._schedule_flush_unlocked(include_open_bucket=False)
 
@@ -814,7 +868,7 @@ class SwarmDashboard:
                 duration_s,
             )
             bucket.completed_conversation_duration_samples_s.append(duration_s)
-            self._dirty_bucket_starts.add(bucket.bucket_start_s)
+            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(now)
             self._schedule_flush_unlocked(include_open_bucket=False)
 
@@ -825,6 +879,10 @@ class SwarmDashboard:
             bucket = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
             self._history[bucket_start_s] = bucket
         return bucket
+
+    def _mark_bucket_dirty_unlocked(self, bucket_start_s: int) -> None:
+        if self.history_store is not None:
+            self._dirty_bucket_starts.add(bucket_start_s)
 
     def _prune_unlocked(self, epoch_s: float) -> None:
         min_allowed_bucket = _bucket_start_epoch_s(epoch_s, 1) - (self.retention_minutes - 1) * 60
@@ -922,29 +980,98 @@ class SwarmDashboard:
     def _schedule_flush_unlocked(self, *, include_open_bucket: bool) -> None:
         if self.history_store is None:
             return
+        self._warn_if_dirty_buckets_stale_unlocked()
         if self._flush_task is not None and not self._flush_task.done():
             return
+        if not self._has_flushable_dirty_buckets_unlocked(include_open_bucket=include_open_bucket):
+            return
+        self._flush_task_started_at_monotonic_s = time.monotonic()
         self._flush_task = asyncio.create_task(self._flush_dirty_buckets(include_open_bucket=include_open_bucket))
 
     async def _flush_dirty_buckets(self, *, include_open_bucket: bool) -> None:
         if self.history_store is None:
             return
 
-        while True:
-            async with self._lock:
-                buckets = self._collect_dirty_buckets_unlocked(include_open_bucket=include_open_bucket)
-            if not buckets:
-                return
+        flush_started = False
+        try:
+            while True:
+                async with self._lock:
+                    buckets = self._collect_dirty_buckets_unlocked(include_open_bucket=include_open_bucket)
+                if not buckets:
+                    if flush_started:
+                        self._last_flush_finished_at_s = self._time_fn()
+                    return
 
-            try:
-                await asyncio.to_thread(self.history_store.write_buckets, buckets)
-            except Exception as exc:
-                logger.warning("Failed to persist dashboard history to bucket store: %s", exc)
-                return
+                if not flush_started:
+                    flush_started = True
+                    self._last_flush_started_at_s = self._time_fn()
+                    self._last_flush_finished_at_s = None
+                    self._last_flush_error = None
 
-            async with self._lock:
-                for bucket in buckets:
-                    self._dirty_bucket_starts.discard(bucket.bucket_start_s)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(self.history_store.write_buckets, buckets),
+                        timeout=self.flush_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    self._last_flush_error = (
+                        f"Dashboard history flush timed out after {self.flush_timeout_s:g}s"
+                    )
+                    self._last_flush_finished_at_s = self._time_fn()
+                    logger.error(
+                        "%s while persisting %s buckets; %s dirty buckets remain for retry",
+                        self._last_flush_error,
+                        len(buckets),
+                        len(self._dirty_bucket_starts),
+                    )
+                    return
+                except Exception as exc:
+                    self._last_flush_error = str(exc)
+                    self._last_flush_finished_at_s = self._time_fn()
+                    logger.warning("Failed to persist dashboard history to bucket store: %s", exc)
+                    return
+
+                async with self._lock:
+                    for bucket in buckets:
+                        current_bucket = self._history.get(bucket.bucket_start_s)
+                        if current_bucket is None or current_bucket.to_dict() == bucket.to_dict():
+                            self._dirty_bucket_starts.discard(bucket.bucket_start_s)
+        finally:
+            if asyncio.current_task() is self._flush_task:
+                self._flush_task_started_at_monotonic_s = None
+
+    def _has_flushable_dirty_buckets_unlocked(self, *, include_open_bucket: bool) -> bool:
+        current_bucket_start_s = _bucket_start_epoch_s(self._time_fn(), 1)
+        return any(
+            bucket_start_s in self._history
+            and (include_open_bucket or bucket_start_s < current_bucket_start_s)
+            for bucket_start_s in self._dirty_bucket_starts
+        )
+
+    def _warn_if_dirty_buckets_stale_unlocked(self) -> None:
+        oldest_dirty_bucket_start_s = min(self._dirty_bucket_starts, default=None)
+        if oldest_dirty_bucket_start_s is None:
+            return
+        oldest_dirty_bucket_age_s = max(self._time_fn() - oldest_dirty_bucket_start_s, 0.0)
+        if oldest_dirty_bucket_age_s < self.dirty_bucket_warning_age_s:
+            return
+
+        now_monotonic_s = time.monotonic()
+        warning_interval_s = max(self.dirty_bucket_warning_age_s, 60.0)
+        if (
+            self._last_dirty_bucket_warning_at_monotonic_s is not None
+            and now_monotonic_s - self._last_dirty_bucket_warning_at_monotonic_s < warning_interval_s
+        ):
+            return
+        self._last_dirty_bucket_warning_at_monotonic_s = now_monotonic_s
+        logger.warning(
+            "Dashboard history persistence has %s dirty buckets; oldest dirty bucket age is %.1fs, "
+            "flush task age is %s, last flush error is %s",
+            len(self._dirty_bucket_starts),
+            oldest_dirty_bucket_age_s,
+            self.persistence_status()["flush_task_age_s"],
+            self._last_flush_error,
+        )
 
     def _history_store_day_writer(self) -> Optional[Callable[..., Optional[str]]]:
         if self.history_store is None:
@@ -1012,11 +1139,11 @@ class SwarmDashboard:
     def _collect_dirty_buckets_unlocked(self, *, include_open_bucket: bool) -> list[SwarmHistoryBucket]:
         current_bucket_start_s = _bucket_start_epoch_s(self._time_fn(), 1)
         return [
-            self._history[bucket_start_s]
+            SwarmHistoryBucket.from_dict(self._history[bucket_start_s].to_dict())
             for bucket_start_s in sorted(self._dirty_bucket_starts)
             if bucket_start_s in self._history
             and (include_open_bucket or bucket_start_s < current_bucket_start_s)
-        ]
+        ][: self.flush_batch_size]
 
 
 def _dashboard_html(*, history_persisted: bool = False) -> str:

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import time
@@ -74,6 +75,20 @@ class SlowHistoryStore(FakeHistoryStore):
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float):
         time.sleep(self.delay_s)
         return super().load_recent(retention_minutes=retention_minutes, now_epoch_s=now_epoch_s)
+
+
+class SlowFirstWriteHistoryStore(FakeHistoryStore):
+    def __init__(self, *, delay_s: float):
+        super().__init__()
+        self.delay_s = delay_s
+        self.write_attempts = 0
+
+    def write_buckets(self, buckets):
+        self.write_attempts += 1
+        if self.write_attempts == 1:
+            time.sleep(self.delay_s)
+            return
+        super().write_buckets(buckets)
 
 
 class FakeBucketItem:
@@ -257,6 +272,8 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["summary"]["active_conversation_days_window"], 0.001)
         self.assertEqual(payload["summary"]["avg_conversation_duration_window_s"], 150.0)
         self.assertEqual(payload["summary"]["peak_connected_sessions_window"], 2)
+        self.assertFalse(payload["history_persistence"]["enabled"])
+        self.assertEqual(payload["history_persistence"]["dirty_bucket_count"], 0)
 
     async def test_hourly_series_averages_state_metrics_and_sums_events(self):
         clock = FakeClock(3 * 3600)
@@ -607,6 +624,102 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted.completed_conversations, 1)
         self.assertEqual(persisted.completed_conversation_duration_total_s, 90.0)
         self.assertEqual(persisted.completed_conversation_duration_samples_s, [90.0])
+
+    async def test_flushes_dirty_buckets_in_bounded_batches(self):
+        clock = FakeClock(5 * 60)
+        store = FakeHistoryStore()
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            retention_minutes=60,
+            history_store=store,
+            flush_batch_size=2,
+            time_fn=clock.now,
+        )
+        for bucket_start_s in range(0, 5 * 60, 60):
+            dashboard._history[bucket_start_s] = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
+            dashboard._dirty_bucket_starts.add(bucket_start_s)
+
+        await dashboard._flush_dirty_buckets(include_open_bucket=False)
+
+        self.assertEqual(store.write_calls, [[0, 60], [120, 180], [240]])
+        status = dashboard.persistence_status()
+        self.assertEqual(status["dirty_bucket_count"], 0)
+        self.assertIsNotNone(status["last_flush_started_at"])
+        self.assertIsNotNone(status["last_flush_finished_at"])
+        self.assertIsNone(status["last_flush_error"])
+
+    async def test_timed_out_flush_leaves_dirty_buckets_for_retry(self):
+        clock = FakeClock(2 * 60)
+        store = SlowFirstWriteHistoryStore(delay_s=0.05)
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            retention_minutes=60,
+            history_store=store,
+            flush_timeout_s=0.01,
+            time_fn=clock.now,
+        )
+        dashboard._history[0] = SwarmHistoryBucket(bucket_start_s=0)
+        dashboard._dirty_bucket_starts.add(0)
+
+        with self.assertLogs("s2s-endpoint", level="ERROR"):
+            await dashboard._flush_dirty_buckets(include_open_bucket=False)
+
+        self.assertEqual(dashboard.persistence_status()["dirty_bucket_count"], 1)
+        self.assertIn("timed out", dashboard.persistence_status()["last_flush_error"])
+        await asyncio.sleep(0.06)
+
+        await dashboard._flush_dirty_buckets(include_open_bucket=False)
+
+        self.assertEqual(store.write_attempts, 2)
+        self.assertEqual(dashboard.persistence_status()["dirty_bucket_count"], 0)
+        self.assertIsNone(dashboard.persistence_status()["last_flush_error"])
+
+    async def test_warns_when_dirty_dashboard_buckets_are_stale(self):
+        clock = FakeClock(10 * 60)
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            retention_minutes=60,
+            history_store=FakeHistoryStore(),
+            dirty_bucket_warning_age_s=300,
+            time_fn=clock.now,
+        )
+        dashboard._history[0] = SwarmHistoryBucket(bucket_start_s=0)
+        dashboard._dirty_bucket_starts.add(0)
+        dashboard._flush_task_started_at_monotonic_s = time.monotonic()
+        dashboard._flush_task = asyncio.create_task(asyncio.sleep(1))
+        try:
+            with self.assertLogs("s2s-endpoint", level="WARNING") as logs:
+                dashboard._schedule_flush_unlocked(include_open_bucket=False)
+            status = dashboard.persistence_status()
+        finally:
+            dashboard._flush_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await dashboard._flush_task
+
+        self.assertIn("oldest dirty bucket age is 600.0s", logs.output[0])
+        self.assertEqual(status["oldest_dirty_bucket_age_s"], 600.0)
+        self.assertIsNotNone(status["flush_task_age_s"])
 
     async def test_restores_persisted_history_from_store_on_start(self):
         bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600)

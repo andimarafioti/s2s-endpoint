@@ -58,6 +58,9 @@ SESSION_TOKEN_TTL_S = float(os.getenv("SESSION_TOKEN_TTL_S", "86400"))
 SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
 DASHBOARD_SAMPLE_INTERVAL_S = float(os.getenv("DASHBOARD_SAMPLE_INTERVAL_S", "15"))
 DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(28 * 24 * 60)))
+DASHBOARD_FLUSH_BATCH_SIZE = int(os.getenv("DASHBOARD_FLUSH_BATCH_SIZE", "100"))
+DASHBOARD_FLUSH_TIMEOUT_S = float(os.getenv("DASHBOARD_FLUSH_TIMEOUT_S", "60"))
+DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S = float(os.getenv("DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S", "300"))
 DASHBOARD_BUCKET_ID = os.getenv("DASHBOARD_BUCKET_ID", "").strip() or None
 DASHBOARD_BUCKET_PREFIX = os.getenv("DASHBOARD_BUCKET_PREFIX", "s2s-endpoint/swarm-dashboard").strip()
 DASHBOARD_BUCKET_TOKEN = os.getenv("DASHBOARD_BUCKET_TOKEN", "").strip() or HF_CONTROL_TOKEN
@@ -139,6 +142,9 @@ dashboard = SwarmDashboard(
     retention_minutes=DASHBOARD_RETENTION_MINUTES,
     history_store=dashboard_history_store,
     restore_history_in_background=True,
+    flush_batch_size=DASHBOARD_FLUSH_BATCH_SIZE,
+    flush_timeout_s=DASHBOARD_FLUSH_TIMEOUT_S,
+    dirty_bucket_warning_age_s=DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S,
 )
 
 
@@ -270,6 +276,7 @@ async def health():
             "role": APP_ROLE,
             "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
             "dashboard_preview_mode": DASHBOARD_PREVIEW_MODE,
+            "dashboard_history": dashboard.persistence_status(),
             "sessions": snapshot,
         }
     )
