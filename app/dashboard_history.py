@@ -11,6 +11,7 @@ from typing import Callable, Optional, Protocol
 logger = logging.getLogger("s2s-endpoint")
 DAY_MINUTES = 24 * 60
 DAY_SECONDS = DAY_MINUTES * 60
+HISTORY_MERGE_COMPARISON_CHUNK_SIZE = 256
 PERSISTENCE_WORKER_RETRY_DELAY_S = 1.0
 
 
@@ -25,6 +26,12 @@ def _bucket_start_epoch_s(epoch_s: float, bucket_minutes: int) -> int:
 
 def _day_start_epoch_s(epoch_s: float) -> int:
     return _bucket_start_epoch_s(epoch_s, DAY_MINUTES)
+
+
+def _startup_merge_retention_minutes(now_epoch_s: float) -> int:
+    current_bucket_start_s = _bucket_start_epoch_s(now_epoch_s, 1)
+    previous_day_start_s = _day_start_epoch_s(now_epoch_s) - DAY_SECONDS
+    return ((current_bucket_start_s - previous_day_start_s) // 60) + 1
 
 
 def _day_key(epoch_s: int | float) -> str:
@@ -643,7 +650,14 @@ class DashboardHistory:
             self._startup_merge_bucket_count = 0
             self._startup_merge_updated_bucket_count = 0
             self._startup_merge_status = "running"
-            buckets = await self._load_persisted_history()
+            now_epoch_s = self._time_fn()
+            buckets = await self._load_persisted_history(
+                retention_minutes=min(
+                    self.retention_minutes,
+                    _startup_merge_retention_minutes(now_epoch_s),
+                ),
+                now_epoch_s=now_epoch_s,
+            )
             updated_bucket_count = await self._merge_persisted_history_buckets(buckets)
         except asyncio.CancelledError:
             self._startup_merge_status = "cancelled"
@@ -663,28 +677,58 @@ class DashboardHistory:
             time.monotonic() - started_s,
         )
 
-    async def _load_persisted_history(self) -> list[SwarmHistoryBucket]:
+    async def _load_persisted_history(
+        self,
+        *,
+        retention_minutes: Optional[int] = None,
+        now_epoch_s: Optional[float] = None,
+    ) -> list[SwarmHistoryBucket]:
         if self.history_store is None:
             return []
         return await asyncio.to_thread(
             self.history_store.load_recent,
-            retention_minutes=self.retention_minutes,
-            now_epoch_s=self._time_fn(),
+            retention_minutes=(
+                self.retention_minutes
+                if retention_minutes is None
+                else retention_minutes
+            ),
+            now_epoch_s=self._time_fn() if now_epoch_s is None else now_epoch_s,
         )
 
     async def _merge_persisted_history_buckets(self, buckets: list[SwarmHistoryBucket]) -> int:
+        merge_candidates: list[tuple[SwarmHistoryBucket, Optional[SwarmHistoryBucket]]] = []
+        sorted_buckets = sorted(buckets, key=lambda item: item.bucket_start_s)
+        for chunk_start in range(0, len(sorted_buckets), HISTORY_MERGE_COMPARISON_CHUNK_SIZE):
+            chunk = sorted_buckets[chunk_start:chunk_start + HISTORY_MERGE_COMPARISON_CHUNK_SIZE]
+            serialized_buckets = [
+                (bucket, bucket.to_dict()) for bucket in chunk
+            ]
+            async with self._lock:
+                for bucket, serialized_bucket in serialized_buckets:
+                    if (
+                        bucket.bucket_start_s in self._dirty_bucket_starts
+                        or bucket.bucket_start_s in self._locally_sampled_bucket_starts
+                    ):
+                        continue
+                    current_bucket = self._history.get(bucket.bucket_start_s)
+                    if current_bucket is None or current_bucket.to_dict() != serialized_bucket:
+                        merge_candidates.append((bucket, current_bucket))
+            await asyncio.sleep(0)
+
         updated_bucket_count = 0
         async with self._lock:
-            for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
+            for bucket, compared_bucket in merge_candidates:
                 if (
                     bucket.bucket_start_s in self._dirty_bucket_starts
                     or bucket.bucket_start_s in self._locally_sampled_bucket_starts
                 ):
                     continue
                 current_bucket = self._history.get(bucket.bucket_start_s)
-                if current_bucket is None or current_bucket.to_dict() != bucket.to_dict():
-                    self._history[bucket.bucket_start_s] = bucket
-                    updated_bucket_count += 1
+                if current_bucket is not compared_bucket:
+                    if current_bucket is not None and current_bucket.to_dict() == bucket.to_dict():
+                        continue
+                self._history[bucket.bucket_start_s] = bucket
+                updated_bucket_count += 1
             self._history = OrderedDict(sorted(self._history.items()))
             self._prune_unlocked(self._time_fn())
         return updated_bucket_count
