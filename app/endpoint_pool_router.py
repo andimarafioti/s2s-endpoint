@@ -293,7 +293,13 @@ class ManagedEndpoint:
 
     @property
     def free_slots(self) -> int:
-        if not self.running or self.parking or self.draining or self.drain_restarting:
+        if (
+            not self.running
+            or self.parking
+            or self.restarting
+            or self.draining
+            or self.drain_restarting
+        ):
             return 0
         if self.require_usage_sync and not self.usage_synced:
             return 0
@@ -1240,11 +1246,15 @@ class EndpointPoolRouter:
         if not candidates:
             return None
 
+        # Pack sessions onto the fullest available endpoint so completely
+        # idle endpoints can keep aging toward their parking timeout. When
+        # idle capacity is needed, reuse the newest idle endpoint first.
         return min(
             candidates,
             key=lambda item: (
-                item.busy_sessions / item.slots,
-                item.busy_sessions,
+                item.busy_sessions == 0,
+                -item.busy_sessions,
+                -item.last_used_at if item.busy_sessions == 0 else 0,
                 item.name,
             ),
         )
