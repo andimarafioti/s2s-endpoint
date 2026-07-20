@@ -1343,12 +1343,14 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         await self.router._schedule_parks_if_needed()
         await asyncio.sleep(0.05)
 
-        self.assertEqual(lease.endpoint_name, "endpoint-a")
-        self.assertEqual(controller.park_calls, ["endpoint-b"])
+        idle_endpoint_name = (
+            {"endpoint-a", "endpoint-b"} - {lease.endpoint_name}
+        ).pop()
+        self.assertEqual(controller.park_calls, [idle_endpoint_name])
         snapshot = await self.router.snapshot()
         endpoints = {endpoint["name"]: endpoint for endpoint in snapshot["endpoints"]}
-        self.assertEqual(endpoints["endpoint-a"]["local_connected_sessions"], 1)
-        self.assertEqual(endpoints["endpoint-a"]["active_sessions"], 1)
+        self.assertEqual(endpoints[lease.endpoint_name]["local_connected_sessions"], 1)
+        self.assertEqual(endpoints[lease.endpoint_name]["active_sessions"], 1)
 
     async def test_warming_endpoint_counts_as_capacity_until_timeout(self):
         controller = FakeEndpointController(
@@ -1427,6 +1429,105 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         snapshot = await self.router.snapshot()
         self.assertEqual(snapshot["running_endpoints"], 1)
+
+
+class EndpointSelectionTests(unittest.TestCase):
+    def _make_router(self, *, endpoint_names, endpoint_slots):
+        controller = FakeEndpointController(
+            [
+                (
+                    name,
+                    "running",
+                    f"https://{name}.example.endpoints.huggingface.cloud",
+                )
+                for name in endpoint_names
+            ]
+        )
+        router = EndpointPoolRouter(
+            endpoint_names=endpoint_names,
+            endpoint_slots=endpoint_slots,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        for endpoint in router._endpoints.values():
+            endpoint.status = "running"
+            endpoint.raw_status = "running"
+            endpoint.url = (
+                f"https://{endpoint.name}.example.endpoints.huggingface.cloud"
+            )
+        return router
+
+    def test_prefers_partially_used_endpoint_over_idle_endpoint(self):
+        router = self._make_router(
+            endpoint_names=["endpoint-idle", "endpoint-busy"],
+            endpoint_slots=2,
+        )
+        router._endpoints["endpoint-busy"].observed_active_sessions = 1
+
+        selected = router._select_endpoint_unlocked()
+
+        self.assertEqual(selected.name, "endpoint-busy")
+
+    def test_prefers_fullest_endpoint_with_available_capacity(self):
+        router = self._make_router(
+            endpoint_names=["endpoint-idle", "endpoint-one", "endpoint-three"],
+            endpoint_slots=4,
+        )
+        router._endpoints["endpoint-one"].observed_active_sessions = 1
+        router._endpoints["endpoint-three"].observed_active_sessions = 3
+
+        selected = router._select_endpoint_unlocked()
+
+        self.assertEqual(selected.name, "endpoint-three")
+
+    def test_prefers_most_recently_used_idle_endpoint(self):
+        router = self._make_router(
+            endpoint_names=["endpoint-a-old", "endpoint-z-new"],
+            endpoint_slots=4,
+        )
+        router._endpoints["endpoint-a-old"].last_used_at = 10
+        router._endpoints["endpoint-z-new"].last_used_at = 20
+
+        selected = router._select_endpoint_unlocked()
+
+        self.assertEqual(selected.name, "endpoint-z-new")
+
+    def test_excludes_endpoints_without_free_slots(self):
+        router = self._make_router(
+            endpoint_names=[
+                "endpoint-eligible",
+                "endpoint-full",
+                "endpoint-draining",
+                "endpoint-parking",
+                "endpoint-restarting",
+                "endpoint-unsynced",
+            ],
+            endpoint_slots=2,
+        )
+        router._endpoints["endpoint-eligible"].observed_active_sessions = 1
+        router._endpoints["endpoint-full"].observed_active_sessions = 2
+        router._endpoints["endpoint-draining"].draining = True
+        router._endpoints["endpoint-parking"].parking = True
+        router._endpoints["endpoint-restarting"].restarting = True
+        router._endpoints["endpoint-unsynced"].require_usage_sync = True
+        router._endpoints["endpoint-unsynced"].usage_synced = False
+
+        selected = router._select_endpoint_unlocked()
+
+        self.assertEqual(selected.name, "endpoint-eligible")
+        for name in (
+            "endpoint-full",
+            "endpoint-draining",
+            "endpoint-parking",
+            "endpoint-restarting",
+            "endpoint-unsynced",
+        ):
+            self.assertEqual(router._endpoints[name].free_slots, 0, name)
 
 
 class ManagedEndpointPropertyTests(unittest.TestCase):
