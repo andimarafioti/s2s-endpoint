@@ -214,7 +214,12 @@ minute buckets are present.
   This also configures the Hugging Face Hub HTTP client request timeout. During
   shutdown, final dashboard persistence gets a total budget of twice this value;
   the load balancer logs any remaining dirty buckets and continues shutdown if
-  the budget expires.
+  the budget expires. Prompt write failures retry with capped exponential
+  backoff at 15, 30, 60, 120, 240, and then 300 seconds; a successful write
+  resets the sequence. Stalled single-flight writes start this backoff only if
+  they eventually resolve with an error. Dashboard persistence status exposes
+  the consecutive failure count, current delay, next retry time, and remaining
+  delay.
 - `DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S`: age at which the load balancer warns
   that dashboard minute persistence is falling behind (defaults to 300 seconds)
 - `DASHBOARD_STARTUP_MERGE_DELAY_S`: interval before each of two startup history
