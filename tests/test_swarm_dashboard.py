@@ -40,9 +40,11 @@ class FakeHistoryStore:
         }
         self.write_calls = []
         self.load_calls = 0
+        self.load_requests = []
 
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float):
         self.load_calls += 1
+        self.load_requests.append((retention_minutes, now_epoch_s))
         min_bucket = int(now_epoch_s // 60) * 60 - (retention_minutes - 1) * 60
         return [
             SwarmHistoryBucket.from_dict(payload)
@@ -757,6 +759,50 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated_bucket_count, 0)
         self.assertEqual(dashboard.history._history[0].running_endpoints_last, 1)
 
+    async def test_merge_releases_lock_between_comparison_chunks(self):
+        clock = FakeClock(2 * 60)
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            retention_minutes=60,
+            time_fn=clock.now,
+        )
+        current_bucket = SwarmHistoryBucket(bucket_start_s=0, running_endpoints_last=1)
+        dashboard.history._history[0] = current_bucket
+        first_comparison_started = asyncio.Event()
+        original_to_dict = current_bucket.to_dict
+
+        def signal_first_comparison():
+            first_comparison_started.set()
+            return original_to_dict()
+
+        current_bucket.to_dict = signal_first_comparison
+        persisted_buckets = [
+            SwarmHistoryBucket(bucket_start_s=0, running_endpoints_last=2),
+            SwarmHistoryBucket(bucket_start_s=60, running_endpoints_last=3),
+        ]
+
+        async def inspect_between_chunks():
+            await first_comparison_started.wait()
+            async with dashboard.history._lock:
+                return 60 not in dashboard.history._history
+
+        inspector_task = asyncio.create_task(inspect_between_chunks())
+        with patch("app.dashboard_history.HISTORY_MERGE_COMPARISON_CHUNK_SIZE", 1):
+            updated_bucket_count = await dashboard.history._merge_persisted_history_buckets(
+                persisted_buckets
+            )
+
+        self.assertTrue(await inspector_task)
+        self.assertEqual(updated_bucket_count, 2)
+        self.assertEqual(dashboard.history._history[60].running_endpoints_last, 3)
+
     async def test_shutdown_abandons_permanently_blocked_flush_after_budget(self):
         clock = FakeClock(2 * 60)
         store = BlockingFirstWriteHistoryStore()
@@ -1097,16 +1143,26 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             await dashboard.stop()
 
     async def test_delayed_startup_merge_recovers_late_history_without_overwriting_live_bucket(self):
-        late_bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600)
-        late_bucket.running_endpoints_last = 3
-        late_bucket.running_endpoints_sum = 3
-        late_bucket.sample_count = 1
-        stale_live_bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600 + 60)
+        current_day_start = _day_start(2026, 5, 19)
+        now_epoch_s = current_day_start + 4 * 3600 + 60
+        previous_day_bucket = SwarmHistoryBucket(
+            bucket_start_s=current_day_start - 12 * 3600,
+            running_endpoints_last=2,
+            running_endpoints_sum=2,
+            sample_count=1,
+        )
+        late_bucket = SwarmHistoryBucket(
+            bucket_start_s=now_epoch_s - 60,
+            running_endpoints_last=3,
+            running_endpoints_sum=3,
+            sample_count=1,
+        )
+        stale_live_bucket = SwarmHistoryBucket(bucket_start_s=now_epoch_s)
         stale_live_bucket.running_endpoints_last = 99
         stale_live_bucket.running_endpoints_sum = 99
         stale_live_bucket.sample_count = 1
 
-        clock = FakeClock(4 * 3600 + 60)
+        clock = FakeClock(now_epoch_s)
         store = FakeHistoryStore()
         dashboard = SwarmDashboard(
             snapshot_provider=FakeSnapshotProvider(_health_snapshot(
@@ -1118,7 +1174,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
                 effective_free_slots=1,
             )),
             sample_interval_s=3600,
-            retention_minutes=24 * 60,
+            retention_minutes=28 * 24 * 60,
             history_store=store,
             restore_history_in_background=True,
             startup_merge_delay_s=0.01,
@@ -1128,19 +1184,28 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         await dashboard.start()
         try:
             await dashboard.history._restore_task
+            store.saved[previous_day_bucket.bucket_start_s] = previous_day_bucket.to_dict()
             store.saved[late_bucket.bucket_start_s] = late_bucket.to_dict()
             store.saved[stale_live_bucket.bucket_start_s] = stale_live_bucket.to_dict()
             await dashboard.history._startup_merge_task
             series = await dashboard.series(window_minutes=2, resolution="minute")
+            snapshot = await dashboard.history.snapshot()
             status = dashboard.startup_merge_status()
         finally:
             await dashboard.stop()
 
         self.assertEqual(store.load_calls, 2)
+        self.assertEqual(store.load_requests, [
+            (28 * 24 * 60, now_epoch_s),
+            (24 * 60 + 4 * 60 + 2, now_epoch_s),
+        ])
+        self.assertIn(previous_day_bucket.bucket_start_s, {
+            bucket.bucket_start_s for bucket in snapshot
+        })
         self.assertEqual([point["running_endpoints"] for point in series], [3, 1])
         self.assertEqual(status["status"], "complete")
-        self.assertEqual(status["bucket_count"], 2)
-        self.assertEqual(status["updated_bucket_count"], 1)
+        self.assertEqual(status["bucket_count"], 3)
+        self.assertEqual(status["updated_bucket_count"], 2)
 
 
 class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
@@ -1202,6 +1267,64 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         self.assertEqual([bucket.bucket_start_s for bucket in loaded], [day_start])
         self.assertEqual(loaded[0].running_endpoints_last, 3)
         self.assertEqual(api.list_prefixes, ["reachy-s2s-lb/days"])
+
+    def test_bounded_startup_merge_window_loads_previous_day_file_and_recent_minute(self):
+        previous_day_start = _day_start(2026, 5, 18)
+        current_day_start = previous_day_start + 24 * 60 * 60
+        now_epoch_s = current_day_start + 4 * 3600 + 60
+        previous_day_buckets = [
+            SwarmHistoryBucket(bucket_start_s=previous_day_start + minute * 60)
+            for minute in range(24 * 60)
+        ]
+        recent_bucket = SwarmHistoryBucket(
+            bucket_start_s=now_epoch_s - 60,
+            running_endpoints_last=4,
+        )
+        ancient_day_start = previous_day_start - 24 * 60 * 60
+        api = FakeBucketApi(
+            {
+                "reachy-s2s-lb/days/2026-05-17.json": {
+                    "version": 1,
+                    "day_start_s": ancient_day_start,
+                    "day": "2026-05-17",
+                    "complete": True,
+                    "minute_bucket_count": 24 * 60,
+                    "expected_minute_bucket_count": 24 * 60,
+                    "buckets": [],
+                },
+                "reachy-s2s-lb/days/2026-05-18.json": {
+                    "version": 1,
+                    "day_start_s": previous_day_start,
+                    "day": "2026-05-18",
+                    "complete": True,
+                    "minute_bucket_count": 24 * 60,
+                    "expected_minute_bucket_count": 24 * 60,
+                    "buckets": [bucket.to_dict() for bucket in previous_day_buckets],
+                },
+                f"reachy-s2s-lb/minutes/2026-05-19/{recent_bucket.bucket_start_s}.json": {
+                    "version": 1,
+                    "bucket": recent_bucket.to_dict(),
+                },
+            }
+        )
+        store = _bucket_store(api)
+
+        loaded = store.load_recent(
+            retention_minutes=24 * 60 + 4 * 60 + 2,
+            now_epoch_s=now_epoch_s,
+        )
+
+        loaded_by_start = {bucket.bucket_start_s: bucket for bucket in loaded}
+        downloaded_paths = [remote_path for remote_path, _ in api.downloads]
+        self.assertEqual(len(loaded), (24 * 60) + 1)
+        self.assertIn(previous_day_start, loaded_by_start)
+        self.assertEqual(loaded_by_start[recent_bucket.bucket_start_s].running_endpoints_last, 4)
+        self.assertIn("reachy-s2s-lb/days/2026-05-18.json", downloaded_paths)
+        self.assertIn(
+            f"reachy-s2s-lb/minutes/2026-05-19/{recent_bucket.bucket_start_s}.json",
+            downloaded_paths,
+        )
+        self.assertNotIn("reachy-s2s-lb/days/2026-05-17.json", downloaded_paths)
 
     def test_load_recent_merges_partial_day_file_with_minute_files(self):
         day_start = _day_start(2026, 5, 18)
