@@ -131,7 +131,9 @@ the endpoint can become ready before older dashboard buckets finish loading. The
 `/dashboard/data` response includes a `history_restore` object with the restore
 status, elapsed time, and restored bucket count. After the initial restore, the
 load balancer performs one delayed merge by default so it also sees files that
-the previous replica wrote while shutting down.
+the previous replica wrote while shutting down. This second read is limited to
+the previous UTC day through the current minute, and bucket comparisons release
+the dashboard lock between bounded chunks.
 
 The dashboard store keeps minute files under `minutes/YYYY-MM-DD/` and also
 uses `days/YYYY-MM-DD.json` files as a compact cache for UTC days. On restore it
@@ -214,7 +216,8 @@ minute buckets are present.
   that dashboard minute persistence is falling behind (defaults to 300 seconds)
 - `DASHBOARD_STARTUP_MERGE_DELAY_S`: delay before a second startup history read
   merges files written late by the previous LB replica (defaults to 60 seconds;
-  set to 0 to disable)
+  set to 0 to disable). The second read covers only the previous UTC day through
+  the current minute, independently of the full dashboard retention setting.
 - `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
   endpoint/session data instead of connecting to real compute endpoints. You can
   also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.
