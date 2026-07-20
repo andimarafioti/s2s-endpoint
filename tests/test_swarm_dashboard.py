@@ -794,6 +794,60 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(elapsed, 0.2)
         self.assertTrue(any("abandoning 1 dirty buckets" in message for message in logs.output))
 
+    async def test_double_cancellation_keeps_inflight_writer_guarded(self):
+        clock = FakeClock(2 * 60)
+        store = BlockingFirstWriteHistoryStore()
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            retention_minutes=60,
+            history_store=store,
+            flush_timeout_s=10,
+            time_fn=clock.now,
+        )
+        dashboard._history[0] = SwarmHistoryBucket(bucket_start_s=0)
+        dashboard._dirty_bucket_starts.add(0)
+        dashboard._schedule_flush_unlocked(include_open_bucket=False)
+        while not store.first_write_started.is_set():
+            await asyncio.sleep(0.001)
+
+        flush_task = dashboard._flush_task
+        write_task = None
+        try:
+            flush_task.cancel()
+            await asyncio.sleep(0.01)
+            self.assertFalse(flush_task.done())
+            flush_task.cancel()
+            done, _ = await asyncio.wait({flush_task}, timeout=0.1)
+            self.assertIn(flush_task, done)
+            with self.assertRaises(asyncio.CancelledError):
+                flush_task.result()
+
+            write_task = dashboard._flush_write_task
+            self.assertIsNotNone(write_task)
+            self.assertFalse(write_task.done())
+            dashboard._schedule_flush_unlocked(include_open_bucket=False)
+            self.assertIs(dashboard._flush_task, flush_task)
+            self.assertEqual(store.write_attempts, 1)
+        finally:
+            store.release_first_write.set()
+            write_task = write_task or dashboard._flush_write_task
+            if write_task is not None:
+                await write_task
+
+        dashboard._schedule_flush_unlocked(include_open_bucket=False)
+        await dashboard._flush_task
+
+        self.assertEqual(store.write_attempts, 2)
+        self.assertIsNone(dashboard._flush_write_task)
+        self.assertEqual(dashboard.persistence_status()["dirty_bucket_count"], 0)
+
     async def test_warns_when_dirty_dashboard_buckets_are_stale(self):
         clock = FakeClock(10 * 60)
         dashboard = SwarmDashboard(

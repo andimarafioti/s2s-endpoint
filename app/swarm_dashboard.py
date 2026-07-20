@@ -1217,7 +1217,7 @@ class SwarmDashboard:
             logger.warning("Failed to persist dashboard history to bucket store: %s", exc)
             return False
         finally:
-            if self._flush_write_task is write_task:
+            if self._flush_write_task is write_task and write_task.done():
                 self._flush_write_task = None
             self._flush_stalled_started_at_s = None
             self._flush_stalled_started_at_monotonic_s = None
