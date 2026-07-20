@@ -13,6 +13,7 @@ DAY_MINUTES = 24 * 60
 DAY_SECONDS = DAY_MINUTES * 60
 HISTORY_MERGE_COMPARISON_CHUNK_SIZE = 256
 PERSISTENCE_WORKER_RETRY_DELAY_S = 1.0
+STARTUP_MERGE_PASS_COUNT = 2
 
 
 def _normalize_status(status: object) -> str:
@@ -366,8 +367,17 @@ class DashboardHistory:
             if history_store is None or startup_merge_delay_s == 0
             else "pending"
         )
+        self._startup_merge_scheduled_passes = (
+            0
+            if history_store is None or startup_merge_delay_s == 0
+            else STARTUP_MERGE_PASS_COUNT
+        )
+        self._startup_merge_attempted_passes = 0
+        self._startup_merge_completed_passes = 0
+        self._startup_merge_failed_passes = 0
         self._startup_merge_bucket_count = 0
         self._startup_merge_updated_bucket_count = 0
+        self._startup_merge_last_error: Optional[str] = None
 
     async def start(self) -> None:
         if self.history_store is not None:
@@ -378,8 +388,14 @@ class DashboardHistory:
                 self._restore_task = asyncio.create_task(self._restore_history())
             else:
                 await self._restore_history()
-            if self.startup_merge_delay_s > 0:
+            if self._startup_merge_scheduled_passes > 0:
                 self._startup_merge_status = "waiting"
+                self._startup_merge_attempted_passes = 0
+                self._startup_merge_completed_passes = 0
+                self._startup_merge_failed_passes = 0
+                self._startup_merge_bucket_count = 0
+                self._startup_merge_updated_bucket_count = 0
+                self._startup_merge_last_error = None
                 self._startup_merge_task = asyncio.create_task(self._delayed_startup_history_merge())
         if self._history_store_day_writer() is not None:
             self._day_rollover_cursor_s = _day_start_epoch_s(self._time_fn())
@@ -511,8 +527,17 @@ class DashboardHistory:
         return {
             "status": self._startup_merge_status,
             "delay_s": self.startup_merge_delay_s,
+            "scheduled_passes": self._startup_merge_scheduled_passes,
+            "attempted_passes": self._startup_merge_attempted_passes,
+            "completed_passes": self._startup_merge_completed_passes,
+            "failed_passes": self._startup_merge_failed_passes,
+            "all_passes_completed": (
+                self._startup_merge_scheduled_passes > 0
+                and self._startup_merge_completed_passes == self._startup_merge_scheduled_passes
+            ),
             "bucket_count": self._startup_merge_bucket_count,
             "updated_bucket_count": self._startup_merge_updated_bucket_count,
+            "last_error": self._startup_merge_last_error,
         }
 
 
@@ -633,49 +658,70 @@ class DashboardHistory:
 
     async def _delayed_startup_history_merge(self) -> None:
         try:
-            await asyncio.sleep(self.startup_merge_delay_s)
             initial_restore_task = self._restore_task
-            if (
-                initial_restore_task is not None
-                and initial_restore_task is not asyncio.current_task()
-                and not initial_restore_task.done()
-            ):
-                await initial_restore_task
-
             if self.history_store is None:
                 self._startup_merge_status = "disabled"
                 return
 
-            started_s = time.monotonic()
-            self._startup_merge_bucket_count = 0
-            self._startup_merge_updated_bucket_count = 0
-            self._startup_merge_status = "running"
-            now_epoch_s = self._time_fn()
-            buckets = await self._load_persisted_history(
-                retention_minutes=min(
-                    self.retention_minutes,
-                    _startup_merge_retention_minutes(now_epoch_s),
-                ),
-                now_epoch_s=now_epoch_s,
-            )
-            updated_bucket_count = await self._merge_persisted_history_buckets(buckets)
+            for pass_number in range(1, self._startup_merge_scheduled_passes + 1):
+                self._startup_merge_status = "waiting"
+                await asyncio.sleep(self.startup_merge_delay_s)
+                if (
+                    pass_number == 1
+                    and initial_restore_task is not None
+                    and initial_restore_task is not asyncio.current_task()
+                    and not initial_restore_task.done()
+                ):
+                    await initial_restore_task
+
+                started_s = time.monotonic()
+                self._startup_merge_status = "running"
+                self._startup_merge_attempted_passes += 1
+                try:
+                    now_epoch_s = self._time_fn()
+                    buckets = await self._load_persisted_history(
+                        retention_minutes=min(
+                            self.retention_minutes,
+                            _startup_merge_retention_minutes(now_epoch_s),
+                        ),
+                        now_epoch_s=now_epoch_s,
+                    )
+                    updated_bucket_count = await self._merge_persisted_history_buckets(buckets)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._startup_merge_failed_passes += 1
+                    self._startup_merge_last_error = str(exc)
+                    logger.warning(
+                        "Dashboard startup history merge pass %s/%s failed: %s",
+                        pass_number,
+                        self._startup_merge_scheduled_passes,
+                        exc,
+                    )
+                    continue
+
+                self._startup_merge_completed_passes += 1
+                self._startup_merge_bucket_count += len(buckets)
+                self._startup_merge_updated_bucket_count += updated_bucket_count
+                logger.info(
+                    "Completed dashboard startup history merge pass %s/%s: "
+                    "loaded %s buckets, updated %s in %.2fs",
+                    pass_number,
+                    self._startup_merge_scheduled_passes,
+                    len(buckets),
+                    updated_bucket_count,
+                    time.monotonic() - started_s,
+                )
         except asyncio.CancelledError:
             self._startup_merge_status = "cancelled"
             raise
-        except Exception as exc:
-            self._startup_merge_status = "failed"
-            logger.warning("Failed to merge delayed dashboard history from bucket store: %s", exc)
-            return
 
-        self._startup_merge_bucket_count = len(buckets)
-        self._startup_merge_updated_bucket_count = updated_bucket_count
-        self._startup_merge_status = "complete" if buckets else "empty"
-        logger.info(
-            "Merged delayed dashboard history: loaded %s buckets, updated %s in %.2fs",
-            len(buckets),
-            updated_bucket_count,
-            time.monotonic() - started_s,
-        )
+        if self._startup_merge_completed_passes == self._startup_merge_scheduled_passes:
+            self._startup_merge_status = "complete"
+        elif self._startup_merge_completed_passes > 0:
+            self._startup_merge_status = "partial"
+        else:
+            self._startup_merge_status = "failed"
 
     async def _load_persisted_history(
         self,

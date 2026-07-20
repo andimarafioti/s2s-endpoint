@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from app.dashboard_history import SwarmHistoryBucket, SwarmStateSample
+from app.dashboard_history import DashboardHistory, SwarmHistoryBucket, SwarmStateSample
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.swarm_dashboard import SwarmDashboard
 
@@ -76,6 +76,23 @@ class SlowHistoryStore(FakeHistoryStore):
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float):
         time.sleep(self.delay_s)
         return super().load_recent(retention_minutes=retention_minutes, now_epoch_s=now_epoch_s)
+
+
+class FailingLoadHistoryStore(FakeHistoryStore):
+    def __init__(self, *, fail_on_load_calls):
+        super().__init__()
+        self.fail_on_load_calls = set(fail_on_load_calls)
+
+    def load_recent(self, *, retention_minutes: int, now_epoch_s: float):
+        load_call = self.load_calls + 1
+        if load_call in self.fail_on_load_calls:
+            self.load_calls += 1
+            self.load_requests.append((retention_minutes, now_epoch_s))
+            raise RuntimeError(f"load failure {load_call}")
+        return super().load_recent(
+            retention_minutes=retention_minutes,
+            now_epoch_s=now_epoch_s,
+        )
 
 
 class BlockingFirstWriteHistoryStore(FakeHistoryStore):
@@ -1194,9 +1211,10 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await dashboard.stop()
 
-        self.assertEqual(store.load_calls, 2)
+        self.assertEqual(store.load_calls, 3)
         self.assertEqual(store.load_requests, [
             (28 * 24 * 60, now_epoch_s),
+            (24 * 60 + 4 * 60 + 2, now_epoch_s),
             (24 * 60 + 4 * 60 + 2, now_epoch_s),
         ])
         self.assertIn(previous_day_bucket.bucket_start_s, {
@@ -1204,8 +1222,89 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual([point["running_endpoints"] for point in series], [3, 1])
         self.assertEqual(status["status"], "complete")
-        self.assertEqual(status["bucket_count"], 3)
+        self.assertEqual(status["scheduled_passes"], 2)
+        self.assertEqual(status["attempted_passes"], 2)
+        self.assertEqual(status["completed_passes"], 2)
+        self.assertEqual(status["failed_passes"], 0)
+        self.assertTrue(status["all_passes_completed"])
+        self.assertEqual(status["bucket_count"], 6)
         self.assertEqual(status["updated_bucket_count"], 2)
+        self.assertIsNone(status["last_error"])
+
+    async def test_second_startup_merge_pass_recovers_history_written_after_first_pass(self):
+        current_day_start = _day_start(2026, 5, 19)
+        now_epoch_s = current_day_start + 4 * 3600 + 60
+        late_bucket = SwarmHistoryBucket(
+            bucket_start_s=now_epoch_s - 60,
+            running_endpoints_last=4,
+            running_endpoints_sum=4,
+            sample_count=1,
+        )
+        clock = FakeClock(now_epoch_s)
+        store = FakeHistoryStore()
+        history = DashboardHistory(
+            retention_minutes=28 * 24 * 60,
+            history_store=store,
+            restore_history_in_background=True,
+            startup_merge_delay_s=0.02,
+            time_fn=clock.now,
+        )
+
+        async def wait_for_first_pass():
+            while history.startup_merge_status()["completed_passes"] < 1:
+                await asyncio.sleep(0.001)
+
+        await history.start()
+        try:
+            await history._restore_task
+            await asyncio.wait_for(wait_for_first_pass(), timeout=1)
+            store.saved[late_bucket.bucket_start_s] = late_bucket.to_dict()
+            await history._startup_merge_task
+            snapshot = await history.snapshot()
+            status = history.startup_merge_status()
+        finally:
+            await history.stop()
+
+        self.assertIn(late_bucket.bucket_start_s, {
+            bucket.bucket_start_s for bucket in snapshot
+        })
+        self.assertEqual(store.load_requests, [
+            (28 * 24 * 60, now_epoch_s),
+            (24 * 60 + 4 * 60 + 2, now_epoch_s),
+            (24 * 60 + 4 * 60 + 2, now_epoch_s),
+        ])
+        self.assertEqual(status["status"], "complete")
+        self.assertEqual(status["scheduled_passes"], 2)
+        self.assertEqual(status["completed_passes"], 2)
+        self.assertTrue(status["all_passes_completed"])
+        self.assertEqual(status["updated_bucket_count"], 1)
+
+    async def test_startup_merge_schedule_continues_after_a_failed_pass(self):
+        clock = FakeClock(_day_start(2026, 5, 19) + 60)
+        store = FailingLoadHistoryStore(fail_on_load_calls={2})
+        history = DashboardHistory(
+            retention_minutes=28 * 24 * 60,
+            history_store=store,
+            restore_history_in_background=True,
+            startup_merge_delay_s=0.01,
+            time_fn=clock.now,
+        )
+
+        await history.start()
+        try:
+            await history._startup_merge_task
+            status = history.startup_merge_status()
+        finally:
+            await history.stop()
+
+        self.assertEqual(store.load_calls, 3)
+        self.assertEqual(status["status"], "partial")
+        self.assertEqual(status["scheduled_passes"], 2)
+        self.assertEqual(status["attempted_passes"], 2)
+        self.assertEqual(status["completed_passes"], 1)
+        self.assertEqual(status["failed_passes"], 1)
+        self.assertFalse(status["all_passes_completed"])
+        self.assertEqual(status["last_error"], "load failure 2")
 
 
 class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
