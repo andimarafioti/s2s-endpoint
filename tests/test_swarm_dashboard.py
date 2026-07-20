@@ -1400,7 +1400,52 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         self.assertEqual([bucket.bucket_start_s for bucket in loaded], [day_start, day_start + 60])
         self.assertEqual([bucket.running_endpoints_last for bucket in loaded], [2, 4])
         self.assertIn("reachy-s2s-lb/minutes/2026-05-18", api.list_prefixes)
+        self.assertEqual([remote_path for remote_path, _ in api.downloads], [
+            "reachy-s2s-lb/days/2026-05-18.json",
+            f"reachy-s2s-lb/minutes/2026-05-18/{day_start + 60}.json",
+        ])
+        self.assertEqual(len(api.batch_adds), 1)
         self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["minute_bucket_count"], 2)
+
+    def test_load_recent_does_not_rewrite_unchanged_finalized_partial_day(self):
+        day_start = _day_start(2026, 5, 18)
+        bucket = SwarmHistoryBucket(bucket_start_s=day_start)
+        day_path = "reachy-s2s-lb/days/2026-05-18.json"
+        minute_path = f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json"
+        api = FakeBucketApi(
+            {
+                day_path: {
+                    "version": 1,
+                    "day_start_s": day_start,
+                    "day": "2026-05-18",
+                    "complete": False,
+                    "finalized": True,
+                    "minute_bucket_count": 1,
+                    "expected_minute_bucket_count": 24 * 60,
+                    "missing_minute_bucket_count": (24 * 60) - 1,
+                    "incomplete_reason": "missing_minute_buckets",
+                    "buckets": [bucket.to_dict()],
+                },
+                minute_path: {
+                    "version": 1,
+                    "bucket": bucket.to_dict(),
+                },
+            }
+        )
+        store = _bucket_store(api)
+
+        loaded = store.load_recent(
+            retention_minutes=24 * 60 + 3,
+            now_epoch_s=day_start + 24 * 60 * 60 + 2 * 60,
+        )
+
+        self.assertEqual([item.bucket_start_s for item in loaded], [day_start])
+        self.assertIn("reachy-s2s-lb/minutes/2026-05-18", api.list_prefixes)
+        self.assertEqual(
+            [remote_path for remote_path, _ in api.downloads],
+            [day_path],
+        )
+        self.assertEqual(api.batch_adds, [])
 
     def test_load_recent_backfills_complete_day_file_from_minutes(self):
         day_start = _day_start(2026, 5, 18)
