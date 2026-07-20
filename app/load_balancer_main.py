@@ -133,6 +133,7 @@ if DASHBOARD_BUCKET_ID:
         bucket_id=DASHBOARD_BUCKET_ID,
         prefix=DASHBOARD_BUCKET_PREFIX,
         token=DASHBOARD_BUCKET_TOKEN,
+        request_timeout_s=DASHBOARD_FLUSH_TIMEOUT_S,
     )
     if DASHBOARD_PREVIEW_MODE:
         dashboard_history_store = ReadOnlyDashboardHistoryStore(dashboard_history_store)

@@ -499,6 +499,7 @@ class SwarmDashboard:
         self.restore_history_in_background = restore_history_in_background
         self.flush_batch_size = flush_batch_size
         self.flush_timeout_s = flush_timeout_s
+        self.shutdown_flush_budget_s = 2 * flush_timeout_s
         self.dirty_bucket_warning_age_s = dirty_bucket_warning_age_s
         self.startup_merge_delay_s = startup_merge_delay_s
         self._time_fn = time_fn
@@ -510,6 +511,7 @@ class SwarmDashboard:
         self._startup_merge_task: Optional[asyncio.Task] = None
         self._flush_task: Optional[asyncio.Task] = None
         self._flush_write_task: Optional[asyncio.Task] = None
+        self._shutdown_persistence_task: Optional[asyncio.Task] = None
         self._day_rollover_task: Optional[asyncio.Task] = None
         self._dirty_bucket_starts: set[int] = set()
         self._locally_sampled_bucket_starts: set[int] = set()
@@ -591,12 +593,28 @@ class SwarmDashboard:
                 pass
             self._day_rollover_task = None
 
+        self._shutdown_persistence_task = asyncio.create_task(self._finish_shutdown_persistence())
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(self._shutdown_persistence_task),
+                timeout=self.shutdown_flush_budget_s,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Dashboard shutdown persistence exceeded its %.1fs budget; abandoning %s dirty buckets "
+                "and continuing shutdown",
+                self.shutdown_flush_budget_s,
+                len(self._dirty_bucket_starts),
+            )
+
+    async def _finish_shutdown_persistence(self) -> None:
         if self._flush_task is not None:
             try:
                 await self._flush_task
             except asyncio.CancelledError:
                 pass
-            self._flush_task = None
+            if self._flush_task.done():
+                self._flush_task = None
 
         await self._flush_dirty_buckets(include_open_bucket=True)
         await self._rollover_completed_days()

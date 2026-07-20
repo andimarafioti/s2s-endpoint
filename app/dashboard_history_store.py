@@ -14,6 +14,19 @@ from app.swarm_dashboard import DashboardHistoryStore, SwarmHistoryBucket, _buck
 logger = logging.getLogger("s2s-endpoint")
 
 
+def _configure_huggingface_http_timeout(timeout_s: float) -> None:
+    import httpx
+    from huggingface_hub import set_client_factory
+    from huggingface_hub.utils._http import default_client_factory
+
+    def client_factory() -> httpx.Client:
+        client = default_client_factory()
+        client.timeout = httpx.Timeout(timeout_s)
+        return client
+
+    set_client_factory(client_factory)
+
+
 def _day_start_epoch_s(epoch_s: float) -> int:
     day_seconds = 24 * 60 * 60
     return int(epoch_s // day_seconds) * day_seconds
@@ -42,18 +55,24 @@ class HuggingFaceBucketHistoryStore:
         bucket_id: str,
         prefix: str = "s2s-endpoint/swarm-dashboard",
         token: Optional[str] = None,
+        request_timeout_s: float = 60.0,
     ) -> None:
         from huggingface_hub import batch_bucket_files, download_bucket_files, list_bucket_tree
+
+        if request_timeout_s <= 0:
+            raise ValueError("request_timeout_s must be > 0")
 
         self.bucket_id = bucket_id.strip()
         self.prefix = prefix.strip().strip("/")
         self.token = token or None
+        self.request_timeout_s = request_timeout_s
         self.read_only = False
         self.download_chunk_size: Optional[int] = None
         self.local_download_cache_dir: Optional[Path] = None
         self._batch_bucket_files = batch_bucket_files
         self._download_bucket_files = download_bucket_files
         self._list_bucket_tree = list_bucket_tree
+        _configure_huggingface_http_timeout(request_timeout_s)
 
         if not self.bucket_id:
             raise ValueError("bucket_id must be set")

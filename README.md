@@ -206,6 +206,10 @@ minute buckets are present.
 - `DASHBOARD_FLUSH_TIMEOUT_S`: age at which an in-flight dashboard storage write
   is reported as stalled (defaults to 60 seconds). The single writer remains in
   flight until it resolves, preventing overlapping writes and stale overwrites.
+  This also configures the Hugging Face Hub HTTP client request timeout. During
+  shutdown, final dashboard persistence gets a total budget of twice this value;
+  the load balancer logs any remaining dirty buckets and continues shutdown if
+  the budget expires.
 - `DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S`: age at which the load balancer warns
   that dashboard minute persistence is falling behind (defaults to 300 seconds)
 - `DASHBOARD_STARTUP_MERGE_DELAY_S`: delay before a second startup history read

@@ -6,6 +6,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.swarm_dashboard import (
@@ -89,7 +90,7 @@ class BlockingFirstWriteHistoryStore(FakeHistoryStore):
         self.write_attempts += 1
         if self.write_attempts == 1:
             self.first_write_started.set()
-            self.release_first_write.wait(timeout=1.0)
+            self.release_first_write.wait()
         super().write_buckets(buckets)
 
 
@@ -757,6 +758,42 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated_bucket_count, 0)
         self.assertEqual(dashboard._history[0].running_endpoints_last, 1)
 
+    async def test_shutdown_abandons_permanently_blocked_flush_after_budget(self):
+        clock = FakeClock(2 * 60)
+        store = BlockingFirstWriteHistoryStore()
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+            )),
+            retention_minutes=60,
+            history_store=store,
+            flush_timeout_s=0.01,
+            time_fn=clock.now,
+        )
+        dashboard._history[0] = SwarmHistoryBucket(bucket_start_s=0)
+        dashboard._dirty_bucket_starts.add(0)
+        dashboard._schedule_flush_unlocked(include_open_bucket=False)
+        while not store.first_write_started.is_set():
+            await asyncio.sleep(0.001)
+
+        started = time.monotonic()
+        try:
+            with self.assertLogs("s2s-endpoint", level="ERROR") as logs:
+                await dashboard.stop()
+            elapsed = time.monotonic() - started
+        finally:
+            store.release_first_write.set()
+            if dashboard._shutdown_persistence_task is not None:
+                await dashboard._shutdown_persistence_task
+
+        self.assertLess(elapsed, 0.2)
+        self.assertTrue(any("abandoning 1 dirty buckets" in message for message in logs.output))
+
     async def test_warns_when_dirty_dashboard_buckets_are_stale(self):
         clock = FakeClock(10 * 60)
         dashboard = SwarmDashboard(
@@ -971,6 +1008,24 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
+    def test_configures_huggingface_http_client_request_timeout(self):
+        with patch("huggingface_hub.set_client_factory") as set_client_factory:
+            store = HuggingFaceBucketHistoryStore(
+                bucket_id="org/dashboard",
+                request_timeout_s=12.5,
+            )
+
+        client_factory = set_client_factory.call_args.args[0]
+        client = client_factory()
+        try:
+            self.assertEqual(store.request_timeout_s, 12.5)
+            self.assertEqual(client.timeout.connect, 12.5)
+            self.assertEqual(client.timeout.read, 12.5)
+            self.assertEqual(client.timeout.write, 12.5)
+            self.assertEqual(client.timeout.pool, 12.5)
+        finally:
+            client.close()
+
     def test_load_recent_prefers_day_files_over_minute_files(self):
         day_start = _day_start(2026, 5, 18)
         day_buckets = []
