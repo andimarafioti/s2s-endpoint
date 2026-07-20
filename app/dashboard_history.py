@@ -13,6 +13,8 @@ DAY_MINUTES = 24 * 60
 DAY_SECONDS = DAY_MINUTES * 60
 HISTORY_MERGE_COMPARISON_CHUNK_SIZE = 256
 PERSISTENCE_WORKER_RETRY_DELAY_S = 1.0
+FLUSH_RETRY_INITIAL_DELAY_S = 15.0
+FLUSH_RETRY_MAX_DELAY_S = 300.0
 STARTUP_MERGE_PASS_COUNT = 2
 
 
@@ -355,6 +357,10 @@ class DashboardHistory:
         self._last_flush_error: Optional[str] = None
         self._flush_stalled_started_at_s: Optional[float] = None
         self._flush_stalled_started_at_monotonic_s: Optional[float] = None
+        self._flush_retry_failure_count = 0
+        self._flush_retry_delay_s: Optional[float] = None
+        self._flush_retry_next_at_s: Optional[float] = None
+        self._flush_retry_not_before_monotonic_s: Optional[float] = None
         self._last_dirty_bucket_warning_at_monotonic_s: Optional[float] = None
         self._day_rollover_cursor_s: Optional[int] = None
         self._history_restore_status = "disabled" if history_store is None else "pending"
@@ -487,6 +493,7 @@ class DashboardHistory:
                 max(time.monotonic() - self._flush_stalled_started_at_monotonic_s, 0.0),
                 2,
             )
+        flush_retry_delay_remaining_s = self._flush_retry_delay_remaining_s()
         return {
             "enabled": self.history_store is not None,
             "read_only": bool(getattr(self.history_store, "read_only", False)),
@@ -517,6 +524,21 @@ class DashboardHistory:
                 else None
             ),
             "flush_stalled_age_s": flush_stalled_age_s,
+            "flush_retry_backoff": self._flush_retry_not_before_monotonic_s is not None,
+            "flush_retry_failure_count": self._flush_retry_failure_count,
+            "flush_retry_delay_s": self._flush_retry_delay_s,
+            "flush_retry_next_at": (
+                _isoformat(self._flush_retry_next_at_s)
+                if self._flush_retry_next_at_s is not None
+                else None
+            ),
+            "flush_retry_delay_remaining_s": (
+                round(flush_retry_delay_remaining_s, 2)
+                if flush_retry_delay_remaining_s is not None
+                else None
+            ),
+            "flush_retry_initial_delay_s": FLUSH_RETRY_INITIAL_DELAY_S,
+            "flush_retry_max_delay_s": FLUSH_RETRY_MAX_DELAY_S,
             "flush_batch_size": self.flush_batch_size,
             "flush_timeout_s": self.flush_timeout_s,
             "dirty_bucket_warning_age_s": self.dirty_bucket_warning_age_s,
@@ -543,7 +565,7 @@ class DashboardHistory:
 
     async def _persistence_loop(self) -> None:
         while True:
-            await self._persistence_wakeup.wait()
+            await self._wait_for_persistence_work()
             self._persistence_wakeup.clear()
             try:
                 self._warn_if_dirty_buckets_stale_unlocked()
@@ -561,6 +583,26 @@ class DashboardHistory:
                 logger.exception("Dashboard persistence worker failed; retrying")
                 await asyncio.sleep(PERSISTENCE_WORKER_RETRY_DELAY_S)
                 self._persistence_wakeup.set()
+
+    async def _wait_for_persistence_work(self) -> None:
+        while True:
+            retry_delay_s = self._flush_retry_delay_remaining_s()
+            if retry_delay_s is None or self._persistence_stop_requested:
+                await self._persistence_wakeup.wait()
+                return
+            if retry_delay_s <= 0:
+                return
+
+            self._persistence_wakeup.clear()
+            try:
+                await asyncio.wait_for(
+                    self._persistence_wakeup.wait(),
+                    timeout=retry_delay_s,
+                )
+            except asyncio.TimeoutError:
+                return
+            if self._persistence_stop_requested:
+                return
 
     async def increment_counter(self, field_name: str) -> None:
         now = self._time_fn()
@@ -788,7 +830,11 @@ class DashboardHistory:
     async def _flush_dirty_buckets(self, *, include_open_bucket: bool) -> None:
         if self.history_store is None:
             return
+        if self._flush_retry_is_pending() and not self._persistence_stop_requested:
+            return
         await self._wait_for_inflight_write()
+        if self._flush_retry_is_pending() and not self._persistence_stop_requested:
+            return
 
         flush_started = False
         try:
@@ -802,6 +848,8 @@ class DashboardHistory:
 
                 if not flush_started:
                     flush_started = True
+                    self._flush_retry_next_at_s = None
+                    self._flush_retry_not_before_monotonic_s = None
                     self._last_flush_started_at_s = self._time_fn()
                     self._last_flush_finished_at_s = None
                     self._last_flush_error = None
@@ -827,8 +875,7 @@ class DashboardHistory:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._last_flush_error = str(exc)
-            self._last_flush_finished_at_s = self._time_fn()
+            self._record_flush_failure(exc)
             logger.warning("Failed dashboard history write finished before persistence resumed: %s", exc)
         finally:
             if self._flush_write_task is write_task and write_task.done():
@@ -865,8 +912,7 @@ class DashboardHistory:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._last_flush_error = str(exc)
-            self._last_flush_finished_at_s = self._time_fn()
+            self._record_flush_failure(exc)
             logger.warning("Failed to persist dashboard history to bucket store: %s", exc)
             return False
         finally:
@@ -877,8 +923,36 @@ class DashboardHistory:
 
         if timed_out:
             logger.info("Stalled dashboard history flush completed; persistence can resume")
+        self._reset_flush_retry_backoff()
         self._last_flush_error = None
         return True
+
+    def _flush_retry_delay_remaining_s(self) -> Optional[float]:
+        if self._flush_retry_not_before_monotonic_s is None:
+            return None
+        return max(self._flush_retry_not_before_monotonic_s - time.monotonic(), 0.0)
+
+    def _flush_retry_is_pending(self) -> bool:
+        retry_delay_s = self._flush_retry_delay_remaining_s()
+        return retry_delay_s is not None and retry_delay_s > 0
+
+    def _record_flush_failure(self, exc: Exception) -> None:
+        self._flush_retry_failure_count += 1
+        if self._flush_retry_delay_s is None:
+            retry_delay_s = FLUSH_RETRY_INITIAL_DELAY_S
+        else:
+            retry_delay_s = min(self._flush_retry_delay_s * 2, FLUSH_RETRY_MAX_DELAY_S)
+        self._flush_retry_delay_s = retry_delay_s
+        self._flush_retry_next_at_s = self._time_fn() + retry_delay_s
+        self._flush_retry_not_before_monotonic_s = time.monotonic() + retry_delay_s
+        self._last_flush_error = str(exc)
+        self._last_flush_finished_at_s = self._time_fn()
+
+    def _reset_flush_retry_backoff(self) -> None:
+        self._flush_retry_failure_count = 0
+        self._flush_retry_delay_s = None
+        self._flush_retry_next_at_s = None
+        self._flush_retry_not_before_monotonic_s = None
 
     def _warn_if_dirty_buckets_stale_unlocked(self) -> None:
         oldest_dirty_bucket_start_s = min(self._dirty_bucket_starts, default=None)

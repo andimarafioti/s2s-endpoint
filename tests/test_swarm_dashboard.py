@@ -110,6 +110,39 @@ class BlockingFirstWriteHistoryStore(FakeHistoryStore):
         super().write_buckets(buckets)
 
 
+class FlakyWriteHistoryStore(FakeHistoryStore):
+    def __init__(self, *, fail_on_write_attempts):
+        super().__init__()
+        self.fail_on_write_attempts = set(fail_on_write_attempts)
+        self.write_attempts = 0
+        self.write_attempt_started_at = []
+
+    def write_buckets(self, buckets):
+        self.write_attempts += 1
+        self.write_attempt_started_at.append(time.monotonic())
+        if self.write_attempts in self.fail_on_write_attempts:
+            raise RuntimeError(f"write failure {self.write_attempts}")
+        super().write_buckets(buckets)
+
+
+class BlockingFailingFirstWriteHistoryStore(FakeHistoryStore):
+    def __init__(self):
+        super().__init__()
+        self.first_write_started = threading.Event()
+        self.release_first_write = threading.Event()
+        self.write_attempts = 0
+        self.write_attempt_started_at = []
+
+    def write_buckets(self, buckets):
+        self.write_attempts += 1
+        self.write_attempt_started_at.append(time.monotonic())
+        if self.write_attempts == 1:
+            self.first_write_started.set()
+            self.release_first_write.wait()
+            raise RuntimeError("blocked write failed")
+        super().write_buckets(buckets)
+
+
 class FakeBucketItem:
     def __init__(self, path: str, *, xet_hash: str | None = None):
         self.path = path
@@ -724,6 +757,147 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(dashboard.persistence_status()["flush_stalled"])
         self.assertIsNone(dashboard.persistence_status()["last_flush_error"])
         await dashboard.stop()
+
+    async def test_flush_errors_back_off_and_success_resets_retry_delay(self):
+        clock = FakeClock(2 * 60)
+        store = FlakyWriteHistoryStore(fail_on_write_attempts={1, 2, 3, 5})
+        history = DashboardHistory(
+            retention_minutes=60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+        history._history[0] = SwarmHistoryBucket(bucket_start_s=0, session_requests=1)
+        history._dirty_bucket_starts.add(0)
+        history._persistence_task = asyncio.create_task(history._persistence_loop())
+
+        async def wait_for_failure_count(expected):
+            while history.persistence_status()["flush_retry_failure_count"] != expected:
+                await asyncio.sleep(0.001)
+
+        async def wait_for_recovery():
+            while history.persistence_status()["dirty_bucket_count"]:
+                await asyncio.sleep(0.001)
+
+        try:
+            with (
+                patch("app.dashboard_history.FLUSH_RETRY_INITIAL_DELAY_S", 0.02),
+                patch("app.dashboard_history.FLUSH_RETRY_MAX_DELAY_S", 0.04),
+                self.assertLogs("s2s-endpoint", level="WARNING"),
+            ):
+                history._wake_persistence_unlocked()
+                await asyncio.wait_for(wait_for_failure_count(1), timeout=1)
+                first_failure_status = history.persistence_status()
+                for _ in range(5):
+                    history._wake_persistence_unlocked()
+                await asyncio.sleep(0.005)
+                self.assertEqual(store.write_attempts, 1)
+
+                await asyncio.wait_for(wait_for_recovery(), timeout=1)
+                recovered_status = history.persistence_status()
+
+                history._history[0].session_requests = 2
+                history._dirty_bucket_starts.add(0)
+                history._wake_persistence_unlocked()
+                await asyncio.wait_for(wait_for_failure_count(1), timeout=1)
+                reset_failure_status = history.persistence_status()
+        finally:
+            history._persistence_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await history._persistence_task
+            history._persistence_task = None
+
+        retry_gaps = [
+            later - earlier
+            for earlier, later in zip(
+                store.write_attempt_started_at,
+                store.write_attempt_started_at[1:],
+            )
+        ]
+        self.assertTrue(first_failure_status["flush_retry_backoff"])
+        self.assertEqual(first_failure_status["flush_retry_delay_s"], 0.02)
+        self.assertIsNotNone(first_failure_status["flush_retry_next_at"])
+        self.assertGreater(first_failure_status["flush_retry_delay_remaining_s"], 0)
+        self.assertGreaterEqual(retry_gaps[0], 0.015)
+        self.assertGreaterEqual(retry_gaps[1], 0.035)
+        self.assertGreaterEqual(retry_gaps[2], 0.035)
+        self.assertFalse(recovered_status["flush_retry_backoff"])
+        self.assertEqual(recovered_status["flush_retry_failure_count"], 0)
+        self.assertIsNone(recovered_status["flush_retry_delay_s"])
+        self.assertIsNone(recovered_status["flush_retry_next_at"])
+        self.assertIsNone(recovered_status["flush_retry_delay_remaining_s"])
+        self.assertIsNone(recovered_status["last_flush_error"])
+        self.assertEqual(store.write_attempts, 5)
+        self.assertTrue(reset_failure_status["flush_retry_backoff"])
+        self.assertEqual(reset_failure_status["flush_retry_failure_count"], 1)
+        self.assertEqual(reset_failure_status["flush_retry_delay_s"], 0.02)
+
+    async def test_stalled_write_starts_backoff_only_after_it_resolves_with_error(self):
+        clock = FakeClock(2 * 60)
+        store = BlockingFailingFirstWriteHistoryStore()
+        history = DashboardHistory(
+            retention_minutes=60,
+            history_store=store,
+            flush_timeout_s=0.01,
+            time_fn=clock.now,
+        )
+        history._history[0] = SwarmHistoryBucket(bucket_start_s=0, session_requests=1)
+        history._dirty_bucket_starts.add(0)
+        history._persistence_task = asyncio.create_task(history._persistence_loop())
+
+        async def wait_for_failure():
+            while history.persistence_status()["flush_retry_failure_count"] < 1:
+                await asyncio.sleep(0.001)
+
+        async def wait_for_recovery():
+            while history.persistence_status()["dirty_bucket_count"]:
+                await asyncio.sleep(0.001)
+
+        try:
+            with (
+                patch("app.dashboard_history.FLUSH_RETRY_INITIAL_DELAY_S", 0.03),
+                patch("app.dashboard_history.FLUSH_RETRY_MAX_DELAY_S", 0.06),
+                self.assertLogs("s2s-endpoint", level="WARNING"),
+            ):
+                history._wake_persistence_unlocked()
+                while not store.first_write_started.is_set():
+                    await asyncio.sleep(0.001)
+                await asyncio.sleep(0.02)
+                stalled_status = history.persistence_status()
+                for _ in range(5):
+                    history._wake_persistence_unlocked()
+                await asyncio.sleep(0.005)
+                self.assertEqual(store.write_attempts, 1)
+
+                released_at = time.monotonic()
+                store.release_first_write.set()
+                await asyncio.wait_for(wait_for_failure(), timeout=1)
+                failed_status = history.persistence_status()
+                for _ in range(5):
+                    history._wake_persistence_unlocked()
+                await asyncio.sleep(0.01)
+                self.assertEqual(store.write_attempts, 1)
+                await asyncio.wait_for(wait_for_recovery(), timeout=1)
+                recovered_status = history.persistence_status()
+        finally:
+            store.release_first_write.set()
+            history._persistence_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await history._persistence_task
+            history._persistence_task = None
+
+        self.assertTrue(stalled_status["flush_stalled"])
+        self.assertFalse(stalled_status["flush_retry_backoff"])
+        self.assertEqual(stalled_status["flush_retry_failure_count"], 0)
+        self.assertIsNone(stalled_status["flush_retry_next_at"])
+        self.assertFalse(failed_status["flush_stalled"])
+        self.assertTrue(failed_status["flush_retry_backoff"])
+        self.assertEqual(failed_status["flush_retry_failure_count"], 1)
+        self.assertGreaterEqual(store.write_attempt_started_at[1] - released_at, 0.025)
+        self.assertEqual(store.write_attempts, 2)
+        self.assertEqual(store.saved[0]["session_requests"], 1)
+        self.assertFalse(recovered_status["flush_retry_backoff"])
+        self.assertEqual(recovered_status["flush_retry_failure_count"], 0)
+        self.assertIsNone(recovered_status["last_flush_error"])
 
     async def test_merge_does_not_overwrite_clean_locally_sampled_bucket(self):
         clock = FakeClock(0)
