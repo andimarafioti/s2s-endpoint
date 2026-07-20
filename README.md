@@ -129,7 +129,9 @@ If you want the dashboard history to survive LB restarts, you can configure it t
 Persisted history is restored in the background during load-balancer startup, so
 the endpoint can become ready before older dashboard buckets finish loading. The
 `/dashboard/data` response includes a `history_restore` object with the restore
-status, elapsed time, and restored bucket count.
+status, elapsed time, and restored bucket count. After the initial restore, the
+load balancer performs one delayed merge by default so it also sees files that
+the previous replica wrote while shutting down.
 
 The dashboard store keeps minute files under `minutes/YYYY-MM-DD/` and also
 uses `days/YYYY-MM-DD.json` files as a compact cache for UTC days. On restore it
@@ -139,10 +141,11 @@ minute buckets for a completed day. While the load balancer stays running, it
 also rolls over each completed UTC day from in-memory history into
 `days/YYYY-MM-DD.json` shortly after midnight UTC. If the day is missing minute
 buckets, the rollover still writes a finalized partial day file with
-`complete: false`, `finalized: true`, and a missing-minute count so later
-restores do not redownload the same minutes forever. Older/open partial day
-files without `finalized: true` are still allowed to merge newly appeared minute
-files and then become finalized.
+`complete: false`, `finalized: true`, and a missing-minute count. Restores treat
+only complete day files as authoritative: partial day files are merged with any
+minute files that appeared later and the partial cache is refreshed. This lets a
+new load balancer recover minute files written late by the previous replica
+during a rolling replacement.
 
 You can precompute day files without running the load balancer:
 
@@ -198,6 +201,20 @@ minute buckets are present.
 - `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
 - `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
   (defaults to 28 days so the 14d/28d dashboard windows can load persisted history)
+- `DASHBOARD_FLUSH_BATCH_SIZE`: maximum minute files written in one storage call
+  (defaults to 100)
+- `DASHBOARD_FLUSH_TIMEOUT_S`: age at which an in-flight dashboard storage write
+  is reported as stalled (defaults to 60 seconds). The single writer remains in
+  flight until it resolves, preventing overlapping writes and stale overwrites.
+  This also configures the Hugging Face Hub HTTP client request timeout. During
+  shutdown, final dashboard persistence gets a total budget of twice this value;
+  the load balancer logs any remaining dirty buckets and continues shutdown if
+  the budget expires.
+- `DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S`: age at which the load balancer warns
+  that dashboard minute persistence is falling behind (defaults to 300 seconds)
+- `DASHBOARD_STARTUP_MERGE_DELAY_S`: delay before a second startup history read
+  merges files written late by the previous LB replica (defaults to 60 seconds;
+  set to 0 to disable)
 - `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
   endpoint/session data instead of connecting to real compute endpoints. You can
   also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.

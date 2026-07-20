@@ -8,10 +8,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.swarm_dashboard import DashboardHistoryStore, SwarmHistoryBucket, _bucket_start_epoch_s
+from app.dashboard_history import DashboardHistoryStore, SwarmHistoryBucket, _bucket_start_epoch_s
 
 
 logger = logging.getLogger("s2s-endpoint")
+
+
+def _configure_huggingface_http_timeout(timeout_s: float) -> None:
+    import httpx
+    from huggingface_hub import get_session
+
+    get_session().timeout = httpx.Timeout(timeout_s)
 
 
 def _day_start_epoch_s(epoch_s: float) -> int:
@@ -32,7 +39,7 @@ class _LoadedDayFiles:
 
     @property
     def authoritative_day_starts(self) -> set[int]:
-        return self.complete_day_starts | self.finalized_partial_day_starts
+        return self.complete_day_starts
 
 
 class HuggingFaceBucketHistoryStore:
@@ -42,18 +49,24 @@ class HuggingFaceBucketHistoryStore:
         bucket_id: str,
         prefix: str = "s2s-endpoint/swarm-dashboard",
         token: Optional[str] = None,
+        request_timeout_s: float = 60.0,
     ) -> None:
         from huggingface_hub import batch_bucket_files, download_bucket_files, list_bucket_tree
+
+        if request_timeout_s <= 0:
+            raise ValueError("request_timeout_s must be > 0")
 
         self.bucket_id = bucket_id.strip()
         self.prefix = prefix.strip().strip("/")
         self.token = token or None
+        self.request_timeout_s = request_timeout_s
         self.read_only = False
         self.download_chunk_size: Optional[int] = None
         self.local_download_cache_dir: Optional[Path] = None
         self._batch_bucket_files = batch_bucket_files
         self._download_bucket_files = download_bucket_files
         self._list_bucket_tree = list_bucket_tree
+        _configure_huggingface_http_timeout(request_timeout_s)
 
         if not self.bucket_id:
             raise ValueError("bucket_id must be set")
