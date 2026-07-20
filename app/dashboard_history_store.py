@@ -106,10 +106,22 @@ class HuggingFaceBucketHistoryStore:
                 max_bucket=max_bucket,
                 existing_bucket_starts=set(loaded_by_start),
             )
+            days_with_new_minute_buckets = {
+                _day_start_epoch_s(bucket.bucket_start_s)
+                for bucket in minute_buckets
+            }
             for bucket in minute_buckets:
                 loaded_by_start[bucket.bucket_start_s] = bucket
+            days_to_cache = [
+                day_start
+                for day_start in days_needing_minute_lookup
+                if (
+                    day_start not in loaded_days.finalized_partial_day_starts
+                    or day_start in days_with_new_minute_buckets
+                )
+            ]
             self._cache_day_files(
-                day_starts=days_needing_minute_lookup,
+                day_starts=days_to_cache,
                 buckets=list(loaded_by_start.values()),
                 now_epoch_s=now_epoch_s,
             )
