@@ -509,13 +509,13 @@ class SwarmDashboard:
         self._sample_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._startup_merge_task: Optional[asyncio.Task] = None
-        self._flush_task: Optional[asyncio.Task] = None
+        self._persistence_task: Optional[asyncio.Task] = None
         self._flush_write_task: Optional[asyncio.Task] = None
-        self._shutdown_persistence_task: Optional[asyncio.Task] = None
-        self._day_rollover_task: Optional[asyncio.Task] = None
+        self._persistence_wakeup = asyncio.Event()
+        self._persistence_stop_requested = False
         self._dirty_bucket_starts: set[int] = set()
         self._locally_sampled_bucket_starts: set[int] = set()
-        self._flush_task_started_at_monotonic_s: Optional[float] = None
+        self._flush_started_at_monotonic_s: Optional[float] = None
         self._last_flush_started_at_s: Optional[float] = None
         self._last_flush_finished_at_s: Optional[float] = None
         self._last_flush_error: Optional[str] = None
@@ -533,9 +533,6 @@ class SwarmDashboard:
             if history_store is None or startup_merge_delay_s == 0
             else "pending"
         )
-        self._startup_merge_detail: Optional[str] = None
-        self._startup_merge_started_at_s: Optional[float] = None
-        self._startup_merge_finished_at_s: Optional[float] = None
         self._startup_merge_bucket_count = 0
         self._startup_merge_updated_bucket_count = 0
 
@@ -551,13 +548,12 @@ class SwarmDashboard:
                 await self._restore_history()
             if self.startup_merge_delay_s > 0:
                 self._startup_merge_status = "waiting"
-                self._startup_merge_detail = (
-                    f"Waiting {self.startup_merge_delay_s:g}s before merging late dashboard history"
-                )
                 self._startup_merge_task = asyncio.create_task(self._delayed_startup_history_merge())
         if self._history_store_day_writer() is not None:
             self._day_rollover_cursor_s = _day_start_epoch_s(self._time_fn())
-            self._day_rollover_task = asyncio.create_task(self._day_rollover_loop())
+        if self._history_store_is_writable():
+            self._persistence_stop_requested = False
+            self._persistence_task = asyncio.create_task(self._persistence_loop())
         self._sample_task = asyncio.create_task(self._sample_loop())
 
     async def stop(self) -> None:
@@ -585,18 +581,16 @@ class SwarmDashboard:
                 pass
             self._sample_task = None
 
-        if self._day_rollover_task is not None:
-            self._day_rollover_task.cancel()
-            try:
-                await self._day_rollover_task
-            except asyncio.CancelledError:
-                pass
-            self._day_rollover_task = None
+        if not self._history_store_is_writable():
+            return
 
-        self._shutdown_persistence_task = asyncio.create_task(self._finish_shutdown_persistence())
+        self._persistence_stop_requested = True
+        self._persistence_wakeup.set()
+        if self._persistence_task is None or self._persistence_task.done():
+            self._persistence_task = asyncio.create_task(self._persistence_loop())
         try:
             await asyncio.wait_for(
-                asyncio.shield(self._shutdown_persistence_task),
+                asyncio.shield(self._persistence_task),
                 timeout=self.shutdown_flush_budget_s,
             )
         except asyncio.TimeoutError:
@@ -606,18 +600,8 @@ class SwarmDashboard:
                 self.shutdown_flush_budget_s,
                 len(self._dirty_bucket_starts),
             )
-
-    async def _finish_shutdown_persistence(self) -> None:
-        if self._flush_task is not None:
-            try:
-                await self._flush_task
-            except asyncio.CancelledError:
-                pass
-            if self._flush_task.done():
-                self._flush_task = None
-
-        await self._flush_dirty_buckets(include_open_bucket=True)
-        await self._rollover_completed_days()
+        else:
+            self._persistence_task = None
 
     async def capture_sample(self) -> SwarmStateSample:
         healthy, detail, snapshot = await self.snapshot_provider()
@@ -637,7 +621,7 @@ class SwarmDashboard:
             self._latest_sample = sample
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(sample.captured_at_s)
-            self._schedule_flush_unlocked(include_open_bucket=False)
+            self._wake_persistence_unlocked()
 
     async def record_session_request(self) -> None:
         await self._increment_counter("session_requests")
@@ -848,12 +832,11 @@ class SwarmDashboard:
     def persistence_status(self) -> dict[str, object]:
         now_epoch_s = self._time_fn()
         oldest_dirty_bucket_start_s = min(self._dirty_bucket_starts, default=None)
-        flush_task_running = self._flush_task is not None and not self._flush_task.done()
         flush_write_in_flight = self._flush_write_task is not None and not self._flush_write_task.done()
         flush_task_age_s = None
-        if flush_task_running and self._flush_task_started_at_monotonic_s is not None:
+        if flush_write_in_flight and self._flush_started_at_monotonic_s is not None:
             flush_task_age_s = round(
-                max(time.monotonic() - self._flush_task_started_at_monotonic_s, 0.0),
+                max(time.monotonic() - self._flush_started_at_monotonic_s, 0.0),
                 2,
             )
         flush_stalled_age_s = None
@@ -898,20 +881,11 @@ class SwarmDashboard:
         }
 
     def startup_merge_status(self) -> dict[str, object]:
-        now_s = time.monotonic()
-        started_at_s = self._startup_merge_started_at_s
-        finished_at_s = self._startup_merge_finished_at_s
         return {
             "status": self._startup_merge_status,
-            "detail": self._startup_merge_detail,
             "delay_s": self.startup_merge_delay_s,
             "bucket_count": self._startup_merge_bucket_count,
             "updated_bucket_count": self._startup_merge_updated_bucket_count,
-            "elapsed_s": (
-                round((finished_at_s or now_s) - started_at_s, 2)
-                if started_at_s is not None
-                else None
-            ),
         }
 
     async def _sample_loop(self) -> None:
@@ -922,15 +896,17 @@ class SwarmDashboard:
         except asyncio.CancelledError:
             raise
 
-    async def _day_rollover_loop(self) -> None:
-        try:
-            while True:
-                now_s = self._time_fn()
-                next_day_start_s = _day_start_epoch_s(now_s) + DAY_SECONDS
-                await asyncio.sleep(max(1.0, next_day_start_s + 90 - now_s))
-                await self._rollover_completed_days()
-        except asyncio.CancelledError:
-            raise
+    async def _persistence_loop(self) -> None:
+        while True:
+            await self._persistence_wakeup.wait()
+            self._persistence_wakeup.clear()
+            self._warn_if_dirty_buckets_stale_unlocked()
+            await self._flush_dirty_buckets(
+                include_open_bucket=self._persistence_stop_requested,
+            )
+            await self._rollover_completed_days(flush_first=False)
+            if self._persistence_stop_requested:
+                return
 
     async def _increment_counter(self, field_name: str) -> None:
         now = self._time_fn()
@@ -939,7 +915,7 @@ class SwarmDashboard:
             setattr(bucket, field_name, getattr(bucket, field_name) + 1)
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(now)
-            self._schedule_flush_unlocked(include_open_bucket=False)
+            self._wake_persistence_unlocked()
 
     async def _record_completed_conversation(self, duration_s: float) -> None:
         now = self._time_fn()
@@ -954,7 +930,7 @@ class SwarmDashboard:
             bucket.completed_conversation_duration_samples_s.append(duration_s)
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(now)
-            self._schedule_flush_unlocked(include_open_bucket=False)
+            self._wake_persistence_unlocked()
 
     def _get_bucket_unlocked(self, epoch_s: float) -> SwarmHistoryBucket:
         bucket_start_s = _bucket_start_epoch_s(epoch_s, 1)
@@ -966,7 +942,7 @@ class SwarmDashboard:
 
     def _mark_bucket_dirty_unlocked(self, bucket_start_s: int) -> None:
         self._locally_sampled_bucket_starts.add(bucket_start_s)
-        if self.history_store is not None:
+        if self._history_store_is_writable():
             self._dirty_bucket_starts.add(bucket_start_s)
 
     def _prune_unlocked(self, epoch_s: float) -> None:
@@ -1020,11 +996,7 @@ class SwarmDashboard:
         self._history_restore_status = "running"
         self._history_restore_detail = "Loading persisted dashboard history"
         try:
-            buckets = await asyncio.to_thread(
-                self.history_store.load_recent,
-                retention_minutes=self.retention_minutes,
-                now_epoch_s=self._time_fn(),
-            )
+            buckets = await self._load_persisted_history()
         except asyncio.CancelledError:
             self._history_restore_status = "cancelled"
             self._history_restore_detail = "Dashboard history restore was cancelled"
@@ -1075,44 +1047,36 @@ class SwarmDashboard:
                 return
 
             started_s = time.monotonic()
-            self._startup_merge_started_at_s = started_s
-            self._startup_merge_finished_at_s = None
             self._startup_merge_bucket_count = 0
             self._startup_merge_updated_bucket_count = 0
             self._startup_merge_status = "running"
-            self._startup_merge_detail = "Merging dashboard history written during startup"
-            buckets = await asyncio.to_thread(
-                self.history_store.load_recent,
-                retention_minutes=self.retention_minutes,
-                now_epoch_s=self._time_fn(),
-            )
+            buckets = await self._load_persisted_history()
             updated_bucket_count = await self._merge_persisted_history_buckets(buckets)
         except asyncio.CancelledError:
             self._startup_merge_status = "cancelled"
-            self._startup_merge_detail = "Delayed dashboard history merge was cancelled"
-            self._startup_merge_finished_at_s = time.monotonic()
             raise
         except Exception as exc:
             self._startup_merge_status = "failed"
-            self._startup_merge_detail = str(exc)
-            self._startup_merge_finished_at_s = time.monotonic()
             logger.warning("Failed to merge delayed dashboard history from bucket store: %s", exc)
             return
 
         self._startup_merge_bucket_count = len(buckets)
         self._startup_merge_updated_bucket_count = updated_bucket_count
-        self._startup_merge_finished_at_s = time.monotonic()
-        if buckets:
-            self._startup_merge_status = "complete"
-            self._startup_merge_detail = "Late dashboard history merged"
-        else:
-            self._startup_merge_status = "empty"
-            self._startup_merge_detail = "No persisted dashboard history found during delayed merge"
+        self._startup_merge_status = "complete" if buckets else "empty"
         logger.info(
             "Merged delayed dashboard history: loaded %s buckets, updated %s in %.2fs",
             len(buckets),
             updated_bucket_count,
             time.monotonic() - started_s,
+        )
+
+    async def _load_persisted_history(self) -> list[SwarmHistoryBucket]:
+        if self.history_store is None:
+            return []
+        return await asyncio.to_thread(
+            self.history_store.load_recent,
+            retention_minutes=self.retention_minutes,
+            now_epoch_s=self._time_fn(),
         )
 
     async def _merge_persisted_history_buckets(self, buckets: list[SwarmHistoryBucket]) -> int:
@@ -1132,22 +1096,16 @@ class SwarmDashboard:
             self._prune_unlocked(self._time_fn())
         return updated_bucket_count
 
-    def _schedule_flush_unlocked(self, *, include_open_bucket: bool) -> None:
-        if self.history_store is None:
+    def _wake_persistence_unlocked(self) -> None:
+        if not self._history_store_is_writable():
             return
         self._warn_if_dirty_buckets_stale_unlocked()
-        if self._flush_write_task is not None and not self._flush_write_task.done():
-            return
-        if self._flush_task is not None and not self._flush_task.done():
-            return
-        if not self._has_flushable_dirty_buckets_unlocked(include_open_bucket=include_open_bucket):
-            return
-        self._flush_task_started_at_monotonic_s = time.monotonic()
-        self._flush_task = asyncio.create_task(self._flush_dirty_buckets(include_open_bucket=include_open_bucket))
+        self._persistence_wakeup.set()
 
     async def _flush_dirty_buckets(self, *, include_open_bucket: bool) -> None:
         if self.history_store is None:
             return
+        await self._wait_for_inflight_write()
 
         flush_started = False
         try:
@@ -1164,6 +1122,7 @@ class SwarmDashboard:
                     self._last_flush_started_at_s = self._time_fn()
                     self._last_flush_finished_at_s = None
                     self._last_flush_error = None
+                    self._flush_started_at_monotonic_s = time.monotonic()
 
                 if not await self._write_bucket_batch(buckets):
                     return
@@ -1174,8 +1133,25 @@ class SwarmDashboard:
                         if current_bucket is None or current_bucket.to_dict() == bucket.to_dict():
                             self._dirty_bucket_starts.discard(bucket.bucket_start_s)
         finally:
-            if asyncio.current_task() is self._flush_task:
-                self._flush_task_started_at_monotonic_s = None
+            self._flush_started_at_monotonic_s = None
+
+    async def _wait_for_inflight_write(self) -> None:
+        write_task = self._flush_write_task
+        if write_task is None:
+            return
+        try:
+            await asyncio.shield(write_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._last_flush_error = str(exc)
+            self._last_flush_finished_at_s = self._time_fn()
+            logger.warning("Failed dashboard history write finished before persistence resumed: %s", exc)
+        finally:
+            if self._flush_write_task is write_task and write_task.done():
+                self._flush_write_task = None
+                self._flush_stalled_started_at_s = None
+                self._flush_stalled_started_at_monotonic_s = None
 
     async def _write_bucket_batch(self, buckets: list[SwarmHistoryBucket]) -> bool:
         if self.history_store is None:
@@ -1187,12 +1163,8 @@ class SwarmDashboard:
         self._flush_write_task = write_task
         timed_out = False
         try:
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(write_task),
-                    timeout=self.flush_timeout_s,
-                )
-            except asyncio.TimeoutError:
+            done, _ = await asyncio.wait({write_task}, timeout=self.flush_timeout_s)
+            if not done:
                 timed_out = True
                 self._last_flush_error = (
                     f"Dashboard history flush stalled after {self.flush_timeout_s:g}s"
@@ -1205,11 +1177,9 @@ class SwarmDashboard:
                     len(buckets),
                 )
                 await asyncio.shield(write_task)
+            else:
+                write_task.result()
         except asyncio.CancelledError:
-            try:
-                await asyncio.shield(write_task)
-            except Exception as exc:
-                logger.warning("Dashboard history write failed during cancellation: %s", exc)
             raise
         except Exception as exc:
             self._last_flush_error = str(exc)
@@ -1226,14 +1196,6 @@ class SwarmDashboard:
             logger.info("Stalled dashboard history flush completed; persistence can resume")
         self._last_flush_error = None
         return True
-
-    def _has_flushable_dirty_buckets_unlocked(self, *, include_open_bucket: bool) -> bool:
-        current_bucket_start_s = _bucket_start_epoch_s(self._time_fn(), 1)
-        return any(
-            bucket_start_s in self._history
-            and (include_open_bucket or bucket_start_s < current_bucket_start_s)
-            for bucket_start_s in self._dirty_bucket_starts
-        )
 
     def _warn_if_dirty_buckets_stale_unlocked(self) -> None:
         oldest_dirty_bucket_start_s = min(self._dirty_bucket_starts, default=None)
@@ -1260,27 +1222,22 @@ class SwarmDashboard:
             self._last_flush_error,
         )
 
+    def _history_store_is_writable(self) -> bool:
+        return self.history_store is not None and not bool(getattr(self.history_store, "read_only", False))
+
     def _history_store_day_writer(self) -> Optional[Callable[..., Optional[str]]]:
-        if self.history_store is None:
-            return None
-        if getattr(self.history_store, "read_only", False):
+        if not self._history_store_is_writable():
             return None
         writer = getattr(self.history_store, "write_day_buckets", None)
         return writer if callable(writer) else None
 
-    async def _rollover_completed_days(self) -> None:
+    async def _rollover_completed_days(self, *, flush_first: bool = True) -> None:
         writer = self._history_store_day_writer()
         if writer is None:
             return
 
-        current_task = asyncio.current_task()
-        if self._flush_task is not None and self._flush_task is not current_task and not self._flush_task.done():
-            try:
-                await self._flush_task
-            except asyncio.CancelledError:
-                raise
-
-        await self._flush_dirty_buckets(include_open_bucket=False)
+        if flush_first:
+            await self._flush_dirty_buckets(include_open_bucket=False)
 
         async with self._lock:
             current_day_start_s = _day_start_epoch_s(self._time_fn())

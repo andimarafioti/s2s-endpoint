@@ -16,15 +16,9 @@ logger = logging.getLogger("s2s-endpoint")
 
 def _configure_huggingface_http_timeout(timeout_s: float) -> None:
     import httpx
-    from huggingface_hub import set_client_factory
-    from huggingface_hub.utils._http import default_client_factory
+    from huggingface_hub import get_session
 
-    def client_factory() -> httpx.Client:
-        client = default_client_factory()
-        client.timeout = httpx.Timeout(timeout_s)
-        return client
-
-    set_client_factory(client_factory)
+    get_session().timeout = httpx.Timeout(timeout_s)
 
 
 def _day_start_epoch_s(epoch_s: float) -> int:
