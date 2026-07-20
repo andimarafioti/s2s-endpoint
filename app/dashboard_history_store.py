@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.swarm_dashboard import DashboardHistoryStore, SwarmHistoryBucket, _bucket_start_epoch_s
+from app.dashboard_history import DashboardHistoryStore, SwarmHistoryBucket, _bucket_start_epoch_s
 
 
 logger = logging.getLogger("s2s-endpoint")

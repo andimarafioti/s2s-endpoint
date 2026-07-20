@@ -8,10 +8,10 @@ from unittest.mock import patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from app.dashboard_history import SwarmHistoryBucket
 from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
 from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointTransitionConflictError
-from app.swarm_dashboard import SwarmHistoryBucket
 from tests.helpers import monotonic_sequence
 
 

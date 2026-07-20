@@ -8,12 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from app.dashboard_history import SwarmHistoryBucket, SwarmStateSample
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
-from app.swarm_dashboard import (
-    SwarmDashboard,
-    SwarmHistoryBucket,
-    SwarmStateSample,
-)
+from app.swarm_dashboard import SwarmDashboard
 
 
 class FakeClock:
@@ -397,7 +394,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         bucket.connected_sessions_last = 1
         bucket.connected_sessions_sum = 6
         bucket.connected_sessions_max = 5
-        dashboard._history[bucket.bucket_start_s] = bucket
+        dashboard.history._history[bucket.bucket_start_s] = bucket
 
         summary = await dashboard.summary(window_minutes=60, requested_window="1h")
 
@@ -437,7 +434,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             bucket.connected_sessions_sum = connected_sessions_sum
             bucket.connected_sessions_max = connected_sessions_max
             bucket.sample_count = sample_count
-            dashboard._history[bucket_start_s] = bucket
+            dashboard.history._history[bucket_start_s] = bucket
 
         add_bucket(
             bucket_start_s=now_s - 23 * 3600,
@@ -552,7 +549,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(len(dashboard._history), 1)
+        self.assertEqual(len(dashboard.history._history), 1)
 
     async def test_persists_closed_buckets_to_history_store(self):
         clock = FakeClock(2 * 3600)
@@ -617,7 +614,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
                 endpoints=[],
             )
         )
-        await dashboard._flush_dirty_buckets(include_open_bucket=False)
+        await dashboard.history._flush_dirty_buckets(include_open_bucket=False)
 
         persisted = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
         self.assertEqual(persisted.session_requests, 1)
@@ -645,10 +642,10 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             time_fn=clock.now,
         )
         for bucket_start_s in range(0, 5 * 60, 60):
-            dashboard._history[bucket_start_s] = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
-            dashboard._dirty_bucket_starts.add(bucket_start_s)
+            dashboard.history._history[bucket_start_s] = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
+            dashboard.history._dirty_bucket_starts.add(bucket_start_s)
 
-        await dashboard._flush_dirty_buckets(include_open_bucket=False)
+        await dashboard.history._flush_dirty_buckets(include_open_bucket=False)
 
         self.assertEqual(store.write_calls, [[0, 60], [120, 180], [240]])
         status = dashboard.persistence_status()
@@ -674,27 +671,27 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             flush_timeout_s=0.01,
             time_fn=clock.now,
         )
-        dashboard._history[0] = SwarmHistoryBucket(bucket_start_s=0, session_requests=1)
-        dashboard._dirty_bucket_starts.add(0)
-        dashboard._persistence_task = asyncio.create_task(dashboard._persistence_loop())
+        dashboard.history._history[0] = SwarmHistoryBucket(bucket_start_s=0, session_requests=1)
+        dashboard.history._dirty_bucket_starts.add(0)
+        dashboard.history._persistence_task = asyncio.create_task(dashboard.history._persistence_loop())
 
         with self.assertLogs("s2s-endpoint", level="ERROR"):
-            dashboard._wake_persistence_unlocked()
+            dashboard.history._wake_persistence_unlocked()
             while not store.first_write_started.is_set():
                 await asyncio.sleep(0.001)
             await asyncio.sleep(0.02)
 
-            persistence_task = dashboard._persistence_task
+            persistence_task = dashboard.history._persistence_task
             status = dashboard.persistence_status()
-            dashboard._history[0].session_requests = 2
-            dashboard._dirty_bucket_starts.add(0)
-            dashboard._wake_persistence_unlocked()
+            dashboard.history._history[0].session_requests = 2
+            dashboard.history._dirty_bucket_starts.add(0)
+            dashboard.history._wake_persistence_unlocked()
 
         self.assertTrue(status["flush_write_in_flight"])
         self.assertTrue(status["flush_stalled"])
         self.assertIsNotNone(status["flush_stalled_since_at"])
         self.assertIsNotNone(status["flush_stalled_age_s"])
-        self.assertIs(dashboard._persistence_task, persistence_task)
+        self.assertIs(dashboard.history._persistence_task, persistence_task)
         self.assertEqual(store.write_attempts, 1)
 
         store.release_first_write.set()
@@ -745,7 +742,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         clock.set(60)
-        await dashboard._flush_dirty_buckets(include_open_bucket=False)
+        await dashboard.history._flush_dirty_buckets(include_open_bucket=False)
         stale_bucket = SwarmHistoryBucket(
             bucket_start_s=0,
             sample_count=1,
@@ -753,12 +750,12 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             running_endpoints_sum=99,
         )
 
-        updated_bucket_count = await dashboard._merge_persisted_history_buckets([stale_bucket])
+        updated_bucket_count = await dashboard.history._merge_persisted_history_buckets([stale_bucket])
 
-        self.assertNotIn(0, dashboard._dirty_bucket_starts)
-        self.assertIn(0, dashboard._locally_sampled_bucket_starts)
+        self.assertNotIn(0, dashboard.history._dirty_bucket_starts)
+        self.assertIn(0, dashboard.history._locally_sampled_bucket_starts)
         self.assertEqual(updated_bucket_count, 0)
-        self.assertEqual(dashboard._history[0].running_endpoints_last, 1)
+        self.assertEqual(dashboard.history._history[0].running_endpoints_last, 1)
 
     async def test_shutdown_abandons_permanently_blocked_flush_after_budget(self):
         clock = FakeClock(2 * 60)
@@ -777,10 +774,10 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             flush_timeout_s=0.01,
             time_fn=clock.now,
         )
-        dashboard._history[0] = SwarmHistoryBucket(bucket_start_s=0)
-        dashboard._dirty_bucket_starts.add(0)
-        dashboard._persistence_task = asyncio.create_task(dashboard._persistence_loop())
-        dashboard._wake_persistence_unlocked()
+        dashboard.history._history[0] = SwarmHistoryBucket(bucket_start_s=0)
+        dashboard.history._dirty_bucket_starts.add(0)
+        dashboard.history._persistence_task = asyncio.create_task(dashboard.history._persistence_loop())
+        dashboard.history._wake_persistence_unlocked()
         while not store.first_write_started.is_set():
             await asyncio.sleep(0.001)
 
@@ -791,8 +788,8 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             elapsed = time.monotonic() - started
         finally:
             store.release_first_write.set()
-            if dashboard._persistence_task is not None:
-                await dashboard._persistence_task
+            if dashboard.history._persistence_task is not None:
+                await dashboard.history._persistence_task
 
         self.assertLess(elapsed, 0.2)
         self.assertTrue(any("abandoning 1 dirty buckets" in message for message in logs.output))
@@ -814,32 +811,32 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             flush_timeout_s=10,
             time_fn=clock.now,
         )
-        dashboard._history[0] = SwarmHistoryBucket(bucket_start_s=0)
-        dashboard._dirty_bucket_starts.add(0)
-        dashboard._persistence_task = asyncio.create_task(dashboard._persistence_loop())
-        dashboard._wake_persistence_unlocked()
+        dashboard.history._history[0] = SwarmHistoryBucket(bucket_start_s=0)
+        dashboard.history._dirty_bucket_starts.add(0)
+        dashboard.history._persistence_task = asyncio.create_task(dashboard.history._persistence_loop())
+        dashboard.history._wake_persistence_unlocked()
         while not store.first_write_started.is_set():
             await asyncio.sleep(0.001)
 
-        persistence_task = dashboard._persistence_task
+        persistence_task = dashboard.history._persistence_task
         try:
             persistence_task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await persistence_task
 
-            write_task = dashboard._flush_write_task
+            write_task = dashboard.history._flush_write_task
             self.assertIsNotNone(write_task)
             self.assertFalse(write_task.done())
-            dashboard._wake_persistence_unlocked()
+            dashboard.history._wake_persistence_unlocked()
             self.assertEqual(store.write_attempts, 1)
         finally:
             store.release_first_write.set()
-            await dashboard._flush_write_task
+            await dashboard.history._flush_write_task
 
         await dashboard.stop()
 
         self.assertEqual(store.write_attempts, 2)
-        self.assertIsNone(dashboard._flush_write_task)
+        self.assertIsNone(dashboard.history._flush_write_task)
         self.assertEqual(dashboard.persistence_status()["dirty_bucket_count"], 0)
 
     async def test_warns_when_dirty_dashboard_buckets_are_stale(self):
@@ -858,18 +855,18 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             dirty_bucket_warning_age_s=300,
             time_fn=clock.now,
         )
-        dashboard._history[0] = SwarmHistoryBucket(bucket_start_s=0)
-        dashboard._dirty_bucket_starts.add(0)
-        dashboard._flush_started_at_monotonic_s = time.monotonic()
-        dashboard._flush_write_task = asyncio.create_task(asyncio.sleep(1))
+        dashboard.history._history[0] = SwarmHistoryBucket(bucket_start_s=0)
+        dashboard.history._dirty_bucket_starts.add(0)
+        dashboard.history._flush_started_at_monotonic_s = time.monotonic()
+        dashboard.history._flush_write_task = asyncio.create_task(asyncio.sleep(1))
         try:
             with self.assertLogs("s2s-endpoint", level="WARNING") as logs:
-                dashboard._wake_persistence_unlocked()
+                dashboard.history._wake_persistence_unlocked()
             status = dashboard.persistence_status()
         finally:
-            dashboard._flush_write_task.cancel()
+            dashboard.history._flush_write_task.cancel()
             with self.assertRaises(asyncio.CancelledError):
-                await dashboard._flush_write_task
+                await dashboard.history._flush_write_task
 
         self.assertIn("oldest dirty bucket age is 600.0s", logs.output[0])
         self.assertEqual(status["oldest_dirty_bucket_age_s"], 600.0)
@@ -927,19 +924,19 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             history_store=store,
             time_fn=clock.now,
         )
-        dashboard._day_rollover_cursor_s = day_start
+        dashboard.history._day_rollover_cursor_s = day_start
         for minute in range(24 * 60):
             bucket_start_s = day_start + minute * 60
             bucket = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
             bucket.sample_count = 1
-            dashboard._history[bucket_start_s] = bucket
+            dashboard.history._history[bucket_start_s] = bucket
 
-        await dashboard._rollover_completed_days()
+        await dashboard.history._rollover_completed_days()
 
         self.assertEqual(len(store.day_write_calls), 1)
         self.assertEqual(store.day_write_calls[0][0], day_start)
         self.assertEqual(len(store.day_write_calls[0][1]), 24 * 60)
-        self.assertEqual(dashboard._day_rollover_cursor_s, day_start + 24 * 60 * 60)
+        self.assertEqual(dashboard.history._day_rollover_cursor_s, day_start + 24 * 60 * 60)
 
     async def test_live_day_rollover_writes_incomplete_past_day(self):
         day_start = _day_start(2026, 5, 18)
@@ -959,17 +956,17 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             history_store=store,
             time_fn=clock.now,
         )
-        dashboard._day_rollover_cursor_s = day_start
+        dashboard.history._day_rollover_cursor_s = day_start
         for minute in range((24 * 60) - 1):
             bucket_start_s = day_start + minute * 60
-            dashboard._history[bucket_start_s] = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
+            dashboard.history._history[bucket_start_s] = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
 
-        await dashboard._rollover_completed_days()
+        await dashboard.history._rollover_completed_days()
 
         self.assertEqual(len(store.day_write_calls), 1)
         self.assertEqual(store.day_write_calls[0][0], day_start)
         self.assertEqual(len(store.day_write_calls[0][1]), (24 * 60) - 1)
-        self.assertEqual(dashboard._day_rollover_cursor_s, day_start + 24 * 60 * 60)
+        self.assertEqual(dashboard.history._day_rollover_cursor_s, day_start + 24 * 60 * 60)
 
     async def test_background_restore_does_not_block_start(self):
         bucket = SwarmHistoryBucket(bucket_start_s=4 * 3600)
@@ -1001,7 +998,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         try:
             self.assertLess(elapsed, 0.1)
             self.assertEqual(dashboard.history_restore_status()["status"], "running")
-            await dashboard._restore_task
+            await dashboard.history._restore_task
             self.assertEqual(dashboard.history_restore_status()["status"], "complete")
             series = await dashboard.series(window_minutes=2, resolution="minute")
             self.assertEqual(series[0]["running_endpoints"], 2)
@@ -1039,10 +1036,10 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         await dashboard.start()
         try:
-            await dashboard._restore_task
+            await dashboard.history._restore_task
             store.saved[late_bucket.bucket_start_s] = late_bucket.to_dict()
             store.saved[stale_live_bucket.bucket_start_s] = stale_live_bucket.to_dict()
-            await dashboard._startup_merge_task
+            await dashboard.history._startup_merge_task
             series = await dashboard.series(window_minutes=2, resolution="minute")
             status = dashboard.startup_merge_status()
         finally:
