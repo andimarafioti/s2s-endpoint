@@ -11,6 +11,7 @@ from typing import Callable, Optional, Protocol
 logger = logging.getLogger("s2s-endpoint")
 DAY_MINUTES = 24 * 60
 DAY_SECONDS = DAY_MINUTES * 60
+PERSISTENCE_WORKER_RETRY_DELAY_S = 1.0
 
 
 def _normalize_status(status: object) -> str:
@@ -449,6 +450,7 @@ class DashboardHistory:
     def persistence_status(self) -> dict[str, object]:
         now_epoch_s = self._time_fn()
         oldest_dirty_bucket_start_s = min(self._dirty_bucket_starts, default=None)
+        worker_alive = self._persistence_task is not None and not self._persistence_task.done()
         flush_write_in_flight = self._flush_write_task is not None and not self._flush_write_task.done()
         flush_task_age_s = None
         if flush_write_in_flight and self._flush_started_at_monotonic_s is not None:
@@ -465,6 +467,7 @@ class DashboardHistory:
         return {
             "enabled": self.history_store is not None,
             "read_only": bool(getattr(self.history_store, "read_only", False)),
+            "worker_alive": worker_alive,
             "dirty_bucket_count": len(self._dirty_bucket_starts),
             "oldest_dirty_bucket_age_s": (
                 round(max(now_epoch_s - oldest_dirty_bucket_start_s, 0.0), 2)
@@ -510,13 +513,22 @@ class DashboardHistory:
         while True:
             await self._persistence_wakeup.wait()
             self._persistence_wakeup.clear()
-            self._warn_if_dirty_buckets_stale_unlocked()
-            await self._flush_dirty_buckets(
-                include_open_bucket=self._persistence_stop_requested,
-            )
-            await self._rollover_completed_days(flush_first=False)
-            if self._persistence_stop_requested:
-                return
+            try:
+                self._warn_if_dirty_buckets_stale_unlocked()
+                await self._flush_dirty_buckets(
+                    include_open_bucket=self._persistence_stop_requested,
+                )
+                await self._rollover_completed_days(flush_first=False)
+                if self._persistence_stop_requested:
+                    await self._flush_dirty_buckets(include_open_bucket=True)
+                    await self._rollover_completed_days(flush_first=False)
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Dashboard persistence worker failed; retrying")
+                await asyncio.sleep(PERSISTENCE_WORKER_RETRY_DELAY_S)
+                self._persistence_wakeup.set()
 
     async def increment_counter(self, field_name: str) -> None:
         now = self._time_fn()
