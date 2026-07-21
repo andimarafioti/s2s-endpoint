@@ -544,6 +544,9 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Maximum Connected Users", html)
         self.assertIn("Median Duration", html)
         self.assertIn("renderRollingChartCards();", html)
+        self.assertIn('id="requester-leaderboard"', html)
+        self.assertIn("Requester Usage", html)
+        self.assertIn("renderRequesterUsage(payload.requesters || {}, summary);", html)
 
     async def test_summary_peak_connected_sessions_uses_bucket_max(self):
         now_s = 6 * 3600
