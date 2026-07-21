@@ -233,6 +233,9 @@ minute buckets are present.
 - `REQUEST_USAGE_MAX_ACTORS_PER_MINUTE`: maximum distinct requester records kept
   in one minute bucket before additional actors roll into an overflow row
   (defaults to 1,000)
+- `REQUEST_USAGE_MAX_RETAINED_RECORDS`: maximum detailed requester records kept
+  across dashboard retention. Oldest requester details are compacted while the
+  minute-level request totals remain available (defaults to 50,000)
 - `REQUEST_USAGE_MAX_PENDING_VALIDATIONS`: maximum queued unique HF token
   identity lookups (defaults to 128)
 - `REQUEST_USAGE_VALIDATION_CONCURRENCY`: maximum concurrent HF `whoami` lookups

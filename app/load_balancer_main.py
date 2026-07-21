@@ -67,6 +67,7 @@ REQUEST_USAGE_TRUST_PROXY_HEADERS = os.getenv(
     "true",
 ).strip().lower() in {"true", "1", "yes"}
 REQUEST_USAGE_MAX_ACTORS_PER_MINUTE = int(os.getenv("REQUEST_USAGE_MAX_ACTORS_PER_MINUTE", "1000"))
+REQUEST_USAGE_MAX_RETAINED_RECORDS = int(os.getenv("REQUEST_USAGE_MAX_RETAINED_RECORDS", "50000"))
 REQUEST_USAGE_MAX_PENDING_VALIDATIONS = int(os.getenv("REQUEST_USAGE_MAX_PENDING_VALIDATIONS", "128"))
 REQUEST_USAGE_VALIDATION_CONCURRENCY = int(os.getenv("REQUEST_USAGE_VALIDATION_CONCURRENCY", "4"))
 REQUEST_USAGE_HIGH_REQUESTS = int(os.getenv("REQUEST_USAGE_HIGH_REQUESTS", "100"))
@@ -165,6 +166,7 @@ dashboard = SwarmDashboard(
     dirty_bucket_warning_age_s=DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S,
     startup_merge_delay_s=DASHBOARD_STARTUP_MERGE_DELAY_S,
     max_requesters_per_bucket=REQUEST_USAGE_MAX_ACTORS_PER_MINUTE,
+    max_requester_records=REQUEST_USAGE_MAX_RETAINED_RECORDS,
     requester_high_volume_threshold=REQUEST_USAGE_HIGH_REQUESTS,
     requester_burst_threshold_per_minute=REQUEST_USAGE_BURST_PER_MINUTE,
     requester_many_networks_threshold=REQUEST_USAGE_MANY_NETWORKS,

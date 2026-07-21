@@ -136,6 +136,44 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_validation_capacity_rejection_is_not_left_pending(self):
+        first_validation_started = asyncio.Event()
+        release_first_validation = asyncio.Event()
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            max_pending_validations=1,
+        )
+
+        async def blocked_validation(token, identity):
+            first_validation_started.set()
+            await release_first_validation.wait()
+
+        resolver._validate_token = blocked_validation
+        first = resolver.identify(
+            FakeRequest(headers={"authorization": "Bearer hf_first_token"})
+        )
+        await first_validation_started.wait()
+
+        rejected = resolver.identify(
+            FakeRequest(headers={"authorization": "Bearer hf_second_token"})
+        )
+
+        self.assertEqual(first.verification, "pending")
+        self.assertEqual(rejected.verification, "unavailable")
+        self.assertEqual(resolver.status()["pending_token_validations"], 1)
+        self.assertNotIn(rejected.actor_id, resolver._validation_tasks)
+
+        release_first_validation.set()
+        while resolver.status()["pending_token_validations"]:
+            await asyncio.sleep(0)
+
+        retried = resolver.identify(
+            FakeRequest(headers={"authorization": "Bearer hf_second_token"})
+        )
+        self.assertEqual(retried.verification, "pending")
+
+        await resolver.stop()
+
 
 class BearerTokenTests(unittest.TestCase):
     def test_extracts_case_insensitive_bearer_token(self):

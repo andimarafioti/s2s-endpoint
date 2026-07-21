@@ -13,6 +13,9 @@ class FakeClock:
     def now(self) -> float:
         return self._now
 
+    def set(self, now: float) -> None:
+        self._now = now
+
 
 class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
     def _service(
@@ -20,9 +23,11 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         clock: FakeClock,
         *,
         thresholds: RequesterUsageThresholds | None = None,
+        max_requester_records: int = 50_000,
     ) -> RequesterUsageService:
         history = DashboardHistory(
             retention_minutes=24 * 60,
+            max_requester_records=max_requester_records,
             time_fn=clock.now,
         )
         return RequesterUsageService(
@@ -125,6 +130,105 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["account_name"], "reachy-user")
         self.assertEqual(record["network_ids"], ["net:first"])
         self.assertEqual(record["client_kinds"], {"browser": 1})
+
+    async def test_compacts_oldest_requester_details_at_retention_wide_limit(self):
+        clock = FakeClock(2 * 3600)
+        service = self._service(clock, max_requester_records=2)
+
+        for index in range(3):
+            clock.set(2 * 3600 + index * 60)
+            await service.record(
+                "request",
+                RequesterIdentity(
+                    actor_id=f"token:{index}",
+                    label=f"Token {index}",
+                    kind="authenticated",
+                    verification="verified",
+                    fingerprint=str(index),
+                    account_name=f"user-{index}",
+                ),
+            )
+
+        buckets = await service.history.snapshot()
+        payload = await service.data(window_minutes=60)
+
+        self.assertEqual(sum(bucket.session_requests for bucket in buckets), 3)
+        self.assertEqual(sum(len(bucket.requester_usage) for bucket in buckets), 2)
+        self.assertEqual(buckets[0].requester_usage, {})
+        self.assertEqual(payload["tracked_requests"], 2)
+        self.assertEqual(payload["unattributed_requests"], 1)
+        self.assertEqual(
+            {row["actor_id"] for row in payload["leaderboard"]},
+            {"token:1", "token:2"},
+        )
+        self.assertEqual(service.history.persistence_status()["requester_record_count"], 2)
+        self.assertEqual(service.history.persistence_status()["max_requester_records"], 2)
+
+    async def test_bounds_requester_details_restored_from_persistence(self):
+        clock = FakeClock(2 * 3600)
+        service = self._service(clock, max_requester_records=2)
+        buckets = []
+        for index in range(3):
+            bucket = SwarmHistoryBucket(bucket_start_s=2 * 3600 + index * 60)
+            bucket.requester_usage[f"token:{index}"] = {
+                "label": f"Token {index}",
+                "kind": "authenticated",
+                "verification": "verified",
+                "fingerprint": str(index),
+                "account_name": f"user-{index}",
+                "requests": 1,
+                "successes": 0,
+                "failures": 0,
+                "abandoned": 0,
+                "network_ids": [],
+                "network_ids_overflow": False,
+                "client_kinds": {},
+            }
+            buckets.append(bucket)
+
+        await service.history._merge_persisted_history_buckets(buckets)
+        restored = await service.history.snapshot()
+
+        self.assertEqual(sum(len(bucket.requester_usage) for bucket in restored), 2)
+        self.assertEqual(restored[0].requester_usage, {})
+        self.assertEqual(service.history.persistence_status()["requester_record_count"], 2)
+
+    async def test_counts_each_bucket_using_its_own_token_state(self):
+        clock = FakeClock(2 * 3600)
+        service = self._service(clock)
+        verified = RequesterIdentity(
+            actor_id="token:changing",
+            label="@reachy-user · token •changing",
+            kind="authenticated",
+            verification="verified",
+            fingerprint="changing",
+            account_name="reachy-user",
+        )
+        invalid = RequesterIdentity(
+            actor_id="token:changing",
+            label="Invalid token •changing",
+            kind="invalid_token",
+            verification="invalid",
+            fingerprint="changing",
+        )
+
+        for _ in range(10):
+            await service.record("request", verified)
+        clock.set(2 * 3600 + 60)
+        for _ in range(5):
+            await service.record("request", invalid)
+
+        payload = await service.data(window_minutes=60)
+        summary = payload["summary"]
+        row = payload["leaderboard"][0]
+
+        self.assertEqual(summary["authenticated_requests_window"], 10)
+        self.assertEqual(summary["invalid_token_requests_window"], 5)
+        self.assertEqual(row["requests"], 15)
+        self.assertEqual(row["kind"], "invalid_token")
+        self.assertEqual(row["verification"], "invalid")
+        self.assertEqual(row["invalid_token_requests"], 5)
+        self.assertIn("invalid HF token", row["signals"])
 
 
 class RequesterDashboardUiTests(unittest.TestCase):

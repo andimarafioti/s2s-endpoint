@@ -12,18 +12,6 @@ from app.dashboard_history import (
 from app.requester_identity import RequesterIdentity
 
 
-_VERIFICATION_RANK = {
-    "unknown": 0,
-    "not_provided": 1,
-    "not_applicable": 1,
-    "unrecognized": 2,
-    "pending": 3,
-    "unavailable": 4,
-    "invalid": 5,
-    "verified": 6,
-}
-
-
 @dataclass(frozen=True)
 class RequesterUsageThresholds:
     high_volume_requests: int = 100
@@ -109,15 +97,15 @@ def aggregate_requester_usage(
         if requests > 0 and actor_id != "overflow":
             if actor_id.startswith("token:"):
                 token_actors.add(actor_id)
-            if kind == "authenticated":
-                authenticated_accounts.add(str(account_name or actor_id))
-                authenticated_requests += requests
-            elif kind == "anonymous":
-                if actor_id != "anonymous:unknown":
-                    anonymous_actors.add(actor_id)
-                anonymous_requests += requests
-            elif kind == "invalid_token":
-                invalid_token_requests += requests
+            authenticated_accounts.update(
+                str(value)
+                for value in actor["authenticated_account_names"]
+            )
+            authenticated_requests += int(actor["authenticated_requests"])
+            anonymous_requests += int(actor["anonymous_requests"])
+            invalid_token_requests += int(actor["invalid_token_requests"])
+            if int(actor["anonymous_requests"]) > 0 and actor_id != "anonymous:unknown":
+                anonymous_actors.add(actor_id)
 
         peak_requests_per_minute = int(actor["peak_requests_per_minute"])
         signals = _usage_signals(
@@ -128,6 +116,7 @@ def aggregate_requester_usage(
             network_count=len(network_ids),
             network_ids_overflow=bool(actor["network_ids_overflow"]),
             automated_requests=automated_requests,
+            invalid_token_requests=int(actor["invalid_token_requests"]),
             peer_count=len(peer_request_counts),
             relative_threshold=relative_threshold,
             thresholds=thresholds,
@@ -157,6 +146,7 @@ def aggregate_requester_usage(
                 "network_count_overflow": bool(actor["network_ids_overflow"]),
                 "client_kinds": dict(sorted(client_kinds.items(), key=lambda item: (-item[1], item[0]))),
                 "automated_requests": automated_requests,
+                "invalid_token_requests": int(actor["invalid_token_requests"]),
                 "first_seen": _isoformat(int(actor["first_seen_s"])),
                 "last_seen": _isoformat(int(actor["last_seen_s"])),
                 "risk": "high" if high_risk else ("watch" if signals else "normal"),
@@ -202,10 +192,10 @@ def aggregate_requester_usage(
 
 def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str, object]]:
     actors: dict[str, dict[str, object]] = {}
-    for bucket in buckets:
+    for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
         for actor_id, record in bucket.requester_usage.items():
             actor = actors.setdefault(actor_id, _new_actor(actor_id, record, bucket.bucket_start_s))
-            _merge_actor_identity(actor, record)
+            _set_actor_identity(actor, record)
 
             requests = max(int(record.get("requests", 0)), 0)
             actor["requests"] = int(actor["requests"]) + requests
@@ -215,6 +205,17 @@ def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str
             actor["peak_requests_per_minute"] = max(int(actor["peak_requests_per_minute"]), requests)
             actor["first_seen_s"] = min(int(actor["first_seen_s"]), bucket.bucket_start_s)
             actor["last_seen_s"] = max(int(actor["last_seen_s"]), bucket.bucket_start_s)
+
+            kind = str(record.get("kind") or "unknown")
+            if kind == "authenticated":
+                actor["authenticated_requests"] = int(actor["authenticated_requests"]) + requests
+                account_names = actor["authenticated_account_names"]
+                if isinstance(account_names, set) and requests > 0:
+                    account_names.add(str(record.get("account_name") or actor_id))
+            elif kind == "anonymous":
+                actor["anonymous_requests"] = int(actor["anonymous_requests"]) + requests
+            elif kind == "invalid_token":
+                actor["invalid_token_requests"] = int(actor["invalid_token_requests"]) + requests
 
             network_ids = actor["network_ids"]
             if isinstance(network_ids, set):
@@ -241,6 +242,10 @@ def _new_actor(actor_id: str, record: dict[str, object], bucket_start_s: int) ->
         "successes": 0,
         "failures": 0,
         "abandoned": 0,
+        "authenticated_requests": 0,
+        "anonymous_requests": 0,
+        "invalid_token_requests": 0,
+        "authenticated_account_names": set(),
         "peak_requests_per_minute": 0,
         "network_ids": set(),
         "network_ids_overflow": False,
@@ -250,17 +255,16 @@ def _new_actor(actor_id: str, record: dict[str, object], bucket_start_s: int) ->
     }
 
 
-def _merge_actor_identity(actor: dict[str, object], record: dict[str, object]) -> None:
-    current_verification = str(actor.get("verification") or "unknown")
-    record_verification = str(record.get("verification") or "unknown")
-    if _VERIFICATION_RANK.get(record_verification, 0) < _VERIFICATION_RANK.get(current_verification, 0):
-        return
+def _set_actor_identity(actor: dict[str, object], record: dict[str, object]) -> None:
     actor["label"] = str(record.get("label") or actor["label"])
     actor["kind"] = str(record.get("kind") or actor["kind"])
-    actor["verification"] = record_verification
+    actor["verification"] = str(record.get("verification") or "unknown")
     actor["fingerprint"] = str(record.get("fingerprint") or actor["fingerprint"])
-    if record.get("account_name") is not None:
-        actor["account_name"] = str(record["account_name"])
+    actor["account_name"] = (
+        str(record["account_name"])
+        if record.get("account_name") is not None
+        else None
+    )
 
 
 def _usage_signals(
@@ -272,6 +276,7 @@ def _usage_signals(
     network_count: int,
     network_ids_overflow: bool,
     automated_requests: int,
+    invalid_token_requests: int,
     peer_count: int,
     relative_threshold: int,
     thresholds: RequesterUsageThresholds,
@@ -289,7 +294,7 @@ def _usage_signals(
         signals.append(f"many networks: {network_count}{'+' if network_ids_overflow else ''}")
     if requests >= 5 and automated_requests / max(requests, 1) >= 0.8:
         signals.append("mostly automation-like clients")
-    if verification == "invalid":
+    if verification == "invalid" or invalid_token_requests > 0:
         signals.append("invalid HF token")
     return signals
 

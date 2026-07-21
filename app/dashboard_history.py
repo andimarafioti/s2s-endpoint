@@ -423,6 +423,7 @@ class DashboardHistory:
         dirty_bucket_warning_age_s: float = 300.0,
         startup_merge_delay_s: float = 60.0,
         max_requesters_per_bucket: int = 1000,
+        max_requester_records: int = 50_000,
         time_fn: Callable[[], float] = time.time,
     ) -> None:
         if retention_minutes < 60:
@@ -437,6 +438,8 @@ class DashboardHistory:
             raise ValueError("startup_merge_delay_s must be >= 0")
         if max_requesters_per_bucket < 1:
             raise ValueError("max_requesters_per_bucket must be >= 1")
+        if max_requester_records < 1:
+            raise ValueError("max_requester_records must be >= 1")
 
         self.retention_minutes = retention_minutes
         self.history_store = history_store
@@ -447,9 +450,11 @@ class DashboardHistory:
         self.dirty_bucket_warning_age_s = dirty_bucket_warning_age_s
         self.startup_merge_delay_s = startup_merge_delay_s
         self.max_requesters_per_bucket = max_requesters_per_bucket
+        self.max_requester_records = max_requester_records
         self._time_fn = time_fn
         self._lock = asyncio.Lock()
         self._history: "OrderedDict[int, SwarmHistoryBucket]" = OrderedDict()
+        self._requester_record_count = 0
         self._restore_task: Optional[asyncio.Task] = None
         self._startup_merge_task: Optional[asyncio.Task] = None
         self._persistence_task: Optional[asyncio.Task] = None
@@ -606,6 +611,8 @@ class DashboardHistory:
             "read_only": bool(getattr(self.history_store, "read_only", False)),
             "worker_alive": worker_alive,
             "dirty_bucket_count": len(self._dirty_bucket_starts),
+            "requester_record_count": self._requester_record_count,
+            "max_requester_records": self.max_requester_records,
             "oldest_dirty_bucket_age_s": (
                 round(max(now_epoch_s - oldest_dirty_bucket_start_s, 0.0), 2)
                 if oldest_dirty_bucket_start_s is not None
@@ -756,10 +763,12 @@ class DashboardHistory:
                         "verification": "not_applicable",
                         "fingerprint": "",
                     }
-                record = bucket.requester_usage.setdefault(
-                    resolved_actor_id,
-                    _new_requester_usage_record(resolved_metadata),
-                )
+                record = bucket.requester_usage.get(resolved_actor_id)
+                if record is None:
+                    self._make_requester_record_capacity_unlocked()
+                    record = _new_requester_usage_record(resolved_metadata)
+                    bucket.requester_usage[resolved_actor_id] = record
+                    self._requester_record_count += 1
                 _merge_requester_identity(record, resolved_metadata)
                 record[requester_field] = int(record.get(requester_field, 0)) + 1
                 if event == "request" and resolved_actor_id != "overflow":
@@ -816,13 +825,42 @@ class DashboardHistory:
         if self._history_store_is_writable():
             self._dirty_bucket_starts.add(bucket_start_s)
 
+    def _make_requester_record_capacity_unlocked(self) -> None:
+        if self._requester_record_count < self.max_requester_records:
+            return
+        for bucket_start_s in sorted(self._history):
+            bucket = self._history[bucket_start_s]
+            if not bucket.requester_usage:
+                continue
+            self._requester_record_count -= len(bucket.requester_usage)
+            bucket.requester_usage.clear()
+            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
+            return
+
+    def _recount_requester_records_unlocked(self) -> None:
+        self._requester_record_count = sum(
+            len(bucket.requester_usage)
+            for bucket in self._history.values()
+        )
+
+    def _enforce_requester_record_limit_unlocked(self) -> None:
+        while self._requester_record_count > self.max_requester_records:
+            before = self._requester_record_count
+            self._make_requester_record_capacity_unlocked()
+            if self._requester_record_count >= before:
+                break
+
     def _prune_unlocked(self, epoch_s: float) -> None:
         min_allowed_bucket = _bucket_start_epoch_s(epoch_s, 1) - (self.retention_minutes - 1) * 60
         while self._history:
             oldest_key = next(iter(self._history))
             if oldest_key >= min_allowed_bucket:
                 break
-            self._history.popitem(last=False)
+            _, removed_bucket = self._history.popitem(last=False)
+            self._requester_record_count = max(
+                self._requester_record_count - len(removed_bucket.requester_usage),
+                0,
+            )
             self._dirty_bucket_starts.discard(oldest_key)
             self._locally_sampled_bucket_starts.discard(oldest_key)
 
@@ -994,6 +1032,8 @@ class DashboardHistory:
                 updated_bucket_count += 1
             self._history = OrderedDict(sorted(self._history.items()))
             self._prune_unlocked(self._time_fn())
+            self._recount_requester_records_unlocked()
+            self._enforce_requester_record_limit_unlocked()
         return updated_bucket_count
 
     def _wake_persistence_unlocked(self) -> None:

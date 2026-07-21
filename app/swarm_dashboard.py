@@ -201,6 +201,7 @@ class SwarmDashboard:
         dirty_bucket_warning_age_s: float = 300.0,
         startup_merge_delay_s: float = 60.0,
         max_requesters_per_bucket: int = 1000,
+        max_requester_records: int = 50_000,
         requester_high_volume_threshold: int = 100,
         requester_burst_threshold_per_minute: int = 20,
         requester_many_networks_threshold: int = 5,
@@ -223,6 +224,7 @@ class SwarmDashboard:
             dirty_bucket_warning_age_s=dirty_bucket_warning_age_s,
             startup_merge_delay_s=startup_merge_delay_s,
             max_requesters_per_bucket=max_requesters_per_bucket,
+            max_requester_records=max_requester_records,
             time_fn=time_fn,
         )
         self.requesters = RequesterUsageService(

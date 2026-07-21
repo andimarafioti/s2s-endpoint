@@ -130,8 +130,8 @@ class RequesterIdentityResolver:
             verification="pending" if _looks_like_hf_token(token) else "unrecognized",
             fingerprint=fingerprint,
         )
-        if _looks_like_hf_token(token):
-            self._schedule_validation(token, identity)
+        if _looks_like_hf_token(token) and not self._schedule_validation(token, identity):
+            identity = replace(identity, verification="unavailable")
         return identity.with_request_context(network_id=network_id, client_kind=client_kind)
 
     def latest_identity(self, identity: RequesterIdentity) -> RequesterIdentity:
@@ -183,17 +183,18 @@ class RequesterIdentityResolver:
         self._cache.move_to_end(actor_id)
         return cached.identity
 
-    def _schedule_validation(self, token: str, identity: RequesterIdentity) -> None:
+    def _schedule_validation(self, token: str, identity: RequesterIdentity) -> bool:
         if identity.actor_id in self._validation_tasks:
-            return
+            return True
         if len(self._validation_tasks) >= self._max_pending_validations:
-            return
+            return False
 
         task = asyncio.create_task(self._validate_token(token, identity))
         self._validation_tasks[identity.actor_id] = task
         task.add_done_callback(
             lambda completed, actor_id=identity.actor_id: self._validation_finished(actor_id, completed)
         )
+        return True
 
     def _validation_finished(self, actor_id: str, task: asyncio.Task[None]) -> None:
         if self._validation_tasks.get(actor_id) is task:
