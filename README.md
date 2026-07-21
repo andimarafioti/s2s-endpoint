@@ -121,9 +121,10 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - free slots and effective free capacity
 - `POST /session` request counts, allocation successes/failures, and connect/disconnect events
 - conversation starts/completions plus average and max completed conversation duration
-- distinct verified Hugging Face users, token fingerprints, and anonymous network fingerprints
+- distinct verified Hugging Face users, token fingerprints, anonymous network
+  fingerprints, and client-reported robot fingerprints
 - a per-requester leaderboard with allocation outcomes, traffic share, burst rate,
-  network count, client type, and unusual-usage signals
+  network count, reported robot count, client type, and unusual-usage signals
 
 Clients can optionally send a Hugging Face user access token as
 `Authorization: Bearer hf_...` on `POST /session`. The request is always allowed
@@ -132,15 +133,29 @@ does not deny allocation. Valid tokens are resolved to the Hugging Face account
 asynchronously through `whoami`, so identity lookup never sits on the allocation
 critical path.
 
-The load balancer never stores raw client tokens or raw IP addresses. It stores
-keyed, one-way fingerprints instead. Tokenless traffic is grouped by the first
-`X-Forwarded-For` address (or the direct client address when proxy headers are
-disabled/unavailable), and coarse user-agent classes such as browser, mobile app,
-`httpx`, `curl`, or bot are counted to help distinguish likely automation. The
-dashboard flags high request volume, large per-minute bursts, dominant traffic
-share, many networks using one token, mostly automation-like clients, and invalid
-tokens. These are operational signals only; this feature does not rate-limit or
-block traffic.
+Reachy clients can also include the daemon's optional 16-character hexadecimal
+`hardware_id` in the JSON body. The content type must be `application/json`:
+
+```json
+{"hardware_id": "0123456789abcdef"}
+```
+
+Missing, malformed, or unsupported request bodies do not deny allocation. A
+valid value is normalized to lowercase and immediately converted to a keyed,
+one-way `robot:` fingerprint. The raw hardware ID is not retained. The dashboard
+counts distinct reported robots for the selected window, reported-robot requests,
+and distinct reported robots per requester. This value is supplied by the client;
+it is an attribution hint, not proof that a request came from genuine hardware.
+
+The load balancer never stores raw client tokens, raw IP addresses, or raw robot
+hardware IDs. It stores keyed, one-way fingerprints instead. Tokenless traffic
+is grouped by the first `X-Forwarded-For` address (or the direct client address
+when proxy headers are disabled/unavailable), and coarse user-agent classes such
+as browser, mobile app, `httpx`, `curl`, or bot are counted to help distinguish
+likely automation. The dashboard flags high request volume, large per-minute
+bursts, dominant traffic share, many networks using one token, mostly
+automation-like clients, and invalid tokens. These are operational signals only;
+this feature does not rate-limit or block traffic.
 
 The timeline automatically switches between minute-level and hourly rollups depending on the selected window. By default the history is in memory and resets when the LB endpoint restarts.
 
@@ -223,10 +238,10 @@ minute buckets are present.
 - `SESSION_PENDING_TIMEOUT_S`: how long an unused reservation stays alive
 - `SESSION_TOKEN_TTL_S`: lifetime of the signed session token
 - `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations
-- `REQUEST_USAGE_HASH_SECRET`: secret key for stable token and IP fingerprints.
-  Defaults to `SESSION_SHARED_SECRET`; set it explicitly if that secret is not
-  stable across LB replacements. If neither is set, fingerprints change on every
-  process restart.
+- `REQUEST_USAGE_HASH_SECRET`: secret key for stable token, IP, and reported robot
+  fingerprints. Defaults to `SESSION_SHARED_SECRET`; set it explicitly if that
+  secret is not stable across LB replacements. If neither is set, fingerprints
+  change on every process restart.
 - `REQUEST_USAGE_TRUST_PROXY_HEADERS`: whether requester attribution trusts the
   first `X-Forwarded-For`/`X-Real-IP` address (defaults to `true`). Disable this
   outside a trusted reverse-proxy deployment.

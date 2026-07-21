@@ -53,12 +53,14 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
             fingerprint="abc123",
             account_name="reachy-user",
             network_id="net:first",
+            reported_robot_id="robot:first",
             client_kind="automation:httpx",
         )
         second_network = RequesterIdentity(
             **{
                 **token_requester.__dict__,
                 "network_id": "net:second",
+                "reported_robot_id": "robot:second",
             }
         )
         anonymous = RequesterIdentity(
@@ -86,12 +88,20 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["authenticated_users_window"], 1)
         self.assertEqual(summary["tokens_window"], 1)
         self.assertEqual(summary["anonymous_ips_window"], 1)
+        self.assertEqual(summary["reported_robots_window"], 2)
+        self.assertEqual(summary["reported_robot_requests_window"], 3)
         self.assertEqual(summary["authenticated_requests_window"], 3)
         self.assertEqual(summary["anonymous_requests_window"], 1)
         self.assertEqual(summary["unattributed_requests_window"], 0)
         self.assertEqual(leaderboard[0]["label"], "@reachy-user · token •abc123")
         self.assertEqual(leaderboard[0]["requests"], 3)
         self.assertEqual(leaderboard[0]["network_count"], 2)
+        self.assertEqual(leaderboard[0]["reported_robot_count"], 2)
+        self.assertEqual(leaderboard[0]["reported_robot_requests"], 3)
+        self.assertEqual(
+            leaderboard[0]["reported_robot_ids"],
+            ["robot:first", "robot:second"],
+        )
         self.assertEqual(leaderboard[0]["automated_requests"], 3)
         self.assertEqual(leaderboard[0]["risk"], "high")
         self.assertIn("high volume: 3 requests", leaderboard[0]["signals"])
@@ -107,6 +117,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
             verification="pending",
             fingerprint="abc123",
             network_id="net:first",
+            reported_robot_id="robot:first",
             client_kind="browser",
         )
         resolved = RequesterIdentity(
@@ -129,6 +140,9 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["verification"], "verified")
         self.assertEqual(record["account_name"], "reachy-user")
         self.assertEqual(record["network_ids"], ["net:first"])
+        self.assertEqual(record["reported_robot_requests"], 1)
+        self.assertEqual(record["reported_robot_ids"], ["robot:first"])
+        self.assertFalse(record["reported_robot_ids_overflow"])
         self.assertEqual(record["client_kinds"], {"browser": 1})
 
     async def test_compacts_oldest_requester_details_at_retention_wide_limit(self):
@@ -247,4 +261,6 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertNotIn("__REQUESTER_DASHBOARD_", html)
         self.assertIn('id="requester-leaderboard"', html)
         self.assertIn("Requester Usage", html)
+        self.assertIn("Reported robots", html)
+        self.assertIn("not hardware attestation", html)
         self.assertIn("function renderRequesterUsage(requesters, summary)", html)

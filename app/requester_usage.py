@@ -78,9 +78,11 @@ def aggregate_requester_usage(
     authenticated_accounts: set[str] = set()
     token_actors: set[str] = set()
     anonymous_actors: set[str] = set()
+    reported_robots: set[str] = set()
     authenticated_requests = 0
     anonymous_requests = 0
     invalid_token_requests = 0
+    reported_robot_requests = 0
 
     for actor_id, actor in actors.items():
         requests = int(actor["requests"])
@@ -88,6 +90,11 @@ def aggregate_requester_usage(
         verification = str(actor["verification"])
         account_name = actor.get("account_name")
         network_ids = actor["network_ids"] if isinstance(actor["network_ids"], set) else set()
+        reported_robot_ids = (
+            actor["reported_robot_ids"]
+            if isinstance(actor["reported_robot_ids"], set)
+            else set()
+        )
         client_kinds = dict(actor["client_kinds"]) if isinstance(actor["client_kinds"], dict) else {}
         automated_requests = sum(
             count for client_kind, count in client_kinds.items() if client_kind.startswith("automation:")
@@ -106,6 +113,8 @@ def aggregate_requester_usage(
             invalid_token_requests += int(actor["invalid_token_requests"])
             if int(actor["anonymous_requests"]) > 0 and actor_id != "anonymous:unknown":
                 anonymous_actors.add(actor_id)
+            reported_robots.update(str(value) for value in reported_robot_ids)
+            reported_robot_requests += int(actor["reported_robot_requests"])
 
         peak_requests_per_minute = int(actor["peak_requests_per_minute"])
         signals = _usage_signals(
@@ -144,6 +153,10 @@ def aggregate_requester_usage(
                 "peak_requests_per_minute": peak_requests_per_minute,
                 "network_count": len(network_ids),
                 "network_count_overflow": bool(actor["network_ids_overflow"]),
+                "reported_robot_count": len(reported_robot_ids),
+                "reported_robot_count_overflow": bool(actor["reported_robot_ids_overflow"]),
+                "reported_robot_ids": sorted(str(value) for value in reported_robot_ids),
+                "reported_robot_requests": int(actor["reported_robot_requests"]),
                 "client_kinds": dict(sorted(client_kinds.items(), key=lambda item: (-item[1], item[0]))),
                 "automated_requests": automated_requests,
                 "invalid_token_requests": int(actor["invalid_token_requests"]),
@@ -165,6 +178,8 @@ def aggregate_requester_usage(
         "authenticated_users_window": len(authenticated_accounts),
         "tokens_window": len(token_actors),
         "anonymous_ips_window": len(anonymous_actors),
+        "reported_robots_window": len(reported_robots),
+        "reported_robot_requests_window": reported_robot_requests,
         "token_requests_window": sum(
             int(row["requests"])
             for row in rows
@@ -223,6 +238,19 @@ def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str
             actor["network_ids_overflow"] = bool(
                 actor["network_ids_overflow"] or record.get("network_ids_overflow", False)
             )
+            actor["reported_robot_requests"] = int(actor["reported_robot_requests"]) + max(
+                int(record.get("reported_robot_requests", 0)),
+                0,
+            )
+            reported_robot_ids = actor["reported_robot_ids"]
+            if isinstance(reported_robot_ids, set):
+                reported_robot_ids.update(
+                    str(item) for item in list(record.get("reported_robot_ids") or [])
+                )
+            actor["reported_robot_ids_overflow"] = bool(
+                actor["reported_robot_ids_overflow"]
+                or record.get("reported_robot_ids_overflow", False)
+            )
             client_kinds = actor["client_kinds"]
             if isinstance(client_kinds, dict):
                 for kind, count in dict(record.get("client_kinds") or {}).items():
@@ -249,6 +277,9 @@ def _new_actor(actor_id: str, record: dict[str, object], bucket_start_s: int) ->
         "peak_requests_per_minute": 0,
         "network_ids": set(),
         "network_ids_overflow": False,
+        "reported_robot_requests": 0,
+        "reported_robot_ids": set(),
+        "reported_robot_ids_overflow": False,
         "client_kinds": {},
         "first_seen_s": bucket_start_s,
         "last_seen_s": bucket_start_s,

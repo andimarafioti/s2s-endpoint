@@ -19,7 +19,12 @@ from app.endpoint_pool_router import (
     HuggingFaceEndpointController,
     fetch_compute_active_sessions,
 )
-from app.requester_identity import RequesterIdentity, RequesterIdentityResolver, bearer_token
+from app.requester_identity import (
+    RequesterIdentity,
+    RequesterIdentityResolver,
+    bearer_token,
+    normalize_hardware_id,
+)
 from app.swarm_dashboard import SwarmDashboard
 
 logger = setup_logging()
@@ -234,12 +239,16 @@ def _log_session_allocation_outcome(
         "requester_kind": requester.kind if requester is not None else None,
         "requester_verification": requester.verification if requester is not None else None,
         "requester_network_id": requester.network_id if requester is not None else None,
+        "requester_reported_robot_id": (
+            requester.reported_robot_id if requester is not None else None
+        ),
         "requester_client_kind": requester.client_kind if requester is not None else None,
     }
     message = (
         "Session allocation outcome outcome=%s session_id=%s endpoint_name=%s "
         "slot_id=%s allocation_wait_ms=%s allocation_total_ms=%d "
-        "waited_for_capacity=%s requester_id=%s requester_kind=%s client_kind=%s"
+        "waited_for_capacity=%s requester_id=%s requester_kind=%s "
+        "reported_robot_id=%s client_kind=%s"
     )
     args: list[object] = [
         outcome,
@@ -251,6 +260,7 @@ def _log_session_allocation_outcome(
         waited_for_capacity,
         requester.actor_id if requester is not None else None,
         requester.kind if requester is not None else None,
+        requester.reported_robot_id if requester is not None else None,
         requester.client_kind if requester is not None else None,
     ]
     if error is not None:
@@ -286,6 +296,19 @@ async def _refresh_requester_identity(requester: RequesterIdentity) -> Requester
     if latest != requester:
         await dashboard.update_requester_identity(latest)
     return latest
+
+
+async def _reported_hardware_id(request: Request) -> str | None:
+    content_type = str(request.headers.get("content-type") or "").lower()
+    if "application/json" not in content_type:
+        return None
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return normalize_hardware_id(payload.get("hardware_id"))
 
 
 @app.get("/")
@@ -334,7 +357,8 @@ async def health():
 
 @app.post("/session")
 async def create_session(request: Request):
-    requester = requester_identity_resolver.identify(request)
+    hardware_id = await _reported_hardware_id(request)
+    requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
     await dashboard.record_session_request(requester)
     requester = await _refresh_requester_identity(requester)
     allocation_started_at = monotonic()

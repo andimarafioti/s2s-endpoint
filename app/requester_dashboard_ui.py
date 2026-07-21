@@ -3,6 +3,7 @@ REQUESTER_DASHBOARD_STYLES = """
     .requester-label { min-width: 210px; }
     .requester-signals { min-width: 220px; color: var(--muted); font-size: 12px; }
     .requester-client-mix { min-width: 150px; color: var(--muted); font-size: 12px; }
+    .requester-robots { min-width: 130px; color: var(--muted); font-size: 12px; }
     .risk-pill.normal { color: var(--good); background: rgba(17, 122, 101, 0.10); }
     .risk-pill.watch { color: var(--warm); background: rgba(217, 130, 43, 0.12); }
     .risk-pill.high { color: var(--danger); background: rgba(187, 45, 59, 0.10); }
@@ -13,7 +14,7 @@ REQUESTER_DASHBOARD_MARKUP = """
       <div class="panel card span-12">
         <div class="label">Traffic Attribution</div>
         <h2>Requester Usage</h2>
-        <p class="muted">HF accounts are resolved asynchronously. Token and network identifiers are one-way fingerprints; raw tokens and IP addresses are never stored.</p>
+        <p class="muted">HF accounts are resolved asynchronously. Token, network, and reported robot identifiers are one-way fingerprints; raw tokens, IP addresses, and hardware IDs are never stored. Robot IDs are client-reported telemetry, not hardware attestation.</p>
         <div class="fleet-summary" id="requester-summary"></div>
         <div class="table-scroll">
           <table>
@@ -26,6 +27,7 @@ REQUESTER_DASHBOARD_MARKUP = """
                 <th>Traffic</th>
                 <th>Peak</th>
                 <th>Networks</th>
+                <th>Reported robots</th>
                 <th>Clients</th>
                 <th>Signals</th>
               </tr>
@@ -41,6 +43,7 @@ REQUESTER_DASHBOARD_MARKUP = """
 REQUESTER_DASHBOARD_KPI_CARDS = """
         kpiCard(`HF users / ${windowLabel}`, prettyNumber(summary.authenticated_users_window || 0), `Distinct verified Hugging Face accounts in the last ${windowLabel}`),
         kpiCard(`Anonymous IPs / ${windowLabel}`, prettyNumber(summary.anonymous_ips_window || 0), `Distinct privacy-safe network fingerprints without tokens`),
+        kpiCard(`Reported robots / ${windowLabel}`, prettyNumber(summary.reported_robots_window || 0), `Distinct privacy-safe robot fingerprints reported by clients; not verified hardware`),
         kpiCard(`Flagged / ${windowLabel}`, prettyNumber(summary.unusual_requesters_window || 0), `Requesters with volume, burst, network, token, or automation signals`),
 """
 
@@ -71,6 +74,17 @@ REQUESTER_DASHBOARD_SCRIPT = """
       return entries.map(([kind, count]) => `${kind.replace('automation:', '')}: ${prettyNumber(count)}`).join(' · ');
     }
 
+    function requesterRobotMix(row) {
+      const count = Number(row.reported_robot_count || 0);
+      if (!count) return 'not reported';
+      const fingerprints = (row.reported_robot_ids || []).slice(0, 2).map((value) => {
+        const fingerprint = String(value).replace(/^robot:/, '').slice(0, 8);
+        return `•${fingerprint}`;
+      });
+      const countLabel = `${prettyNumber(count)}${row.reported_robot_count_overflow ? '+' : ''}`;
+      return fingerprints.length ? `${countLabel} · ${fingerprints.join(', ')}` : countLabel;
+    }
+
     function renderRequesterUsage(requesters, summary) {
       const rows = requesters?.leaderboard || [];
       const windowLabel = summary.window_label || '6h';
@@ -78,6 +92,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
         `<span class="status-pill good">${htmlEscape(prettyNumber(summary.authenticated_users_window || 0))} HF users</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.tokens_window || 0))} tokens</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.anonymous_ips_window || 0))} anonymous IPs</span>`,
+        `<span class="status-pill">${htmlEscape(prettyNumber(summary.reported_robots_window || 0))} reported robots</span>`,
         `<span class="status-pill ${summary.unusual_requesters_window ? 'bad' : 'good'}">${htmlEscape(prettyNumber(summary.unusual_requesters_window || 0))} flagged</span>`,
       ].join('');
 
@@ -100,11 +115,12 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td>${htmlEscape(row.traffic_share_pct || 0)}%</td>
             <td>${htmlEscape(prettyNumber(row.peak_requests_per_minute || 0))}/min</td>
             <td>${htmlEscape(networks)}</td>
+            <td class="requester-robots">${htmlEscape(requesterRobotMix(row))}<div class="muted">${htmlEscape(prettyNumber(row.reported_robot_requests || 0))} requests</div></td>
             <td class="requester-client-mix">${htmlEscape(requesterClientMix(row.client_kinds))}</td>
             <td class="requester-signals">${htmlEscape(signals)}</td>
           </tr>
         `;
-      }).join('') : '<tr><td colspan="9" class="muted">No attributed session requests in this window yet.</td></tr>';
+      }).join('') : '<tr><td colspan="10" class="muted">No attributed session requests in this window yet.</td></tr>';
 
       const unattributed = Number(requesters?.unattributed_requests || 0);
       document.getElementById('requester-detail').textContent = unattributed

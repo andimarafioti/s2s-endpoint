@@ -488,6 +488,33 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_session_allocation_tracks_reported_hardware_id_as_fingerprint(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+        raw_hardware_id = "ABCDEF0123456789"
+
+        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
+            response = await module.create_session(FakeJsonRequest({"hardware_id": raw_hardware_id}))
+
+        self.assertEqual(response.status_code, 200)
+        requester = fake_dashboard.requesters[0]
+        self.assertTrue(requester.reported_robot_id.startswith("robot:"))
+        self.assertNotIn(raw_hardware_id.lower(), requester.reported_robot_id)
+
+    async def test_session_allocation_ignores_invalid_reported_hardware_id(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+
+        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
+            response = await module.create_session(FakeJsonRequest({"hardware_id": "invalid"}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(fake_dashboard.requesters[0].reported_robot_id)
+
     async def test_failed_session_allocation_logs_outcome(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
@@ -556,9 +583,11 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
 class FakeDashboard:
     def __init__(self):
         self.calls = []
+        self.requesters = []
 
     async def record_session_request(self, requester=None):
         self.calls.append("request")
+        self.requesters.append(requester)
 
     async def record_session_allocation_failure(self, requester=None):
         self.calls.append("failure")
@@ -614,6 +643,18 @@ class FakeDisconnectedRequest:
 class FakeConnectedRequest(FakeDisconnectedRequest):
     async def is_disconnected(self):
         return False
+
+
+class FakeJsonRequest(FakeConnectedRequest):
+    def __init__(self, payload):
+        self.payload = payload
+        self.headers = {
+            **self.headers,
+            "content-type": "application/json",
+        }
+
+    async def json(self):
+        return self.payload
 
 
 if __name__ == "__main__":
