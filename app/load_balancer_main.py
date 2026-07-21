@@ -23,8 +23,8 @@ from app.requester_identity import (
     RequesterIdentity,
     RequesterIdentityResolver,
     bearer_token,
-    normalize_hardware_id,
 )
+from app.session_request_metadata import reported_hardware_id
 from app.session_requester_tracker import SessionRequesterTracker
 from app.swarm_dashboard import SwarmDashboard
 
@@ -302,19 +302,6 @@ async def _refresh_requester_identity(requester: RequesterIdentity) -> Requester
     return latest
 
 
-async def _reported_hardware_id(request: Request) -> str | None:
-    content_type = str(request.headers.get("content-type") or "").lower()
-    if "application/json" not in content_type:
-        return None
-    try:
-        payload = await request.json()
-    except (UnicodeDecodeError, ValueError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return normalize_hardware_id(payload.get("hardware_id"))
-
-
 @app.get("/")
 async def root():
     return {
@@ -363,7 +350,7 @@ async def health():
 
 @app.post("/session")
 async def create_session(request: Request):
-    hardware_id = await _reported_hardware_id(request)
+    hardware_id = await reported_hardware_id(request)
     requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
     await dashboard.record_session_request(requester)
     requester = await _refresh_requester_identity(requester)

@@ -153,8 +153,9 @@ means the load balancer returned session credentials to the client; connection
 is recorded only after the compute endpoint sends the first successful websocket
 `connected` callback for that session. The dashboard therefore shows which HF
 users, token fingerprints, or anonymous network fingerprints actually joined an
-allocated session. A recent pending session or a connection crossing the selected
-window boundary can temporarily appear as an allocation/connection gap.
+allocated session. Allocations and connections are independent event counts in
+the selected window, not a cohort conversion rate; a session can be allocated
+before one window and connect during the next.
 
 The load balancer never stores raw client tokens, raw IP addresses, or raw robot
 hardware IDs. It stores keyed, one-way fingerprints instead. Tokenless traffic

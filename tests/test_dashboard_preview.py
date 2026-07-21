@@ -688,8 +688,8 @@ class FakeJsonRequest(FakeConnectedRequest):
             "content-type": "application/json",
         }
 
-    async def json(self):
-        return self.payload
+    async def stream(self):
+        yield json.dumps(self.payload).encode("utf-8")
 
 
 if __name__ == "__main__":

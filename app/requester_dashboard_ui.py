@@ -115,7 +115,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
             </td>
             <td><strong>${htmlEscape(prettyNumber(row.requests || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.requests_per_hour || 0))}/h</div></td>
             <td>${htmlEscape(prettyNumber(row.successes || 0))}<div class="muted">${htmlEscape(row.success_rate_pct || 0)}%</div></td>
-            <td><strong>${htmlEscape(prettyNumber(row.connections || 0))}</strong><div class="muted">${htmlEscape(row.connection_rate_pct || 0)}% of allocated</div></td>
+            <td><strong>${htmlEscape(prettyNumber(row.connections || 0))}</strong><div class="muted">websocket joins</div></td>
             <td>${htmlEscape(row.traffic_share_pct || 0)}%</td>
             <td>${htmlEscape(prettyNumber(row.peak_requests_per_minute || 0))}/min</td>
             <td>${htmlEscape(networks)}</td>
@@ -130,7 +130,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
       const attributionDetail = unattributed
         ? `${prettyNumber(unattributed)} request(s) in the last ${windowLabel} predate attribution or could not be attributed.`
         : `All recorded session requests in the last ${windowLabel} have requester attribution.`;
-      document.getElementById('requester-detail').textContent = `${attributionDetail} Connected counts the first compute websocket callback for an allocated session; recent pending sessions and window boundaries can create a temporary allocation/connection gap.`;
+      document.getElementById('requester-detail').textContent = `${attributionDetail} Connected counts the first compute websocket callback for an allocated session. Allocated and Connected are independent event counts in the selected window, not a cohort conversion rate.`;
     }
 """
 

@@ -165,11 +165,6 @@ def aggregate_requester_usage(
                 "abandoned": int(actor["abandoned"]),
                 "connections": connections,
                 "success_rate_pct": round((successes / requests) * 100.0, 1) if requests else 0.0,
-                "connection_rate_pct": (
-                    round((connections / successes) * 100.0, 1)
-                    if successes
-                    else 0.0
-                ),
                 "traffic_share_pct": traffic_share_pct,
                 "requests_per_hour": round(requests / window_hours, 2),
                 "peak_requests_per_minute": peak_requests_per_minute,
@@ -206,11 +201,6 @@ def aggregate_requester_usage(
         "connected_requesters_window": len(connected_requesters),
         "authenticated_users_connected_window": len(connected_authenticated_accounts),
         "attributed_connections_window": attributed_connections,
-        "allocation_connection_gap_window": sum(
-            max(int(row["successes"]) - int(row["connections"]), 0)
-            for row in rows
-            if row["actor_id"] != "overflow"
-        ),
         "token_requests_window": sum(
             int(row["requests"])
             for row in rows
