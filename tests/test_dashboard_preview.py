@@ -437,7 +437,7 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(fake_session_manager.cancelled_session_ids, ["session-123"])
-        self.assertEqual(fake_dashboard.calls, ["request"])
+        self.assertEqual(fake_dashboard.calls, ["request", "abandoned"])
         record = logs.records[0]
         self.assertEqual(record.outcome, "client_disconnected")
         self.assertEqual(record.session_id, "session-123")
@@ -473,6 +473,9 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.allocation_wait_ms, 40)
         self.assertEqual(record.allocation_total_ms, 50)
         self.assertTrue(record.waited_for_capacity)
+        self.assertEqual(record.requester_id, "anonymous:unknown")
+        self.assertEqual(record.requester_kind, "anonymous")
+        self.assertIn("requester_id=anonymous:unknown", record.getMessage())
         payload = json.loads(response.body)
         self.assertEqual(
             payload,
@@ -554,14 +557,17 @@ class FakeDashboard:
     def __init__(self):
         self.calls = []
 
-    async def record_session_request(self):
+    async def record_session_request(self, requester=None):
         self.calls.append("request")
 
-    async def record_session_allocation_failure(self):
+    async def record_session_allocation_failure(self, requester=None):
         self.calls.append("failure")
 
-    async def record_session_allocation_success(self):
+    async def record_session_allocation_success(self, requester=None):
         self.calls.append("success")
+
+    async def record_session_request_abandoned(self, requester=None):
+        self.calls.append("abandoned")
 
 
 class FakeSessionManager:

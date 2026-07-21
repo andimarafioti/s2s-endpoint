@@ -324,6 +324,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["summary"]["active_conversation_days_window"], 0.001)
         self.assertEqual(payload["summary"]["avg_conversation_duration_window_s"], 150.0)
         self.assertEqual(payload["summary"]["peak_connected_sessions_window"], 2)
+        self.assertEqual(payload["summary"]["unattributed_requests_window"], 1)
         self.assertFalse(payload["history_persistence"]["enabled"])
         self.assertEqual(payload["history_persistence"]["dirty_bucket_count"], 0)
 
@@ -427,7 +428,6 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Maximum Connected Users", html)
         self.assertIn("Median Duration", html)
         self.assertIn("renderRollingChartCards();", html)
-
     async def test_summary_peak_connected_sessions_uses_bucket_max(self):
         now_s = 6 * 3600
         dashboard = SwarmDashboard(

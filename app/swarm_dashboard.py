@@ -12,6 +12,9 @@ from app.dashboard_history import (
     _bucket_start_epoch_s,
     _isoformat,
 )
+from app.requester_dashboard_ui import inject_requester_dashboard
+from app.requester_identity import RequesterIdentity
+from app.requester_usage import RequesterUsageService, RequesterUsageThresholds
 
 
 SnapshotProvider = Callable[[], Awaitable[tuple[bool, Optional[str], dict[str, object]]]]
@@ -184,7 +187,6 @@ class SwarmBucketAggregate:
         }
 
 
-
 class SwarmDashboard:
     def __init__(
         self,
@@ -198,6 +200,11 @@ class SwarmDashboard:
         flush_timeout_s: float = 60.0,
         dirty_bucket_warning_age_s: float = 300.0,
         startup_merge_delay_s: float = 60.0,
+        max_requesters_per_bucket: int = 1000,
+        max_requester_records: int = 50_000,
+        requester_high_volume_threshold: int = 100,
+        requester_burst_threshold_per_minute: int = 20,
+        requester_many_networks_threshold: int = 5,
         time_fn: Callable[[], float] = time.time,
     ) -> None:
         if sample_interval_s <= 0:
@@ -216,6 +223,17 @@ class SwarmDashboard:
             flush_timeout_s=flush_timeout_s,
             dirty_bucket_warning_age_s=dirty_bucket_warning_age_s,
             startup_merge_delay_s=startup_merge_delay_s,
+            max_requesters_per_bucket=max_requesters_per_bucket,
+            max_requester_records=max_requester_records,
+            time_fn=time_fn,
+        )
+        self.requesters = RequesterUsageService(
+            history=self.history,
+            thresholds=RequesterUsageThresholds(
+                high_volume_requests=requester_high_volume_threshold,
+                burst_requests_per_minute=requester_burst_threshold_per_minute,
+                many_networks=requester_many_networks_threshold,
+            ),
             time_fn=time_fn,
         )
         self._latest_sample: Optional[SwarmStateSample] = None
@@ -251,14 +269,20 @@ class SwarmDashboard:
         await self.history.record_sample(sample)
         self._latest_sample = sample
 
-    async def record_session_request(self) -> None:
-        await self.history.increment_counter("session_requests")
+    async def record_session_request(self, requester: RequesterIdentity | None = None) -> None:
+        await self.requesters.record("request", requester)
 
-    async def record_session_allocation_success(self) -> None:
-        await self.history.increment_counter("session_allocation_successes")
+    async def record_session_allocation_success(self, requester: RequesterIdentity | None = None) -> None:
+        await self.requesters.record("success", requester)
 
-    async def record_session_allocation_failure(self) -> None:
-        await self.history.increment_counter("session_allocation_failures")
+    async def record_session_allocation_failure(self, requester: RequesterIdentity | None = None) -> None:
+        await self.requesters.record("failure", requester)
+
+    async def record_session_request_abandoned(self, requester: RequesterIdentity | None = None) -> None:
+        await self.requesters.record("abandoned", requester)
+
+    async def update_requester_identity(self, requester: RequesterIdentity) -> None:
+        await self.requesters.update_identity(requester)
 
     async def record_session_event(
         self,
@@ -289,6 +313,8 @@ class SwarmDashboard:
         series = await self.series(window_minutes=window_minutes, resolution=resolved_resolution)
         rolling_series = await self.rolling_series(window_minutes=window_minutes, resolution=resolved_resolution)
         summary = await self.summary(window_minutes=window_minutes, requested_window=window or "6h")
+        requesters = await self.requesters.data(window_minutes=window_minutes)
+        summary.update(requesters["summary"])
 
         return {
             "generated_at": _isoformat(self._time_fn()),
@@ -299,6 +325,7 @@ class SwarmDashboard:
             },
             "current": current.to_dict(),
             "summary": summary,
+            "requesters": requesters,
             "series": series,
             "rolling_windows": [
                 {"label": label, "minutes": minutes}
@@ -489,7 +516,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         if history_persisted
         else "Single-replica LB in-memory history; resets on restart."
     )
-    return """<!doctype html>
+    html = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -921,6 +948,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     .muted { color: var(--muted); }
     .mono { font-family: "Menlo", "Consolas", monospace; }
     .footer-note { margin-top: 14px; color: var(--muted); font-size: 13px; }
+__REQUESTER_DASHBOARD_STYLES__
 
     @media (max-width: 1100px) {
       .hero, .kpis, .rolling-grid { grid-template-columns: 1fr; }
@@ -1029,6 +1057,8 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         </div>
         <div class="chart-shell"><canvas id="conversations-chart" width="1200" height="260"></canvas></div>
       </div>
+
+__REQUESTER_DASHBOARD_MARKUP__
 
       <div class="panel card span-12">
         <div class="label">Current Fleet</div>
@@ -1248,6 +1278,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         kpiCard('Pending joins', prettyNumber(current.pending_sessions), 'Reserved sessions waiting to connect'),
         kpiCard(`Requests / ${windowLabel}`, prettyNumber(summary.session_requests_window), `POST /session requests in the last ${windowLabel}`),
         kpiCard(`Failures / ${windowLabel}`, prettyNumber(summary.session_failures_window), `Allocation failures in the last ${windowLabel}`),
+__REQUESTER_DASHBOARD_KPI_CARDS__
         kpiCard(`Started / ${windowLabel}`, prettyNumber(summary.conversations_started_window), `Conversation starts recorded in the last ${windowLabel}`),
         kpiCard(`Completed / ${windowLabel}`, prettyNumber(summary.conversations_completed_window), `Conversation ends recorded in the last ${windowLabel}`),
         kpiCard(`Avg duration / ${windowLabel}`, formatDuration(summary.avg_conversation_duration_window_s), `Average completed conversation duration in the last ${windowLabel}`),
@@ -1259,6 +1290,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       ].join('');
     }
 
+__REQUESTER_DASHBOARD_SCRIPT__
     function countEndpointStates(endpoints) {
       const counts = { running: 0, warm: 0, parked: 0, error: 0 };
       for (const endpoint of endpoints) {
@@ -1597,6 +1629,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
 
       renderHeroStats(current, summary);
       renderKpis(current, summary);
+      renderRequesterUsage(payload.requesters || {}, summary);
       renderHealth(current);
       renderEndpointWall(current.endpoints || []);
 
@@ -1688,3 +1721,4 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
 </body>
 </html>
 """.replace("__HISTORY_NOTE__", history_note)
+    return inject_requester_dashboard(html)

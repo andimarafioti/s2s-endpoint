@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import logging
 import re
 import time
@@ -168,6 +169,7 @@ class SwarmHistoryBucket:
     completed_conversation_duration_total_s: float = 0.0
     completed_conversation_duration_max_s: float = 0.0
     completed_conversation_duration_samples_s: list[float] = field(default_factory=list)
+    requester_usage: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def record_sample(self, sample: SwarmStateSample) -> None:
         self.sample_count += 1
@@ -233,7 +235,7 @@ class SwarmHistoryBucket:
         payload = {}
         for bucket_field in dataclass_fields(self):
             value = getattr(self, bucket_field.name)
-            payload[bucket_field.name] = list(value) if isinstance(value, list) else value
+            payload[bucket_field.name] = copy.deepcopy(value) if isinstance(value, (dict, list)) else value
         return payload
 
     @classmethod
@@ -305,7 +307,108 @@ def _coerce_history_bucket_field(name: str, payload: dict[str, object]) -> objec
         return bool(payload.get(name, False))
     if name == "completed_conversation_duration_samples_s":
         return [max(float(value), 0.0) for value in list(payload.get(name) or [])]
+    if name == "requester_usage":
+        return _coerce_requester_usage(payload.get(name))
     raise KeyError(f"Unknown SwarmHistoryBucket field: {name}")
+
+
+def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
+    if not isinstance(value, dict):
+        return {}
+
+    usage: dict[str, dict[str, object]] = {}
+    for raw_actor_id, raw_record in value.items():
+        if not isinstance(raw_record, dict):
+            continue
+        actor_id = str(raw_actor_id)[:128]
+        network_ids = [str(item)[:128] for item in list(raw_record.get("network_ids") or [])[:32]]
+        raw_client_kinds = raw_record.get("client_kinds") or {}
+        client_kinds = (
+            {
+                str(kind)[:80]: max(int(count), 0)
+                for kind, count in raw_client_kinds.items()
+            }
+            if isinstance(raw_client_kinds, dict)
+            else {}
+        )
+        usage[actor_id] = {
+            "label": str(raw_record.get("label") or "Unknown requester")[:160],
+            "kind": str(raw_record.get("kind") or "unknown")[:40],
+            "verification": str(raw_record.get("verification") or "unknown")[:40],
+            "fingerprint": str(raw_record.get("fingerprint") or "")[:40],
+            "account_name": (
+                str(raw_record["account_name"])[:80]
+                if raw_record.get("account_name") is not None
+                else None
+            ),
+            "requests": max(int(raw_record.get("requests", 0)), 0),
+            "successes": max(int(raw_record.get("successes", 0)), 0),
+            "failures": max(int(raw_record.get("failures", 0)), 0),
+            "abandoned": max(int(raw_record.get("abandoned", 0)), 0),
+            "network_ids": network_ids,
+            "network_ids_overflow": bool(raw_record.get("network_ids_overflow", False)),
+            "client_kinds": client_kinds,
+        }
+    return usage
+
+
+_VERIFICATION_RANK = {
+    "unknown": 0,
+    "not_provided": 1,
+    "not_applicable": 1,
+    "unrecognized": 2,
+    "pending": 3,
+    "unavailable": 4,
+    "invalid": 5,
+    "verified": 6,
+}
+
+
+def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object]:
+    return {
+        "label": str(metadata.get("label") or "Unknown requester")[:160],
+        "kind": str(metadata.get("kind") or "unknown")[:40],
+        "verification": str(metadata.get("verification") or "unknown")[:40],
+        "fingerprint": str(metadata.get("fingerprint") or "")[:40],
+        "account_name": metadata.get("account_name"),
+        "requests": 0,
+        "successes": 0,
+        "failures": 0,
+        "abandoned": 0,
+        "network_ids": [],
+        "network_ids_overflow": False,
+        "client_kinds": {},
+    }
+
+
+def _merge_requester_identity(record: dict[str, object], metadata: dict[str, object]) -> None:
+    current_verification = str(record.get("verification") or "unknown")
+    new_verification = str(metadata.get("verification") or "unknown")
+    if _VERIFICATION_RANK.get(new_verification, 0) < _VERIFICATION_RANK.get(current_verification, 0):
+        return
+
+    record["label"] = str(metadata.get("label") or record.get("label") or "Unknown requester")[:160]
+    record["kind"] = str(metadata.get("kind") or record.get("kind") or "unknown")[:40]
+    record["verification"] = new_verification[:40]
+    record["fingerprint"] = str(metadata.get("fingerprint") or record.get("fingerprint") or "")[:40]
+    account_name = metadata.get("account_name")
+    if account_name is not None:
+        record["account_name"] = str(account_name)[:80]
+
+
+def _record_request_context(record: dict[str, object], metadata: dict[str, object]) -> None:
+    network_id = metadata.get("network_id")
+    network_ids = record.setdefault("network_ids", [])
+    if network_id and isinstance(network_ids, list) and network_id not in network_ids:
+        if len(network_ids) < 32:
+            network_ids.append(str(network_id)[:128])
+        else:
+            record["network_ids_overflow"] = True
+
+    client_kind = str(metadata.get("client_kind") or "unknown")[:80]
+    client_kinds = record.setdefault("client_kinds", {})
+    if isinstance(client_kinds, dict):
+        client_kinds[client_kind] = int(client_kinds.get(client_kind, 0)) + 1
 
 
 class DashboardHistory:
@@ -319,6 +422,8 @@ class DashboardHistory:
         flush_timeout_s: float = 60.0,
         dirty_bucket_warning_age_s: float = 300.0,
         startup_merge_delay_s: float = 60.0,
+        max_requesters_per_bucket: int = 1000,
+        max_requester_records: int = 50_000,
         time_fn: Callable[[], float] = time.time,
     ) -> None:
         if retention_minutes < 60:
@@ -331,6 +436,10 @@ class DashboardHistory:
             raise ValueError("dirty_bucket_warning_age_s must be > 0")
         if startup_merge_delay_s < 0:
             raise ValueError("startup_merge_delay_s must be >= 0")
+        if max_requesters_per_bucket < 1:
+            raise ValueError("max_requesters_per_bucket must be >= 1")
+        if max_requester_records < 1:
+            raise ValueError("max_requester_records must be >= 1")
 
         self.retention_minutes = retention_minutes
         self.history_store = history_store
@@ -340,9 +449,12 @@ class DashboardHistory:
         self.shutdown_flush_budget_s = 2 * flush_timeout_s
         self.dirty_bucket_warning_age_s = dirty_bucket_warning_age_s
         self.startup_merge_delay_s = startup_merge_delay_s
+        self.max_requesters_per_bucket = max_requesters_per_bucket
+        self.max_requester_records = max_requester_records
         self._time_fn = time_fn
         self._lock = asyncio.Lock()
         self._history: "OrderedDict[int, SwarmHistoryBucket]" = OrderedDict()
+        self._requester_record_count = 0
         self._restore_task: Optional[asyncio.Task] = None
         self._startup_merge_task: Optional[asyncio.Task] = None
         self._persistence_task: Optional[asyncio.Task] = None
@@ -499,6 +611,8 @@ class DashboardHistory:
             "read_only": bool(getattr(self.history_store, "read_only", False)),
             "worker_alive": worker_alive,
             "dirty_bucket_count": len(self._dirty_bucket_starts),
+            "requester_record_count": self._requester_record_count,
+            "max_requester_records": self.max_requester_records,
             "oldest_dirty_bucket_age_s": (
                 round(max(now_epoch_s - oldest_dirty_bucket_start_s, 0.0), 2)
                 if oldest_dirty_bucket_start_s is not None
@@ -613,6 +727,76 @@ class DashboardHistory:
             self._prune_unlocked(now)
             self._wake_persistence_unlocked()
 
+    async def record_requester_event(
+        self,
+        event: str,
+        *,
+        actor_id: str | None,
+        metadata: dict[str, object] | None,
+    ) -> None:
+        counter_fields = {
+            "request": ("session_requests", "requests"),
+            "success": ("session_allocation_successes", "successes"),
+            "failure": ("session_allocation_failures", "failures"),
+            "abandoned": (None, "abandoned"),
+        }
+        if event not in counter_fields:
+            raise ValueError(f"Unknown requester event: {event}")
+
+        now = self._time_fn()
+        async with self._lock:
+            bucket = self._get_bucket_unlocked(now)
+            global_field, requester_field = counter_fields[event]
+            if global_field is not None:
+                setattr(bucket, global_field, getattr(bucket, global_field) + 1)
+            if actor_id and metadata is not None:
+                resolved_actor_id = actor_id
+                resolved_metadata = metadata
+                if (
+                    resolved_actor_id not in bucket.requester_usage
+                    and len(bucket.requester_usage) >= self.max_requesters_per_bucket
+                ):
+                    resolved_actor_id = "overflow"
+                    resolved_metadata = {
+                        "label": "Other requesters (cardinality limit)",
+                        "kind": "overflow",
+                        "verification": "not_applicable",
+                        "fingerprint": "",
+                    }
+                record = bucket.requester_usage.get(resolved_actor_id)
+                if record is None:
+                    self._make_requester_record_capacity_unlocked()
+                    record = _new_requester_usage_record(resolved_metadata)
+                    bucket.requester_usage[resolved_actor_id] = record
+                    self._requester_record_count += 1
+                _merge_requester_identity(record, resolved_metadata)
+                record[requester_field] = int(record.get(requester_field, 0)) + 1
+                if event == "request" and resolved_actor_id != "overflow":
+                    _record_request_context(record, resolved_metadata)
+            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
+            self._prune_unlocked(now)
+            self._wake_persistence_unlocked()
+
+    async def update_requester_identity(
+        self,
+        actor_id: str,
+        metadata: dict[str, object],
+    ) -> None:
+        async with self._lock:
+            updated_bucket_starts: list[int] = []
+            for bucket in self._history.values():
+                record = bucket.requester_usage.get(actor_id)
+                if record is None:
+                    continue
+                before = copy.deepcopy(record)
+                _merge_requester_identity(record, metadata)
+                if record != before:
+                    updated_bucket_starts.append(bucket.bucket_start_s)
+            for bucket_start_s in updated_bucket_starts:
+                self._mark_bucket_dirty_unlocked(bucket_start_s)
+            if updated_bucket_starts:
+                self._wake_persistence_unlocked()
+
     async def record_completed_conversation(self, duration_s: float) -> None:
         now = self._time_fn()
         async with self._lock:
@@ -641,13 +825,42 @@ class DashboardHistory:
         if self._history_store_is_writable():
             self._dirty_bucket_starts.add(bucket_start_s)
 
+    def _make_requester_record_capacity_unlocked(self) -> None:
+        if self._requester_record_count < self.max_requester_records:
+            return
+        for bucket_start_s in sorted(self._history):
+            bucket = self._history[bucket_start_s]
+            if not bucket.requester_usage:
+                continue
+            self._requester_record_count -= len(bucket.requester_usage)
+            bucket.requester_usage.clear()
+            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
+            return
+
+    def _recount_requester_records_unlocked(self) -> None:
+        self._requester_record_count = sum(
+            len(bucket.requester_usage)
+            for bucket in self._history.values()
+        )
+
+    def _enforce_requester_record_limit_unlocked(self) -> None:
+        while self._requester_record_count > self.max_requester_records:
+            before = self._requester_record_count
+            self._make_requester_record_capacity_unlocked()
+            if self._requester_record_count >= before:
+                break
+
     def _prune_unlocked(self, epoch_s: float) -> None:
         min_allowed_bucket = _bucket_start_epoch_s(epoch_s, 1) - (self.retention_minutes - 1) * 60
         while self._history:
             oldest_key = next(iter(self._history))
             if oldest_key >= min_allowed_bucket:
                 break
-            self._history.popitem(last=False)
+            _, removed_bucket = self._history.popitem(last=False)
+            self._requester_record_count = max(
+                self._requester_record_count - len(removed_bucket.requester_usage),
+                0,
+            )
             self._dirty_bucket_starts.discard(oldest_key)
             self._locally_sampled_bucket_starts.discard(oldest_key)
 
@@ -819,6 +1032,8 @@ class DashboardHistory:
                 updated_bucket_count += 1
             self._history = OrderedDict(sorted(self._history.items()))
             self._prune_unlocked(self._time_fn())
+            self._recount_requester_records_unlocked()
+            self._enforce_requester_record_limit_unlocked()
         return updated_bucket_count
 
     def _wake_persistence_unlocked(self) -> None:

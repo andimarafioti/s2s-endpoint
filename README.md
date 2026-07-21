@@ -121,6 +121,26 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - free slots and effective free capacity
 - `POST /session` request counts, allocation successes/failures, and connect/disconnect events
 - conversation starts/completions plus average and max completed conversation duration
+- distinct verified Hugging Face users, token fingerprints, and anonymous network fingerprints
+- a per-requester leaderboard with allocation outcomes, traffic share, burst rate,
+  network count, client type, and unusual-usage signals
+
+Clients can optionally send a Hugging Face user access token as
+`Authorization: Bearer hf_...` on `POST /session`. The request is always allowed
+to continue: a missing, invalid, unrecognized, or temporarily unverifiable token
+does not deny allocation. Valid tokens are resolved to the Hugging Face account
+asynchronously through `whoami`, so identity lookup never sits on the allocation
+critical path.
+
+The load balancer never stores raw client tokens or raw IP addresses. It stores
+keyed, one-way fingerprints instead. Tokenless traffic is grouped by the first
+`X-Forwarded-For` address (or the direct client address when proxy headers are
+disabled/unavailable), and coarse user-agent classes such as browser, mobile app,
+`httpx`, `curl`, or bot are counted to help distinguish likely automation. The
+dashboard flags high request volume, large per-minute bursts, dominant traffic
+share, many networks using one token, mostly automation-like clients, and invalid
+tokens. These are operational signals only; this feature does not rate-limit or
+block traffic.
 
 The timeline automatically switches between minute-level and hourly rollups depending on the selected window. By default the history is in memory and resets when the LB endpoint restarts.
 
@@ -203,6 +223,29 @@ minute buckets are present.
 - `SESSION_PENDING_TIMEOUT_S`: how long an unused reservation stays alive
 - `SESSION_TOKEN_TTL_S`: lifetime of the signed session token
 - `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations
+- `REQUEST_USAGE_HASH_SECRET`: secret key for stable token and IP fingerprints.
+  Defaults to `SESSION_SHARED_SECRET`; set it explicitly if that secret is not
+  stable across LB replacements. If neither is set, fingerprints change on every
+  process restart.
+- `REQUEST_USAGE_TRUST_PROXY_HEADERS`: whether requester attribution trusts the
+  first `X-Forwarded-For`/`X-Real-IP` address (defaults to `true`). Disable this
+  outside a trusted reverse-proxy deployment.
+- `REQUEST_USAGE_MAX_ACTORS_PER_MINUTE`: maximum distinct requester records kept
+  in one minute bucket before additional actors roll into an overflow row
+  (defaults to 1,000)
+- `REQUEST_USAGE_MAX_RETAINED_RECORDS`: maximum detailed requester records kept
+  across dashboard retention. Oldest requester details are compacted while the
+  minute-level request totals remain available (defaults to 50,000)
+- `REQUEST_USAGE_MAX_PENDING_VALIDATIONS`: maximum queued unique HF token
+  identity lookups (defaults to 128)
+- `REQUEST_USAGE_VALIDATION_CONCURRENCY`: maximum concurrent HF `whoami` lookups
+  (defaults to 4)
+- `REQUEST_USAGE_HIGH_REQUESTS`: request count that raises a high-volume signal
+  in the selected dashboard window (defaults to 100)
+- `REQUEST_USAGE_BURST_PER_MINUTE`: per-requester one-minute peak that raises a
+  burst signal (defaults to 20)
+- `REQUEST_USAGE_MANY_NETWORKS`: distinct network fingerprints for one requester
+  that raise a many-networks signal (defaults to 5)
 - `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
 - `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
   (defaults to 28 days so the 14d/28d dashboard windows can load persisted history)
