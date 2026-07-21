@@ -473,6 +473,9 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.allocation_wait_ms, 40)
         self.assertEqual(record.allocation_total_ms, 50)
         self.assertTrue(record.waited_for_capacity)
+        self.assertEqual(record.requester_id, "anonymous:unknown")
+        self.assertEqual(record.requester_kind, "anonymous")
+        self.assertIn("requester_id=anonymous:unknown", record.getMessage())
         payload = json.loads(response.body)
         self.assertEqual(
             payload,

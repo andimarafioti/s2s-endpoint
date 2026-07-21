@@ -134,6 +134,15 @@ class RequesterIdentityResolver:
             self._schedule_validation(token, identity)
         return identity.with_request_context(network_id=network_id, client_kind=client_kind)
 
+    def latest_identity(self, identity: RequesterIdentity) -> RequesterIdentity:
+        cached = self._cached_identity(identity.actor_id)
+        if cached is None:
+            return identity
+        return cached.with_request_context(
+            network_id=identity.network_id,
+            client_kind=identity.client_kind,
+        )
+
     async def stop(self) -> None:
         tasks = list(self._validation_tasks.values())
         for task in tasks:

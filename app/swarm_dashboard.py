@@ -304,7 +304,8 @@ def _aggregate_requester_usage(
                 authenticated_accounts.add(str(account_name or actor_id))
                 authenticated_requests += requests
             elif kind == "anonymous":
-                anonymous_actors.add(actor_id)
+                if actor_id != "anonymous:unknown":
+                    anonymous_actors.add(actor_id)
                 anonymous_requests += requests
             elif kind == "invalid_token":
                 invalid_token_requests += requests
@@ -374,6 +375,11 @@ def _aggregate_requester_usage(
             "authenticated_users_window": len(authenticated_accounts),
             "tokens_window": len(token_actors),
             "anonymous_ips_window": len(anonymous_actors),
+            "token_requests_window": sum(
+                int(row["requests"])
+                for row in rows
+                if str(row["actor_id"]).startswith("token:")
+            ),
             "authenticated_requests_window": authenticated_requests,
             "anonymous_requests_window": anonymous_requests,
             "invalid_token_requests_window": invalid_token_requests,

@@ -237,7 +237,7 @@ def _log_session_allocation_outcome(
     message = (
         "Session allocation outcome outcome=%s session_id=%s endpoint_name=%s "
         "slot_id=%s allocation_wait_ms=%s allocation_total_ms=%d "
-        "waited_for_capacity=%s"
+        "waited_for_capacity=%s requester_id=%s requester_kind=%s client_kind=%s"
     )
     args: list[object] = [
         outcome,
@@ -247,6 +247,9 @@ def _log_session_allocation_outcome(
         allocation_wait_ms,
         allocation_total_ms,
         waited_for_capacity,
+        requester.actor_id if requester is not None else None,
+        requester.kind if requester is not None else None,
+        requester.client_kind if requester is not None else None,
     ]
     if error is not None:
         message += " error=%s"
@@ -274,6 +277,13 @@ def _public_session_allocation(allocation: dict[str, object]) -> dict[str, objec
         )
         if key in allocation
     }
+
+
+async def _refresh_requester_identity(requester: RequesterIdentity) -> RequesterIdentity:
+    latest = requester_identity_resolver.latest_identity(requester)
+    if latest != requester:
+        await dashboard.update_requester_identity(latest)
+    return latest
 
 
 @app.get("/")
@@ -324,10 +334,12 @@ async def health():
 async def create_session(request: Request):
     requester = requester_identity_resolver.identify(request)
     await dashboard.record_session_request(requester)
+    requester = await _refresh_requester_identity(requester)
     allocation_started_at = monotonic()
     try:
         allocation = await session_manager.allocate(public_base_url(request))
     except Exception as exc:
+        requester = await _refresh_requester_identity(requester)
         allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
         waited_for_capacity = isinstance(exc, EndpointCapacityTimeoutError)
         failure_allocation = {"waited_for_capacity": waited_for_capacity}
@@ -348,6 +360,7 @@ async def create_session(request: Request):
     allocation.setdefault("allocation_wait_ms", allocation_wait_ms)
 
     if await request.is_disconnected():
+        requester = await _refresh_requester_identity(requester)
         session_id = allocation.get("session_id")
         if session_id and hasattr(session_manager, "cancel_pending_session"):
             await session_manager.cancel_pending_session(session_id)
@@ -362,6 +375,7 @@ async def create_session(request: Request):
         await dashboard.record_session_request_abandoned(requester)
         raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
 
+    requester = await _refresh_requester_identity(requester)
     await dashboard.record_session_allocation_success(requester)
     _log_session_allocation_outcome(
         "success",

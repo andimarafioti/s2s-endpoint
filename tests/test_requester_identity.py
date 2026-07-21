@@ -77,7 +77,8 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(raw_token, pending.label)
 
         await asyncio.wait_for(updated.wait(), timeout=1)
-        resolved = resolver.identify(request)
+        resolved = resolver.latest_identity(pending)
+        cached_request = resolver.identify(request)
 
         self.assertEqual(calls, [raw_token])
         self.assertEqual(resolved.kind, "authenticated")
@@ -85,6 +86,7 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved.account_name, "reachy-user")
         self.assertIn("@reachy-user", resolved.label)
         self.assertEqual(resolved.client_kind, "automation:httpx")
+        self.assertEqual(cached_request, resolved)
         self.assertEqual(updates[0].actor_id, pending.actor_id)
 
         await resolver.stop()
