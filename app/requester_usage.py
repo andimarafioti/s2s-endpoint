@@ -79,10 +79,14 @@ def aggregate_requester_usage(
     token_actors: set[str] = set()
     anonymous_actors: set[str] = set()
     reported_robots: set[str] = set()
+    allocated_requesters: set[str] = set()
+    connected_requesters: set[str] = set()
+    connected_authenticated_accounts: set[str] = set()
     authenticated_requests = 0
     anonymous_requests = 0
     invalid_token_requests = 0
     reported_robot_requests = 0
+    attributed_connections = 0
 
     for actor_id, actor in actors.items():
         requests = int(actor["requests"])
@@ -116,6 +120,19 @@ def aggregate_requester_usage(
             reported_robots.update(str(value) for value in reported_robot_ids)
             reported_robot_requests += int(actor["reported_robot_requests"])
 
+        successes = int(actor["successes"])
+        connections = int(actor["connections"])
+        if actor_id != "overflow":
+            if successes > 0:
+                allocated_requesters.add(actor_id)
+            if connections > 0:
+                connected_requesters.add(actor_id)
+                attributed_connections += connections
+                connected_authenticated_accounts.update(
+                    str(value)
+                    for value in actor["connected_authenticated_account_names"]
+                )
+
         peak_requests_per_minute = int(actor["peak_requests_per_minute"])
         signals = _usage_signals(
             requests=requests,
@@ -134,7 +151,6 @@ def aggregate_requester_usage(
             signal.startswith(("high volume", "burst", "dominant traffic share"))
             for signal in signals
         )
-        successes = int(actor["successes"])
         rows.append(
             {
                 "actor_id": actor_id,
@@ -147,7 +163,13 @@ def aggregate_requester_usage(
                 "successes": successes,
                 "failures": int(actor["failures"]),
                 "abandoned": int(actor["abandoned"]),
+                "connections": connections,
                 "success_rate_pct": round((successes / requests) * 100.0, 1) if requests else 0.0,
+                "connection_rate_pct": (
+                    round((connections / successes) * 100.0, 1)
+                    if successes
+                    else 0.0
+                ),
                 "traffic_share_pct": traffic_share_pct,
                 "requests_per_hour": round(requests / window_hours, 2),
                 "peak_requests_per_minute": peak_requests_per_minute,
@@ -180,6 +202,15 @@ def aggregate_requester_usage(
         "anonymous_ips_window": len(anonymous_actors),
         "reported_robots_window": len(reported_robots),
         "reported_robot_requests_window": reported_robot_requests,
+        "allocated_requesters_window": len(allocated_requesters),
+        "connected_requesters_window": len(connected_requesters),
+        "authenticated_users_connected_window": len(connected_authenticated_accounts),
+        "attributed_connections_window": attributed_connections,
+        "allocation_connection_gap_window": sum(
+            max(int(row["successes"]) - int(row["connections"]), 0)
+            for row in rows
+            if row["actor_id"] != "overflow"
+        ),
         "token_requests_window": sum(
             int(row["requests"])
             for row in rows
@@ -217,6 +248,8 @@ def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str
             actor["successes"] = int(actor["successes"]) + max(int(record.get("successes", 0)), 0)
             actor["failures"] = int(actor["failures"]) + max(int(record.get("failures", 0)), 0)
             actor["abandoned"] = int(actor["abandoned"]) + max(int(record.get("abandoned", 0)), 0)
+            connections = max(int(record.get("connections", 0)), 0)
+            actor["connections"] = int(actor["connections"]) + connections
             actor["peak_requests_per_minute"] = max(int(actor["peak_requests_per_minute"]), requests)
             actor["first_seen_s"] = min(int(actor["first_seen_s"]), bucket.bucket_start_s)
             actor["last_seen_s"] = max(int(actor["last_seen_s"]), bucket.bucket_start_s)
@@ -227,6 +260,9 @@ def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str
                 account_names = actor["authenticated_account_names"]
                 if isinstance(account_names, set) and requests > 0:
                     account_names.add(str(record.get("account_name") or actor_id))
+                connected_account_names = actor["connected_authenticated_account_names"]
+                if isinstance(connected_account_names, set) and connections > 0:
+                    connected_account_names.add(str(record.get("account_name") or actor_id))
             elif kind == "anonymous":
                 actor["anonymous_requests"] = int(actor["anonymous_requests"]) + requests
             elif kind == "invalid_token":
@@ -270,10 +306,12 @@ def _new_actor(actor_id: str, record: dict[str, object], bucket_start_s: int) ->
         "successes": 0,
         "failures": 0,
         "abandoned": 0,
+        "connections": 0,
         "authenticated_requests": 0,
         "anonymous_requests": 0,
         "invalid_token_requests": 0,
         "authenticated_account_names": set(),
+        "connected_authenticated_account_names": set(),
         "peak_requests_per_minute": 0,
         "network_ids": set(),
         "network_ids_overflow": False,

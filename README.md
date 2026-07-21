@@ -123,8 +123,9 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - conversation starts/completions plus average and max completed conversation duration
 - distinct verified Hugging Face users, token fingerprints, anonymous network
   fingerprints, and client-reported robot fingerprints
-- a per-requester leaderboard with allocation outcomes, traffic share, burst rate,
-  network count, reported robot count, client type, and unusual-usage signals
+- a per-requester leaderboard with allocation and connection outcomes, traffic
+  share, burst rate, network count, reported robot count, client type, and
+  unusual-usage signals
 
 Clients can optionally send a Hugging Face user access token as
 `Authorization: Bearer hf_...` on `POST /session`. The request is always allowed
@@ -146,6 +147,14 @@ one-way `robot:` fingerprint. The raw hardware ID is not retained. The dashboard
 counts distinct reported robots for the selected window, reported-robot requests,
 and distinct reported robots per requester. This value is supplied by the client;
 it is an attribution hint, not proof that a request came from genuine hardware.
+
+The per-requester `Connected` count is stricter than `Allocated`. Allocation
+means the load balancer returned session credentials to the client; connection
+is recorded only after the compute endpoint sends the first successful websocket
+`connected` callback for that session. The dashboard therefore shows which HF
+users, token fingerprints, or anonymous network fingerprints actually joined an
+allocated session. A recent pending session or a connection crossing the selected
+window boundary can temporarily appear as an allocation/connection gap.
 
 The load balancer never stores raw client tokens, raw IP addresses, or raw robot
 hardware IDs. It stores keyed, one-way fingerprints instead. Tokenless traffic

@@ -24,6 +24,7 @@ REQUESTER_DASHBOARD_MARKUP = """
                 <th>Status</th>
                 <th>Requests</th>
                 <th>Allocated</th>
+                <th>Connected</th>
                 <th>Traffic</th>
                 <th>Peak</th>
                 <th>Networks</th>
@@ -42,6 +43,7 @@ REQUESTER_DASHBOARD_MARKUP = """
 
 REQUESTER_DASHBOARD_KPI_CARDS = """
         kpiCard(`HF users / ${windowLabel}`, prettyNumber(summary.authenticated_users_window || 0), `Distinct verified Hugging Face accounts in the last ${windowLabel}`),
+        kpiCard(`Connected requesters / ${windowLabel}`, prettyNumber(summary.connected_requesters_window || 0), `Distinct requesters whose allocated session reached the compute websocket`),
         kpiCard(`Anonymous IPs / ${windowLabel}`, prettyNumber(summary.anonymous_ips_window || 0), `Distinct privacy-safe network fingerprints without tokens`),
         kpiCard(`Reported robots / ${windowLabel}`, prettyNumber(summary.reported_robots_window || 0), `Distinct privacy-safe robot fingerprints reported by clients; not verified hardware`),
         kpiCard(`Flagged / ${windowLabel}`, prettyNumber(summary.unusual_requesters_window || 0), `Requesters with volume, burst, network, token, or automation signals`),
@@ -91,6 +93,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
       document.getElementById('requester-summary').innerHTML = [
         `<span class="status-pill good">${htmlEscape(prettyNumber(summary.authenticated_users_window || 0))} HF users</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.tokens_window || 0))} tokens</span>`,
+        `<span class="status-pill">${htmlEscape(prettyNumber(summary.allocated_requesters_window || 0))} allocated · ${htmlEscape(prettyNumber(summary.connected_requesters_window || 0))} connected</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.anonymous_ips_window || 0))} anonymous IPs</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.reported_robots_window || 0))} reported robots</span>`,
         `<span class="status-pill ${summary.unusual_requesters_window ? 'bad' : 'good'}">${htmlEscape(prettyNumber(summary.unusual_requesters_window || 0))} flagged</span>`,
@@ -112,6 +115,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
             </td>
             <td><strong>${htmlEscape(prettyNumber(row.requests || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.requests_per_hour || 0))}/h</div></td>
             <td>${htmlEscape(prettyNumber(row.successes || 0))}<div class="muted">${htmlEscape(row.success_rate_pct || 0)}%</div></td>
+            <td><strong>${htmlEscape(prettyNumber(row.connections || 0))}</strong><div class="muted">${htmlEscape(row.connection_rate_pct || 0)}% of allocated</div></td>
             <td>${htmlEscape(row.traffic_share_pct || 0)}%</td>
             <td>${htmlEscape(prettyNumber(row.peak_requests_per_minute || 0))}/min</td>
             <td>${htmlEscape(networks)}</td>
@@ -120,12 +124,13 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td class="requester-signals">${htmlEscape(signals)}</td>
           </tr>
         `;
-      }).join('') : '<tr><td colspan="10" class="muted">No attributed session requests in this window yet.</td></tr>';
+      }).join('') : '<tr><td colspan="11" class="muted">No attributed session requests in this window yet.</td></tr>';
 
       const unattributed = Number(requesters?.unattributed_requests || 0);
-      document.getElementById('requester-detail').textContent = unattributed
+      const attributionDetail = unattributed
         ? `${prettyNumber(unattributed)} request(s) in the last ${windowLabel} predate attribution or could not be attributed.`
         : `All recorded session requests in the last ${windowLabel} have requester attribution.`;
+      document.getElementById('requester-detail').textContent = `${attributionDetail} Connected counts the first compute websocket callback for an allocated session; recent pending sessions and window boundaries can create a temporary allocation/connection gap.`;
     }
 """
 

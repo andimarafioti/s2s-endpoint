@@ -515,6 +515,26 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(fake_dashboard.requesters[0].reported_robot_id)
 
+    async def test_connected_callback_is_attributed_to_requester_once(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+
+        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
+            await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(module.session_requester_tracker.count(), 1)
+        payload = {"session_token": "session-token", "event": "connected"}
+        first = await module.session_event("session-123", payload)
+        second = await module.session_event("session-123", payload)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(module.session_requester_tracker.count(), 0)
+        self.assertEqual(fake_dashboard.session_events, ["connected", "connected"])
+        self.assertEqual(fake_dashboard.connected_requesters, [fake_dashboard.requesters[0]])
+
     async def test_failed_session_allocation_logs_outcome(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
@@ -584,6 +604,8 @@ class FakeDashboard:
     def __init__(self):
         self.calls = []
         self.requesters = []
+        self.session_events = []
+        self.connected_requesters = []
 
     async def record_session_request(self, requester=None):
         self.calls.append("request")
@@ -597,6 +619,12 @@ class FakeDashboard:
 
     async def record_session_request_abandoned(self, requester=None):
         self.calls.append("abandoned")
+
+    async def record_session_event(self, event, **kwargs):
+        self.session_events.append(event)
+
+    async def record_requester_session_connected(self, requester):
+        self.connected_requesters.append(requester)
 
 
 class FakeSessionManager:
@@ -619,6 +647,13 @@ class FakeSessionManager:
 
     async def cancel_pending_session(self, session_id):
         self.cancelled_session_ids.append(session_id)
+
+    async def handle_event(self, session_id, session_token, event):
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "state": "connected" if event == "connected" else "released",
+        }
 
 
 class FakeFailingSessionManager:

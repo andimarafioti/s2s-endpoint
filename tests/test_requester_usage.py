@@ -77,6 +77,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         await service.record("request", second_network)
         await service.record("request", token_requester)
         await service.record("success", token_requester)
+        await service.record("connected", token_requester)
         await service.record("failure", token_requester)
         await service.record("request", anonymous)
 
@@ -90,6 +91,11 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["anonymous_ips_window"], 1)
         self.assertEqual(summary["reported_robots_window"], 2)
         self.assertEqual(summary["reported_robot_requests_window"], 3)
+        self.assertEqual(summary["allocated_requesters_window"], 1)
+        self.assertEqual(summary["connected_requesters_window"], 1)
+        self.assertEqual(summary["authenticated_users_connected_window"], 1)
+        self.assertEqual(summary["attributed_connections_window"], 1)
+        self.assertEqual(summary["allocation_connection_gap_window"], 0)
         self.assertEqual(summary["authenticated_requests_window"], 3)
         self.assertEqual(summary["anonymous_requests_window"], 1)
         self.assertEqual(summary["unattributed_requests_window"], 0)
@@ -103,6 +109,8 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
             ["robot:first", "robot:second"],
         )
         self.assertEqual(leaderboard[0]["automated_requests"], 3)
+        self.assertEqual(leaderboard[0]["connections"], 1)
+        self.assertEqual(leaderboard[0]["connection_rate_pct"], 100.0)
         self.assertEqual(leaderboard[0]["risk"], "high")
         self.assertIn("high volume: 3 requests", leaderboard[0]["signals"])
         self.assertIn("burst: 3/min", leaderboard[0]["signals"])
@@ -131,6 +139,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
 
         await service.record("request", pending)
         await service.update_identity(resolved)
+        await service.record("connected", resolved)
 
         bucket = (await service.history.snapshot())[-1]
         restored = SwarmHistoryBucket.from_dict(bucket.to_dict())
@@ -143,6 +152,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["reported_robot_requests"], 1)
         self.assertEqual(record["reported_robot_ids"], ["robot:first"])
         self.assertFalse(record["reported_robot_ids_overflow"])
+        self.assertEqual(record["connections"], 1)
         self.assertEqual(record["client_kinds"], {"browser": 1})
 
     async def test_compacts_oldest_requester_details_at_retention_wide_limit(self):
@@ -262,5 +272,7 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertIn('id="requester-leaderboard"', html)
         self.assertIn("Requester Usage", html)
         self.assertIn("Reported robots", html)
+        self.assertIn("Connected requesters", html)
+        self.assertIn("first compute websocket callback", html)
         self.assertIn("not hardware attestation", html)
         self.assertIn("function renderRequesterUsage(requesters, summary)", html)

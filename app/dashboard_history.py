@@ -349,6 +349,7 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "successes": max(int(raw_record.get("successes", 0)), 0),
             "failures": max(int(raw_record.get("failures", 0)), 0),
             "abandoned": max(int(raw_record.get("abandoned", 0)), 0),
+            "connections": max(int(raw_record.get("connections", 0)), 0),
             "network_ids": network_ids,
             "network_ids_overflow": bool(raw_record.get("network_ids_overflow", False)),
             "reported_robot_requests": max(
@@ -387,6 +388,7 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
         "successes": 0,
         "failures": 0,
         "abandoned": 0,
+        "connections": 0,
         "network_ids": [],
         "network_ids_overflow": False,
         "reported_robot_requests": 0,
@@ -764,6 +766,7 @@ class DashboardHistory:
             "success": ("session_allocation_successes", "successes"),
             "failure": ("session_allocation_failures", "failures"),
             "abandoned": (None, "abandoned"),
+            "connected": (None, "connections"),
         }
         if event not in counter_fields:
             raise ValueError(f"Unknown requester event: {event}")
