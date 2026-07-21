@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 from app.dashboard_history import DashboardHistory, SwarmHistoryBucket, SwarmStateSample
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
-from app.requester_identity import RequesterIdentity
 from app.swarm_dashboard import SwarmDashboard
 
 
@@ -329,121 +328,6 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["history_persistence"]["enabled"])
         self.assertEqual(payload["history_persistence"]["dirty_bucket_count"], 0)
 
-    async def test_requester_usage_counts_hf_users_anonymous_ips_and_anomalies(self):
-        clock = FakeClock(2 * 3600)
-        dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=2,
-                waking=0,
-                free_slots=2,
-                effective_free_slots=2,
-            )),
-            retention_minutes=24 * 60,
-            requester_high_volume_threshold=3,
-            requester_burst_threshold_per_minute=3,
-            requester_many_networks_threshold=2,
-            time_fn=clock.now,
-        )
-        token_requester = RequesterIdentity(
-            actor_id="token:abc123",
-            label="@reachy-user · token •abc123",
-            kind="authenticated",
-            verification="verified",
-            fingerprint="abc123",
-            account_name="reachy-user",
-            network_id="net:first",
-            client_kind="automation:httpx",
-        )
-        second_network = RequesterIdentity(
-            **{
-                **token_requester.__dict__,
-                "network_id": "net:second",
-            }
-        )
-        anonymous = RequesterIdentity(
-            actor_id="anonymous:ip123",
-            label="Anonymous IP •ip123",
-            kind="anonymous",
-            verification="not_provided",
-            fingerprint="ip123",
-            network_id="net:ip123",
-            client_kind="browser",
-        )
-
-        await dashboard.record_session_request(token_requester)
-        await dashboard.record_session_request(second_network)
-        await dashboard.record_session_request(token_requester)
-        await dashboard.record_session_allocation_success(token_requester)
-        await dashboard.record_session_allocation_failure(token_requester)
-        await dashboard.record_session_request(anonymous)
-
-        payload = await dashboard.data(window="60m", resolution="minute")
-        summary = payload["summary"]
-        leaderboard = payload["requesters"]["leaderboard"]
-
-        self.assertEqual(summary["unique_requesters_window"], 2)
-        self.assertEqual(summary["authenticated_users_window"], 1)
-        self.assertEqual(summary["tokens_window"], 1)
-        self.assertEqual(summary["anonymous_ips_window"], 1)
-        self.assertEqual(summary["authenticated_requests_window"], 3)
-        self.assertEqual(summary["anonymous_requests_window"], 1)
-        self.assertEqual(summary["unattributed_requests_window"], 0)
-        self.assertEqual(leaderboard[0]["label"], "@reachy-user · token •abc123")
-        self.assertEqual(leaderboard[0]["requests"], 3)
-        self.assertEqual(leaderboard[0]["network_count"], 2)
-        self.assertEqual(leaderboard[0]["automated_requests"], 3)
-        self.assertEqual(leaderboard[0]["risk"], "high")
-        self.assertIn("high volume: 3 requests", leaderboard[0]["signals"])
-        self.assertIn("burst: 3/min", leaderboard[0]["signals"])
-        self.assertIn("many networks: 2", leaderboard[0]["signals"])
-
-    async def test_resolved_identity_updates_and_round_trips_existing_history(self):
-        clock = FakeClock(2 * 3600)
-        dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=2,
-                waking=0,
-                free_slots=2,
-                effective_free_slots=2,
-            )),
-            retention_minutes=24 * 60,
-            time_fn=clock.now,
-        )
-        pending = RequesterIdentity(
-            actor_id="token:abc123",
-            label="HF token •abc123",
-            kind="unverified_token",
-            verification="pending",
-            fingerprint="abc123",
-            network_id="net:first",
-            client_kind="browser",
-        )
-        resolved = RequesterIdentity(
-            actor_id="token:abc123",
-            label="@reachy-user · token •abc123",
-            kind="authenticated",
-            verification="verified",
-            fingerprint="abc123",
-            account_name="reachy-user",
-        )
-
-        await dashboard.record_session_request(pending)
-        await dashboard.update_requester_identity(resolved)
-
-        bucket = (await dashboard.history.snapshot())[-1]
-        restored = SwarmHistoryBucket.from_dict(bucket.to_dict())
-        record = restored.requester_usage["token:abc123"]
-        self.assertEqual(record["label"], "@reachy-user · token •abc123")
-        self.assertEqual(record["kind"], "authenticated")
-        self.assertEqual(record["verification"], "verified")
-        self.assertEqual(record["account_name"], "reachy-user")
-        self.assertEqual(record["network_ids"], ["net:first"])
-        self.assertEqual(record["client_kinds"], {"browser": 1})
-
     async def test_hourly_series_averages_state_metrics_and_sums_events(self):
         clock = FakeClock(3 * 3600)
         dashboard = SwarmDashboard(
@@ -544,10 +428,6 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Maximum Connected Users", html)
         self.assertIn("Median Duration", html)
         self.assertIn("renderRollingChartCards();", html)
-        self.assertIn('id="requester-leaderboard"', html)
-        self.assertIn("Requester Usage", html)
-        self.assertIn("renderRequesterUsage(payload.requesters || {}, summary);", html)
-
     async def test_summary_peak_connected_sessions_uses_bucket_max(self):
         now_s = 6 * 3600
         dashboard = SwarmDashboard(

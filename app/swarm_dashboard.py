@@ -12,7 +12,9 @@ from app.dashboard_history import (
     _bucket_start_epoch_s,
     _isoformat,
 )
+from app.requester_dashboard_ui import inject_requester_dashboard
 from app.requester_identity import RequesterIdentity
+from app.requester_usage import RequesterUsageService, RequesterUsageThresholds
 
 
 SnapshotProvider = Callable[[], Awaitable[tuple[bool, Optional[str], dict[str, object]]]]
@@ -185,220 +187,6 @@ class SwarmBucketAggregate:
         }
 
 
-_REQUESTER_VERIFICATION_RANK = {
-    "unknown": 0,
-    "not_provided": 1,
-    "not_applicable": 1,
-    "unrecognized": 2,
-    "pending": 3,
-    "unavailable": 4,
-    "invalid": 5,
-    "verified": 6,
-}
-
-
-def _aggregate_requester_usage(
-    buckets: Iterable[SwarmHistoryBucket],
-    *,
-    window_minutes: int,
-    total_session_requests: int,
-    high_volume_threshold: int,
-    burst_threshold_per_minute: int,
-    many_networks_threshold: int,
-) -> dict[str, object]:
-    actors: dict[str, dict[str, object]] = {}
-    for bucket in buckets:
-        for actor_id, record in bucket.requester_usage.items():
-            actor = actors.setdefault(
-                actor_id,
-                {
-                    "actor_id": actor_id,
-                    "label": str(record.get("label") or "Unknown requester"),
-                    "kind": str(record.get("kind") or "unknown"),
-                    "verification": str(record.get("verification") or "unknown"),
-                    "fingerprint": str(record.get("fingerprint") or ""),
-                    "account_name": record.get("account_name"),
-                    "requests": 0,
-                    "successes": 0,
-                    "failures": 0,
-                    "abandoned": 0,
-                    "peak_requests_per_minute": 0,
-                    "network_ids": set(),
-                    "network_ids_overflow": False,
-                    "client_kinds": {},
-                    "first_seen_s": bucket.bucket_start_s,
-                    "last_seen_s": bucket.bucket_start_s,
-                },
-            )
-
-            current_verification = str(actor.get("verification") or "unknown")
-            record_verification = str(record.get("verification") or "unknown")
-            if _REQUESTER_VERIFICATION_RANK.get(record_verification, 0) >= _REQUESTER_VERIFICATION_RANK.get(
-                current_verification,
-                0,
-            ):
-                actor["label"] = str(record.get("label") or actor["label"])
-                actor["kind"] = str(record.get("kind") or actor["kind"])
-                actor["verification"] = record_verification
-                actor["fingerprint"] = str(record.get("fingerprint") or actor["fingerprint"])
-                if record.get("account_name") is not None:
-                    actor["account_name"] = str(record["account_name"])
-
-            requests = max(int(record.get("requests", 0)), 0)
-            actor["requests"] = int(actor["requests"]) + requests
-            actor["successes"] = int(actor["successes"]) + max(int(record.get("successes", 0)), 0)
-            actor["failures"] = int(actor["failures"]) + max(int(record.get("failures", 0)), 0)
-            actor["abandoned"] = int(actor["abandoned"]) + max(int(record.get("abandoned", 0)), 0)
-            actor["peak_requests_per_minute"] = max(int(actor["peak_requests_per_minute"]), requests)
-            actor["first_seen_s"] = min(int(actor["first_seen_s"]), bucket.bucket_start_s)
-            actor["last_seen_s"] = max(int(actor["last_seen_s"]), bucket.bucket_start_s)
-
-            network_ids = actor["network_ids"]
-            if isinstance(network_ids, set):
-                network_ids.update(str(item) for item in list(record.get("network_ids") or []))
-            actor["network_ids_overflow"] = bool(
-                actor["network_ids_overflow"] or record.get("network_ids_overflow", False)
-            )
-            client_kinds = actor["client_kinds"]
-            if isinstance(client_kinds, dict):
-                for kind, count in dict(record.get("client_kinds") or {}).items():
-                    client_kinds[str(kind)] = int(client_kinds.get(str(kind), 0)) + max(int(count), 0)
-
-    tracked_requests = sum(int(actor["requests"]) for actor in actors.values())
-    peer_request_counts = [
-        int(actor["requests"])
-        for actor_id, actor in actors.items()
-        if actor_id != "overflow" and int(actor["requests"]) > 0
-    ]
-    median_peer_requests = _median([float(value) for value in peer_request_counts])
-    relative_threshold = max(20, int(median_peer_requests * 5))
-    window_hours = max(window_minutes / 60.0, 1.0 / 60.0)
-
-    rows: list[dict[str, object]] = []
-    authenticated_accounts: set[str] = set()
-    token_actors: set[str] = set()
-    anonymous_actors: set[str] = set()
-    authenticated_requests = 0
-    anonymous_requests = 0
-    invalid_token_requests = 0
-
-    for actor_id, actor in actors.items():
-        requests = int(actor["requests"])
-        successes = int(actor["successes"])
-        failures = int(actor["failures"])
-        abandoned = int(actor["abandoned"])
-        kind = str(actor["kind"])
-        verification = str(actor["verification"])
-        account_name = actor.get("account_name")
-        network_ids = actor["network_ids"] if isinstance(actor["network_ids"], set) else set()
-        client_kinds = dict(actor["client_kinds"]) if isinstance(actor["client_kinds"], dict) else {}
-        automated_requests = sum(
-            count for client_kind, count in client_kinds.items() if client_kind.startswith("automation:")
-        )
-        traffic_share_pct = round((requests / total_session_requests) * 100.0, 1) if total_session_requests else 0.0
-
-        if requests > 0 and actor_id != "overflow":
-            if actor_id.startswith("token:"):
-                token_actors.add(actor_id)
-            if kind == "authenticated":
-                authenticated_accounts.add(str(account_name or actor_id))
-                authenticated_requests += requests
-            elif kind == "anonymous":
-                if actor_id != "anonymous:unknown":
-                    anonymous_actors.add(actor_id)
-                anonymous_requests += requests
-            elif kind == "invalid_token":
-                invalid_token_requests += requests
-
-        signals: list[str] = []
-        if requests >= high_volume_threshold:
-            signals.append(f"high volume: {requests:,} requests")
-        elif requests >= relative_threshold and len(peer_request_counts) >= 2:
-            signals.append(f"unusual vs peers: {requests:,} requests")
-        peak_requests_per_minute = int(actor["peak_requests_per_minute"])
-        if peak_requests_per_minute >= burst_threshold_per_minute:
-            signals.append(f"burst: {peak_requests_per_minute:,}/min")
-        if requests >= 20 and traffic_share_pct >= 50.0:
-            signals.append(f"dominant traffic share: {traffic_share_pct:g}%")
-        if len(network_ids) >= many_networks_threshold or bool(actor["network_ids_overflow"]):
-            suffix = "+" if actor["network_ids_overflow"] else ""
-            signals.append(f"many networks: {len(network_ids)}{suffix}")
-        if requests >= 5 and automated_requests / max(requests, 1) >= 0.8:
-            signals.append("mostly automation-like clients")
-        if verification == "invalid":
-            signals.append("invalid HF token")
-
-        high_risk = any(
-            signal.startswith(("high volume", "burst", "dominant traffic share"))
-            for signal in signals
-        )
-        risk = "high" if high_risk else ("watch" if signals else "normal")
-        rows.append(
-            {
-                "actor_id": actor_id,
-                "label": actor["label"],
-                "kind": kind,
-                "verification": verification,
-                "fingerprint": actor["fingerprint"],
-                "account_name": account_name,
-                "requests": requests,
-                "successes": successes,
-                "failures": failures,
-                "abandoned": abandoned,
-                "success_rate_pct": round((successes / requests) * 100.0, 1) if requests else 0.0,
-                "traffic_share_pct": traffic_share_pct,
-                "requests_per_hour": round(requests / window_hours, 2),
-                "peak_requests_per_minute": peak_requests_per_minute,
-                "network_count": len(network_ids),
-                "network_count_overflow": bool(actor["network_ids_overflow"]),
-                "client_kinds": dict(sorted(client_kinds.items(), key=lambda item: (-item[1], item[0]))),
-                "automated_requests": automated_requests,
-                "first_seen": _isoformat(int(actor["first_seen_s"])),
-                "last_seen": _isoformat(int(actor["last_seen_s"])),
-                "risk": risk,
-                "signals": signals,
-            }
-        )
-
-    rows.sort(key=lambda row: (-int(row["requests"]), str(row["label"])))
-    unusual_requesters = sum(1 for row in rows if row["risk"] != "normal")
-    unattributed_requests = max(total_session_requests - tracked_requests, 0)
-    unique_requesters = sum(
-        1
-        for row in rows
-        if row["actor_id"] != "overflow" and int(row["requests"]) > 0
-    )
-
-    return {
-        "summary": {
-            "unique_requesters_window": unique_requesters,
-            "authenticated_users_window": len(authenticated_accounts),
-            "tokens_window": len(token_actors),
-            "anonymous_ips_window": len(anonymous_actors),
-            "token_requests_window": sum(
-                int(row["requests"])
-                for row in rows
-                if str(row["actor_id"]).startswith("token:")
-            ),
-            "authenticated_requests_window": authenticated_requests,
-            "anonymous_requests_window": anonymous_requests,
-            "invalid_token_requests_window": invalid_token_requests,
-            "unattributed_requests_window": unattributed_requests,
-            "unusual_requesters_window": unusual_requesters,
-        },
-        "tracked_requests": tracked_requests,
-        "unattributed_requests": unattributed_requests,
-        "median_requests_per_requester": median_peer_requests,
-        "thresholds": {
-            "high_volume_requests": high_volume_threshold,
-            "burst_requests_per_minute": burst_threshold_per_minute,
-            "many_networks": many_networks_threshold,
-        },
-        "leaderboard": rows[:20],
-    }
-
-
-
 class SwarmDashboard:
     def __init__(
         self,
@@ -426,9 +214,6 @@ class SwarmDashboard:
         self.retention_minutes = retention_minutes
         self.history_store = history_store
         self._time_fn = time_fn
-        self.requester_high_volume_threshold = requester_high_volume_threshold
-        self.requester_burst_threshold_per_minute = requester_burst_threshold_per_minute
-        self.requester_many_networks_threshold = requester_many_networks_threshold
         self.history = DashboardHistory(
             retention_minutes=retention_minutes,
             history_store=history_store,
@@ -438,6 +223,15 @@ class SwarmDashboard:
             dirty_bucket_warning_age_s=dirty_bucket_warning_age_s,
             startup_merge_delay_s=startup_merge_delay_s,
             max_requesters_per_bucket=max_requesters_per_bucket,
+            time_fn=time_fn,
+        )
+        self.requesters = RequesterUsageService(
+            history=self.history,
+            thresholds=RequesterUsageThresholds(
+                high_volume_requests=requester_high_volume_threshold,
+                burst_requests_per_minute=requester_burst_threshold_per_minute,
+                many_networks=requester_many_networks_threshold,
+            ),
             time_fn=time_fn,
         )
         self._latest_sample: Optional[SwarmStateSample] = None
@@ -474,38 +268,19 @@ class SwarmDashboard:
         self._latest_sample = sample
 
     async def record_session_request(self, requester: RequesterIdentity | None = None) -> None:
-        await self.history.record_requester_event(
-            "request",
-            actor_id=requester.actor_id if requester is not None else None,
-            metadata=requester.history_metadata() if requester is not None else None,
-        )
+        await self.requesters.record("request", requester)
 
     async def record_session_allocation_success(self, requester: RequesterIdentity | None = None) -> None:
-        await self.history.record_requester_event(
-            "success",
-            actor_id=requester.actor_id if requester is not None else None,
-            metadata=requester.history_metadata() if requester is not None else None,
-        )
+        await self.requesters.record("success", requester)
 
     async def record_session_allocation_failure(self, requester: RequesterIdentity | None = None) -> None:
-        await self.history.record_requester_event(
-            "failure",
-            actor_id=requester.actor_id if requester is not None else None,
-            metadata=requester.history_metadata() if requester is not None else None,
-        )
+        await self.requesters.record("failure", requester)
 
     async def record_session_request_abandoned(self, requester: RequesterIdentity | None = None) -> None:
-        await self.history.record_requester_event(
-            "abandoned",
-            actor_id=requester.actor_id if requester is not None else None,
-            metadata=requester.history_metadata() if requester is not None else None,
-        )
+        await self.requesters.record("abandoned", requester)
 
     async def update_requester_identity(self, requester: RequesterIdentity) -> None:
-        await self.history.update_requester_identity(
-            requester.actor_id,
-            requester.history_metadata(),
-        )
+        await self.requesters.update_identity(requester)
 
     async def record_session_event(
         self,
@@ -536,7 +311,7 @@ class SwarmDashboard:
         series = await self.series(window_minutes=window_minutes, resolution=resolved_resolution)
         rolling_series = await self.rolling_series(window_minutes=window_minutes, resolution=resolved_resolution)
         summary = await self.summary(window_minutes=window_minutes, requested_window=window or "6h")
-        requesters = await self.requester_usage(window_minutes=window_minutes)
+        requesters = await self.requesters.data(window_minutes=window_minutes)
         summary.update(requesters["summary"])
 
         return {
@@ -633,20 +408,6 @@ class SwarmDashboard:
             return points
 
         return self._aggregate_hourly(minute_map, start_bucket, end_bucket)
-
-    async def requester_usage(self, *, window_minutes: int) -> dict[str, object]:
-        minute_buckets = await self.history.snapshot()
-        min_bucket = _bucket_start_epoch_s(self._time_fn(), 1) - (window_minutes - 1) * 60
-        selected = [bucket for bucket in minute_buckets if bucket.bucket_start_s >= min_bucket]
-        total_session_requests = sum(bucket.session_requests for bucket in selected)
-        return _aggregate_requester_usage(
-            selected,
-            window_minutes=window_minutes,
-            total_session_requests=total_session_requests,
-            high_volume_threshold=self.requester_high_volume_threshold,
-            burst_threshold_per_minute=self.requester_burst_threshold_per_minute,
-            many_networks_threshold=self.requester_many_networks_threshold,
-        )
 
     async def rolling_series(self, *, window_minutes: int, resolution: str) -> list[dict[str, object]]:
         minute_buckets = await self.history.snapshot()
@@ -753,7 +514,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         if history_persisted
         else "Single-replica LB in-memory history; resets on restart."
     )
-    return """<!doctype html>
+    html = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -1185,13 +946,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     .muted { color: var(--muted); }
     .mono { font-family: "Menlo", "Consolas", monospace; }
     .footer-note { margin-top: 14px; color: var(--muted); font-size: 13px; }
-    .table-scroll { overflow-x: auto; }
-    .requester-label { min-width: 210px; }
-    .requester-signals { min-width: 220px; color: var(--muted); font-size: 12px; }
-    .requester-client-mix { min-width: 150px; color: var(--muted); font-size: 12px; }
-    .risk-pill.normal { color: var(--good); background: rgba(17, 122, 101, 0.10); }
-    .risk-pill.watch { color: var(--warm); background: rgba(217, 130, 43, 0.12); }
-    .risk-pill.high { color: var(--danger); background: rgba(187, 45, 59, 0.10); }
+__REQUESTER_DASHBOARD_STYLES__
 
     @media (max-width: 1100px) {
       .hero, .kpis, .rolling-grid { grid-template-columns: 1fr; }
@@ -1301,31 +1056,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         <div class="chart-shell"><canvas id="conversations-chart" width="1200" height="260"></canvas></div>
       </div>
 
-      <div class="panel card span-12">
-        <div class="label">Traffic Attribution</div>
-        <h2>Requester Usage</h2>
-        <p class="muted">HF accounts are resolved asynchronously. Token and network identifiers are one-way fingerprints; raw tokens and IP addresses are never stored.</p>
-        <div class="fleet-summary" id="requester-summary"></div>
-        <div class="table-scroll">
-          <table>
-            <thead>
-              <tr>
-                <th>Requester</th>
-                <th>Status</th>
-                <th>Requests</th>
-                <th>Allocated</th>
-                <th>Traffic</th>
-                <th>Peak</th>
-                <th>Networks</th>
-                <th>Clients</th>
-                <th>Signals</th>
-              </tr>
-            </thead>
-            <tbody id="requester-leaderboard"></tbody>
-          </table>
-        </div>
-        <div class="footer-note" id="requester-detail"></div>
-      </div>
+__REQUESTER_DASHBOARD_MARKUP__
 
       <div class="panel card span-12">
         <div class="label">Current Fleet</div>
@@ -1545,9 +1276,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
         kpiCard('Pending joins', prettyNumber(current.pending_sessions), 'Reserved sessions waiting to connect'),
         kpiCard(`Requests / ${windowLabel}`, prettyNumber(summary.session_requests_window), `POST /session requests in the last ${windowLabel}`),
         kpiCard(`Failures / ${windowLabel}`, prettyNumber(summary.session_failures_window), `Allocation failures in the last ${windowLabel}`),
-        kpiCard(`HF users / ${windowLabel}`, prettyNumber(summary.authenticated_users_window || 0), `Distinct verified Hugging Face accounts in the last ${windowLabel}`),
-        kpiCard(`Anonymous IPs / ${windowLabel}`, prettyNumber(summary.anonymous_ips_window || 0), `Distinct privacy-safe network fingerprints without tokens`),
-        kpiCard(`Flagged / ${windowLabel}`, prettyNumber(summary.unusual_requesters_window || 0), `Requesters with volume, burst, network, token, or automation signals`),
+__REQUESTER_DASHBOARD_KPI_CARDS__
         kpiCard(`Started / ${windowLabel}`, prettyNumber(summary.conversations_started_window), `Conversation starts recorded in the last ${windowLabel}`),
         kpiCard(`Completed / ${windowLabel}`, prettyNumber(summary.conversations_completed_window), `Conversation ends recorded in the last ${windowLabel}`),
         kpiCard(`Avg duration / ${windowLabel}`, formatDuration(summary.avg_conversation_duration_window_s), `Average completed conversation duration in the last ${windowLabel}`),
@@ -1559,72 +1288,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
       ].join('');
     }
 
-    function requesterStatusClass(row) {
-      if (row.risk === 'high') return 'bad';
-      if (row.risk === 'watch' || row.verification === 'pending' || row.verification === 'unavailable') return 'warm';
-      return 'good';
-    }
-
-    function requesterStatusLabel(row) {
-      const labels = {
-        verified: 'verified HF',
-        pending: 'verifying',
-        unavailable: 'lookup unavailable',
-        invalid: 'invalid token',
-        unrecognized: 'unrecognized token',
-        not_provided: 'no token',
-        not_applicable: 'other',
-      };
-      return labels[row.verification] || row.kind || 'unknown';
-    }
-
-    function requesterClientMix(clientKinds) {
-      const entries = Object.entries(clientKinds || {}).slice(0, 3);
-      if (!entries.length) return 'unknown';
-      return entries.map(([kind, count]) => `${kind.replace('automation:', '')}: ${prettyNumber(count)}`).join(' · ');
-    }
-
-    function renderRequesterUsage(requesters, summary) {
-      const rows = requesters?.leaderboard || [];
-      const windowLabel = summary.window_label || '6h';
-      document.getElementById('requester-summary').innerHTML = [
-        `<span class="status-pill good">${htmlEscape(prettyNumber(summary.authenticated_users_window || 0))} HF users</span>`,
-        `<span class="status-pill">${htmlEscape(prettyNumber(summary.tokens_window || 0))} tokens</span>`,
-        `<span class="status-pill">${htmlEscape(prettyNumber(summary.anonymous_ips_window || 0))} anonymous IPs</span>`,
-        `<span class="status-pill ${summary.unusual_requesters_window ? 'bad' : 'good'}">${htmlEscape(prettyNumber(summary.unusual_requesters_window || 0))} flagged</span>`,
-      ].join('');
-
-      document.getElementById('requester-leaderboard').innerHTML = rows.length ? rows.map((row) => {
-        const statusClass = requesterStatusClass(row);
-        const networks = `${prettyNumber(row.network_count || 0)}${row.network_count_overflow ? '+' : ''}`;
-        const signals = (row.signals || []).join(' · ') || 'No unusual signal';
-        return `
-          <tr>
-            <td class="requester-label">
-              <div><strong>${htmlEscape(row.label || 'Unknown requester')}</strong></div>
-              <div class="muted mono" style="margin-top:4px;">${htmlEscape(row.actor_id || '')}</div>
-            </td>
-            <td>
-              <span class="status-pill ${statusClass}">${htmlEscape(requesterStatusLabel(row))}</span>
-              <div style="margin-top:6px;"><span class="tiny-pill risk-pill ${htmlEscape(row.risk || 'normal')}">${htmlEscape(row.risk || 'normal')}</span></div>
-            </td>
-            <td><strong>${htmlEscape(prettyNumber(row.requests || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.requests_per_hour || 0))}/h</div></td>
-            <td>${htmlEscape(prettyNumber(row.successes || 0))}<div class="muted">${htmlEscape(row.success_rate_pct || 0)}%</div></td>
-            <td>${htmlEscape(row.traffic_share_pct || 0)}%</td>
-            <td>${htmlEscape(prettyNumber(row.peak_requests_per_minute || 0))}/min</td>
-            <td>${htmlEscape(networks)}</td>
-            <td class="requester-client-mix">${htmlEscape(requesterClientMix(row.client_kinds))}</td>
-            <td class="requester-signals">${htmlEscape(signals)}</td>
-          </tr>
-        `;
-      }).join('') : '<tr><td colspan="9" class="muted">No attributed session requests in this window yet.</td></tr>';
-
-      const unattributed = Number(requesters?.unattributed_requests || 0);
-      document.getElementById('requester-detail').textContent = unattributed
-        ? `${prettyNumber(unattributed)} request(s) in the last ${windowLabel} predate attribution or could not be attributed.`
-        : `All recorded session requests in the last ${windowLabel} have requester attribution.`;
-    }
-
+__REQUESTER_DASHBOARD_SCRIPT__
     function countEndpointStates(endpoints) {
       const counts = { running: 0, warm: 0, parked: 0, error: 0 };
       for (const endpoint of endpoints) {
@@ -2055,3 +1719,4 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
 </body>
 </html>
 """.replace("__HISTORY_NOTE__", history_note)
+    return inject_requester_dashboard(html)
