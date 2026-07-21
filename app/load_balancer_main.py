@@ -19,7 +19,13 @@ from app.endpoint_pool_router import (
     HuggingFaceEndpointController,
     fetch_compute_active_sessions,
 )
-from app.requester_identity import RequesterIdentity, RequesterIdentityResolver, bearer_token
+from app.requester_identity import (
+    RequesterIdentity,
+    RequesterIdentityResolver,
+    bearer_token,
+)
+from app.session_request_metadata import reported_hardware_id
+from app.session_requester_tracker import SessionRequesterTracker
 from app.swarm_dashboard import SwarmDashboard
 
 logger = setup_logging()
@@ -178,6 +184,9 @@ requester_identity_resolver = RequesterIdentityResolver(
     max_pending_validations=REQUEST_USAGE_MAX_PENDING_VALIDATIONS,
     validation_concurrency=REQUEST_USAGE_VALIDATION_CONCURRENCY,
 )
+session_requester_tracker = SessionRequesterTracker(
+    retention_s=SESSION_PENDING_TIMEOUT_S + max(2 * SESSION_REAP_INTERVAL_S, 30.0),
+)
 
 
 async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
@@ -234,12 +243,16 @@ def _log_session_allocation_outcome(
         "requester_kind": requester.kind if requester is not None else None,
         "requester_verification": requester.verification if requester is not None else None,
         "requester_network_id": requester.network_id if requester is not None else None,
+        "requester_reported_robot_id": (
+            requester.reported_robot_id if requester is not None else None
+        ),
         "requester_client_kind": requester.client_kind if requester is not None else None,
     }
     message = (
         "Session allocation outcome outcome=%s session_id=%s endpoint_name=%s "
         "slot_id=%s allocation_wait_ms=%s allocation_total_ms=%d "
-        "waited_for_capacity=%s requester_id=%s requester_kind=%s client_kind=%s"
+        "waited_for_capacity=%s requester_id=%s requester_kind=%s "
+        "reported_robot_id=%s client_kind=%s"
     )
     args: list[object] = [
         outcome,
@@ -251,6 +264,7 @@ def _log_session_allocation_outcome(
         waited_for_capacity,
         requester.actor_id if requester is not None else None,
         requester.kind if requester is not None else None,
+        requester.reported_robot_id if requester is not None else None,
         requester.client_kind if requester is not None else None,
     ]
     if error is not None:
@@ -319,6 +333,8 @@ async def health():
     if not healthy:
         raise HTTPException(status_code=503, detail=detail or "endpoint router is not ready")
 
+    requester_tracking = requester_identity_resolver.status()
+    requester_tracking["pending_session_attributions"] = session_requester_tracker.count()
     return JSONResponse(
         {
             "status": "ok",
@@ -326,7 +342,7 @@ async def health():
             "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
             "dashboard_preview_mode": DASHBOARD_PREVIEW_MODE,
             "dashboard_history": dashboard.persistence_status(),
-            "requester_tracking": requester_identity_resolver.status(),
+            "requester_tracking": requester_tracking,
             "sessions": snapshot,
         }
     )
@@ -334,7 +350,8 @@ async def health():
 
 @app.post("/session")
 async def create_session(request: Request):
-    requester = requester_identity_resolver.identify(request)
+    hardware_id = await reported_hardware_id(request)
+    requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
     await dashboard.record_session_request(requester)
     requester = await _refresh_requester_identity(requester)
     allocation_started_at = monotonic()
@@ -378,6 +395,9 @@ async def create_session(request: Request):
         raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
 
     requester = await _refresh_requester_identity(requester)
+    session_id = str(allocation.get("session_id") or "")
+    if session_id:
+        session_requester_tracker.remember(session_id, requester)
     await dashboard.record_session_allocation_success(requester)
     _log_session_allocation_outcome(
         "success",
@@ -403,6 +423,7 @@ async def session_event(session_id: str, payload: dict[str, Any]):
         result = await session_manager.handle_event(session_id, session_token, event)
     except KeyError:
         if event == "disconnected":
+            session_requester_tracker.discard(session_id)
             return JSONResponse({"status": "ok", "session_id": session_id, "state": "already_released"})
         raise HTTPException(status_code=404, detail="Unknown session id") from None
     except ValueError as exc:
@@ -413,6 +434,13 @@ async def session_event(session_id: str, payload: dict[str, Any]):
         conversation_duration_s=result.get("conversation_duration_s"),
         conversation_counted=bool(result.get("conversation_counted")),
     )
+    if event == "connected":
+        requester = session_requester_tracker.take(session_id)
+        if requester is not None:
+            requester = await _refresh_requester_identity(requester)
+            await dashboard.record_requester_session_connected(requester)
+    elif event == "disconnected":
+        session_requester_tracker.discard(session_id)
     return JSONResponse(result)
 
 

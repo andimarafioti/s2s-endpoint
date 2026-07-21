@@ -281,6 +281,9 @@ class SwarmDashboard:
     async def record_session_request_abandoned(self, requester: RequesterIdentity | None = None) -> None:
         await self.requesters.record("abandoned", requester)
 
+    async def record_requester_session_connected(self, requester: RequesterIdentity) -> None:
+        await self.requesters.record("connected", requester)
+
     async def update_requester_identity(self, requester: RequesterIdentity) -> None:
         await self.requesters.update_identity(requester)
 

@@ -2,7 +2,12 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
-from app.requester_identity import RequesterIdentityResolver, bearer_token, client_address
+from app.requester_identity import (
+    RequesterIdentityResolver,
+    bearer_token,
+    client_address,
+    normalize_hardware_id,
+)
 
 
 class FakeRequest:
@@ -18,6 +23,20 @@ class FakeHubError(RuntimeError):
 
 
 class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reported_hardware_id_is_normalized_and_fingerprinted(self):
+        resolver = RequesterIdentityResolver(hash_secret="stable-secret", whoami_fn=lambda token: {})
+
+        uppercase = resolver.identify(FakeRequest(), hardware_id="ABCDEF0123456789")
+        lowercase = resolver.identify(FakeRequest(), hardware_id="abcdef0123456789")
+        malformed = resolver.identify(FakeRequest(), hardware_id="not-a-hardware-id")
+
+        self.assertEqual(uppercase.reported_robot_id, lowercase.reported_robot_id)
+        self.assertTrue(str(uppercase.reported_robot_id).startswith("robot:"))
+        self.assertNotIn("abcdef0123456789", str(uppercase.history_metadata()))
+        self.assertIsNone(malformed.reported_robot_id)
+
+        await resolver.stop()
+
     async def test_anonymous_requests_are_grouped_by_hashed_forwarded_ip(self):
         resolver = RequesterIdentityResolver(hash_secret="stable-secret", whoami_fn=lambda token: {})
         first = resolver.identify(
@@ -183,6 +202,12 @@ class BearerTokenTests(unittest.TestCase):
         self.assertIsNone(bearer_token(None))
         self.assertIsNone(bearer_token("Basic value"))
         self.assertIsNone(bearer_token("Bearer   "))
+
+    def test_normalizes_only_reachy_hardware_id_format(self):
+        self.assertEqual(normalize_hardware_id(" ABCDEF0123456789 "), "abcdef0123456789")
+        self.assertIsNone(normalize_hardware_id("abcdef012345678"))
+        self.assertIsNone(normalize_hardware_id("abcdef012345678z"))
+        self.assertIsNone(normalize_hardware_id(123))
 
 
 if __name__ == "__main__":

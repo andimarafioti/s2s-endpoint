@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+import re
 import secrets
 import time
 from collections import OrderedDict
@@ -15,6 +16,7 @@ from typing import Awaitable, Callable, Optional
 logger = logging.getLogger("s2s-endpoint")
 IdentityUpdateHandler = Callable[["RequesterIdentity"], Awaitable[None]]
 WhoAmIFunction = Callable[[str], dict[str, object]]
+REACHY_HARDWARE_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
 @dataclass(frozen=True)
@@ -26,10 +28,22 @@ class RequesterIdentity:
     fingerprint: str
     account_name: Optional[str] = None
     network_id: Optional[str] = None
+    reported_robot_id: Optional[str] = None
     client_kind: str = "unknown"
 
-    def with_request_context(self, *, network_id: Optional[str], client_kind: str) -> "RequesterIdentity":
-        return replace(self, network_id=network_id, client_kind=client_kind)
+    def with_request_context(
+        self,
+        *,
+        network_id: Optional[str],
+        reported_robot_id: Optional[str],
+        client_kind: str,
+    ) -> "RequesterIdentity":
+        return replace(
+            self,
+            network_id=network_id,
+            reported_robot_id=reported_robot_id,
+            client_kind=client_kind,
+        )
 
     def history_metadata(self) -> dict[str, object]:
         return {
@@ -39,6 +53,7 @@ class RequesterIdentity:
             "fingerprint": self.fingerprint,
             "account_name": self.account_name,
             "network_id": self.network_id,
+            "reported_robot_id": self.reported_robot_id,
             "client_kind": self.client_kind,
         }
 
@@ -97,8 +112,14 @@ class RequesterIdentityResolver:
     def set_identity_update_handler(self, handler: IdentityUpdateHandler) -> None:
         self._on_identity_update = handler
 
-    def identify(self, request: object) -> RequesterIdentity:
+    def identify(
+        self,
+        request: object,
+        *,
+        hardware_id: object = None,
+    ) -> RequesterIdentity:
         network_id = self._network_id(request)
+        reported_robot_id = self._reported_robot_id(hardware_id)
         client_kind = _client_kind(_header(request, "user-agent"))
         token = bearer_token(_header(request, "authorization"))
 
@@ -115,13 +136,21 @@ class RequesterIdentityResolver:
                 verification="not_provided",
                 fingerprint=fingerprint,
             )
-            return identity.with_request_context(network_id=network_id, client_kind=client_kind)
+            return identity.with_request_context(
+                network_id=network_id,
+                reported_robot_id=reported_robot_id,
+                client_kind=client_kind,
+            )
 
         fingerprint = self._fingerprint("token", token)
         actor_id = f"token:{fingerprint}"
         cached = self._cached_identity(actor_id)
         if cached is not None:
-            return cached.with_request_context(network_id=network_id, client_kind=client_kind)
+            return cached.with_request_context(
+                network_id=network_id,
+                reported_robot_id=reported_robot_id,
+                client_kind=client_kind,
+            )
 
         identity = RequesterIdentity(
             actor_id=actor_id,
@@ -132,7 +161,11 @@ class RequesterIdentityResolver:
         )
         if _looks_like_hf_token(token) and not self._schedule_validation(token, identity):
             identity = replace(identity, verification="unavailable")
-        return identity.with_request_context(network_id=network_id, client_kind=client_kind)
+        return identity.with_request_context(
+            network_id=network_id,
+            reported_robot_id=reported_robot_id,
+            client_kind=client_kind,
+        )
 
     def latest_identity(self, identity: RequesterIdentity) -> RequesterIdentity:
         cached = self._cached_identity(identity.actor_id)
@@ -140,6 +173,7 @@ class RequesterIdentityResolver:
             return identity
         return cached.with_request_context(
             network_id=identity.network_id,
+            reported_robot_id=identity.reported_robot_id,
             client_kind=identity.client_kind,
         )
 
@@ -164,6 +198,12 @@ class RequesterIdentityResolver:
         if not address:
             return None
         return f"net:{self._fingerprint('network', address)}"
+
+    def _reported_robot_id(self, hardware_id: object) -> Optional[str]:
+        normalized = normalize_hardware_id(hardware_id)
+        if normalized is None:
+            return None
+        return f"robot:{self._fingerprint('robot', normalized)}"
 
     def _fingerprint(self, namespace: str, value: str) -> str:
         digest = hmac.new(
@@ -266,6 +306,15 @@ def bearer_token(authorization: str | None) -> str | None:
         return None
     token = token.strip()
     return token or None
+
+
+def normalize_hardware_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if REACHY_HARDWARE_ID_PATTERN.fullmatch(normalized) is None:
+        return None
+    return normalized
 
 
 def client_address(request: object, *, trust_proxy_headers: bool) -> Optional[str]:
