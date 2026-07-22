@@ -110,6 +110,37 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_reachy_authorization_header_is_used_for_hf_identity(self):
+        calls = []
+        updated = asyncio.Event()
+
+        def whoami(token):
+            calls.append(token)
+            return {"name": "reachy-user"}
+
+        async def on_update(_identity):
+            updated.set()
+
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=whoami,
+            on_identity_update=on_update,
+        )
+        raw_token = "hf_a_reachy_header_token"
+        request = FakeRequest(
+            headers={"x-reachy-mini-authorization": f"Bearer {raw_token}"}
+        )
+
+        pending = resolver.identify(request)
+        await asyncio.wait_for(updated.wait(), timeout=1)
+        resolved = resolver.latest_identity(pending)
+
+        self.assertEqual(calls, [raw_token])
+        self.assertEqual(resolved.kind, "authenticated")
+        self.assertEqual(resolved.account_name, "reachy-user")
+
+        await resolver.stop()
+
     async def test_invalid_token_is_classified_but_request_remains_identifiable(self):
         updated = asyncio.Event()
         updates = []
