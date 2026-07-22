@@ -104,7 +104,16 @@ This removes the LB from the websocket data path. The LB only handles control-pl
 
 ### When every slot is busy: the waiting queue
 
-`POST /session` never blocks. If a slot is free (and no one is already waiting) it
+The queue is **off by default**. Set `SESSION_QUEUE_ENABLED=true` on a load-balancer
+instance to turn it on; leave it unset and `POST /session` keeps the pre-queue
+contract — the request blocks until a slot frees (up to
+`COMPUTE_ENDPOINT_WAIT_TIMEOUT_S`, then `503`), `/queue/*` returns `404`, and the
+only response-shape difference from the old behavior is the added
+`"state": "granted"` field. Enable it only once the instance's clients understand
+`"state": "queued"` responses and poll `GET /queue/{id}` — a pre-queue client on a
+queueing instance would get a `200` without a `connect_url` and fail.
+
+With the queue enabled, `POST /session` never blocks. If a slot is free (and no one is already waiting) it
 returns a grant as above, marked `"state": "granted"`. Otherwise the caller joins a
 FIFO waiting queue and gets a **ticket** instead:
 
@@ -125,7 +134,7 @@ the client's teardown beacon). Waiting reserves no compute and, on the demo Spac
 usage time — only a live connected session counts. If the queue itself is full the
 `POST /session` returns `503` with `{ "state": "at_capacity" }`.
 
-Tunable via env: `QUEUE_MAX_DEPTH` (default 100), `QUEUE_TICKET_TTL_S` (8),
+Tunable via env: `SESSION_QUEUE_ENABLED` (default false), `QUEUE_MAX_DEPTH` (default 100), `QUEUE_TICKET_TTL_S` (8),
 `QUEUE_POLL_INTERVAL_S` (2), `QUEUE_REAP_INTERVAL_S` (2). Setting `QUEUE_MAX_DEPTH=0`
 disables the waiting room: any caller who can't be granted a slot immediately gets
 `at_capacity` instead of a ticket. The queue is never unbounded.

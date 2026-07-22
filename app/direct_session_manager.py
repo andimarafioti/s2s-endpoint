@@ -54,6 +54,10 @@ class DirectSessionManager:
         session_token_ttl_s: float = 86400.0,
         reap_interval_s: float = 5.0,
         allocate_timeout_s: float = 900.0,
+        # No default on purpose: every construction site must consciously pick a
+        # /session contract — queueless blocking (as before the queue existed) or
+        # ticket-and-poll. The env default in load_balancer_main is off.
+        queue_enabled: bool,
         queue_max_depth: int = 100,
         queue_ticket_ttl_s: float = 8.0,
         queue_poll_interval_s: float = 2.0,
@@ -71,6 +75,7 @@ class DirectSessionManager:
         self.session_token_ttl_s = session_token_ttl_s
         self.reap_interval_s = reap_interval_s
         self.allocate_timeout_s = allocate_timeout_s
+        self.queue_enabled = queue_enabled
         self.queue_max_depth = queue_max_depth
         self.queue_ticket_ttl_s = queue_ticket_ttl_s
         self.queue_poll_interval_s = queue_poll_interval_s
@@ -90,7 +95,8 @@ class DirectSessionManager:
     async def start(self) -> None:
         await self.endpoint_router.start()
         self._reaper_task = asyncio.create_task(self._reap_loop())
-        self._ticket_reaper_task = asyncio.create_task(self._ticket_reap_loop())
+        if self.queue_enabled:
+            self._ticket_reaper_task = asyncio.create_task(self._ticket_reap_loop())
 
     async def stop(self) -> None:
         for task_attr in ("_reaper_task", "_ticket_reaper_task"):
@@ -114,8 +120,23 @@ class DirectSessionManager:
     async def allocate(self, lb_base_url: str) -> dict[str, object]:
         """Grant a session if a slot is free *and* nobody is waiting; otherwise
         mint a queue ticket. Never blocks — the waiting lives in the queue, polled
-        via ``poll``. Raises ``QueueAtCapacityError`` when the queue itself is full."""
+        via ``poll``. Raises ``QueueAtCapacityError`` when the queue itself is full.
+
+        With the queue disabled this is the pre-queue contract instead: block until
+        a slot frees (up to ``allocate_timeout_s``, then
+        ``EndpointCapacityTimeoutError``) and never return a ticket."""
         started_at = monotonic()
+        if not self.queue_enabled:
+            lease = await self.endpoint_router.acquire(timeout_s=self.allocate_timeout_s)
+            granted_at = monotonic()
+            return await self._grant_from_lease(
+                lease,
+                lb_base_url,
+                allocated_at=granted_at,
+                allocation_wait_ms=elapsed_ms(started_at, granted_at),
+                waited_for_capacity=lease.waited_for_capacity,
+            )
+
         lease: Optional[EndpointLease] = None
         # The empty-line check and the slot grab must be one atomic step, or two
         # concurrent callers could both see an empty queue and both fast-path into

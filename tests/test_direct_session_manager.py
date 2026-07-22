@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from app.direct_session_manager import DirectSessionManager, QueueAtCapacityError
-from app.endpoint_pool_router import EndpointLease
+from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointLease
 from app.session_tokens import verify_session_token, websocket_host_matches
 from tests.helpers import monotonic_sequence
 
@@ -112,6 +112,7 @@ class SessionQueueTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=60,
             session_token_ttl_s=3600,
             reap_interval_s=3600,
@@ -254,6 +255,85 @@ class SessionQueueTests(unittest.IsolatedAsyncioTestCase):
             await manager.poll(ticket["queue_id"], "https://lb.example")
 
 
+class BlockingCapacityRouter(FakeLeaseRouter):
+    """Fake for queueless mode: ``acquire`` blocks until capacity is signalled,
+    honouring its timeout — the pre-queue router contract."""
+
+    def __init__(self):
+        super().__init__()
+        self.capacity_freed = asyncio.Event()
+
+    async def acquire(self, timeout_s: float = 900.0) -> EndpointLease:
+        try:
+            await asyncio.wait_for(self.capacity_freed.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            raise EndpointCapacityTimeoutError("no capacity") from None
+        return await super().acquire()
+
+
+class SessionQueueDisabledTests(unittest.IsolatedAsyncioTestCase):
+    """With the queue disabled, the manager must honour the pre-queue /session
+    contract: block for a slot, grant the pre-queue payload, never mint tickets."""
+
+    async def asyncTearDown(self):
+        manager = getattr(self, "manager", None)
+        if manager is not None:
+            await manager.stop()
+
+    def _make(self, router, **kwargs):
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            queue_enabled=False,
+            pending_timeout_s=60,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+            **kwargs,
+        )
+        return self.manager
+
+    async def test_allocate_grants_immediately_when_capacity_free(self):
+        manager = self._make(FakeLeaseRouter())
+        await manager.start()
+
+        allocation = await manager.allocate("https://lb.example")
+
+        # The one intentional delta from the pre-queue payload: a constant
+        # "granted" marker. Never "queued" — no tickets in this mode.
+        self.assertEqual(allocation["state"], "granted")
+        self.assertEqual(allocation["endpoint_name"], "endpoint-1")
+        self.assertFalse(allocation["waited_for_capacity"])
+
+    async def test_allocate_blocks_until_a_slot_frees(self):
+        router = BlockingCapacityRouter()
+        router.waited_for_capacity = True
+        manager = self._make(router)
+        await manager.start()
+
+        task = asyncio.create_task(manager.allocate("https://lb.example"))
+        await asyncio.sleep(0.05)
+        self.assertFalse(task.done())  # holding the request open, not ticketing
+
+        router.capacity_freed.set()
+        allocation = await task
+
+        self.assertEqual(allocation["state"], "granted")
+        self.assertTrue(allocation["waited_for_capacity"])
+
+    async def test_allocate_times_out_like_pre_queue(self):
+        manager = self._make(BlockingCapacityRouter(), allocate_timeout_s=0.05)
+        await manager.start()
+
+        with self.assertRaises(EndpointCapacityTimeoutError):
+            await manager.allocate("https://lb.example")
+
+    async def test_ticket_reaper_not_started(self):
+        manager = self._make(FakeLeaseRouter())
+        await manager.start()
+
+        self.assertIsNone(manager._ticket_reaper_task)
+
+
 class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         manager = getattr(self, "manager", None)
@@ -265,6 +345,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=60,
             session_token_ttl_s=3600,
             reap_interval_s=60,
@@ -320,6 +401,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=60,
             session_token_ttl_s=3600,
             reap_interval_s=60,
@@ -351,6 +433,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=0.01,
             session_token_ttl_s=3600,
             reap_interval_s=0.01,
@@ -373,6 +456,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=60,
             session_token_ttl_s=3600,
             reap_interval_s=60,
@@ -394,6 +478,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=3600,
             session_token_ttl_s=3600,
             reap_interval_s=3600,
@@ -418,6 +503,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=3600,
             session_token_ttl_s=3600,
             reap_interval_s=3600,
@@ -446,6 +532,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=3600,
             session_token_ttl_s=3600,
             reap_interval_s=3600,
@@ -461,6 +548,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=3600,
             session_token_ttl_s=3600,
             reap_interval_s=3600,
@@ -486,6 +574,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=3600,
             session_token_ttl_s=3600,
             reap_interval_s=3600,
@@ -526,6 +615,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=3600,
             session_token_ttl_s=3600,
             reap_interval_s=3600,
@@ -563,6 +653,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = DirectSessionManager(
             endpoint_router=router,
             session_shared_secret="shared-secret",
+            queue_enabled=True,
             pending_timeout_s=3600,
             session_token_ttl_s=3600,
             reap_interval_s=3600,

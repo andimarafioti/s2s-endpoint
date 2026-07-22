@@ -66,6 +66,14 @@ SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
 # Waiting queue: when every slot is busy a caller gets a ticket and polls
 # GET /queue/{id} until the head of the line claims a freed slot. Waiting never
 # reserves compute or usage time; an un-polled ticket is reaped after its TTL.
+#
+# The queue ships dark: with SESSION_QUEUE_ENABLED unset, /session behaves
+# exactly as before the queue existed — the request blocks until a slot frees
+# (up to COMPUTE_ENDPOINT_WAIT_TIMEOUT_S) and /queue/* returns 404. Set
+# SESSION_QUEUE_ENABLED=true on an instance only once its clients understand
+# {"state": "queued"} responses and poll GET /queue/{id}; a pre-queue client
+# on a queueing instance would receive a 200 without a connect_url and fail.
+SESSION_QUEUE_ENABLED = os.getenv("SESSION_QUEUE_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
 QUEUE_MAX_DEPTH = int(os.getenv("QUEUE_MAX_DEPTH", "100"))
 QUEUE_TICKET_TTL_S = float(os.getenv("QUEUE_TICKET_TTL_S", "8"))
 QUEUE_POLL_INTERVAL_S = float(os.getenv("QUEUE_POLL_INTERVAL_S", "2"))
@@ -155,6 +163,7 @@ else:
         pending_timeout_s=SESSION_PENDING_TIMEOUT_S,
         session_token_ttl_s=SESSION_TOKEN_TTL_S,
         reap_interval_s=SESSION_REAP_INTERVAL_S,
+        queue_enabled=SESSION_QUEUE_ENABLED,
         queue_max_depth=QUEUE_MAX_DEPTH,
         queue_ticket_ttl_s=QUEUE_TICKET_TTL_S,
         queue_poll_interval_s=QUEUE_POLL_INTERVAL_S,
@@ -213,6 +222,10 @@ class LoadBalancerRuntime:
         # Dashboard preview mode uses a synthetic manager with no real sessions.
         if hasattr(session_manager, "set_abnormal_disconnect_handler"):
             session_manager.set_abnormal_disconnect_handler(record_abnormal_session_disconnect)
+        logger.info(
+            "Session queue %s",
+            "enabled" if getattr(session_manager, "queue_enabled", False) else "disabled",
+        )
         await session_manager.start()
         await dashboard.start()
 
@@ -410,8 +423,10 @@ async def create_session(request: Request):
 @app.get("/queue/{queue_id}")
 async def queue_status(queue_id: str, request: Request):
     """Advance a waiting ticket: report position, or — for the head of the line —
-    hand back a session grant once a slot frees. 404 for an unknown/expired ticket."""
-    if not hasattr(session_manager, "poll"):
+    hand back a session grant once a slot frees. 404 for an unknown/expired ticket.
+    404 for everything when the queue is disabled — indistinguishable from main,
+    where these routes don't exist."""
+    if not getattr(session_manager, "queue_enabled", False):
         raise HTTPException(status_code=404, detail="Not found.")
 
     poll_started_at = monotonic()
@@ -432,7 +447,7 @@ async def queue_status(queue_id: str, request: Request):
 @app.delete("/queue/{queue_id}")
 async def queue_leave(queue_id: str):
     """Leave the queue early (explicit button / teardown beacon). Idempotent."""
-    if not hasattr(session_manager, "leave"):
+    if not getattr(session_manager, "queue_enabled", False):
         raise HTTPException(status_code=404, detail="Not found.")
     left = await session_manager.leave(queue_id)
     return JSONResponse({"status": "ok", "state": "left", "removed": left})
