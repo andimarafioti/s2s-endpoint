@@ -141,6 +141,17 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_reachy_conversation_app_user_agent_is_classified(self):
+        resolver = RequesterIdentityResolver(hash_secret="stable-secret")
+
+        identity = resolver.identify(
+            FakeRequest(headers={"user-agent": "reachy-mini-conversation-app"})
+        )
+
+        self.assertEqual(identity.client_kind, "reachy-mini")
+
+        await resolver.stop()
+
     async def test_invalid_token_is_classified_but_request_remains_identifiable(self):
         updated = asyncio.Event()
         updates = []
@@ -168,7 +179,33 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
-    async def test_non_hf_bearer_value_is_not_sent_to_whoami(self):
+    async def test_oauth_token_without_hf_prefix_is_sent_to_whoami(self):
+        calls = []
+        updated = asyncio.Event()
+
+        async def on_update(_identity):
+            updated.set()
+
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=lambda token: calls.append(token) or {"name": "reachy-user"},
+            on_identity_update=on_update,
+        )
+        raw_token = "oauth-token-without-hf-prefix"
+
+        pending = resolver.identify(
+            FakeRequest(headers={"authorization": f"Bearer {raw_token}"})
+        )
+        await asyncio.wait_for(updated.wait(), timeout=1)
+        resolved = resolver.latest_identity(pending)
+
+        self.assertEqual(calls, [raw_token])
+        self.assertEqual(resolved.kind, "authenticated")
+        self.assertEqual(resolved.verification, "verified")
+
+        await resolver.stop()
+
+    async def test_oversized_bearer_value_is_not_sent_to_whoami(self):
         calls = []
         resolver = RequesterIdentityResolver(
             hash_secret="stable-secret",
@@ -176,7 +213,7 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
         )
 
         identity = resolver.identify(
-            FakeRequest(headers={"authorization": "Bearer not-an-hf-token"})
+            FakeRequest(headers={"authorization": f"Bearer {'x' * 4097}"})
         )
         await asyncio.sleep(0)
 
