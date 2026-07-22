@@ -1,5 +1,6 @@
 import logging
 import os
+import secrets
 from time import monotonic
 from typing import Any
 
@@ -12,10 +13,19 @@ from app.dashboard_preview import DashboardPreviewSessionManager
 from app.direct_session_manager import DirectSessionManager, QueueAtCapacityError
 from app.endpoint_pool_router import (
     EndpointCapacityTimeoutError,
+    EndpointDrainLeaseConflictError,
     EndpointPoolRouter,
+    EndpointTransitionConflictError,
     HuggingFaceEndpointController,
     fetch_compute_active_sessions,
 )
+from app.requester_identity import (
+    RequesterIdentity,
+    RequesterIdentityResolver,
+    bearer_token,
+)
+from app.session_request_metadata import reported_hardware_id
+from app.session_requester_tracker import SessionRequesterTracker
 from app.swarm_dashboard import SwarmDashboard
 
 logger = setup_logging()
@@ -43,7 +53,11 @@ COMPUTE_ENDPOINT_RESTART_BACKOFF_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_B
 COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S", "300"))
 COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S", "120"))
 COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S", "600"))
+COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S", "3600"))
+COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S", "600"))
+COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S", "300"))
 HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TOKEN", "").strip() or None
+LB_ADMIN_AUTH_TOKEN = os.getenv("LB_ADMIN_AUTH_TOKEN", "").strip() or None
 
 SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
 SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
@@ -56,8 +70,28 @@ QUEUE_MAX_DEPTH = int(os.getenv("QUEUE_MAX_DEPTH", "100"))
 QUEUE_TICKET_TTL_S = float(os.getenv("QUEUE_TICKET_TTL_S", "8"))
 QUEUE_POLL_INTERVAL_S = float(os.getenv("QUEUE_POLL_INTERVAL_S", "2"))
 QUEUE_REAP_INTERVAL_S = float(os.getenv("QUEUE_REAP_INTERVAL_S", "2"))
+REQUEST_USAGE_HASH_SECRET = (
+    os.getenv("REQUEST_USAGE_HASH_SECRET", "").strip()
+    or SESSION_SHARED_SECRET
+    or None
+)
+REQUEST_USAGE_TRUST_PROXY_HEADERS = os.getenv(
+    "REQUEST_USAGE_TRUST_PROXY_HEADERS",
+    "true",
+).strip().lower() in {"true", "1", "yes"}
+REQUEST_USAGE_MAX_ACTORS_PER_MINUTE = int(os.getenv("REQUEST_USAGE_MAX_ACTORS_PER_MINUTE", "1000"))
+REQUEST_USAGE_MAX_RETAINED_RECORDS = int(os.getenv("REQUEST_USAGE_MAX_RETAINED_RECORDS", "50000"))
+REQUEST_USAGE_MAX_PENDING_VALIDATIONS = int(os.getenv("REQUEST_USAGE_MAX_PENDING_VALIDATIONS", "128"))
+REQUEST_USAGE_VALIDATION_CONCURRENCY = int(os.getenv("REQUEST_USAGE_VALIDATION_CONCURRENCY", "4"))
+REQUEST_USAGE_HIGH_REQUESTS = int(os.getenv("REQUEST_USAGE_HIGH_REQUESTS", "100"))
+REQUEST_USAGE_BURST_PER_MINUTE = int(os.getenv("REQUEST_USAGE_BURST_PER_MINUTE", "20"))
+REQUEST_USAGE_MANY_NETWORKS = int(os.getenv("REQUEST_USAGE_MANY_NETWORKS", "5"))
 DASHBOARD_SAMPLE_INTERVAL_S = float(os.getenv("DASHBOARD_SAMPLE_INTERVAL_S", "15"))
 DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(28 * 24 * 60)))
+DASHBOARD_FLUSH_BATCH_SIZE = int(os.getenv("DASHBOARD_FLUSH_BATCH_SIZE", "100"))
+DASHBOARD_FLUSH_TIMEOUT_S = float(os.getenv("DASHBOARD_FLUSH_TIMEOUT_S", "60"))
+DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S = float(os.getenv("DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S", "300"))
+DASHBOARD_STARTUP_MERGE_DELAY_S = float(os.getenv("DASHBOARD_STARTUP_MERGE_DELAY_S", "60"))
 DASHBOARD_BUCKET_ID = os.getenv("DASHBOARD_BUCKET_ID", "").strip() or None
 DASHBOARD_BUCKET_PREFIX = os.getenv("DASHBOARD_BUCKET_PREFIX", "s2s-endpoint/swarm-dashboard").strip()
 DASHBOARD_BUCKET_TOKEN = os.getenv("DASHBOARD_BUCKET_TOKEN", "").strip() or HF_CONTROL_TOKEN
@@ -99,7 +133,16 @@ def build_endpoint_router() -> EndpointPoolRouter:
         restart_backoff_max_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S,
         restart_stable_running_s=COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S,
         drain_restart_timeout_s=COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S,
+        drain_lease_ttl_s=COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S,
+        drain_warning_after_s=COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S,
+        drain_warning_interval_s=COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S,
         compute_usage_fetcher=fetch_compute_active_sessions,
+        # How long a previously observed usage count stays trusted when
+        # health polls fail transiently. Must be comfortably above the
+        # reconcile interval (10s): the default 60s means roughly six
+        # consecutive failed polls before a synced node loses capacity.
+        # Setting it below the reconcile interval revokes on a single blip.
+        usage_sync_stale_ttl_s=float(os.getenv("COMPUTE_USAGE_STALE_TTL_S", "60")),
     )
 
 
@@ -124,6 +167,7 @@ if DASHBOARD_BUCKET_ID:
         bucket_id=DASHBOARD_BUCKET_ID,
         prefix=DASHBOARD_BUCKET_PREFIX,
         token=DASHBOARD_BUCKET_TOKEN,
+        request_timeout_s=DASHBOARD_FLUSH_TIMEOUT_S,
     )
     if DASHBOARD_PREVIEW_MODE:
         dashboard_history_store = ReadOnlyDashboardHistoryStore(dashboard_history_store)
@@ -134,15 +178,46 @@ dashboard = SwarmDashboard(
     retention_minutes=DASHBOARD_RETENTION_MINUTES,
     history_store=dashboard_history_store,
     restore_history_in_background=True,
+    flush_batch_size=DASHBOARD_FLUSH_BATCH_SIZE,
+    flush_timeout_s=DASHBOARD_FLUSH_TIMEOUT_S,
+    dirty_bucket_warning_age_s=DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S,
+    startup_merge_delay_s=DASHBOARD_STARTUP_MERGE_DELAY_S,
+    max_requesters_per_bucket=REQUEST_USAGE_MAX_ACTORS_PER_MINUTE,
+    max_requester_records=REQUEST_USAGE_MAX_RETAINED_RECORDS,
+    requester_high_volume_threshold=REQUEST_USAGE_HIGH_REQUESTS,
+    requester_burst_threshold_per_minute=REQUEST_USAGE_BURST_PER_MINUTE,
+    requester_many_networks_threshold=REQUEST_USAGE_MANY_NETWORKS,
 )
+requester_identity_resolver = RequesterIdentityResolver(
+    hash_secret=REQUEST_USAGE_HASH_SECRET,
+    on_identity_update=dashboard.update_requester_identity,
+    trust_proxy_headers=REQUEST_USAGE_TRUST_PROXY_HEADERS,
+    max_pending_validations=REQUEST_USAGE_MAX_PENDING_VALIDATIONS,
+    validation_concurrency=REQUEST_USAGE_VALIDATION_CONCURRENCY,
+)
+session_requester_tracker = SessionRequesterTracker(
+    retention_s=SESSION_PENDING_TIMEOUT_S + max(2 * SESSION_REAP_INTERVAL_S, 30.0),
+)
+
+
+async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
+    await dashboard.record_session_event(
+        "disconnected",
+        conversation_duration_s=result.get("conversation_duration_s"),
+        conversation_counted=bool(result.get("conversation_counted")),
+    )
 
 
 class LoadBalancerRuntime:
     async def start(self) -> None:
+        # Dashboard preview mode uses a synthetic manager with no real sessions.
+        if hasattr(session_manager, "set_abnormal_disconnect_handler"):
+            session_manager.set_abnormal_disconnect_handler(record_abnormal_session_disconnect)
         await session_manager.start()
         await dashboard.start()
 
     async def stop(self) -> None:
+        await requester_identity_resolver.stop()
         await dashboard.stop()
         await session_manager.stop()
 
@@ -157,6 +232,7 @@ def _log_session_allocation_outcome(
     allocation_wait_ms: int | None,
     allocation_total_ms: int,
     level: int,
+    requester: RequesterIdentity | None = None,
     error: str | None = None,
 ) -> None:
     allocation = allocation or {}
@@ -174,11 +250,20 @@ def _log_session_allocation_outcome(
         "waited_for_capacity": waited_for_capacity,
         "allocation_error": error,
         "http_route": "POST /session",
+        "requester_id": requester.actor_id if requester is not None else None,
+        "requester_kind": requester.kind if requester is not None else None,
+        "requester_verification": requester.verification if requester is not None else None,
+        "requester_network_id": requester.network_id if requester is not None else None,
+        "requester_reported_robot_id": (
+            requester.reported_robot_id if requester is not None else None
+        ),
+        "requester_client_kind": requester.client_kind if requester is not None else None,
     }
     message = (
         "Session allocation outcome outcome=%s session_id=%s endpoint_name=%s "
         "slot_id=%s allocation_wait_ms=%s allocation_total_ms=%d "
-        "waited_for_capacity=%s"
+        "waited_for_capacity=%s requester_id=%s requester_kind=%s "
+        "reported_robot_id=%s client_kind=%s"
     )
     args: list[object] = [
         outcome,
@@ -188,6 +273,10 @@ def _log_session_allocation_outcome(
         allocation_wait_ms,
         allocation_total_ms,
         waited_for_capacity,
+        requester.actor_id if requester is not None else None,
+        requester.kind if requester is not None else None,
+        requester.reported_robot_id if requester is not None else None,
+        requester.client_kind if requester is not None else None,
     ]
     if error is not None:
         message += " error=%s"
@@ -215,6 +304,13 @@ def _public_session_allocation(allocation: dict[str, object]) -> dict[str, objec
         )
         if key in allocation
     }
+
+
+async def _refresh_requester_identity(requester: RequesterIdentity) -> RequesterIdentity:
+    latest = requester_identity_resolver.latest_identity(requester)
+    if latest != requester:
+        await dashboard.update_requester_identity(latest)
+    return latest
 
 
 @app.get("/")
@@ -248,12 +344,16 @@ async def health():
     if not healthy:
         raise HTTPException(status_code=503, detail=detail or "endpoint router is not ready")
 
+    requester_tracking = requester_identity_resolver.status()
+    requester_tracking["pending_session_attributions"] = session_requester_tracker.count()
     return JSONResponse(
         {
             "status": "ok",
             "role": APP_ROLE,
             "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
             "dashboard_preview_mode": DASHBOARD_PREVIEW_MODE,
+            "dashboard_history": dashboard.persistence_status(),
+            "requester_tracking": requester_tracking,
             "sessions": snapshot,
         }
     )
@@ -264,7 +364,10 @@ async def create_session(request: Request):
     """Grant a session if a slot is free and the line is empty, otherwise return a
     queue ticket the caller polls via GET /queue/{id}. 503 with {state:"at_capacity"}
     when the queue itself is full; 503 otherwise when the pool can't allocate."""
-    await dashboard.record_session_request()
+    hardware_id = await reported_hardware_id(request)
+    requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
+    await dashboard.record_session_request(requester)
+    requester = await _refresh_requester_identity(requester)
     allocation_started_at = monotonic()
     try:
         allocation = await session_manager.allocate(public_base_url(request))
@@ -278,9 +381,10 @@ async def create_session(request: Request):
             level=logging.WARNING,
             error=str(exc),
         )
-        await dashboard.record_session_allocation_failure()
+        await dashboard.record_session_allocation_failure(requester)
         return JSONResponse({"state": "at_capacity", "detail": str(exc)}, status_code=503)
     except Exception as exc:
+        requester = await _refresh_requester_identity(requester)
         allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
         waited_for_capacity = isinstance(exc, EndpointCapacityTimeoutError)
         failure_allocation = {"waited_for_capacity": waited_for_capacity}
@@ -290,16 +394,17 @@ async def create_session(request: Request):
             allocation_wait_ms=allocation_total_ms if waited_for_capacity else None,
             allocation_total_ms=allocation_total_ms,
             level=logging.WARNING,
+            requester=requester,
             error=str(exc),
         )
-        await dashboard.record_session_allocation_failure()
+        await dashboard.record_session_allocation_failure(requester)
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
 
     # No slot free (and/or others waiting): the caller joined the queue.
     if allocation.get("state") == "queued":
         return JSONResponse(allocation)
 
-    return await _deliver_grant(request, allocation, allocation_started_at)
+    return await _deliver_grant(request, allocation, allocation_started_at, requester)
 
 
 @app.get("/queue/{queue_id}")
@@ -319,7 +424,9 @@ async def queue_status(queue_id: str, request: Request):
         return JSONResponse(result)
 
     # Head of line claimed a slot — same delivery path as a fast-path grant.
-    return await _deliver_grant(request, result, poll_started_at)
+    hardware_id = await reported_hardware_id(request)
+    requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
+    return await _deliver_grant(request, result, poll_started_at, requester)
 
 
 @app.delete("/queue/{queue_id}")
@@ -332,7 +439,10 @@ async def queue_leave(queue_id: str):
 
 
 async def _deliver_grant(
-    request: Request, allocation: dict[str, object], started_at: float
+    request: Request,
+    allocation: dict[str, object],
+    started_at: float,
+    requester: RequesterIdentity,
 ) -> JSONResponse:
     """Shared tail for a granted session (fast path or queue claim): guard against a
     client that vanished, record the success, and return the public grant fields."""
@@ -341,6 +451,7 @@ async def _deliver_grant(
     allocation.setdefault("allocation_wait_ms", allocation_wait_ms)
 
     if await request.is_disconnected():
+        requester = await _refresh_requester_identity(requester)
         session_id = allocation.get("session_id")
         if session_id and hasattr(session_manager, "cancel_pending_session"):
             await session_manager.cancel_pending_session(session_id)
@@ -350,16 +461,23 @@ async def _deliver_grant(
             allocation_wait_ms=allocation_wait_ms,
             allocation_total_ms=allocation_total_ms,
             level=logging.WARNING,
+            requester=requester,
         )
+        await dashboard.record_session_request_abandoned(requester)
         raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
 
-    await dashboard.record_session_allocation_success()
+    requester = await _refresh_requester_identity(requester)
+    session_id = str(allocation.get("session_id") or "")
+    if session_id:
+        session_requester_tracker.remember(session_id, requester)
+    await dashboard.record_session_allocation_success(requester)
     _log_session_allocation_outcome(
         "success",
         allocation=allocation,
         allocation_wait_ms=allocation_wait_ms,
         allocation_total_ms=allocation_total_ms,
         level=logging.INFO,
+        requester=requester,
     )
     payload = _public_session_allocation(allocation)
     payload["state"] = "granted"
@@ -379,6 +497,7 @@ async def session_event(session_id: str, payload: dict[str, Any]):
         result = await session_manager.handle_event(session_id, session_token, event)
     except KeyError:
         if event == "disconnected":
+            session_requester_tracker.discard(session_id)
             return JSONResponse({"status": "ok", "session_id": session_id, "state": "already_released"})
         raise HTTPException(status_code=404, detail="Unknown session id") from None
     except ValueError as exc:
@@ -389,7 +508,122 @@ async def session_event(session_id: str, payload: dict[str, Any]):
         conversation_duration_s=result.get("conversation_duration_s"),
         conversation_counted=bool(result.get("conversation_counted")),
     )
+    if event == "connected":
+        requester = session_requester_tracker.take(session_id)
+        if requester is not None:
+            requester = await _refresh_requester_identity(requester)
+            await dashboard.record_requester_session_connected(requester)
+    elif event == "disconnected":
+        session_requester_tracker.discard(session_id)
     return JSONResponse(result)
+
+
+@app.get("/internal/endpoints/{endpoint_name}")
+async def endpoint_status(endpoint_name: str, request: Request):
+    require_admin_auth(request)
+
+    endpoint_snapshot = await get_endpoint_snapshot(endpoint_name)
+    return JSONResponse(
+        {
+            "status": "ok",
+            "endpoint_name": endpoint_name,
+            "endpoint": endpoint_snapshot,
+        }
+    )
+
+
+@app.post("/internal/endpoints/{endpoint_name}/drain")
+async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str, Any]):
+    require_admin_auth(request)
+
+    endpoint_router = getattr(session_manager, "endpoint_router", None)
+    if endpoint_router is None:
+        raise HTTPException(status_code=503, detail="Endpoint draining is not available")
+
+    endpoint_snapshot = await get_endpoint_snapshot(endpoint_name)
+    draining = payload.get("draining", True)
+    if type(draining) is not bool:
+        raise HTTPException(status_code=422, detail="draining must be a boolean")
+    lease_ttl_s = payload.get("lease_ttl_s")
+    if lease_ttl_s is not None and (
+        type(lease_ttl_s) not in (int, float) or lease_ttl_s <= 0
+    ):
+        raise HTTPException(status_code=422, detail="lease_ttl_s must be a positive number")
+    lease_id = payload.get("lease_id")
+    force = payload.get("force", False)
+    if type(force) is not bool:
+        raise HTTPException(status_code=422, detail="force must be a boolean")
+    if draining and force:
+        raise HTTPException(status_code=422, detail="force is only valid when clearing a drain")
+    if not force and (not isinstance(lease_id, str) or not lease_id.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail="lease_id is required unless force-clearing a drain",
+        )
+    try:
+        await endpoint_router.set_draining(
+            endpoint_name,
+            draining,
+            lease_ttl_s=float(lease_ttl_s) if lease_ttl_s is not None else None,
+            lease_id=lease_id.strip() if isinstance(lease_id, str) else None,
+            force=force,
+        )
+    except KeyError:
+        raise HTTPException(status_code=503, detail="Endpoint became unavailable") from None
+    except EndpointTransitionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except EndpointDrainLeaseConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    endpoint_snapshot = await get_endpoint_snapshot(endpoint_name)
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "endpoint_name": endpoint_name,
+            "draining": endpoint_snapshot.get("draining"),
+            "endpoint": endpoint_snapshot,
+        }
+    )
+
+
+async def get_endpoint_snapshot(endpoint_name: str) -> dict[str, object]:
+    endpoint_router = getattr(session_manager, "endpoint_router", None)
+    if endpoint_router is None:
+        raise HTTPException(status_code=503, detail="Endpoint status is not available")
+
+    _, _, snapshot = await session_manager.healthcheck()
+    router_snapshot = snapshot.get("router", {})
+    endpoints = router_snapshot.get("endpoints", []) if isinstance(router_snapshot, dict) else []
+    endpoint_snapshot = next(
+        (
+            endpoint
+            for endpoint in endpoints
+            if isinstance(endpoint, dict) and endpoint.get("name") == endpoint_name
+        ),
+        None,
+    )
+    if endpoint_snapshot is None:
+        raise HTTPException(status_code=404, detail="Unknown endpoint")
+    return endpoint_snapshot
+
+
+def require_admin_auth(request: Request) -> None:
+    if not LB_ADMIN_AUTH_TOKEN:
+        raise HTTPException(status_code=503, detail="LB admin auth token is not configured")
+
+    token = _bearer_token(request.headers.get("authorization"))
+    if token is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing admin bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not secrets.compare_digest(token, LB_ADMIN_AUTH_TOKEN):
+        raise HTTPException(status_code=403, detail="Invalid admin authorization")
+
+
+def _bearer_token(authorization: str | None) -> str | None:
+    return bearer_token(authorization)
 
 
 @app.websocket("/ws")

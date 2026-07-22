@@ -5,7 +5,7 @@ import secrets
 from collections import OrderedDict
 from dataclasses import dataclass
 from time import monotonic
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from app.app_utils import elapsed_ms
 from app.endpoint_pool_router import EndpointLease, EndpointPoolRouter
@@ -13,6 +13,7 @@ from app.session_tokens import attach_session_token, create_session_token, verif
 
 
 logger = logging.getLogger("s2s-endpoint")
+SessionReleaseHandler = Callable[[dict[str, object]], Awaitable[None]]
 
 
 class QueueAtCapacityError(RuntimeError):
@@ -81,6 +82,10 @@ class DirectSessionManager:
         self._queue: "OrderedDict[str, QueueTicket]" = OrderedDict()
         self._reaper_task: Optional[asyncio.Task] = None
         self._ticket_reaper_task: Optional[asyncio.Task] = None
+        self._abnormal_disconnect_handler: Optional[SessionReleaseHandler] = None
+
+    def set_abnormal_disconnect_handler(self, handler: Optional[SessionReleaseHandler]) -> None:
+        self._abnormal_disconnect_handler = handler
 
     async def start(self) -> None:
         await self.endpoint_router.start()
@@ -334,19 +339,7 @@ class DirectSessionManager:
             session_to_release.lease.slot_id,
             connected=session_to_release.connected,
         )
-        conversation_duration_s = 0.0
-        if session_to_release.connected_at_monotonic is not None:
-            conversation_duration_s = max(
-                monotonic() - session_to_release.connected_at_monotonic,
-                0.0,
-            )
-        return {
-            "status": "ok",
-            "session_id": session_id,
-            "state": "released",
-            "conversation_counted": session_to_release.connected_at_monotonic is not None,
-            "conversation_duration_s": conversation_duration_s,
-        }
+        return self._release_result(session_to_release, release_reason="client_disconnected")
 
     async def snapshot(self) -> dict[str, object]:
         async with self._lock:
@@ -460,12 +453,44 @@ class DirectSessionManager:
                     to_release.append(self._sessions.pop(session_id))
 
         for session in to_release:
+            # Keep slot cleanup independent from best-effort dashboard accounting.
             await self.endpoint_router.release(session.lease.slot_id, connected=session.connected)
+            result = self._release_result(session, release_reason="endpoint_unavailable")
             logger.info(
                 "Released session %s for downed endpoint %s (connected=%s)",
                 session.session_id,
                 endpoint_name,
                 session.connected,
+            )
+            if session.connected:
+                await self._record_abnormal_disconnect(result)
+
+    def _release_result(self, session: DirectSession, *, release_reason: str) -> dict[str, object]:
+        conversation_duration_s = 0.0
+        if session.connected_at_monotonic is not None:
+            conversation_duration_s = max(
+                monotonic() - session.connected_at_monotonic,
+                0.0,
+            )
+        return {
+            "status": "ok",
+            "session_id": session.session_id,
+            "state": "released",
+            "event": "disconnected",
+            "release_reason": release_reason,
+            "conversation_counted": session.connected_at_monotonic is not None,
+            "conversation_duration_s": conversation_duration_s,
+        }
+
+    async def _record_abnormal_disconnect(self, result: dict[str, object]) -> None:
+        if self._abnormal_disconnect_handler is None:
+            return
+        try:
+            await self._abnormal_disconnect_handler(result)
+        except Exception:
+            logger.exception(
+                "Failed to record abnormal disconnect for session %s",
+                result.get("session_id"),
             )
 
 
