@@ -74,6 +74,31 @@ class RequesterRateLimiterTests(unittest.TestCase):
         self.assertEqual(status["totals"]["allocation_failures"], 1)
         self.assertNotIn("no_connects", status["totals"])
 
+    def test_queued_abandonment_releases_in_flight_permit_without_failure(self):
+        decision = self.limiter.acquire(self.requester)
+        self.assertTrue(decision.allowed)
+
+        self.limiter.record_allocation_abandoned(self.requester)
+
+        status = self.limiter.status()
+        self.assertEqual(status["active_allocations"], 0)
+        self.assertEqual(status["totals"]["allocation_abandonments"], 1)
+        self.assertNotIn("allocation_failures", status["totals"])
+        self.assertNotIn("no_connects", status["totals"])
+
+    def test_zero_length_pending_timeout_is_tracked_as_immediately_expired(self):
+        decision = self.limiter.acquire(self.requester)
+        self.assertTrue(decision.allowed)
+        self.limiter.record_allocation(
+            "session-1",
+            self.requester,
+            pending_timeout_s=0,
+        )
+
+        self.limiter.status()
+
+        self.assertEqual(self.limiter.status()["totals"]["no_connects"], 1)
+
     def test_rejects_request_burst_and_recovers_when_window_moves(self):
         limiter = RequesterRateLimiter(
             config=RequesterRateLimitConfig(

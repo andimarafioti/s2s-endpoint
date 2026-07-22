@@ -25,6 +25,8 @@ REQUESTER_DASHBOARD_MARKUP = """
                 <th>Requests</th>
                 <th>Allocated</th>
                 <th>Connected</th>
+                <th>Duration</th>
+                <th>Limited</th>
                 <th>Traffic</th>
                 <th>Peak</th>
                 <th>Networks</th>
@@ -44,6 +46,7 @@ REQUESTER_DASHBOARD_MARKUP = """
 REQUESTER_DASHBOARD_KPI_CARDS = """
         kpiCard(`HF users / ${windowLabel}`, prettyNumber(summary.authenticated_users_window || 0), `Distinct verified Hugging Face accounts in the last ${windowLabel}`),
         kpiCard(`Connected requesters / ${windowLabel}`, prettyNumber(summary.connected_requesters_window || 0), `Distinct requesters whose allocated session reached the compute websocket`),
+        kpiCard(`Rate limited / ${windowLabel}`, prettyNumber(summary.session_rate_limited_window || 0), `POST /session requests rejected before compute allocation`),
         kpiCard(`Anonymous IPs / ${windowLabel}`, prettyNumber(summary.anonymous_ips_window || 0), `Distinct privacy-safe network fingerprints without tokens`),
         kpiCard(`Reported robots / ${windowLabel}`, prettyNumber(summary.reported_robots_window || 0), `Distinct privacy-safe robot fingerprints reported by clients; not verified hardware`),
         kpiCard(`Flagged / ${windowLabel}`, prettyNumber(summary.unusual_requesters_window || 0), `Requesters with volume, burst, network, token, or automation signals`),
@@ -94,6 +97,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
         `<span class="status-pill good">${htmlEscape(prettyNumber(summary.authenticated_users_window || 0))} HF users</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.tokens_window || 0))} tokens</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.allocated_requesters_window || 0))} allocated · ${htmlEscape(prettyNumber(summary.connected_requesters_window || 0))} connected</span>`,
+        `<span class="status-pill ${summary.session_rate_limited_window ? 'bad' : 'good'}">${htmlEscape(prettyNumber(summary.session_rate_limited_window || 0))} limited</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.anonymous_ips_window || 0))} anonymous IPs</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.reported_robots_window || 0))} reported robots</span>`,
         `<span class="status-pill ${summary.unusual_requesters_window ? 'bad' : 'good'}">${htmlEscape(prettyNumber(summary.unusual_requesters_window || 0))} flagged</span>`,
@@ -116,6 +120,8 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td><strong>${htmlEscape(prettyNumber(row.requests || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.requests_per_hour || 0))}/h</div></td>
             <td>${htmlEscape(prettyNumber(row.successes || 0))}<div class="muted">${htmlEscape(row.success_rate_pct || 0)}%</div></td>
             <td><strong>${htmlEscape(prettyNumber(row.connections || 0))}</strong><div class="muted">websocket joins</div></td>
+            <td><strong>${htmlEscape(formatDuration(row.avg_connected_duration_s || 0))} avg</strong><div class="muted">${htmlEscape(prettyNumber(row.short_sessions || 0))} short · ${htmlEscape(formatDuration(row.max_connected_duration_s || 0))} max</div></td>
+            <td><strong>${htmlEscape(prettyNumber(row.rate_limited || 0))}</strong><div class="muted">before allocation</div></td>
             <td>${htmlEscape(row.traffic_share_pct || 0)}%</td>
             <td>${htmlEscape(prettyNumber(row.peak_requests_per_minute || 0))}/min</td>
             <td>${htmlEscape(networks)}</td>
@@ -124,13 +130,13 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td class="requester-signals">${htmlEscape(signals)}</td>
           </tr>
         `;
-      }).join('') : '<tr><td colspan="11" class="muted">No attributed session requests in this window yet.</td></tr>';
+      }).join('') : '<tr><td colspan="13" class="muted">No attributed session requests in this window yet.</td></tr>';
 
       const unattributed = Number(requesters?.unattributed_requests || 0);
       const attributionDetail = unattributed
         ? `${prettyNumber(unattributed)} request(s) in the last ${windowLabel} predate attribution or could not be attributed.`
         : `All recorded session requests in the last ${windowLabel} have requester attribution.`;
-      document.getElementById('requester-detail').textContent = `${attributionDetail} Connected counts the first compute websocket callback for an allocated session. Allocated and Connected are independent event counts in the selected window, not a cohort conversion rate.`;
+      document.getElementById('requester-detail').textContent = `${attributionDetail} Connected counts the first compute websocket callback for an allocated session. Duration uses attributed completed sessions; system-forced disconnects are excluded from the short-session count. Allocated, Connected, and completed duration are independent events in the selected window, not a cohort conversion rate.`;
     }
 """
 

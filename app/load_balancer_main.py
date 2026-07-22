@@ -24,6 +24,11 @@ from app.requester_identity import (
     RequesterIdentityResolver,
     bearer_token,
 )
+from app.requester_rate_limiter import (
+    RateLimitDecision,
+    RequesterRateLimitConfig,
+    RequesterRateLimiter,
+)
 from app.session_request_metadata import reported_hardware_id
 from app.session_requester_tracker import SessionRequesterTracker
 from app.swarm_dashboard import SwarmDashboard
@@ -94,6 +99,25 @@ REQUEST_USAGE_VALIDATION_CONCURRENCY = int(os.getenv("REQUEST_USAGE_VALIDATION_C
 REQUEST_USAGE_HIGH_REQUESTS = int(os.getenv("REQUEST_USAGE_HIGH_REQUESTS", "100"))
 REQUEST_USAGE_BURST_PER_MINUTE = int(os.getenv("REQUEST_USAGE_BURST_PER_MINUTE", "20"))
 REQUEST_USAGE_MANY_NETWORKS = int(os.getenv("REQUEST_USAGE_MANY_NETWORKS", "5"))
+REQUEST_RATE_LIMIT_ENABLED = os.getenv(
+    "REQUEST_RATE_LIMIT_ENABLED",
+    "true",
+).strip().lower() in {"true", "1", "yes"}
+REQUEST_RATE_LIMIT_WINDOW_S = float(os.getenv("REQUEST_RATE_LIMIT_WINDOW_S", "60"))
+REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW = int(
+    os.getenv("REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW", "20")
+)
+REQUEST_RATE_LIMIT_MAX_PARALLEL = int(os.getenv("REQUEST_RATE_LIMIT_MAX_PARALLEL", "2"))
+REQUEST_RATE_LIMIT_NO_CONNECTS = int(os.getenv("REQUEST_RATE_LIMIT_NO_CONNECTS", "3"))
+REQUEST_RATE_LIMIT_SHORT_SESSION_S = float(
+    os.getenv("REQUEST_RATE_LIMIT_SHORT_SESSION_S", "10")
+)
+REQUEST_RATE_LIMIT_SHORT_SESSIONS = int(os.getenv("REQUEST_RATE_LIMIT_SHORT_SESSIONS", "8"))
+REQUEST_RATE_LIMIT_COOLDOWN_S = float(os.getenv("REQUEST_RATE_LIMIT_COOLDOWN_S", "900"))
+REQUEST_RATE_LIMIT_ACTOR_RETENTION_S = float(
+    os.getenv("REQUEST_RATE_LIMIT_ACTOR_RETENTION_S", "3600")
+)
+REQUEST_RATE_LIMIT_MAX_ACTORS = int(os.getenv("REQUEST_RATE_LIMIT_MAX_ACTORS", "10000"))
 DASHBOARD_SAMPLE_INTERVAL_S = float(os.getenv("DASHBOARD_SAMPLE_INTERVAL_S", "15"))
 DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(28 * 24 * 60)))
 DASHBOARD_FLUSH_BATCH_SIZE = int(os.getenv("DASHBOARD_FLUSH_BATCH_SIZE", "100"))
@@ -206,6 +230,20 @@ requester_identity_resolver = RequesterIdentityResolver(
     max_pending_validations=REQUEST_USAGE_MAX_PENDING_VALIDATIONS,
     validation_concurrency=REQUEST_USAGE_VALIDATION_CONCURRENCY,
 )
+requester_rate_limiter = RequesterRateLimiter(
+    config=RequesterRateLimitConfig(
+        enabled=REQUEST_RATE_LIMIT_ENABLED,
+        request_window_s=REQUEST_RATE_LIMIT_WINDOW_S,
+        max_requests_per_window=REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW,
+        max_parallel_allocations=REQUEST_RATE_LIMIT_MAX_PARALLEL,
+        max_consecutive_no_connects=REQUEST_RATE_LIMIT_NO_CONNECTS,
+        short_session_threshold_s=REQUEST_RATE_LIMIT_SHORT_SESSION_S,
+        max_consecutive_short_sessions=REQUEST_RATE_LIMIT_SHORT_SESSIONS,
+        cooldown_s=REQUEST_RATE_LIMIT_COOLDOWN_S,
+        actor_retention_s=REQUEST_RATE_LIMIT_ACTOR_RETENTION_S,
+        max_actor_states=REQUEST_RATE_LIMIT_MAX_ACTORS,
+    )
+)
 session_requester_tracker = SessionRequesterTracker(
     retention_s=SESSION_PENDING_TIMEOUT_S + max(2 * SESSION_REAP_INTERVAL_S, 30.0),
 )
@@ -219,6 +257,19 @@ queue_requester_tracker = SessionRequesterTracker(
 
 
 async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
+    session_id = str(result.get("session_id") or "")
+    if session_id:
+        outcome = requester_rate_limiter.record_disconnected(
+            session_id,
+            duration_s=_optional_float(result.get("conversation_duration_s")),
+            penalize=False,
+        )
+        if outcome is not None and outcome.connected and outcome.duration_s is not None:
+            await dashboard.record_requester_session_disconnected(
+                outcome.requester,
+                duration_s=outcome.duration_s,
+                short_session=False,
+            )
     await dashboard.record_session_event(
         "disconnected",
         conversation_duration_s=result.get("conversation_duration_s"),
@@ -230,6 +281,8 @@ async def record_expired_queue_ticket(ticket_id: str) -> None:
     """Terminal outcome for a queued request whose ticket the reaper dropped:
     the waiter stopped polling, which is the queue's version of abandoning."""
     requester = queue_requester_tracker.take(ticket_id)
+    if requester is not None:
+        requester_rate_limiter.record_allocation_abandoned(requester)
     await dashboard.record_session_request_abandoned(requester)
 
 
@@ -317,11 +370,57 @@ def _log_session_allocation_outcome(
     logger.log(level, message, *args, extra=extra)
 
 
+def _log_rate_limit_rejection(
+    decision: RateLimitDecision,
+    *,
+    requester: RequesterIdentity,
+) -> None:
+    extra = {
+        "outcome": "rate_limited",
+        "http_route": "POST /session",
+        "rate_limit_reason": decision.reason,
+        "retry_after_s": decision.retry_after_s,
+        "recent_requests": decision.recent_requests,
+        "active_allocations": decision.active_allocations,
+        "consecutive_no_connects": decision.consecutive_no_connects,
+        "consecutive_short_sessions": decision.consecutive_short_sessions,
+        "requester_id": requester.actor_id,
+        "requester_kind": requester.kind,
+        "requester_verification": requester.verification,
+        "requester_network_id": requester.network_id,
+        "requester_reported_robot_id": requester.reported_robot_id,
+        "requester_client_kind": requester.client_kind,
+    }
+    logger.warning(
+        "Session request rate limited requester_id=%s requester_kind=%s "
+        "reported_robot_id=%s client_kind=%s reason=%s retry_after_s=%s "
+        "recent_requests=%d active_allocations=%d consecutive_no_connects=%d "
+        "consecutive_short_sessions=%d",
+        requester.actor_id,
+        requester.kind,
+        requester.reported_robot_id,
+        requester.client_kind,
+        decision.reason,
+        decision.retry_after_s,
+        decision.recent_requests,
+        decision.active_allocations,
+        decision.consecutive_no_connects,
+        decision.consecutive_short_sessions,
+        extra=extra,
+    )
+
+
 def _allocation_wait_ms(allocation: dict[str, object], *, fallback_ms: int) -> int:
     value = allocation.get("allocation_wait_ms")
     if value is None:
         return fallback_ms
     return max(int(value), 0)
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
 
 
 def _public_session_allocation(allocation: dict[str, object]) -> dict[str, object]:
@@ -379,6 +478,7 @@ async def health():
 
     requester_tracking = requester_identity_resolver.status()
     requester_tracking["pending_session_attributions"] = session_requester_tracker.count()
+    requester_tracking["rate_limit"] = requester_rate_limiter.status()
     return JSONResponse(
         {
             "status": "ok",
@@ -401,10 +501,25 @@ async def create_session(request: Request):
     requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
     await dashboard.record_session_request(requester)
     requester = await _refresh_requester_identity(requester)
+    rate_limit_decision = requester_rate_limiter.acquire(requester)
+    if not rate_limit_decision.allowed:
+        _log_rate_limit_rejection(rate_limit_decision, requester=requester)
+        await dashboard.record_session_rate_limited(requester)
+        retry_after_s = rate_limit_decision.retry_after_s or 1
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "requester_rate_limited",
+                "reason": rate_limit_decision.reason,
+                "retry_after_s": retry_after_s,
+            },
+            headers={"Retry-After": str(retry_after_s)},
+        )
     allocation_started_at = monotonic()
     try:
         allocation = await session_manager.allocate(public_base_url(request))
     except QueueAtCapacityError as exc:
+        requester_rate_limiter.record_allocation_failure(requester)
         requester = await _refresh_requester_identity(requester)
         allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
         _log_session_allocation_outcome(
@@ -418,7 +533,10 @@ async def create_session(request: Request):
         )
         await dashboard.record_session_allocation_failure(requester)
         return JSONResponse({"state": "at_capacity", "detail": str(exc)}, status_code=503)
-    except Exception as exc:
+    except BaseException as exc:
+        requester_rate_limiter.record_allocation_failure(requester)
+        if not isinstance(exc, Exception):
+            raise
         requester = await _refresh_requester_identity(requester)
         allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
         waited_for_capacity = isinstance(exc, EndpointCapacityTimeoutError)
@@ -492,6 +610,8 @@ async def queue_leave(queue_id: str):
     if left:
         # Terminal outcome for the queued request: leaving the line is the queue's
         # version of abandoning before delivery.
+        if requester is not None:
+            requester_rate_limiter.record_allocation_abandoned(requester)
         await dashboard.record_session_request_abandoned(requester)
     return JSONResponse({"status": "ok", "state": "left", "removed": left})
 
@@ -509,12 +629,24 @@ async def _deliver_grant(
     allocation_total_ms = elapsed_ms(started_at, monotonic())
     allocation_wait_ms = _allocation_wait_ms(allocation, fallback_ms=allocation_total_ms)
     allocation.setdefault("allocation_wait_ms", allocation_wait_ms)
+    session_id = str(allocation.get("session_id") or "")
+    if session_id:
+        requester_rate_limiter.record_allocation(
+            session_id,
+            requester,
+            pending_timeout_s=float(
+                allocation.get("pending_timeout_s") or SESSION_PENDING_TIMEOUT_S
+            ),
+        )
+    else:
+        requester_rate_limiter.record_allocation_failure(requester)
 
     if await request.is_disconnected():
         requester = await _refresh_requester_identity(requester)
-        session_id = allocation.get("session_id")
         if session_id and hasattr(session_manager, "cancel_pending_session"):
             await session_manager.cancel_pending_session(session_id)
+        if session_id:
+            requester_rate_limiter.record_disconnected(session_id)
         _log_session_allocation_outcome(
             "client_disconnected",
             allocation=allocation,
@@ -528,7 +660,6 @@ async def _deliver_grant(
         raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
 
     requester = await _refresh_requester_identity(requester)
-    session_id = str(allocation.get("session_id") or "")
     if session_id:
         session_requester_tracker.remember(session_id, requester)
     await dashboard.record_session_allocation_success(requester)
@@ -559,6 +690,7 @@ async def session_event(session_id: str, payload: dict[str, Any]):
         result = await session_manager.handle_event(session_id, session_token, event)
     except KeyError:
         if event == "disconnected":
+            requester_rate_limiter.record_disconnected(session_id)
             session_requester_tracker.discard(session_id)
             return JSONResponse({"status": "ok", "session_id": session_id, "state": "already_released"})
         raise HTTPException(status_code=404, detail="Unknown session id") from None
@@ -571,11 +703,26 @@ async def session_event(session_id: str, payload: dict[str, Any]):
         conversation_counted=bool(result.get("conversation_counted")),
     )
     if event == "connected":
+        requester_rate_limiter.record_connected(session_id)
         requester = session_requester_tracker.take(session_id)
         if requester is not None:
             requester = await _refresh_requester_identity(requester)
             await dashboard.record_requester_session_connected(requester)
     elif event == "disconnected":
+        outcome = requester_rate_limiter.record_disconnected(
+            session_id,
+            duration_s=_optional_float(result.get("conversation_duration_s")),
+            penalize=(
+                bool(result.get("conversation_counted"))
+                and result.get("release_reason") != "endpoint_unavailable"
+            ),
+        )
+        if outcome is not None and outcome.connected and outcome.duration_s is not None:
+            await dashboard.record_requester_session_disconnected(
+                outcome.requester,
+                duration_s=outcome.duration_s,
+                short_session=outcome.short_session,
+            )
         session_requester_tracker.discard(session_id)
     return JSONResponse(result)
 

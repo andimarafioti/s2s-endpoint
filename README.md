@@ -319,6 +319,26 @@ minute buckets are present.
   burst signal (defaults to 20)
 - `REQUEST_USAGE_MANY_NETWORKS`: distinct network fingerprints for one requester
   that raise a many-networks signal (defaults to 5)
+- `REQUEST_RATE_LIMIT_ENABLED`: enforce requester rate limits (defaults to `true`).
+  When disabled, the limiter continues tracking outcomes without rejecting requests.
+  Limiter state is local to the load-balancer process and resets when it restarts.
+- `REQUEST_RATE_LIMIT_WINDOW_S`: rolling request-rate window (defaults to 60 seconds)
+- `REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW`: maximum `POST /session` attempts from
+  one requester in the rolling window (defaults to 20)
+- `REQUEST_RATE_LIMIT_MAX_PARALLEL`: maximum simultaneous allocation calls, pending
+  joins, and connected sessions from one requester (defaults to 2)
+- `REQUEST_RATE_LIMIT_NO_CONNECTS`: consecutive allocated sessions that can expire
+  or disconnect without joining before a cooldown starts (defaults to 3)
+- `REQUEST_RATE_LIMIT_SHORT_SESSION_S`: connected duration at or below which a
+  session counts toward reconnect-loop detection (defaults to 10 seconds)
+- `REQUEST_RATE_LIMIT_SHORT_SESSIONS`: consecutive short connected sessions before
+  a cooldown starts (defaults to 8). A longer session resets this streak.
+- `REQUEST_RATE_LIMIT_COOLDOWN_S`: behavioral cooldown duration after repeated
+  no-connect allocations or short sessions (defaults to 900 seconds)
+- `REQUEST_RATE_LIMIT_ACTOR_RETENTION_S`: idle requester limiter state retention
+  (defaults to 3,600 seconds)
+- `REQUEST_RATE_LIMIT_MAX_ACTORS`: maximum in-memory requester limiter states
+  (defaults to 10,000). When all entries are active, new requesters fail closed.
 - `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
 - `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
   (defaults to 28 days so the 14d/28d dashboard windows can load persisted history)

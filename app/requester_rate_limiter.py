@@ -84,7 +84,8 @@ class RequesterRateLimiter:
 
     Calls are synchronous so a check and its in-flight reservation happen without
     another asyncio task interleaving between them. The load balancer must release
-    that reservation through ``record_allocation`` or ``record_allocation_failure``.
+    that reservation through ``record_allocation``, ``record_allocation_failure``,
+    or ``record_allocation_abandoned``.
     """
 
     def __init__(
@@ -158,8 +159,8 @@ class RequesterRateLimiter:
         *,
         pending_timeout_s: float,
     ) -> None:
-        if pending_timeout_s <= 0:
-            raise ValueError("pending_timeout_s must be > 0")
+        if pending_timeout_s < 0:
+            raise ValueError("pending_timeout_s must be >= 0")
         now_s = self._time_fn()
         state = self._actors.get(requester.actor_id)
         if state is None:
@@ -181,12 +182,21 @@ class RequesterRateLimiter:
         self._totals["allocations"] += 1
 
     def record_allocation_failure(self, requester: RequesterIdentity) -> None:
+        if self._release_in_flight(requester):
+            self._totals["allocation_failures"] += 1
+
+    def record_allocation_abandoned(self, requester: RequesterIdentity) -> None:
+        """Release a queued admission that ended before compute was allocated."""
+        if self._release_in_flight(requester):
+            self._totals["allocation_abandonments"] += 1
+
+    def _release_in_flight(self, requester: RequesterIdentity) -> bool:
         state = self._actors.get(requester.actor_id)
         if state is None:
-            return
+            return False
         state.in_flight_allocations = max(state.in_flight_allocations - 1, 0)
         state.last_seen_s = self._time_fn()
-        self._totals["allocation_failures"] += 1
+        return True
 
     def record_connected(self, session_id: str) -> RequesterIdentity | None:
         state, allocation = self._allocation(session_id)

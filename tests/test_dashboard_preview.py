@@ -12,6 +12,7 @@ from app.dashboard_history import SwarmHistoryBucket
 from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
 from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointTransitionConflictError
+from app.requester_rate_limiter import RequesterRateLimitConfig, RequesterRateLimiter
 from tests.helpers import monotonic_sequence
 
 
@@ -97,6 +98,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["dashboard_history"]["enabled"])
+        self.assertTrue(response.json()["requester_tracking"]["rate_limit"]["enabled"])
 
     @patch("app.dashboard_history_store.HuggingFaceBucketHistoryStore.__init__", return_value=None)
     def test_preview_mode_uses_dashboard_bucket_persistence_read_only(self, init_store):
@@ -489,6 +491,71 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_rate_limit_rejects_before_compute_allocation(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager(allocation_wait_ms=40)
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        module.requester_rate_limiter = RequesterRateLimiter(
+            config=RequesterRateLimitConfig(max_parallel_allocations=1)
+        )
+
+        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
+            await module.create_session(FakeConnectedRequest())
+
+        with (
+            self.assertLogs("s2s-endpoint", level="WARNING") as logs,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(raised.exception.headers["Retry-After"], "60")
+        self.assertEqual(raised.exception.detail["code"], "requester_rate_limited")
+        self.assertEqual(raised.exception.detail["reason"], "parallel_allocations")
+        self.assertEqual(fake_session_manager.allocation_calls, 1)
+        self.assertEqual(
+            fake_dashboard.calls,
+            ["request", "success", "request", "rate_limited"],
+        )
+        record = logs.records[0]
+        self.assertEqual(record.outcome, "rate_limited")
+        self.assertEqual(record.rate_limit_reason, "parallel_allocations")
+        self.assertEqual(record.requester_client_kind, "missing-user-agent")
+
+    async def test_leaving_queue_releases_parallel_allocation_permit(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeQueuedSessionManager()
+
+        response = await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(json.loads(response.body)["state"], "queued")
+        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 1)
+
+        await module.queue_leave("queue-123")
+
+        status = module.requester_rate_limiter.status()
+        self.assertEqual(status["active_allocations"], 0)
+        self.assertEqual(status["totals"]["allocation_abandonments"], 1)
+        self.assertEqual(fake_dashboard.calls, ["request", "abandoned"])
+
+    async def test_expired_queue_ticket_releases_parallel_allocation_permit(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeQueuedSessionManager()
+
+        await module.create_session(FakeConnectedRequest())
+        await module.record_expired_queue_ticket("queue-123")
+
+        status = module.requester_rate_limiter.status()
+        self.assertEqual(status["active_allocations"], 0)
+        self.assertEqual(status["totals"]["allocation_abandonments"], 1)
+        self.assertEqual(fake_dashboard.calls, ["request", "abandoned"])
+
     async def test_session_allocation_tracks_reported_hardware_id_as_fingerprint(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
@@ -535,6 +602,47 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(module.session_requester_tracker.count(), 0)
         self.assertEqual(fake_dashboard.session_events, ["connected", "connected"])
         self.assertEqual(fake_dashboard.connected_requesters, [fake_dashboard.requesters[0]])
+
+    async def test_disconnected_callback_records_requester_duration_after_connect(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+
+        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
+            await module.create_session(FakeConnectedRequest())
+
+        await module.session_event(
+            "session-123",
+            {"session_token": "session-token", "event": "connected"},
+        )
+        await module.session_event(
+            "session-123",
+            {"session_token": "session-token", "event": "disconnected"},
+        )
+
+        self.assertEqual(
+            fake_dashboard.disconnected_requesters,
+            [(fake_dashboard.requesters[0], 6.0, True)],
+        )
+
+    async def test_pre_connect_compute_rejection_does_not_penalize_requester(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+
+        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
+            await module.create_session(FakeConnectedRequest())
+
+        await module.session_event(
+            "session-123",
+            {"session_token": "session-token", "event": "disconnected"},
+        )
+
+        totals = module.requester_rate_limiter.status()["totals"]
+        self.assertNotIn("no_connects", totals)
+        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 0)
 
     async def test_failed_session_allocation_logs_outcome(self):
         module = self._import_load_balancer()
@@ -607,6 +715,7 @@ class FakeDashboard:
         self.requesters = []
         self.session_events = []
         self.connected_requesters = []
+        self.disconnected_requesters = []
 
     async def record_session_request(self, requester=None):
         self.calls.append("request")
@@ -621,21 +730,36 @@ class FakeDashboard:
     async def record_session_request_abandoned(self, requester=None):
         self.calls.append("abandoned")
 
+    async def record_session_rate_limited(self, requester=None):
+        self.calls.append("rate_limited")
+
     async def record_session_event(self, event, **kwargs):
         self.session_events.append(event)
 
     async def record_requester_session_connected(self, requester):
         self.connected_requesters.append(requester)
 
+    async def record_requester_session_disconnected(
+        self,
+        requester,
+        *,
+        duration_s,
+        short_session,
+    ):
+        self.disconnected_requesters.append((requester, duration_s, short_session))
+
 
 class FakeSessionManager:
     def __init__(self, *, allocation_wait_ms: int = 1200):
         self.cancelled_session_ids = []
         self.allocation_wait_ms = allocation_wait_ms
+        self.allocation_calls = 0
+        self.connected_session_ids = set()
 
     async def allocate(self, lb_base_url):
         # Mirrors DirectSessionManager._grant_from_lease, which stamps
         # "state": "granted" on every grant it returns.
+        self.allocation_calls += 1
         return {
             "state": "granted",
             "session_id": "session-123",
@@ -653,10 +777,20 @@ class FakeSessionManager:
         self.cancelled_session_ids.append(session_id)
 
     async def handle_event(self, session_id, session_token, event):
+        was_connected = session_id in self.connected_session_ids
+        if event == "connected":
+            self.connected_session_ids.add(session_id)
+        elif event == "disconnected":
+            self.connected_session_ids.discard(session_id)
         return {
             "status": "ok",
             "session_id": session_id,
             "state": "connected" if event == "connected" else "released",
+            "release_reason": "client_disconnected" if event == "disconnected" else None,
+            "conversation_counted": event == "disconnected" and was_connected,
+            "conversation_duration_s": (
+                6.0 if event == "disconnected" and was_connected else None
+            ),
         }
 
 
@@ -666,6 +800,27 @@ class FakeFailingSessionManager:
 
     async def allocate(self, lb_base_url):
         raise self.exc
+
+
+class FakeQueuedSessionManager:
+    queue_enabled = True
+
+    def __init__(self):
+        self.left = False
+
+    async def allocate(self, lb_base_url):
+        return {
+            "state": "queued",
+            "queue_id": "queue-123",
+            "position": 1,
+            "poll_interval_s": 1,
+        }
+
+    async def leave(self, queue_id):
+        if queue_id != "queue-123" or self.left:
+            return False
+        self.left = True
+        return True
 
 
 class FakeDisconnectedRequest:
