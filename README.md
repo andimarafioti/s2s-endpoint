@@ -175,7 +175,7 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
   unusual-usage signals
 
 Clients can optionally send a Hugging Face user access token as
-`X-Reachy-Mini-Authorization: Bearer hf_...` on `POST /session`. Standard
+`X-Reachy-Mini-Authorization: Bearer <token>` on `POST /session`. Standard
 `Authorization` is also accepted when the hosting gateway passes it through. The
 request is always allowed to continue: a missing, invalid, unrecognized, or
 temporarily unverifiable token does not deny allocation. Valid tokens are
@@ -209,11 +209,11 @@ The load balancer never stores raw client tokens, raw IP addresses, or raw robot
 hardware IDs. It stores keyed, one-way fingerprints instead. Tokenless traffic
 is grouped by the first `X-Forwarded-For` address (or the direct client address
 when proxy headers are disabled/unavailable), and coarse user-agent classes such
-as browser, mobile app, `httpx`, `curl`, or bot are counted to help distinguish
-likely automation. The dashboard flags high request volume, large per-minute
-bursts, dominant traffic share, many networks using one token, mostly
-automation-like clients, and invalid tokens. These are operational signals only;
-this feature does not rate-limit or block traffic.
+as Reachy Mini, browser, mobile app, `httpx`, `curl`, or bot are counted to help
+distinguish likely automation. The dashboard flags high request volume, large
+per-minute bursts, dominant traffic share, many networks using one token, mostly
+automation-like clients, and invalid tokens. These are operational signals
+only; this feature does not rate-limit or block traffic.
 
 The timeline automatically switches between minute-level and hourly rollups depending on the selected window. By default the history is in memory and resets when the LB endpoint restarts.
 

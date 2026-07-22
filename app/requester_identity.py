@@ -154,14 +154,15 @@ class RequesterIdentityResolver:
                 client_kind=client_kind,
             )
 
+        token_is_validatable = _is_validatable_hf_token(token)
         identity = RequesterIdentity(
             actor_id=actor_id,
             label=f"HF token •{fingerprint[:8]}",
             kind="unverified_token",
-            verification="pending" if _looks_like_hf_token(token) else "unrecognized",
+            verification="pending" if token_is_validatable else "unrecognized",
             fingerprint=fingerprint,
         )
-        if _looks_like_hf_token(token) and not self._schedule_validation(token, identity):
+        if token_is_validatable and not self._schedule_validation(token, identity):
             identity = replace(identity, verification="unavailable")
         return identity.with_request_context(
             network_id=network_id,
@@ -358,8 +359,12 @@ def _header(request: object, name: str) -> Optional[str]:
     return str(value) if value is not None else None
 
 
-def _looks_like_hf_token(token: str) -> bool:
-    return token.startswith("hf_") and 8 <= len(token) <= 512
+def _is_validatable_hf_token(token: str) -> bool:
+    return (
+        0 < len(token) <= 4096
+        and token.isprintable()
+        and not any(character.isspace() for character in token)
+    )
 
 
 def _safe_text(value: object, *, max_length: int) -> Optional[str]:
@@ -373,6 +378,8 @@ def _client_kind(user_agent: str | None) -> str:
     value = (user_agent or "").strip().lower()
     if not value:
         return "missing-user-agent"
+    if "reachy-mini-conversation-app" in value:
+        return "reachy-mini"
 
     automation_markers = (
         ("python-httpx", "automation:httpx"),
