@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from app.app_utils import build_lifespan, elapsed_ms, public_base_url, setup_logging
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
-from app.direct_session_manager import DirectSessionManager
+from app.direct_session_manager import DirectSessionManager, QueueAtCapacityError
 from app.endpoint_pool_router import (
     EndpointCapacityTimeoutError,
     EndpointDrainLeaseConflictError,
@@ -63,6 +63,21 @@ SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
 SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
 SESSION_TOKEN_TTL_S = float(os.getenv("SESSION_TOKEN_TTL_S", "86400"))
 SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
+# Waiting queue: when every slot is busy a caller gets a ticket and polls
+# GET /queue/{id} until the head of the line claims a freed slot. Waiting never
+# reserves compute or usage time; an un-polled ticket is reaped after its TTL.
+#
+# The queue ships dark: with SESSION_QUEUE_ENABLED unset, /session behaves
+# exactly as before the queue existed — the request blocks until a slot frees
+# (up to COMPUTE_ENDPOINT_WAIT_TIMEOUT_S) and /queue/* returns 404. Set
+# SESSION_QUEUE_ENABLED=true on an instance only once its clients understand
+# {"state": "queued"} responses and poll GET /queue/{id}; a pre-queue client
+# on a queueing instance would receive a 200 without a connect_url and fail.
+SESSION_QUEUE_ENABLED = os.getenv("SESSION_QUEUE_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
+QUEUE_MAX_DEPTH = int(os.getenv("QUEUE_MAX_DEPTH", "100"))
+QUEUE_TICKET_TTL_S = float(os.getenv("QUEUE_TICKET_TTL_S", "8"))
+QUEUE_POLL_INTERVAL_S = float(os.getenv("QUEUE_POLL_INTERVAL_S", "2"))
+QUEUE_REAP_INTERVAL_S = float(os.getenv("QUEUE_REAP_INTERVAL_S", "2"))
 REQUEST_USAGE_HASH_SECRET = (
     os.getenv("REQUEST_USAGE_HASH_SECRET", "").strip()
     or SESSION_SHARED_SECRET
@@ -141,6 +156,8 @@ def build_endpoint_router() -> EndpointPoolRouter:
 
 if DASHBOARD_PREVIEW_MODE:
     session_manager = DashboardPreviewSessionManager(endpoint_slots=COMPUTE_ENDPOINT_SLOTS)
+    if SESSION_QUEUE_ENABLED:
+        logger.warning("SESSION_QUEUE_ENABLED is ignored in dashboard preview mode")
 else:
     session_manager = DirectSessionManager(
         endpoint_router=build_endpoint_router(),
@@ -148,6 +165,11 @@ else:
         pending_timeout_s=SESSION_PENDING_TIMEOUT_S,
         session_token_ttl_s=SESSION_TOKEN_TTL_S,
         reap_interval_s=SESSION_REAP_INTERVAL_S,
+        queue_enabled=SESSION_QUEUE_ENABLED,
+        queue_max_depth=QUEUE_MAX_DEPTH,
+        queue_ticket_ttl_s=QUEUE_TICKET_TTL_S,
+        queue_poll_interval_s=QUEUE_POLL_INTERVAL_S,
+        queue_reap_interval_s=QUEUE_REAP_INTERVAL_S,
     )
 
 dashboard_history_store = None
@@ -187,6 +209,13 @@ requester_identity_resolver = RequesterIdentityResolver(
 session_requester_tracker = SessionRequesterTracker(
     retention_s=SESSION_PENDING_TIMEOUT_S + max(2 * SESSION_REAP_INTERVAL_S, 30.0),
 )
+# Queue polls are bodyless GETs, so the hardware-id identity resolved from the
+# original POST /session can't be re-derived at claim time — carry it across the
+# wait keyed by ticket. Refreshed on every poll; retention only has to outlive
+# the ticket itself (un-polled tickets die at QUEUE_TICKET_TTL_S).
+queue_requester_tracker = SessionRequesterTracker(
+    retention_s=QUEUE_TICKET_TTL_S + max(2 * QUEUE_REAP_INTERVAL_S, 10.0),
+)
 
 
 async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
@@ -197,11 +226,24 @@ async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
     )
 
 
+async def record_expired_queue_ticket(ticket_id: str) -> None:
+    """Terminal outcome for a queued request whose ticket the reaper dropped:
+    the waiter stopped polling, which is the queue's version of abandoning."""
+    requester = queue_requester_tracker.take(ticket_id)
+    await dashboard.record_session_request_abandoned(requester)
+
+
 class LoadBalancerRuntime:
     async def start(self) -> None:
         # Dashboard preview mode uses a synthetic manager with no real sessions.
         if hasattr(session_manager, "set_abnormal_disconnect_handler"):
             session_manager.set_abnormal_disconnect_handler(record_abnormal_session_disconnect)
+        if hasattr(session_manager, "set_ticket_expired_handler"):
+            session_manager.set_ticket_expired_handler(record_expired_queue_ticket)
+        logger.info(
+            "Session queue %s",
+            "enabled" if session_manager.queue_enabled else "disabled",
+        )
         await session_manager.start()
         await dashboard.start()
 
@@ -223,6 +265,7 @@ def _log_session_allocation_outcome(
     level: int,
     requester: RequesterIdentity | None = None,
     error: str | None = None,
+    http_route: str = "POST /session",
 ) -> None:
     allocation = allocation or {}
     session_id = allocation.get("session_id")
@@ -238,7 +281,7 @@ def _log_session_allocation_outcome(
         "outcome": outcome,
         "waited_for_capacity": waited_for_capacity,
         "allocation_error": error,
-        "http_route": "POST /session",
+        "http_route": http_route,
         "requester_id": requester.actor_id if requester is not None else None,
         "requester_kind": requester.kind if requester is not None else None,
         "requester_verification": requester.verification if requester is not None else None,
@@ -290,6 +333,7 @@ def _public_session_allocation(allocation: dict[str, object]) -> dict[str, objec
             "connect_url",
             "session_token",
             "pending_timeout_s",
+            "state",
         )
         if key in allocation
     }
@@ -350,6 +394,9 @@ async def health():
 
 @app.post("/session")
 async def create_session(request: Request):
+    """Grant a session if a slot is free and the line is empty, otherwise return a
+    queue ticket the caller polls via GET /queue/{id}. 503 with {state:"at_capacity"}
+    when the queue itself is full; 503 otherwise when the pool can't allocate."""
     hardware_id = await reported_hardware_id(request)
     requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
     await dashboard.record_session_request(requester)
@@ -357,6 +404,20 @@ async def create_session(request: Request):
     allocation_started_at = monotonic()
     try:
         allocation = await session_manager.allocate(public_base_url(request))
+    except QueueAtCapacityError as exc:
+        requester = await _refresh_requester_identity(requester)
+        allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
+        _log_session_allocation_outcome(
+            "queue_at_capacity",
+            allocation=None,
+            allocation_wait_ms=None,
+            allocation_total_ms=allocation_total_ms,
+            level=logging.WARNING,
+            requester=requester,
+            error=str(exc),
+        )
+        await dashboard.record_session_allocation_failure(requester)
+        return JSONResponse({"state": "at_capacity", "detail": str(exc)}, status_code=503)
     except Exception as exc:
         requester = await _refresh_requester_identity(requester)
         allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
@@ -374,7 +435,78 @@ async def create_session(request: Request):
         await dashboard.record_session_allocation_failure(requester)
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
 
-    allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
+    # No slot free (and/or others waiting): the caller joined the queue. Keep the
+    # requester identity for the claim — queue polls are bodyless GETs that can't
+    # re-derive it.
+    if allocation.get("state") == "queued":
+        queue_requester_tracker.remember(str(allocation["queue_id"]), requester)
+        return JSONResponse(allocation)
+
+    return await _deliver_grant(request, allocation, allocation_started_at, requester)
+
+
+@app.get("/queue/{queue_id}")
+async def queue_status(queue_id: str, request: Request):
+    """Advance a waiting ticket: report position, or — for the head of the line —
+    hand back a session grant once a slot frees. 404 for an unknown/expired ticket.
+    404 for everything when the queue is disabled — indistinguishable from main,
+    where these routes don't exist."""
+    if not session_manager.queue_enabled:
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    poll_started_at = monotonic()
+    try:
+        result = await session_manager.poll(queue_id, public_base_url(request))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown or expired ticket.") from None
+    except Exception as exc:
+        # Same contract as POST /session: allocation-time failures are 503s, not
+        # 500s. The manager re-queues the ticket at the head on a failed claim,
+        # so the caller keeps its place and simply polls again.
+        raise HTTPException(status_code=503, detail=f"Failed to claim session: {exc}") from exc
+
+    requester = queue_requester_tracker.take(queue_id)
+    if result.get("state") == "queued":
+        if requester is not None:
+            queue_requester_tracker.remember(queue_id, requester)  # refresh retention
+        return JSONResponse(result)
+
+    # Head of line claimed a slot — same delivery path as a fast-path grant. The
+    # requester was resolved at ticket creation; falling back to the poll request
+    # (bodyless, so IP-only) only happens if the tracker entry expired.
+    if requester is None:
+        hardware_id = await reported_hardware_id(request)
+        requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
+    return await _deliver_grant(
+        request, result, poll_started_at, requester, http_route="GET /queue/{queue_id}"
+    )
+
+
+@app.delete("/queue/{queue_id}")
+async def queue_leave(queue_id: str):
+    """Leave the queue early (explicit button / teardown beacon). Idempotent."""
+    if not session_manager.queue_enabled:
+        raise HTTPException(status_code=404, detail="Not found.")
+    left = await session_manager.leave(queue_id)
+    requester = queue_requester_tracker.take(queue_id)
+    if left:
+        # Terminal outcome for the queued request: leaving the line is the queue's
+        # version of abandoning before delivery.
+        await dashboard.record_session_request_abandoned(requester)
+    return JSONResponse({"status": "ok", "state": "left", "removed": left})
+
+
+async def _deliver_grant(
+    request: Request,
+    allocation: dict[str, object],
+    started_at: float,
+    requester: RequesterIdentity,
+    *,
+    http_route: str = "POST /session",
+) -> JSONResponse:
+    """Shared tail for a granted session (fast path or queue claim): guard against a
+    client that vanished, record the success, and return the public grant fields."""
+    allocation_total_ms = elapsed_ms(started_at, monotonic())
     allocation_wait_ms = _allocation_wait_ms(allocation, fallback_ms=allocation_total_ms)
     allocation.setdefault("allocation_wait_ms", allocation_wait_ms)
 
@@ -390,6 +522,7 @@ async def create_session(request: Request):
             allocation_total_ms=allocation_total_ms,
             level=logging.WARNING,
             requester=requester,
+            http_route=http_route,
         )
         await dashboard.record_session_request_abandoned(requester)
         raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
@@ -406,7 +539,10 @@ async def create_session(request: Request):
         allocation_total_ms=allocation_total_ms,
         level=logging.INFO,
         requester=requester,
+        http_route=http_route,
     )
+    # "state": "granted" rides along from the manager's grant dict through the
+    # public-field whitelist — single-sourced there, not re-asserted here.
     return JSONResponse(_public_session_allocation(allocation))
 
 
