@@ -128,11 +128,12 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
   unusual-usage signals
 
 Clients can optionally send a Hugging Face user access token as
-`Authorization: Bearer hf_...` on `POST /session`. The request is always allowed
-to continue: a missing, invalid, unrecognized, or temporarily unverifiable token
-does not deny allocation. Valid tokens are resolved to the Hugging Face account
-asynchronously through `whoami`, so identity lookup never sits on the allocation
-critical path.
+`X-Reachy-Mini-Authorization: Bearer hf_...` on `POST /session`. Standard
+`Authorization` is also accepted when the hosting gateway passes it through. The
+request is always allowed to continue: a missing, invalid, unrecognized, or
+temporarily unverifiable token does not deny allocation. Valid tokens are
+resolved to the Hugging Face account asynchronously through `whoami`, so identity
+lookup never sits on the allocation critical path.
 
 Reachy clients can also include the daemon's optional 16-character hexadecimal
 `hardware_id` in the JSON body. The content type must be `application/json`:

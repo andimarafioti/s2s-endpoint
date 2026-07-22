@@ -121,7 +121,9 @@ class RequesterIdentityResolver:
         network_id = self._network_id(request)
         reported_robot_id = self._reported_robot_id(hardware_id)
         client_kind = _client_kind(_header(request, "user-agent"))
-        token = bearer_token(_header(request, "authorization"))
+        token = bearer_token(_header(request, "x-reachy-mini-authorization"))
+        if token is None:
+            token = bearer_token(_header(request, "authorization"))
 
         if token is None:
             fingerprint = network_id.removeprefix("net:") if network_id else "unknown"
