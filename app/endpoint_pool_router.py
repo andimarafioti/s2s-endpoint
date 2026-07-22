@@ -458,6 +458,29 @@ class EndpointPoolRouter:
                 await self._reconcile_task
             self._reconcile_task = None
 
+    def _claim_slot_unlocked(
+        self, *, waited_for_capacity: bool
+    ) -> tuple[Optional[EndpointLease], list[str]]:
+        """Single slot-claim attempt; the caller must hold ``self._condition``.
+
+        On a hit: bumps the endpoint's session accounting and returns the lease
+        plus any proactive wake-ups. On a miss: returns ``None`` plus force-marked
+        wake-ups so capacity is on its way for whoever retries. The caller spawns
+        the wake tasks once outside the claim."""
+        endpoint = self._select_endpoint_unlocked()
+        if endpoint is None or endpoint.ws_url is None:
+            return None, self._mark_endpoints_to_wake_unlocked(force=True)
+        endpoint.active_sessions += 1
+        endpoint.last_used_at = time.monotonic()
+        wake_names = self._mark_endpoints_to_wake_unlocked()
+        lease = EndpointLease(
+            slot_id=endpoint.name,
+            endpoint_name=endpoint.name,
+            ws_url=endpoint.ws_url,
+            waited_for_capacity=waited_for_capacity,
+        )
+        return lease, wake_names
+
     async def acquire(self, timeout_s: float = 900.0) -> EndpointLease:
         deadline = asyncio.get_event_loop().time() + timeout_s
         waited_for_capacity = False
@@ -466,20 +489,11 @@ class EndpointPoolRouter:
             async with self._condition:
                 self._raise_if_closed()
 
-                endpoint = self._select_endpoint_unlocked()
-                if endpoint is not None and endpoint.ws_url is not None:
-                    endpoint.active_sessions += 1
-                    endpoint.last_used_at = time.monotonic()
-                    wake_names = self._mark_endpoints_to_wake_unlocked()
-                    lease = EndpointLease(
-                        slot_id=endpoint.name,
-                        endpoint_name=endpoint.name,
-                        ws_url=endpoint.ws_url,
-                        waited_for_capacity=waited_for_capacity,
-                    )
+                lease, wake_names = self._claim_slot_unlocked(
+                    waited_for_capacity=waited_for_capacity
+                )
+                if lease is not None:
                     break
-
-                wake_names = self._mark_endpoints_to_wake_unlocked(force=True)
                 # Spawn the wake tasks BEFORE suspending on the condition.
                 # The endpoints are already marked waking, so no other path
                 # will pick them up; waiting first would strand them until an
@@ -514,22 +528,9 @@ class EndpointPoolRouter:
         nothing is free it nudges a parked endpoint awake (same as ``acquire``'s
         wait path) so capacity is on its way for the next attempt. Used by the
         session queue, which owns the waiting instead of blocking here."""
-        lease: Optional[EndpointLease] = None
         async with self._condition:
             self._raise_if_closed()
-            endpoint = self._select_endpoint_unlocked()
-            if endpoint is not None and endpoint.ws_url is not None:
-                endpoint.active_sessions += 1
-                endpoint.last_used_at = time.monotonic()
-                wake_names = self._mark_endpoints_to_wake_unlocked()
-                lease = EndpointLease(
-                    slot_id=endpoint.name,
-                    endpoint_name=endpoint.name,
-                    ws_url=endpoint.ws_url,
-                    waited_for_capacity=False,
-                )
-            else:
-                wake_names = self._mark_endpoints_to_wake_unlocked(force=True)
+            lease, wake_names = self._claim_slot_unlocked(waited_for_capacity=False)
 
         self._spawn_wake_tasks(wake_names)
         return lease

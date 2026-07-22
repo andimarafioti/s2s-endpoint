@@ -634,7 +634,10 @@ class FakeSessionManager:
         self.allocation_wait_ms = allocation_wait_ms
 
     async def allocate(self, lb_base_url):
+        # Mirrors DirectSessionManager._grant_from_lease, which stamps
+        # "state": "granted" on every grant it returns.
         return {
+            "state": "granted",
             "session_id": "session-123",
             "websocket_url": "wss://endpoint-a.example/ws",
             "connect_url": f"{lb_base_url}ws?session=session-123",

@@ -6,6 +6,10 @@ from typing import Optional
 class DashboardPreviewSessionManager:
     """Synthetic session manager used to preview dashboard UI without HF endpoints."""
 
+    # Preview mode has no real sessions, so no waiting queue either; the routes
+    # read this attribute uniformly across both manager types.
+    queue_enabled = False
+
     def __init__(self, *, endpoint_slots: int = 2, time_fn=time.time) -> None:
         self.endpoint_slots = max(int(endpoint_slots), 1)
         self._time_fn = time_fn

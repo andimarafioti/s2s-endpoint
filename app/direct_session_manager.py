@@ -14,6 +14,7 @@ from app.session_tokens import attach_session_token, create_session_token, verif
 
 logger = logging.getLogger("s2s-endpoint")
 SessionReleaseHandler = Callable[[dict[str, object]], Awaitable[None]]
+TicketExpiredHandler = Callable[[str], Awaitable[None]]
 
 
 class QueueAtCapacityError(RuntimeError):
@@ -88,9 +89,15 @@ class DirectSessionManager:
         self._reaper_task: Optional[asyncio.Task] = None
         self._ticket_reaper_task: Optional[asyncio.Task] = None
         self._abnormal_disconnect_handler: Optional[SessionReleaseHandler] = None
+        self._ticket_expired_handler: Optional[TicketExpiredHandler] = None
 
     def set_abnormal_disconnect_handler(self, handler: Optional[SessionReleaseHandler]) -> None:
         self._abnormal_disconnect_handler = handler
+
+    def set_ticket_expired_handler(self, handler: Optional[TicketExpiredHandler]) -> None:
+        """Called with each ticket_id the reaper drops for going un-polled past the
+        TTL — the caller's chance to record the abandoned request."""
+        self._ticket_expired_handler = handler
 
     async def start(self) -> None:
         await self.endpoint_router.start()
@@ -128,57 +135,49 @@ class DirectSessionManager:
         started_at = monotonic()
         if not self.queue_enabled:
             lease = await self.endpoint_router.acquire(timeout_s=self.allocate_timeout_s)
-            granted_at = monotonic()
-            return await self._grant_from_lease(
-                lease,
-                lb_base_url,
-                allocated_at=granted_at,
-                allocation_wait_ms=elapsed_ms(started_at, granted_at),
-                waited_for_capacity=lease.waited_for_capacity,
-            )
+        else:
+            lease = None
+            # The empty-line check and the slot grab must be one atomic step, or two
+            # concurrent callers could both see an empty queue and both fast-path into
+            # the same freed capacity, jumping the line. Holding the lock across
+            # ``try_acquire`` is safe: it only touches the router's own lock and never
+            # calls back into this manager, and it never waits for capacity.
+            async with self._lock:
+                # FIFO: only fast-path a grant when the line is empty. If anyone is
+                # already waiting, a fresh caller joins the back — no queue-jumping.
+                if not self._queue:
+                    lease = await self.endpoint_router.try_acquire()
+                if lease is None:
+                    # No slot free (or someone already waiting): join the queue. A
+                    # depth of 0 disables the waiting room entirely — every caller
+                    # that can't be granted immediately is turned away at capacity.
+                    if len(self._queue) >= self.queue_max_depth:
+                        raise QueueAtCapacityError(
+                            f"queue is full ({self.queue_max_depth} waiting)"
+                        )
+                    now = monotonic()
+                    ticket_id = secrets.token_urlsafe(18)
+                    self._queue[ticket_id] = QueueTicket(ticket_id, created_at=now, last_seen=now)
+                    position = len(self._queue)  # just appended, so it's last in line
 
-        lease: Optional[EndpointLease] = None
-        # The empty-line check and the slot grab must be one atomic step, or two
-        # concurrent callers could both see an empty queue and both fast-path into
-        # the same freed capacity, jumping the line. Holding the lock across
-        # ``try_acquire`` is safe: it only touches the router's own lock and never
-        # calls back into this manager, and it never waits for capacity.
-        async with self._lock:
-            # FIFO: only fast-path a grant when the line is empty. If anyone is
-            # already waiting, a fresh caller joins the back — no queue-jumping.
-            if not self._queue:
-                lease = await self.endpoint_router.try_acquire()
             if lease is None:
-                # No slot free (or someone already waiting): join the queue. A
-                # depth of 0 disables the waiting room entirely — every caller
-                # that can't be granted immediately is turned away at capacity.
-                if len(self._queue) >= self.queue_max_depth:
-                    raise QueueAtCapacityError(
-                        f"queue is full ({self.queue_max_depth} waiting)"
-                    )
-                now = monotonic()
-                ticket_id = secrets.token_urlsafe(18)
-                self._queue[ticket_id] = QueueTicket(ticket_id, created_at=now, last_seen=now)
-                position = len(self._queue)  # just appended, so it's last in line
+                logger.info(
+                    "Queued session request ticket_id=%s position=%d queue_depth=%d",
+                    ticket_id,
+                    position,
+                    position,
+                    extra={"ticket_id": ticket_id, "position": position, "outcome": "queued"},
+                )
+                return self._ticket_view(ticket_id, position)
 
-        if lease is not None:
-            granted_at = monotonic()
-            return await self._grant_from_lease(
-                lease,
-                lb_base_url,
-                allocated_at=granted_at,
-                allocation_wait_ms=elapsed_ms(started_at, granted_at),
-                waited_for_capacity=lease.waited_for_capacity,
-            )
-
-        logger.info(
-            "Queued session request ticket_id=%s position=%d queue_depth=%d",
-            ticket_id,
-            position,
-            position,
-            extra={"ticket_id": ticket_id, "position": position, "outcome": "queued"},
+        granted_at = monotonic()
+        return await self._grant_from_lease(
+            lease,
+            lb_base_url,
+            allocated_at=granted_at,
+            allocation_wait_ms=elapsed_ms(started_at, granted_at),
+            waited_for_capacity=lease.waited_for_capacity,
         )
-        return self._ticket_view(ticket_id, position)
 
     async def poll(self, ticket_id: str, lb_base_url: str) -> dict[str, object]:
         """Advance a waiting ticket. Refreshes its last-seen, reports position, and
@@ -210,13 +209,23 @@ class DirectSessionManager:
                 elapsed_ms(created_at, now),
                 extra={"ticket_id": ticket_id, "outcome": "claimed"},
             )
-            return await self._grant_from_lease(
-                lease,
-                lb_base_url,
-                allocated_at=now,
-                allocation_wait_ms=elapsed_ms(created_at, now),
-                waited_for_capacity=True,
-            )
+            try:
+                return await self._grant_from_lease(
+                    lease,
+                    lb_base_url,
+                    allocated_at=now,
+                    allocation_wait_ms=elapsed_ms(created_at, now),
+                    waited_for_capacity=True,
+                )
+            except BaseException:
+                # The ticket was popped optimistically under the lock; a grant
+                # failure must not evict the head of the line after its whole
+                # wait. Put it back in front so the next poll retries.
+                async with self._lock:
+                    if ticket_id not in self._queue:
+                        self._queue[ticket_id] = ticket
+                        self._queue.move_to_end(ticket_id, last=False)
+                raise
 
         return self._ticket_view(ticket_id, position)
 
@@ -433,6 +442,13 @@ class DirectSessionManager:
                     dropped.append(ticket_id)
 
         for ticket_id in dropped:
+            if self._ticket_expired_handler is not None:
+                try:
+                    await self._ticket_expired_handler(ticket_id)
+                except Exception:
+                    logger.exception(
+                        "Ticket-expired handler failed for ticket %s", ticket_id
+                    )
             logger.info(
                 "Dropped abandoned queue ticket %s (no poll within %.0fs TTL)",
                 ticket_id,

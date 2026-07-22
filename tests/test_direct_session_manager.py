@@ -254,6 +254,46 @@ class SessionQueueTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(KeyError):
             await manager.poll(ticket["queue_id"], "https://lb.example")
 
+    async def test_reaped_ticket_fires_expired_handler(self):
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = self._make(router, queue_ticket_ttl_s=0.0)
+        await manager.start()
+
+        expired: list[str] = []
+
+        async def on_expired(ticket_id: str) -> None:
+            expired.append(ticket_id)
+
+        manager.set_ticket_expired_handler(on_expired)
+        ticket = await manager.allocate("https://lb.example")
+        await manager._reap_stale_tickets()
+
+        self.assertEqual(expired, [ticket["queue_id"]])
+
+    async def test_failed_claim_requeues_ticket_at_head(self):
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = self._make(router)
+        await manager.start()
+
+        first = await manager.allocate("https://lb.example")
+        second = await manager.allocate("https://lb.example")
+        router.has_capacity = True
+
+        # A grant failure after the optimistic pop must not evict the head:
+        # the ticket goes back to the front and the next poll retries.
+        with patch.object(
+            manager, "_grant_from_lease", side_effect=RuntimeError("token minting broke")
+        ):
+            with self.assertRaises(RuntimeError):
+                await manager.poll(first["queue_id"], "https://lb.example")
+
+        still_queued = await manager.poll(second["queue_id"], "https://lb.example")
+        self.assertEqual(still_queued["state"], "queued")
+        self.assertEqual(still_queued["position"], 2)
+
+        granted = await manager.poll(first["queue_id"], "https://lb.example")
+        self.assertEqual(granted["state"], "granted")
+
 
 class BlockingCapacityRouter(FakeLeaseRouter):
     """Fake for queueless mode: ``acquire`` blocks until capacity is signalled,
