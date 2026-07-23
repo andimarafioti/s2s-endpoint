@@ -328,7 +328,7 @@ minute buckets are present.
 - `REQUEST_RATE_LIMIT_MAX_PARALLEL`: maximum simultaneous allocation calls, pending
   joins, and connected sessions from one requester (defaults to 10)
 - `REQUEST_RATE_LIMIT_NO_CONNECTS`: consecutive allocated sessions that can expire
-  or disconnect without joining before a cooldown starts (defaults to 3)
+  or disconnect without joining before a cooldown starts (defaults to 5)
 - `REQUEST_RATE_LIMIT_SHORT_SESSION_S`: connected duration at or below which a
   session counts toward reconnect-loop detection (defaults to 10 seconds)
 - `REQUEST_RATE_LIMIT_SHORT_SESSIONS`: consecutive short connected sessions before

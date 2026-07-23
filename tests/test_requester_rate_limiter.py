@@ -153,6 +153,25 @@ class RequesterRateLimiterTests(unittest.TestCase):
         self.assertEqual(rejected.retry_after_s, 120)
         self.assertEqual(self.limiter.status()["totals"]["no_connects"], 3)
 
+    def test_default_cooldown_starts_after_five_no_connects(self):
+        limiter = RequesterRateLimiter(time_fn=self.clock)
+        for index in range(5):
+            decision = limiter.acquire(self.requester)
+            self.assertTrue(decision.allowed)
+            limiter.record_allocation(
+                f"session-{index}",
+                self.requester,
+                pending_timeout_s=1,
+            )
+            self.clock.advance(1)
+
+        rejected = limiter.acquire(self.requester)
+
+        self.assertFalse(rejected.allowed)
+        self.assertEqual(rejected.reason, "behavior_cooldown")
+        self.assertEqual(rejected.consecutive_no_connects, 5)
+        self.assertEqual(limiter.status()["limits"]["max_consecutive_no_connects"], 5)
+
     def test_successful_join_resets_no_connect_streak(self):
         for index in range(2):
             self.allocate(f"miss-{index}", pending_timeout_s=10)

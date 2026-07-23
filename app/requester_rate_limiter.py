@@ -15,7 +15,7 @@ class RequesterRateLimitConfig:
     request_window_s: float = 60.0
     max_requests_per_window: int = 20
     max_parallel_allocations: int = 10
-    max_consecutive_no_connects: int = 3
+    max_consecutive_no_connects: int = 5
     short_session_threshold_s: float = 10.0
     max_consecutive_short_sessions: int = 8
     cooldown_s: float = 15 * 60.0
