@@ -216,7 +216,23 @@ async def pool():
         data = await asyncio.to_thread(_http_get_json, INTERNAL_POOL_URL)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return JSONResponse(data)
+    return JSONResponse(_redact_pool_payload(data))
+
+
+def _redact_pool_payload(data: dict[str, object]) -> dict[str, object]:
+    """Strip session ids from the pool payload before it leaves the replica.
+
+    A realtime session id doubles as the bearer token for the LLM proxy
+    paths, so exposing it here would hand every reader a usable credential.
+    The load balancer's stuck-unit recovery reads only unit states and
+    durations, which pass through untouched.
+    """
+    units = data.get("units")
+    if isinstance(units, list):
+        for unit in units:
+            if isinstance(unit, dict):
+                unit.pop("session_id", None)
+    return data
 
 
 @app.post("/v1/chat/completions")

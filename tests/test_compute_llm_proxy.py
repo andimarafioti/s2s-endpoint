@@ -40,6 +40,9 @@ class StubInternalPipeline:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
+            def do_GET(self) -> None:
+                self.do_POST()
+
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length)
@@ -254,6 +257,47 @@ def test_only_post_is_exposed_on_proxy_paths(monkeypatch: Any) -> None:
             assert client.get(path).status_code == 405
 
         assert stub.requests == []
+    finally:
+        stub.close()
+
+
+def test_pool_passthrough_redacts_session_ids(monkeypatch: Any) -> None:
+    """Session ids double as bearer tokens for the LLM proxy paths, so the
+    replica's pool passthrough must strip them. The LB's stuck-unit recovery
+    only reads unit states and durations, which stay intact."""
+    stub = StubInternalPipeline()
+    try:
+        pool_payload = {
+            "size": 2,
+            "in_use": 2,
+            "units": [
+                {"index": 0, "state": "active", "session_id": "session_secret_bearer"},
+                {
+                    "index": 1,
+                    "state": "stuck",
+                    "session_id": "session_other",
+                    "draining_for_s": 12.5,
+                    "stuck_for_s": 3.0,
+                },
+            ],
+        }
+        stub.responder = lambda path: (200, pool_payload)
+        monkeypatch.setattr(compute_main, "INTERNAL_POOL_URL", f"{stub.base_url}/v1/pool")
+        client = TestClient(compute_main.app)
+
+        response = client.get("/v1/pool")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["size"] == 2
+        assert payload["units"][0] == {"index": 0, "state": "active"}
+        assert payload["units"][1] == {
+            "index": 1,
+            "state": "stuck",
+            "draining_for_s": 12.5,
+            "stuck_for_s": 3.0,
+        }
+        assert "session_secret_bearer" not in response.text
     finally:
         stub.close()
 
