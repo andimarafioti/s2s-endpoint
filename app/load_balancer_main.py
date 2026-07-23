@@ -330,6 +330,7 @@ def _public_session_allocation(allocation: dict[str, object]) -> dict[str, objec
         for key in (
             "session_id",
             "websocket_url",
+            "http_base_url",
             "connect_url",
             "session_token",
             "pending_timeout_s",
