@@ -499,8 +499,7 @@ class DirectSessionManager:
                 endpoint_name,
                 session.connected,
             )
-            if session.connected:
-                await self._record_abnormal_disconnect(result)
+            await self._record_abnormal_disconnect(result)
 
     def _release_result(self, session: DirectSession, *, release_reason: str) -> dict[str, object]:
         conversation_duration_s = 0.0
