@@ -1,4 +1,8 @@
 import unittest
+from unittest.mock import patch
+
+from limits.storage import MemoryStorage
+from limits.strategies import MovingWindowRateLimiter
 
 from app.requester_identity import RequesterIdentity
 from app.requester_rate_limiter import (
@@ -21,6 +25,9 @@ class FakeClock:
 class RequesterRateLimiterTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
+        self.time_patch = patch("limits.storage.memory.time.time", self.clock)
+        self.time_patch.start()
+        self.addCleanup(self.time_patch.stop)
         self.config = RequesterRateLimitConfig(
             request_window_s=60,
             max_requests_per_window=100,
@@ -41,6 +48,16 @@ class RequesterRateLimiterTests(unittest.TestCase):
             fingerprint="abc123",
             network_id="net:abc123",
             client_kind="automation:python-requests",
+        )
+
+    def test_uses_limits_moving_window_with_in_memory_storage(self):
+        self.assertIsInstance(
+            self.limiter._request_rate_limiter,
+            MovingWindowRateLimiter,
+        )
+        self.assertIsInstance(
+            self.limiter._request_rate_limiter.storage,
+            MemoryStorage,
         )
 
     def allocate(self, session_id: str, *, pending_timeout_s: float = 60) -> None:
@@ -134,11 +151,13 @@ class RequesterRateLimiterTests(unittest.TestCase):
         rejected = limiter.acquire(self.requester)
         self.assertFalse(rejected.allowed)
         self.assertEqual(rejected.reason, "request_rate")
+        self.assertEqual(rejected.recent_requests, 3)
         self.assertEqual(rejected.retry_after_s, 60)
 
-        self.clock.advance(60)
+        self.clock.advance(60.001)
         recovered = limiter.acquire(self.requester)
         self.assertTrue(recovered.allowed)
+        self.assertEqual(recovered.recent_requests, 1)
 
     def test_repeated_allocations_that_never_connect_trigger_cooldown(self):
         for index in range(3):
@@ -328,7 +347,7 @@ class RequesterRateLimiterTests(unittest.TestCase):
         self.assertEqual(capacity_rejection.reason, "tracker_capacity")
         self.assertFalse(original_rejection.allowed)
         self.assertEqual(original_rejection.reason, "request_rate")
-        self.assertEqual(original_rejection.recent_requests, 2)
+        self.assertEqual(original_rejection.recent_requests, 1)
 
     def test_full_actor_table_evicts_retention_expired_state(self):
         limiter = RequesterRateLimiter(

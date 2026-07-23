@@ -321,7 +321,8 @@ minute buckets are present.
   that raise a many-networks signal (defaults to 5)
 - `REQUEST_RATE_LIMIT_ENABLED`: enforce requester rate limits (defaults to `true`).
   When disabled, the limiter continues tracking outcomes without rejecting requests.
-  Limiter state is local to the load-balancer process and resets when it restarts.
+  Request windows use `limits` with in-memory moving-window storage; lifecycle
+  policy state is also local to the load-balancer process. Both reset on restart.
 - `REQUEST_RATE_LIMIT_WINDOW_S`: rolling request-rate window (defaults to 60 seconds)
 - `REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW`: maximum `POST /session` attempts from
   one requester in the rolling window (defaults to 20)
