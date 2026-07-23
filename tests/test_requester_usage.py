@@ -79,6 +79,22 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         await service.record("success", token_requester)
         await service.record("connected", token_requester)
         await service.record("failure", token_requester)
+        await service.record("rate_limited", token_requester)
+        await service.record_session_outcome(
+            token_requester,
+            duration_s=6,
+            short_session=True,
+        )
+        await service.record_session_outcome(
+            token_requester,
+            duration_s=6,
+            short_session=True,
+        )
+        await service.record_session_outcome(
+            token_requester,
+            duration_s=45,
+            short_session=False,
+        )
         await service.record("request", anonymous)
 
         payload = await service.data(window_minutes=60)
@@ -97,6 +113,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["attributed_connections_window"], 1)
         self.assertEqual(summary["authenticated_requests_window"], 3)
         self.assertEqual(summary["anonymous_requests_window"], 1)
+        self.assertEqual(summary["rate_limited_requests_window"], 1)
         self.assertEqual(summary["unattributed_requests_window"], 0)
         self.assertEqual(leaderboard[0]["label"], "@reachy-user · token •abc123")
         self.assertEqual(leaderboard[0]["requests"], 3)
@@ -109,11 +126,20 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(leaderboard[0]["automated_requests"], 3)
         self.assertEqual(leaderboard[0]["connections"], 1)
+        self.assertEqual(leaderboard[0]["completed_sessions"], 3)
+        self.assertEqual(leaderboard[0]["short_sessions"], 2)
+        self.assertEqual(leaderboard[0]["avg_connected_duration_s"], 19.0)
+        self.assertEqual(leaderboard[0]["max_connected_duration_s"], 45.0)
+        self.assertEqual(leaderboard[0]["rate_limited"], 1)
         self.assertNotIn("connection_rate_pct", leaderboard[0])
         self.assertEqual(leaderboard[0]["risk"], "high")
         self.assertIn("high volume: 3 requests", leaderboard[0]["signals"])
         self.assertIn("burst: 3/min", leaderboard[0]["signals"])
         self.assertIn("many networks: 2", leaderboard[0]["signals"])
+        self.assertIn("rate limited: 1 request", leaderboard[0]["signals"])
+        self.assertFalse(
+            any(signal.startswith("mostly short sessions") for signal in leaderboard[0]["signals"])
+        )
 
     async def test_resolved_identity_updates_and_round_trips_existing_history(self):
         service = self._service(FakeClock(2 * 3600))

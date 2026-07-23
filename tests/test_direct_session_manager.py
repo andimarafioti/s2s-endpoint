@@ -4,6 +4,8 @@ from unittest.mock import patch
 
 from app.direct_session_manager import DirectSessionManager, QueueAtCapacityError
 from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointLease
+from app.requester_identity import RequesterIdentity
+from app.requester_rate_limiter import RequesterRateLimiter
 from app.session_tokens import verify_session_token, websocket_host_matches
 from tests.helpers import monotonic_sequence
 
@@ -69,6 +71,18 @@ class ToggleCapacityRouter(FakeLeaseRouter):
         if not self.has_capacity:
             return None
         return await self.acquire()
+
+
+class SharedEndpointLeaseRouter(FakeLeaseRouter):
+    async def acquire(self, timeout_s: float = 900.0) -> EndpointLease:
+        self.acquire_calls += 1
+        slot_id = f"endpoint-1:{self.acquire_calls}"
+        return EndpointLease(
+            slot_id=slot_id,
+            endpoint_name="endpoint-1",
+            ws_url="wss://endpoint-1.example.endpoints.huggingface.cloud/ws",
+            waited_for_capacity=self.waited_for_capacity,
+        )
 
 
 class YieldingToggleRouter(ToggleCapacityRouter):
@@ -644,6 +658,61 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         snapshot = await self.manager.snapshot()
         self.assertEqual(snapshot["connected_sessions"], 0)
+
+    async def test_endpoint_down_releases_pending_rate_limit_allocations_without_penalty(self):
+        router = SharedEndpointLeaseRouter()
+        now = [0.0]
+        limiter = RequesterRateLimiter(time_fn=lambda: now[0])
+        requester = RequesterIdentity(
+            actor_id="robot:test",
+            label="Test robot",
+            kind="robot",
+            verification="verified",
+            fingerprint="test",
+            network_id="net:test",
+            client_kind="robot:httpx",
+        )
+        recorded_disconnects = []
+
+        async def record_disconnect(result):
+            recorded_disconnects.append(result)
+            limiter.record_disconnected(
+                str(result["session_id"]),
+                duration_s=float(result["conversation_duration_s"]),
+                penalize=False,
+            )
+
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            queue_enabled=True,
+            pending_timeout_s=60,
+            session_token_ttl_s=3600,
+            reap_interval_s=3600,
+        )
+        self.manager.set_abnormal_disconnect_handler(record_disconnect)
+        await self.manager.start()
+
+        for _ in range(5):
+            self.assertTrue(limiter.acquire(requester).allowed)
+            allocation = await self.manager.allocate("https://lb.example")
+            limiter.record_allocation(
+                str(allocation["session_id"]),
+                requester,
+                pending_timeout_s=60,
+            )
+
+        await router._on_endpoint_down("endpoint-1")
+        now[0] = 61.0
+
+        status = limiter.status()
+        self.assertEqual(status["active_allocations"], 0)
+        self.assertNotIn("no_connects", status["totals"])
+        self.assertEqual(len(recorded_disconnects), 5)
+        self.assertTrue(
+            all(not result["conversation_counted"] for result in recorded_disconnects)
+        )
+        self.assertTrue(limiter.acquire(requester).allowed)
 
     async def test_endpoint_down_after_clean_disconnect_records_no_abnormal_disconnect(self):
         router = FakeLeaseRouter()

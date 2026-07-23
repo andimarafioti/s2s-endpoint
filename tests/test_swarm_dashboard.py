@@ -296,6 +296,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         await dashboard.capture_sample()
         await dashboard.record_session_request()
         await dashboard.record_session_allocation_success()
+        await dashboard.record_session_rate_limited()
         await dashboard.record_session_event("connected")
         await dashboard.record_session_event(
             "disconnected",
@@ -312,12 +313,14 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current["parked_endpoints"], 1)
         self.assertEqual(point["session_requests"], 1)
         self.assertEqual(point["session_allocation_successes"], 1)
+        self.assertEqual(point["session_rate_limited"], 1)
         self.assertEqual(point["session_connected_events"], 1)
         self.assertEqual(point["completed_conversations"], 1)
         self.assertEqual(point["avg_conversation_duration_s"], 150.0)
         self.assertEqual(point["max_conversation_duration_min"], 2.5)
         self.assertEqual(payload["summary"]["window_label"], "60m")
         self.assertEqual(payload["summary"]["session_requests_window"], 1)
+        self.assertEqual(payload["summary"]["session_rate_limited_window"], 1)
         self.assertEqual(payload["summary"]["conversations_completed_window"], 1)
         self.assertEqual(payload["summary"]["active_conversation_minutes_window"], 2.0)
         self.assertEqual(payload["summary"]["active_conversation_hours_window"], 0.03)
