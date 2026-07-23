@@ -2,7 +2,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Protocol
-from urllib.parse import urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 
 class SuppressHealthcheckAccessFilter(logging.Filter):
@@ -50,6 +50,18 @@ def build_lifespan(manager: LifecycleManager):
 
 def elapsed_ms(start_monotonic: float, end_monotonic: float) -> int:
     return max(int(round((end_monotonic - start_monotonic) * 1000)), 0)
+
+
+def http_base_url_from_ws_url(ws_url: str) -> str:
+    """HTTP origin of the server behind a websocket URL, path dropped.
+
+    A compute replica serves its websocket and its LLM proxy paths from the
+    same host, so the HTTP base for ``wss://host/v1/realtime`` is
+    ``https://host``.
+    """
+    parts = urlsplit(ws_url)
+    scheme = {"ws": "http", "wss": "https"}.get(parts.scheme, parts.scheme)
+    return urlunsplit((scheme, parts.netloc, "", "", ""))
 
 
 def public_base_url(request) -> str:

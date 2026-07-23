@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Awaitable, Callable, Optional
 
-from app.app_utils import elapsed_ms
+from app.app_utils import elapsed_ms, http_base_url_from_ws_url
 from app.endpoint_pool_router import EndpointLease, EndpointPoolRouter
 from app.session_tokens import attach_session_token, create_session_token, verify_session_token
 
@@ -292,6 +292,9 @@ class DirectSessionManager:
             "state": "granted",
             "session_id": session_id,
             "websocket_url": lease.ws_url,
+            # HTTP origin of the replica that owns the session, for the LLM
+            # proxy paths it serves next to the websocket.
+            "http_base_url": http_base_url_from_ws_url(lease.ws_url),
             "connect_url": attach_session_token(lease.ws_url, session_token),
             "session_token": session_token,
             "pending_timeout_s": self.pending_timeout_s,

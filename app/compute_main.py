@@ -6,8 +6,10 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket
-from fastapi.responses import JSONResponse
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from app.app_utils import build_lifespan, setup_logging
 from app.session_router import SessionRouter
@@ -63,6 +65,8 @@ INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_USAGE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_USAGE_PATH}"
 INTERNAL_POOL_PATH = "/v1/pool"
 INTERNAL_POOL_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_POOL_PATH}"
+INTERNAL_HTTP_BASE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}"
+LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
 
 
 def _add_bool_flag(cmd: list[str], enabled: bool, flag: str) -> None:
@@ -212,7 +216,95 @@ async def pool():
         data = await asyncio.to_thread(_http_get_json, INTERNAL_POOL_URL)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return JSONResponse(data)
+    return JSONResponse(_redact_pool_payload(data))
+
+
+def _redact_pool_payload(data: dict[str, object]) -> dict[str, object]:
+    """Strip session ids from the pool payload before it leaves the replica.
+
+    A realtime session id doubles as the bearer token for the LLM proxy
+    paths, so exposing it here would hand every reader a usable credential.
+    The load balancer's stuck-unit recovery reads only unit states and
+    durations, which pass through untouched.
+    """
+    units = data.get("units")
+    if isinstance(units, list):
+        for unit in units:
+            if isinstance(unit, dict):
+                unit.pop("session_id", None)
+    return data
+
+
+@app.post("/v1/chat/completions")
+async def llm_proxy_chat_completions(request: Request) -> Response:
+    return await _proxy_llm_request(request, "/v1/chat/completions")
+
+
+@app.post("/v1/responses")
+async def llm_proxy_responses(request: Request) -> Response:
+    return await _proxy_llm_request(request, "/v1/responses")
+
+
+async def _proxy_llm_request(request: Request, path: str) -> Response:
+    """Pass an LLM proxy request through to the internal pipeline verbatim.
+
+    The pipeline owns the whole contract (session gating, rate limits, 501
+    reasons); the replica forwards method, body, and Authorization header
+    unchanged and streams the answer back frame by frame, whatever its
+    status. The replica only synthesizes an answer (502) when the internal
+    pipeline itself is unreachable.
+    """
+    headers = {}
+    for name in ("authorization", "content-type"):
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+
+    # Connects are loopback so a short timeout is safe; reads get none at
+    # all, because a proxied generation can legitimately take minutes.
+    timeout = httpx.Timeout(None, connect=LLM_PROXY_CONNECT_TIMEOUT_S)
+    client = httpx.AsyncClient(timeout=timeout)
+    try:
+        upstream_request = client.build_request(
+            "POST",
+            INTERNAL_HTTP_BASE_URL + path,
+            content=await request.body(),
+            headers=headers,
+        )
+        upstream = await client.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        logger.warning("LLM proxy: internal pipeline unreachable: %s", exc)
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "The internal pipeline is unreachable.",
+                    "type": "upstream_unreachable",
+                }
+            },
+            status_code=502,
+        )
+    except Exception:
+        await client.aclose()
+        raise
+
+    async def _cleanup() -> None:
+        await upstream.aclose()
+        await client.aclose()
+
+    # The content type rides along as a raw header: a media_type would get a
+    # charset appended by Starlette, and the answer must stay verbatim.
+    response_headers = {}
+    upstream_content_type = upstream.headers.get("content-type")
+    if upstream_content_type:
+        response_headers["content-type"] = upstream_content_type
+
+    return StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @app.websocket("/v1/realtime")
