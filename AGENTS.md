@@ -2,6 +2,7 @@
 
 - Never include `codex` in branch names or pull request titles.
 - Always make changes as consecutive commits, with each commit preserving exactly what changed at that step. Do not fold follow-up work into earlier commits unless explicitly asked.
+- Never merge pull requests automatically. Leave every pull request open for user review, and merge only when the user explicitly asks to merge that specific pull request.
 - For existing/open pull requests, do not amend, squash, rebase-rewrite, or force-push follow-up changes. Make new commits and push normally unless explicitly asked to rewrite history.
 
 # Operational Log Analysis Notes
