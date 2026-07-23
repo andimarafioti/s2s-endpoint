@@ -63,6 +63,24 @@ class RequesterRateLimiterTests(unittest.TestCase):
         self.assertEqual(rejected.active_allocations, 2)
         self.assertEqual(rejected.retry_after_s, 60)
 
+    def test_default_limit_allows_ten_parallel_allocations(self):
+        limiter = RequesterRateLimiter(time_fn=self.clock)
+        for index in range(10):
+            decision = limiter.acquire(self.requester)
+            self.assertTrue(decision.allowed)
+            limiter.record_allocation(
+                f"session-{index}",
+                self.requester,
+                pending_timeout_s=60,
+            )
+
+        rejected = limiter.acquire(self.requester)
+
+        self.assertFalse(rejected.allowed)
+        self.assertEqual(rejected.reason, "parallel_allocations")
+        self.assertEqual(rejected.active_allocations, 10)
+        self.assertEqual(limiter.status()["limits"]["max_parallel_allocations"], 10)
+
     def test_allocation_failure_releases_in_flight_permit_without_behavior_penalty(self):
         decision = self.limiter.acquire(self.requester)
         self.assertTrue(decision.allowed)

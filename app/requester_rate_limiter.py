@@ -14,7 +14,7 @@ class RequesterRateLimitConfig:
     enabled: bool = True
     request_window_s: float = 60.0
     max_requests_per_window: int = 20
-    max_parallel_allocations: int = 2
+    max_parallel_allocations: int = 10
     max_consecutive_no_connects: int = 3
     short_session_threshold_s: float = 10.0
     max_consecutive_short_sessions: int = 8

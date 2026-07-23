@@ -326,7 +326,7 @@ minute buckets are present.
 - `REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW`: maximum `POST /session` attempts from
   one requester in the rolling window (defaults to 20)
 - `REQUEST_RATE_LIMIT_MAX_PARALLEL`: maximum simultaneous allocation calls, pending
-  joins, and connected sessions from one requester (defaults to 2)
+  joins, and connected sessions from one requester (defaults to 10)
 - `REQUEST_RATE_LIMIT_NO_CONNECTS`: consecutive allocated sessions that can expire
   or disconnect without joining before a cooldown starts (defaults to 3)
 - `REQUEST_RATE_LIMIT_SHORT_SESSION_S`: connected duration at or below which a
