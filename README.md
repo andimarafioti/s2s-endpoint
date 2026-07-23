@@ -338,7 +338,8 @@ minute buckets are present.
 - `REQUEST_RATE_LIMIT_ACTOR_RETENTION_S`: idle requester limiter state retention
   (defaults to 3,600 seconds)
 - `REQUEST_RATE_LIMIT_MAX_ACTORS`: maximum in-memory requester limiter states
-  (defaults to 10,000). When all entries are active, new requesters fail closed.
+  (defaults to 10,000). Retention-expired inactive states are evicted first; if
+  the table remains full of fresh state, previously unseen requesters fail closed.
 - `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
 - `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
   (defaults to 28 days so the 14d/28d dashboard windows can load persisted history)

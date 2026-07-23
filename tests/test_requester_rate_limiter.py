@@ -226,6 +226,29 @@ class RequesterRateLimiterTests(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.consecutive_short_sessions, 2)
 
+    def test_non_penalized_long_session_breaks_short_reconnect_streak(self):
+        for index in range(2):
+            self.allocate(f"short-{index}")
+            self.limiter.record_connected(f"short-{index}")
+            self.limiter.record_disconnected(f"short-{index}", duration_s=6)
+
+        self.allocate("system-release")
+        self.limiter.record_connected("system-release")
+        outcome = self.limiter.record_disconnected(
+            "system-release",
+            duration_s=600,
+            penalize=False,
+        )
+
+        self.assertFalse(outcome.short_session)
+        self.allocate("next-short")
+        self.limiter.record_connected("next-short")
+        self.limiter.record_disconnected("next-short", duration_s=6)
+
+        decision = self.limiter.acquire(self.requester)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.consecutive_short_sessions, 1)
+
     def test_system_release_does_not_penalize_requester(self):
         self.allocate("session-1")
         self.limiter.record_connected("session-1")
@@ -278,6 +301,60 @@ class RequesterRateLimiterTests(unittest.TestCase):
 
         self.assertFalse(rejected.allowed)
         self.assertEqual(rejected.reason, "tracker_capacity")
+
+    def test_full_actor_table_preserves_fresh_request_history(self):
+        limiter = RequesterRateLimiter(
+            config=RequesterRateLimitConfig(
+                max_actor_states=1,
+                max_requests_per_window=1,
+            ),
+            time_fn=self.clock,
+        )
+        first = limiter.acquire(self.requester)
+        self.assertTrue(first.allowed)
+        limiter.record_allocation_failure(self.requester)
+        other = RequesterIdentity(
+            actor_id="anonymous:other",
+            label="other",
+            kind="anonymous",
+            verification="not_provided",
+            fingerprint="other",
+        )
+
+        capacity_rejection = limiter.acquire(other)
+        original_rejection = limiter.acquire(self.requester)
+
+        self.assertFalse(capacity_rejection.allowed)
+        self.assertEqual(capacity_rejection.reason, "tracker_capacity")
+        self.assertFalse(original_rejection.allowed)
+        self.assertEqual(original_rejection.reason, "request_rate")
+        self.assertEqual(original_rejection.recent_requests, 2)
+
+    def test_full_actor_table_evicts_retention_expired_state(self):
+        limiter = RequesterRateLimiter(
+            config=RequesterRateLimitConfig(
+                actor_retention_s=1,
+                max_actor_states=1,
+            ),
+            time_fn=self.clock,
+        )
+        first = limiter.acquire(self.requester)
+        self.assertTrue(first.allowed)
+        limiter.record_allocation_failure(self.requester)
+        self.clock.advance(1)
+        other = RequesterIdentity(
+            actor_id="anonymous:other",
+            label="other",
+            kind="anonymous",
+            verification="not_provided",
+            fingerprint="other",
+        )
+
+        admitted = limiter.acquire(other)
+
+        self.assertTrue(admitted.allowed)
+        self.assertEqual(admitted.actor_id, other.actor_id)
+        self.assertEqual(limiter.status()["tracked_actors"], 1)
 
 
 class RequesterRateLimitConfigTests(unittest.TestCase):

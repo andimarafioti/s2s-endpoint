@@ -242,15 +242,16 @@ class RequesterRateLimiter:
             0.0,
         )
         short_session = resolved_duration_s <= self.config.short_session_threshold_s
-        if penalize and short_session:
-            state.consecutive_short_sessions += 1
-            self._totals["short_sessions"] += 1
-            if (
-                state.consecutive_short_sessions
-                >= self.config.max_consecutive_short_sessions
-            ):
-                self._activate_cooldown(state, now_s)
-        elif penalize:
+        if short_session:
+            if penalize:
+                state.consecutive_short_sessions += 1
+                self._totals["short_sessions"] += 1
+                if (
+                    state.consecutive_short_sessions
+                    >= self.config.max_consecutive_short_sessions
+                ):
+                    self._activate_cooldown(state, now_s)
+        else:
             state.consecutive_short_sessions = 0
         self._totals["completed_sessions"] += 1
         return RequesterSessionOutcome(
@@ -303,13 +304,10 @@ class RequesterRateLimiter:
     def _make_actor_capacity(self, now_s: float) -> None:
         if len(self._actors) < self.config.max_actor_states:
             return
+        # Preserve fresh request windows and behavioral streaks. Pruning removes
+        # retention-expired inactive states; if that is not enough, unseen actors
+        # fail closed rather than weakening enforcement for already tracked actors.
         self._prune_all(now_s)
-        if len(self._actors) < self.config.max_actor_states:
-            return
-        for actor_id, state in list(self._actors.items()):
-            if self._active_allocations(state) == 0 and state.blocked_until_s <= now_s:
-                self._actors.pop(actor_id, None)
-                return
 
     def _expire_pending_allocations(self, state: _ActorState, now_s: float) -> None:
         expired_session_ids = [
