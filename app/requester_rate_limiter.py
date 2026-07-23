@@ -2,13 +2,9 @@ from __future__ import annotations
 
 import math
 import time
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import Callable
-
-from limits import RateLimitItemPerSecond
-from limits.storage import MemoryStorage
-from limits.strategies import MovingWindowRateLimiter
+from typing import Callable, Deque
 
 from app.requester_identity import RequesterIdentity
 
@@ -16,7 +12,7 @@ from app.requester_identity import RequesterIdentity
 @dataclass(frozen=True)
 class RequesterRateLimitConfig:
     enabled: bool = True
-    request_window_s: int = 60
+    request_window_s: float = 60.0
     max_requests_per_window: int = 20
     max_parallel_allocations: int = 10
     max_consecutive_no_connects: int = 5
@@ -75,6 +71,7 @@ class _TrackedAllocation:
 class _ActorState:
     requester: RequesterIdentity
     last_seen_s: float
+    request_times_s: Deque[float] = field(default_factory=deque)
     in_flight_allocations: int = 0
     allocations: dict[str, _TrackedAllocation] = field(default_factory=dict)
     consecutive_no_connects: int = 0
@@ -85,8 +82,6 @@ class _ActorState:
 class RequesterRateLimiter:
     """Bound requester capacity using allocation outcomes instead of User-Agent bans.
 
-    ``limits`` owns the standard moving request window. This class only retains
-    state needed for releasable concurrency permits and session-outcome policies.
     Calls are synchronous so a check and its in-flight reservation happen without
     another asyncio task interleaving between them. The load balancer must release
     that reservation through ``record_allocation``, ``record_allocation_failure``,
@@ -101,12 +96,6 @@ class RequesterRateLimiter:
     ) -> None:
         self.config = config or RequesterRateLimitConfig()
         self._time_fn = time_fn
-        self._request_limit = RateLimitItemPerSecond(
-            self.config.max_requests_per_window,
-            self.config.request_window_s,
-            namespace="S2S_REQUESTER",
-        )
-        self._request_rate_limiter = MovingWindowRateLimiter(MemoryStorage())
         self._actors: "OrderedDict[str, _ActorState]" = OrderedDict()
         self._session_actors: dict[str, str] = {}
         self._totals: Counter[str] = Counter()
@@ -136,49 +125,32 @@ class RequesterRateLimiter:
             )
 
         self._expire_pending_allocations(state, now_s)
+        self._prune_request_window(state, now_s)
+        state.request_times_s.append(now_s)
         state.requester = requester
         state.last_seen_s = now_s
         self._actors.move_to_end(requester.actor_id)
-
-        request_allowed = self._request_rate_limiter.hit(
-            self._request_limit,
-            requester.actor_id,
-        )
-        request_window = self._request_rate_limiter.get_window_stats(
-            self._request_limit,
-            requester.actor_id,
-        )
-        recent_requests = (
-            self.config.max_requests_per_window - request_window.remaining
-        )
 
         reason: str | None = None
         retry_after_s: int | None = None
         if state.blocked_until_s > now_s:
             reason = "behavior_cooldown"
             retry_after_s = _retry_after(state.blocked_until_s - now_s)
-        elif not request_allowed:
+        elif len(state.request_times_s) > self.config.max_requests_per_window:
             reason = "request_rate"
-            retry_after_s = _retry_after(request_window.reset_time - time.time())
+            retry_after_s = _retry_after(
+                state.request_times_s[0] + self.config.request_window_s - now_s
+            )
         elif self._active_allocations(state) >= self.config.max_parallel_allocations:
             reason = "parallel_allocations"
             retry_after_s = self._parallel_retry_after(state, now_s)
 
         if reason is not None and self.config.enabled:
-            return self._reject(
-                state,
-                reason=reason,
-                retry_after_s=retry_after_s,
-                recent_requests=recent_requests,
-            )
+            return self._reject(state, reason=reason, retry_after_s=retry_after_s)
 
         state.in_flight_allocations += 1
         self._totals["allowed"] += 1
-        return self._decision(
-            state,
-            allowed=True,
-            recent_requests=recent_requests,
-        )
+        return self._decision(state, allowed=True)
 
     def record_allocation(
         self,
@@ -385,14 +357,20 @@ class RequesterRateLimiter:
             return None, None
         return state, state.allocations.pop(session_id, None)
 
+    def _prune_request_window(self, state: _ActorState, now_s: float) -> None:
+        cutoff_s = now_s - self.config.request_window_s
+        while state.request_times_s and state.request_times_s[0] <= cutoff_s:
+            state.request_times_s.popleft()
+
     def _prune_if_due(self, now_s: float) -> None:
-        prune_interval_s = min(self.config.actor_retention_s, 60.0)
+        prune_interval_s = min(self.config.request_window_s, 60.0)
         if now_s - self._last_prune_s >= prune_interval_s:
             self._prune_all(now_s)
 
     def _prune_all(self, now_s: float) -> None:
         for state in list(self._actors.values()):
             self._expire_pending_allocations(state, now_s)
+            self._prune_request_window(state, now_s)
         retention_cutoff_s = now_s - self.config.actor_retention_s
         for actor_id, state in list(self._actors.items()):
             if (
@@ -422,16 +400,10 @@ class RequesterRateLimiter:
         *,
         reason: str,
         retry_after_s: int | None,
-        recent_requests: int,
     ) -> RateLimitDecision:
         self._totals["rejected"] += 1
         self._rejection_reasons[reason] += 1
-        decision = self._decision(
-            state,
-            allowed=False,
-            reason=reason,
-            recent_requests=recent_requests,
-        )
+        decision = self._decision(state, allowed=False, reason=reason)
         return RateLimitDecision(
             **{
                 **decision.__dict__,
@@ -463,7 +435,6 @@ class RequesterRateLimiter:
         state: _ActorState,
         *,
         allowed: bool,
-        recent_requests: int,
         reason: str | None = None,
     ) -> RateLimitDecision:
         return RateLimitDecision(
@@ -471,7 +442,7 @@ class RequesterRateLimiter:
             reason=reason,
             retry_after_s=None,
             actor_id=state.requester.actor_id,
-            recent_requests=recent_requests,
+            recent_requests=len(state.request_times_s),
             active_allocations=self._active_allocations(state),
             consecutive_no_connects=state.consecutive_no_connects,
             consecutive_short_sessions=state.consecutive_short_sessions,

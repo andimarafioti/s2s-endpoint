@@ -1,5 +1,4 @@
 fastapi==0.116.1
 huggingface_hub==1.15.0
-limits==5.8.0
 uvicorn[standard]==0.35.0
 websockets==15.0.1
