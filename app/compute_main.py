@@ -36,11 +36,11 @@ ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().
 LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
 
 # Responses API / HF router
-MODEL_NAME = os.getenv("MODEL_NAME", "google/gemma-4-31B-it:cerebras").strip()
+MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
 INIT_CHAT_PROMPT = os.getenv("INIT_CHAT_PROMPT", "").strip()
-RESPONSES_API_BASE_URL = os.getenv("RESPONSES_API_BASE_URL", "https://router.huggingface.co/v1").strip()
+RESPONSES_API_BASE_URL = os.getenv("RESPONSES_API_BASE_URL", "").strip()
 RESPONSES_API_API_KEY = os.getenv("RESPONSES_API_API_KEY", "").strip() or os.getenv("HF_TOKEN", "").strip()
-RESPONSES_API_REASONING_EFFORT = os.getenv("RESPONSES_API_REASONING_EFFORT", "none").strip()
+RESPONSES_API_REASONING_EFFORT = os.getenv("RESPONSES_API_REASONING_EFFORT", "").strip()
 RESPONSES_API_STREAM = os.getenv("RESPONSES_API_STREAM", "1").strip().lower() in {"1", "true", "yes"}
 
 # Optional generic extras for power users
@@ -115,7 +115,8 @@ def build_s2s_command(host: str, port: int) -> list[str]:
             _add_str_flag(cmd, RESPONSES_API_BASE_URL, "--responses_api_base_url")
         if RESPONSES_API_API_KEY:
             _add_str_flag(cmd, RESPONSES_API_API_KEY, "--responses_api_api_key")
-        _add_str_flag(cmd, RESPONSES_API_REASONING_EFFORT, "--responses_api_reasoning_effort")
+        if RESPONSES_API_REASONING_EFFORT:
+            _add_str_flag(cmd, RESPONSES_API_REASONING_EFFORT, "--responses_api_reasoning_effort")
         _add_bool_flag(cmd, RESPONSES_API_STREAM, "--responses_api_stream")
 
     if EXTRA_S2S_ARGS:
