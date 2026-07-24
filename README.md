@@ -454,9 +454,9 @@ For the direct-session architecture, compute endpoints are usually created as
 `public` endpoints so clients can connect directly after the LB assigns them a
 session token.
 
-With the current defaults, compute endpoints also need an `HF_TOKEN` or
-`RESPONSES_API_API_KEY` secret at runtime because the speech-to-speech wrapper
-defaults to `LLM=chat-completions` with Hugging Face router settings:
+When targeting a third-party service protected by an API key, compute endpoints must also be configured with an `HF_TOKEN` or `RESPONSES_API_API_KEY` secret at runtime.
+
+The speech-to-speech wrapper defaults to `LLM=chat-completions`. To use the Hugging Face router, for example, set the following environment variables:
 `MODEL_NAME=google/gemma-4-31B-it:cerebras`,
 `RESPONSES_API_BASE_URL=https://router.huggingface.co/v1`, and
 `RESPONSES_API_REASONING_EFFORT=none`.
