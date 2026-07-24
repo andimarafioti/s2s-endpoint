@@ -1,7 +1,43 @@
+import importlib
+import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from app import compute_main
+
+
+class BuildS2SCommandTests(unittest.TestCase):
+    def build_command_with_env(self, env: dict[str, str]) -> list[str]:
+        with patch.dict(os.environ, env, clear=True):
+            module = importlib.reload(compute_main)
+            command = module.build_s2s_command("127.0.0.1", 9000)
+        importlib.reload(compute_main)
+        return command
+
+    def test_chat_completions_forwards_explicit_openai_compatible_connection_flags(self):
+        command = self.build_command_with_env(
+            {
+                "LLM": "chat-completions",
+                "MODEL_NAME": "google/gemma-4-31B-it:cerebras",
+                "RESPONSES_API_BASE_URL": "https://router.huggingface.co/v1",
+                "RESPONSES_API_REASONING_EFFORT": "none",
+                "HF_TOKEN": "hf_token",
+            }
+        )
+
+        self.assertEqual(command[command.index("--llm_backend") + 1], "chat-completions")
+        self.assertEqual(command[command.index("--model_name") + 1], "google/gemma-4-31B-it:cerebras")
+        self.assertEqual(command[command.index("--responses_api_base_url") + 1], "https://router.huggingface.co/v1")
+        self.assertEqual(command[command.index("--responses_api_api_key") + 1], "hf_token")
+        self.assertEqual(command[command.index("--responses_api_reasoning_effort") + 1], "none")
+
+    def test_chat_completions_defaults_use_hf_router_and_no_reasoning(self):
+        command = self.build_command_with_env({})
+
+        self.assertEqual(command[command.index("--llm_backend") + 1], "chat-completions")
+        self.assertEqual(command[command.index("--model_name") + 1], "google/gemma-4-31B-it:cerebras")
+        self.assertEqual(command[command.index("--responses_api_base_url") + 1], "https://router.huggingface.co/v1")
+        self.assertEqual(command[command.index("--responses_api_reasoning_effort") + 1], "none")
 
 
 class WaitForInternalRealtimeTests(unittest.IsolatedAsyncioTestCase):

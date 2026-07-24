@@ -28,7 +28,7 @@ LANGUAGE = os.getenv("LANGUAGE", "en").strip()
 CHAT_SIZE = os.getenv("CHAT_SIZE", "30").strip()
 
 STT = os.getenv("STT", "parakeet-tdt").strip()
-LLM = os.getenv("LLM", "responses-api").strip()
+LLM = os.getenv("LLM", "chat-completions").strip()
 TTS = os.getenv("TTS", "qwen3").strip()
 
 # General module flags
@@ -36,10 +36,11 @@ ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().
 LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
 
 # Responses API / HF router
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5.4").strip()
-INIT_CHAT_PROMPT = os.getenv("INIT_CHAT_PROMPT", "").strip()
+MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
+INIT_CHAT_PROMPT = os.getenv("INIT_CHAT_PROMPT", "gpt-5.4").strip()
 RESPONSES_API_BASE_URL = os.getenv("RESPONSES_API_BASE_URL", "").strip()
 RESPONSES_API_API_KEY = os.getenv("RESPONSES_API_API_KEY", "").strip() or os.getenv("HF_TOKEN", "").strip()
+RESPONSES_API_REASONING_EFFORT = os.getenv("RESPONSES_API_REASONING_EFFORT", "").strip()
 RESPONSES_API_STREAM = os.getenv("RESPONSES_API_STREAM", "1").strip().lower() in {"1", "true", "yes"}
 
 # Optional generic extras for power users
@@ -109,11 +110,13 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     _add_str_flag(cmd, MODEL_NAME, "--model_name")
     _add_str_flag(cmd, INIT_CHAT_PROMPT, "--init_chat_prompt")
 
-    if LLM == "responses-api":
+    if LLM in {"responses-api", "chat-completions"}:
         if RESPONSES_API_BASE_URL:
             _add_str_flag(cmd, RESPONSES_API_BASE_URL, "--responses_api_base_url")
         if RESPONSES_API_API_KEY:
             _add_str_flag(cmd, RESPONSES_API_API_KEY, "--responses_api_api_key")
+        if RESPONSES_API_REASONING_EFFORT:
+            _add_str_flag(cmd, RESPONSES_API_REASONING_EFFORT, "--responses_api_reasoning_effort")
         _add_bool_flag(cmd, RESPONSES_API_STREAM, "--responses_api_stream")
 
     if EXTRA_S2S_ARGS:
