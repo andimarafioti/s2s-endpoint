@@ -37,7 +37,7 @@ LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERV
 
 # Responses API / HF router
 MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
-INIT_CHAT_PROMPT = os.getenv("INIT_CHAT_PROMPT", "").strip()
+INIT_CHAT_PROMPT = os.getenv("INIT_CHAT_PROMPT", "gpt-5.4").strip()
 RESPONSES_API_BASE_URL = os.getenv("RESPONSES_API_BASE_URL", "").strip()
 RESPONSES_API_API_KEY = os.getenv("RESPONSES_API_API_KEY", "").strip() or os.getenv("HF_TOKEN", "").strip()
 RESPONSES_API_REASONING_EFFORT = os.getenv("RESPONSES_API_REASONING_EFFORT", "").strip()
