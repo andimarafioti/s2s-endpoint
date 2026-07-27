@@ -8,7 +8,7 @@ from app.endpoint_pool_router import (
     ComputeUsage,
     ComputeUsageSchemaError,
     EndpointDrainLeaseConflictError,
-    EndpointPoolRouter,
+    EndpointPoolRouter as ProductionEndpointPoolRouter,
     EndpointSnapshot,
     EndpointTransitionConflictError,
     ManagedEndpoint,
@@ -87,6 +87,48 @@ class FakeUrlopenResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
+def _make_test_router(
+    *,
+    endpoint_slots: int | None = None,
+    compute_usage_fetcher=None,
+    **kwargs,
+) -> ProductionEndpointPoolRouter:
+    if endpoint_slots is not None and endpoint_slots < 1:
+        raise ValueError("endpoint_slots must be >= 1")
+    if compute_usage_fetcher is None:
+        if endpoint_slots is None:
+            raise ValueError("test router needs endpoint_slots or compute_usage_fetcher")
+
+        def compute_usage_fetcher(url: str) -> ComputeUsage:
+            return ComputeUsage(active_sessions=0, max_sessions=endpoint_slots)
+
+    raw_fetcher = compute_usage_fetcher
+
+    def fetch_usage(url: str) -> ComputeUsage:
+        result = raw_fetcher(url)
+        if isinstance(result, ComputeUsage):
+            return result
+        if endpoint_slots is None:
+            raise TypeError("active-session-only test fetcher needs endpoint_slots")
+        return ComputeUsage(
+            active_sessions=int(result),
+            max_sessions=endpoint_slots,
+        )
+
+    router = ProductionEndpointPoolRouter(
+        compute_usage_fetcher=fetch_usage,
+        **kwargs,
+    )
+    if endpoint_slots is not None:
+        # Some selection tests operate directly on ManagedEndpoint state
+        # without a refresh. Seed them as if one health poll already succeeded;
+        # production routers always learn these values through fetch_usage.
+        for endpoint in router._endpoints.values():
+            endpoint.slots = endpoint_slots
+            endpoint.usage_synced = True
+    return router
+
+
 class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         router = getattr(self, "router", None)
@@ -143,7 +185,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "paused", None),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -176,7 +218,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             return original_wake(name)
 
         controller.wake = delayed_wake
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -204,7 +246,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "paused", None),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -234,7 +276,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "running", "https://endpoint-b.example.endpoints.huggingface.cloud"),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -261,7 +303,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         controller = FakeEndpointController(
             [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -286,7 +328,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         controller = FakeEndpointController(
             [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -311,7 +353,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         controller = FakeEndpointController(
             [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -373,7 +415,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         controller = FakeEndpointController(
             [("endpoint-a", "running", endpoint_url)]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -440,7 +482,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         controller = FakeEndpointController(
             [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -474,7 +516,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         controller = FakeEndpointController(
             [("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud")]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -516,7 +558,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -546,7 +588,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "running", "https://endpoint-b.example.endpoints.huggingface.cloud"),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -572,7 +614,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", endpoint_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -610,7 +652,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "paused", None),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=0,
@@ -636,7 +678,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "paused", None),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -674,7 +716,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", endpoint_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=4,
             min_warm_endpoints=1,
@@ -728,7 +770,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", endpoint_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=2,
             min_warm_endpoints=1,
@@ -775,7 +817,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "running", endpoint_b_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             min_warm_endpoints=1,
             wake_threshold_slots=1,
@@ -835,7 +877,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "paused", None),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -881,7 +923,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=2,
             min_warm_endpoints=1,
@@ -927,7 +969,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=2,
             min_warm_endpoints=1,
@@ -966,7 +1008,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=2,
             min_warm_endpoints=1,
@@ -1003,7 +1045,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "running", "https://endpoint-b.example.endpoints.huggingface.cloud"),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -1040,7 +1082,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -1070,7 +1112,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", endpoint_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -1113,7 +1155,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", endpoint_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=2,
             min_warm_endpoints=1,
@@ -1146,7 +1188,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "paused", None),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             min_warm_endpoints=1,
             wake_threshold_slots=1,
@@ -1178,7 +1220,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", endpoint_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -1208,7 +1250,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", endpoint_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=2,
             min_warm_endpoints=1,
@@ -1244,7 +1286,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", endpoint_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=2,
             min_warm_endpoints=1,
@@ -1295,7 +1337,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", endpoint_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -1324,7 +1366,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-a", "running", endpoint_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -1364,7 +1406,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "running", endpoint_b_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -1396,7 +1438,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-b", "running", endpoint_b_url),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -1432,7 +1474,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-c", "paused", None),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b", "endpoint-c"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -1475,7 +1517,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 ("endpoint-c", "running", "https://endpoint-c.example.endpoints.huggingface.cloud"),
             ]
         )
-        self.router = EndpointPoolRouter(
+        self.router = _make_test_router(
             endpoint_names=["endpoint-a", "endpoint-b", "endpoint-c"],
             endpoint_slots=1,
             min_warm_endpoints=1,
@@ -1515,7 +1557,7 @@ class EndpointSelectionTests(unittest.TestCase):
                 for name in endpoint_names
             ]
         )
-        router = EndpointPoolRouter(
+        router = _make_test_router(
             endpoint_names=endpoint_names,
             endpoint_slots=endpoint_slots,
             min_warm_endpoints=1,
@@ -1627,7 +1669,7 @@ def _make_drain_router(controller, *, drain_restart_timeout_s=600, endpoint_slot
         controller=controller,
     )
     defaults.update(extra)
-    return EndpointPoolRouter(**defaults)
+    return _make_test_router(**defaults)
 
 
 class DrainRestartTests(unittest.IsolatedAsyncioTestCase):

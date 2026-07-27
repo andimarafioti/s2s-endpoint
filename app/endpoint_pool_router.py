@@ -374,7 +374,6 @@ class EndpointPoolRouter:
         self,
         *,
         endpoint_names: list[str],
-        endpoint_slots: Optional[int] = None,
         min_warm_endpoints: int,
         wake_threshold_slots: int,
         idle_park_timeout_s: float,
@@ -392,18 +391,12 @@ class EndpointPoolRouter:
         drain_lease_ttl_s: float = 3600.0,
         drain_warning_after_s: float = 600.0,
         drain_warning_interval_s: float = 300.0,
-        compute_usage_fetcher: Optional[ComputeUsageFetcher] = None,
+        compute_usage_fetcher: ComputeUsageFetcher,
         usage_sync_stale_ttl_s: float = 60.0,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
         if not names:
             raise ValueError("endpoint_names must not be empty")
-        if endpoint_slots is not None and endpoint_slots < 1:
-            raise ValueError("endpoint_slots must be >= 1")
-        if endpoint_slots is None and compute_usage_fetcher is None:
-            raise ValueError(
-                "compute_usage_fetcher is required when endpoint_slots is not provided"
-            )
         if min_warm_endpoints < 0:
             raise ValueError("min_warm_endpoints must be >= 0")
         if min_warm_endpoints > len(names):
@@ -443,9 +436,9 @@ class EndpointPoolRouter:
         self._endpoints = {
             name: ManagedEndpoint(
                 name=name,
-                slots=endpoint_slots or 0,
+                slots=0,
                 ws_path=endpoint_ws_path,
-                require_usage_sync=compute_usage_fetcher is not None,
+                require_usage_sync=True,
             )
             for name in names
         }
@@ -470,8 +463,6 @@ class EndpointPoolRouter:
         otherwise offer zero capacity until the first reconcile tick. One
         immediate retry covers transient failures without delaying startup.
         """
-        if self.compute_usage_fetcher is None:
-            return
         async with self._lock:
             needs_retry = any(
                 endpoint.running and not endpoint.usage_synced
@@ -901,9 +892,6 @@ class EndpointPoolRouter:
             await asyncio.gather(*(self._wake_endpoint(name) for name in wake_names))
 
     async def _sync_compute_usage(self) -> None:
-        if self.compute_usage_fetcher is None:
-            return
-
         async with self._condition:
             targets = [
                 (endpoint.name, endpoint.url, endpoint.drain_generation)
@@ -979,15 +967,6 @@ class EndpointPoolRouter:
                             )
                     continue
 
-                if isinstance(result, int) and endpoint.slots > 0:
-                    # Compatibility for custom routers that provide a static
-                    # endpoint_slots value and an active-session-only fetcher.
-                    # The production load balancer does neither: it consumes
-                    # ComputeUsage from each compute endpoint's /health.
-                    result = ComputeUsage(
-                        active_sessions=max(result, 0),
-                        max_sessions=endpoint.slots,
-                    )
                 if not isinstance(result, ComputeUsage):
                     logger.error(
                         "Compute usage schema error for %s, endpoint offers no capacity "
@@ -1064,10 +1043,8 @@ class EndpointPoolRouter:
             # The process is fresh, but its capacity may have changed while it
             # was parked. Keep it unroutable until /health reports both current
             # usage and max_sessions.
-            endpoint.usage_synced = self.compute_usage_fetcher is None
-            endpoint.last_usage_sync_at = (
-                time.monotonic() if endpoint.usage_synced else None
-            )
+            endpoint.usage_synced = False
+            endpoint.last_usage_sync_at = None
             self._last_error = None
             self._condition.notify_all()
 
@@ -1230,10 +1207,8 @@ class EndpointPoolRouter:
             if endpoint.running:
                 endpoint.running_since = time.monotonic()
                 endpoint.observed_active_sessions = 0
-                endpoint.usage_synced = self.compute_usage_fetcher is None
-                endpoint.last_usage_sync_at = (
-                    time.monotonic() if endpoint.usage_synced else None
-                )
+                endpoint.usage_synced = False
+                endpoint.last_usage_sync_at = None
             self._condition.notify_all()
 
         await self._sync_compute_usage()
