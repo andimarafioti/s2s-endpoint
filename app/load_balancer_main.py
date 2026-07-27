@@ -17,7 +17,7 @@ from app.endpoint_pool_router import (
     EndpointPoolRouter,
     EndpointTransitionConflictError,
     HuggingFaceEndpointController,
-    fetch_compute_active_sessions,
+    fetch_compute_usage,
 )
 from app.requester_identity import (
     RequesterIdentity,
@@ -39,10 +39,9 @@ APP_ROLE = "load_balancer"
 HF_ENDPOINT_NAMESPACE = os.getenv("HF_ENDPOINT_NAMESPACE", "").strip() or None
 COMPUTE_ENDPOINT_NAMES_ENV = os.getenv("COMPUTE_ENDPOINT_NAMES", "").strip()
 COMPUTE_ENDPOINT_NAMES = [name.strip() for name in COMPUTE_ENDPOINT_NAMES_ENV.split(",") if name.strip()]
-COMPUTE_ENDPOINT_SLOTS = int(os.getenv("COMPUTE_ENDPOINT_SLOTS", "1"))
 COMPUTE_ENDPOINT_MIN_WARM = int(os.getenv("COMPUTE_ENDPOINT_MIN_WARM", "1"))
 COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS = int(
-    os.getenv("COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS", str(COMPUTE_ENDPOINT_SLOTS))
+    os.getenv("COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS", "1")
 )
 COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "600"))
 COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S", "10"))
@@ -151,7 +150,6 @@ def build_endpoint_router() -> EndpointPoolRouter:
 
     return EndpointPoolRouter(
         endpoint_names=COMPUTE_ENDPOINT_NAMES,
-        endpoint_slots=COMPUTE_ENDPOINT_SLOTS,
         min_warm_endpoints=COMPUTE_ENDPOINT_MIN_WARM,
         wake_threshold_slots=COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS,
         idle_park_timeout_s=COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S,
@@ -168,7 +166,7 @@ def build_endpoint_router() -> EndpointPoolRouter:
         drain_lease_ttl_s=COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S,
         drain_warning_after_s=COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S,
         drain_warning_interval_s=COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S,
-        compute_usage_fetcher=fetch_compute_active_sessions,
+        compute_usage_fetcher=fetch_compute_usage,
         # How long a previously observed usage count stays trusted when
         # health polls fail transiently. Must be comfortably above the
         # reconcile interval (10s): the default 60s means roughly six
@@ -179,7 +177,7 @@ def build_endpoint_router() -> EndpointPoolRouter:
 
 
 if DASHBOARD_PREVIEW_MODE:
-    session_manager = DashboardPreviewSessionManager(endpoint_slots=COMPUTE_ENDPOINT_SLOTS)
+    session_manager = DashboardPreviewSessionManager()
     if SESSION_QUEUE_ENABLED:
         logger.warning("SESSION_QUEUE_ENABLED is ignored in dashboard preview mode")
 else:

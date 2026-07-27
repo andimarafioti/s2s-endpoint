@@ -51,7 +51,7 @@ class ReadOnlyDashboardHistoryStoreTests(unittest.TestCase):
 class DashboardPreviewSessionManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_healthcheck_returns_synthetic_dashboard_snapshot(self):
         clock = FakeClock(1000.0)
-        manager = DashboardPreviewSessionManager(endpoint_slots=2, time_fn=clock)
+        manager = DashboardPreviewSessionManager(time_fn=clock)
         await manager.start()
 
         healthy, detail, snapshot = await manager.healthcheck()
@@ -64,10 +64,38 @@ class DashboardPreviewSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(snapshot["router"]["effective_free_slots"], snapshot["router"]["free_slots"])
 
     async def test_allocation_is_disabled(self):
-        manager = DashboardPreviewSessionManager(endpoint_slots=1)
+        manager = DashboardPreviewSessionManager()
 
         with self.assertRaisesRegex(RuntimeError, "preview mode"):
             await manager.allocate("https://lb.example")
+
+    async def test_healthcheck_uses_each_endpoints_last_known_capacity(self):
+        clock = FakeClock(1000.0)
+        manager = DashboardPreviewSessionManager(
+            last_known_capacities={
+                "preview-compute-01": 1,
+                "preview-compute-02": 3,
+                "preview-compute-03": 4,
+                "preview-compute-04": 2,
+            },
+            time_fn=clock,
+        )
+
+        _, _, snapshot = await manager.healthcheck()
+
+        endpoints = {
+            endpoint["name"]: endpoint
+            for endpoint in snapshot["router"]["endpoints"]
+        }
+        self.assertEqual(endpoints["preview-compute-01"]["max_sessions"], 1)
+        self.assertEqual(endpoints["preview-compute-02"]["max_sessions"], 3)
+        self.assertEqual(endpoints["preview-compute-03"]["max_sessions"], 4)
+        self.assertEqual(endpoints["preview-compute-04"]["max_sessions"], 2)
+        self.assertEqual(snapshot["router"]["warming_slots"], 4)
+        self.assertEqual(
+            snapshot["router"]["effective_free_slots"],
+            snapshot["router"]["free_slots"] + 4,
+        )
 
 
 class LoadBalancerPreviewModeTests(unittest.TestCase):
