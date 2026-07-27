@@ -177,7 +177,7 @@ def build_endpoint_router() -> EndpointPoolRouter:
 
 
 if DASHBOARD_PREVIEW_MODE:
-    session_manager = DashboardPreviewSessionManager(endpoint_slots=1)
+    session_manager = DashboardPreviewSessionManager()
     if SESSION_QUEUE_ENABLED:
         logger.warning("SESSION_QUEUE_ENABLED is ignored in dashboard preview mode")
 else:

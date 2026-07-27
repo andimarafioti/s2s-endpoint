@@ -377,6 +377,8 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
   endpoint/session data instead of connecting to real compute endpoints. You can
   also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.
+  Synthetic endpoints retain their own last-known `max_sessions` capacity
+  through initializing, paused, and updating states.
   If `DASHBOARD_BUCKET_ID` is set, preview mode loads existing dashboard history
   from the bucket read-only and never writes preview data back to the bucket.
 - `DASHBOARD_BUCKET_ID`: optional HF storage bucket id used to persist dashboard history
