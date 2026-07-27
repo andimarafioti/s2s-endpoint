@@ -1561,16 +1561,22 @@ class EndpointPoolRouter:
             ep.status = snapshot.status
             ep.raw_status = snapshot.raw_status
             ep.url = snapshot.url
-            ep.drain_restarting = False
             ep.last_error = None
             self._last_error = None
+            ep.observed_active_sessions = 0
+            ep.usage_synced = False
+            ep.last_usage_sync_at = None
+            ep.usage_sync_drain_generation = None
             if ep.running:
                 ep.running_since = time.monotonic()
-                ep.observed_active_sessions = 0
-                ep.usage_synced = True
-                ep.last_usage_sync_at = time.monotonic()
-            self._condition.notify_all()
 
+        try:
+            await self._sync_compute_usage(notify=False)
+        finally:
+            async with self._condition:
+                ep = self._endpoints[name]
+                ep.drain_restarting = False
+                self._condition.notify_all()
         logger.info("Drain restart completed for endpoint %s (status: %s)", name, snapshot.raw_status)
 
     def _raise_if_closed(self) -> None:

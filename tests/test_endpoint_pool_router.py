@@ -2029,6 +2029,81 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
             ep = self.router._endpoints["endpoint-a"]
         self.assertFalse(ep.drain_restarting)
 
+    async def test_drain_restart_blocks_allocation_until_new_capacity_is_synced(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+
+        class RestartCapacityFetcher:
+            def __init__(self):
+                self.calls = 0
+                self.restart_poll_started = threading.Event()
+                self.release_restart_poll = threading.Event()
+
+            def __call__(self, url: str) -> ComputeUsage:
+                self.calls += 1
+                if self.calls == 1:
+                    return ComputeUsage(active_sessions=0, max_sessions=4)
+                self.restart_poll_started.set()
+                if not self.release_restart_poll.wait(timeout=1):
+                    raise RuntimeError("timed out waiting to release restart poll")
+                return ComputeUsage(active_sessions=0, max_sessions=1)
+
+        usage_fetcher = RestartCapacityFetcher()
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", endpoint_url)]
+        )
+        self.router = _make_drain_router(
+            controller,
+            endpoint_names=["endpoint-a"],
+            drain_restart_timeout_s=600,
+            compute_usage_fetcher=usage_fetcher,
+        )
+        self.router._fetch_pool_units = lambda url: [
+            {"state": "active"},
+            {"state": "draining", "draining_for_s": 700},
+        ]
+
+        await self.router.start()
+        initial_snapshot = await self.router.snapshot()
+        self.assertEqual(
+            initial_snapshot["endpoints"][0]["max_sessions"],
+            4,
+        )
+
+        await self.router._check_drain_restarts()
+        poll_started = await asyncio.to_thread(
+            usage_fetcher.restart_poll_started.wait,
+            1,
+        )
+        self.assertTrue(poll_started)
+
+        restarting_snapshot = await self.router.snapshot()
+        endpoint = restarting_snapshot["endpoints"][0]
+        self.assertTrue(endpoint["drain_restarting"])
+        self.assertFalse(endpoint["usage_synced"])
+        self.assertEqual(endpoint["max_sessions"], 4)
+        self.assertEqual(endpoint["free_slots"], 0)
+
+        with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
+            await self.router.acquire(timeout_s=0.05)
+
+        usage_fetcher.release_restart_poll.set()
+        for _ in range(50):
+            if not self.router._endpoints["endpoint-a"].drain_restarting:
+                break
+            await asyncio.sleep(0.01)
+
+        final_snapshot = await self.router.snapshot()
+        endpoint = final_snapshot["endpoints"][0]
+        self.assertFalse(endpoint["drain_restarting"])
+        self.assertTrue(endpoint["usage_synced"])
+        self.assertEqual(endpoint["max_sessions"], 1)
+        self.assertEqual(endpoint["free_slots"], 1)
+
+        lease = await self.router.acquire(timeout_s=0.2)
+        with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
+            await self.router.acquire(timeout_s=0.01)
+        await self.router.release(lease.slot_id, connected=False)
+
 
 class EndpointUrlTests(unittest.TestCase):
     def test_to_ws_url_uses_realtime_route(self):
