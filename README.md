@@ -273,9 +273,16 @@ minute buckets are present.
 
 ## Load Balancer Env Vars
 
+Each compute endpoint owns its capacity through `NUM_PIPELINES`. Its `/health`
+response publishes that value as `router.max_sessions`, and the load balancer
+learns it independently for every running endpoint alongside the active session
+count. Updating and restarting a compute endpoint is therefore enough to change
+its capacity; the load balancer picks up the new value on its next reconciliation
+without a configuration change or restart. The former `COMPUTE_ENDPOINT_SLOTS`
+load-balancer variable is ignored and can be removed from existing deployments.
+
 - `HF_ENDPOINT_NAMESPACE`: namespace that owns the compute endpoints
 - `COMPUTE_ENDPOINT_NAMES`: comma-separated endpoint names
-- `COMPUTE_ENDPOINT_SLOTS`: concurrent sessions each compute endpoint can handle
 - `COMPUTE_ENDPOINT_MIN_WARM`: number of compute endpoints that should stay warm
 - `COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS`: when total free slots drop to this level,
   the LB starts waking another parked endpoint
@@ -370,6 +377,8 @@ minute buckets are present.
 - `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
   endpoint/session data instead of connecting to real compute endpoints. You can
   also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.
+  Synthetic endpoints retain their own last-known `max_sessions` capacity
+  through initializing, paused, and updating states.
   If `DASHBOARD_BUCKET_ID` is set, preview mode loads existing dashboard history
   from the bucket read-only and never writes preview data back to the bucket.
 - `DASHBOARD_BUCKET_ID`: optional HF storage bucket id used to persist dashboard history
@@ -543,7 +552,6 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --region us-east-1 \
   --compute-endpoint-prefix reachy-s2s \
   --compute-endpoint-count 3 \
-  --compute-endpoint-slots 1 \
   --compute-endpoint-min-warm 1 \
   --compute-endpoint-wake-threshold-slots 1 \
   --compute-endpoint-idle-park-timeout-s 300 \

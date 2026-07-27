@@ -6,12 +6,37 @@ from typing import Optional
 class DashboardPreviewSessionManager:
     """Synthetic session manager used to preview dashboard UI without HF endpoints."""
 
+    ENDPOINT_NAMES = (
+        "preview-compute-01",
+        "preview-compute-02",
+        "preview-compute-03",
+        "preview-compute-04",
+    )
+    DEFAULT_ENDPOINT_CAPACITY = 2
+
     # Preview mode has no real sessions, so no waiting queue either; the routes
     # read this attribute uniformly across both manager types.
     queue_enabled = False
 
-    def __init__(self, *, endpoint_slots: int = 2, time_fn=time.time) -> None:
-        self.endpoint_slots = max(int(endpoint_slots), 1)
+    def __init__(
+        self,
+        *,
+        last_known_capacities: Optional[dict[str, int]] = None,
+        time_fn=time.time,
+    ) -> None:
+        configured_capacities = last_known_capacities or {}
+        self._last_known_capacities = {
+            name: max(
+                int(
+                    configured_capacities.get(
+                        name,
+                        self.DEFAULT_ENDPOINT_CAPACITY,
+                    )
+                ),
+                1,
+            )
+            for name in self.ENDPOINT_NAMES
+        }
         self._time_fn = time_fn
         self._started_at_s = self._time_fn()
         self._running = False
@@ -48,9 +73,10 @@ class DashboardPreviewSessionManager:
 
         for name, status, waking, parking in endpoint_states:
             is_running = status == "running"
-            active_sessions = min(active_remaining, self.endpoint_slots) if is_running else 0
+            capacity = self._last_known_capacities[name]
+            active_sessions = min(active_remaining, capacity) if is_running else 0
             active_remaining -= active_sessions
-            free_slots = max(self.endpoint_slots - active_sessions, 0) if is_running else 0
+            free_slots = max(capacity - active_sessions, 0) if is_running else 0
             endpoints.append(
                 {
                     "name": name,
@@ -58,6 +84,7 @@ class DashboardPreviewSessionManager:
                     "waking": waking,
                     "parking": parking,
                     "active_sessions": active_sessions,
+                    "max_sessions": capacity,
                     "free_slots": free_slots,
                     "url": f"https://{name}.preview.local" if is_running else None,
                     "last_error": None,
@@ -65,7 +92,8 @@ class DashboardPreviewSessionManager:
             )
 
         free_slots = sum(int(endpoint["free_slots"]) for endpoint in endpoints)
-        effective_free_slots = free_slots + waking_endpoint_count * self.endpoint_slots
+        warming_slots = sum(self._last_known_capacities[name] for name, _, waking, _ in endpoint_states if waking)
+        effective_free_slots = free_slots + warming_slots
         snapshot = {
             "pending_sessions": pending_sessions,
             "connected_sessions": connected_sessions,
@@ -75,6 +103,7 @@ class DashboardPreviewSessionManager:
                 "waking_endpoints": waking_endpoint_count,
                 "active_sessions": connected_sessions,
                 "free_slots": free_slots,
+                "warming_slots": warming_slots,
                 "effective_free_slots": effective_free_slots,
                 "errors": [],
                 "endpoints": endpoints,
