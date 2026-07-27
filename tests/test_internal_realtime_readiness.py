@@ -31,13 +31,13 @@ class BuildS2SCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("--responses_api_api_key") + 1], "hf_token")
         self.assertEqual(command[command.index("--responses_api_reasoning_effort") + 1], "none")
 
-    def test_chat_completions_defaults_use_hf_router_and_no_reasoning(self):
+    def test_chat_completions_defaults_leave_provider_configuration_unset(self):
         command = self.build_command_with_env({})
 
         self.assertEqual(command[command.index("--llm_backend") + 1], "chat-completions")
-        self.assertEqual(command[command.index("--model_name") + 1], "google/gemma-4-31B-it:cerebras")
-        self.assertEqual(command[command.index("--responses_api_base_url") + 1], "https://router.huggingface.co/v1")
-        self.assertEqual(command[command.index("--responses_api_reasoning_effort") + 1], "none")
+        self.assertNotIn("--model_name", command)
+        self.assertNotIn("--responses_api_base_url", command)
+        self.assertNotIn("--responses_api_reasoning_effort", command)
 
 
 class WaitForInternalRealtimeTests(unittest.IsolatedAsyncioTestCase):
