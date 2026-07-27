@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -856,6 +857,64 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(endpoints["endpoint-b"]["max_sessions"], 1)
         self.assertEqual(endpoints["endpoint-b"]["free_slots"], 0)
         self.assertEqual(snapshot["free_slots"], 2)
+
+    async def test_overlapping_usage_syncs_cannot_apply_results_out_of_order(self):
+        endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+
+        class ReverseCompletionFetcher:
+            def __init__(self):
+                self.calls = 0
+                self.first_started = threading.Event()
+                self.release_first = threading.Event()
+
+            def __call__(self, url: str) -> ComputeUsage:
+                self.calls += 1
+                if self.calls == 1:
+                    self.first_started.set()
+                    if not self.release_first.wait(timeout=1):
+                        raise RuntimeError("timed out waiting to release first poll")
+                    return ComputeUsage(active_sessions=0, max_sessions=2)
+                return ComputeUsage(active_sessions=1, max_sessions=2)
+
+        usage_fetcher = ReverseCompletionFetcher()
+        controller = FakeEndpointController(
+            [("endpoint-a", "running", endpoint_url)]
+        )
+        self.router = _make_test_router(
+            endpoint_names=["endpoint-a"],
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=usage_fetcher,
+        )
+        endpoint = self.router._endpoints["endpoint-a"]
+        endpoint.status = "running"
+        endpoint.raw_status = "running"
+        endpoint.url = endpoint_url
+        endpoint.unobserved_connected_sessions = 1
+
+        first_sync = asyncio.create_task(self.router._sync_compute_usage())
+        started = await asyncio.to_thread(usage_fetcher.first_started.wait, 1)
+        self.assertTrue(started)
+        second_sync = asyncio.create_task(self.router._sync_compute_usage())
+        await asyncio.sleep(0.05)
+
+        # The second fetch must not start while the first poll/apply cycle is
+        # still in flight.
+        self.assertEqual(usage_fetcher.calls, 1)
+        usage_fetcher.release_first.set()
+        await asyncio.gather(first_sync, second_sync)
+
+        snapshot = await self.router.snapshot()
+        endpoint_snapshot = snapshot["endpoints"][0]
+        self.assertEqual(usage_fetcher.calls, 2)
+        self.assertEqual(endpoint_snapshot["observed_active_sessions"], 1)
+        self.assertEqual(endpoint_snapshot["unobserved_connected_sessions"], 0)
+        self.assertEqual(endpoint_snapshot["active_sessions"], 1)
 
     async def test_acquire_wakes_parked_node_when_running_nodes_are_unsynced(self):
         # Regression: acquire() used to mark parked endpoints as waking, then

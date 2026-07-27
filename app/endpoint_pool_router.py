@@ -444,6 +444,7 @@ class EndpointPoolRouter:
         }
         self._lock = asyncio.Lock()
         self._condition = asyncio.Condition(self._lock)
+        self._usage_sync_lock = asyncio.Lock()
         self._closed = False
         self._reconcile_task: Optional[asyncio.Task] = None
         self._initial_warm_task: Optional[asyncio.Task] = None
@@ -892,6 +893,13 @@ class EndpointPoolRouter:
             await asyncio.gather(*(self._wake_endpoint(name) for name in wake_names))
 
     async def _sync_compute_usage(self) -> None:
+        # Wake, restart, refresh, and startup paths can all request a usage
+        # sync concurrently. Serialize complete poll/apply cycles so an older,
+        # slower response can never overwrite a newer observation.
+        async with self._usage_sync_lock:
+            await self._sync_compute_usage_serialized()
+
+    async def _sync_compute_usage_serialized(self) -> None:
         async with self._condition:
             targets = [
                 (endpoint.name, endpoint.url, endpoint.drain_generation)
