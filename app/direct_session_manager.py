@@ -11,7 +11,6 @@ from app.app_utils import elapsed_ms
 from app.endpoint_pool_router import EndpointLease, EndpointPoolRouter
 from app.session_tokens import attach_session_token, create_session_token, verify_session_token
 
-
 logger = logging.getLogger("s2s-endpoint")
 SessionReleaseHandler = Callable[[dict[str, object]], Awaitable[None]]
 TicketExpiredHandler = Callable[[str], Awaitable[None]]
@@ -27,6 +26,7 @@ class QueueTicket:
 
     ``last_seen`` is refreshed on every poll; a ticket that goes un-polled past
     the TTL is how we detect a caller who abandoned the queue."""
+
     ticket_id: str
     created_at: float
     last_seen: float
@@ -152,9 +152,7 @@ class DirectSessionManager:
                     # depth of 0 disables the waiting room entirely — every caller
                     # that can't be granted immediately is turned away at capacity.
                     if len(self._queue) >= self.queue_max_depth:
-                        raise QueueAtCapacityError(
-                            f"queue is full ({self.queue_max_depth} waiting)"
-                        )
+                        raise QueueAtCapacityError(f"queue is full ({self.queue_max_depth} waiting)")
                     now = monotonic()
                     ticket_id = secrets.token_urlsafe(18)
                     self._queue[ticket_id] = QueueTicket(ticket_id, created_at=now, last_seen=now)
@@ -446,9 +444,7 @@ class DirectSessionManager:
                 try:
                     await self._ticket_expired_handler(ticket_id)
                 except Exception:
-                    logger.exception(
-                        "Ticket-expired handler failed for ticket %s", ticket_id
-                    )
+                    logger.exception("Ticket-expired handler failed for ticket %s", ticket_id)
             logger.info(
                 "Dropped abandoned queue ticket %s (no poll within %.0fs TTL)",
                 ticket_id,

@@ -50,8 +50,9 @@ class WaitForInternalRealtimeTests(unittest.IsolatedAsyncioTestCase):
 
         connect = AsyncMock(side_effect=AssertionError("websocket handshake should not be used"))
 
-        with patch.object(compute_main, "_http_get_json", fake_get_json), patch.object(
-            compute_main.asyncio, "open_connection", connect
+        with (
+            patch.object(compute_main, "_http_get_json", fake_get_json),
+            patch.object(compute_main.asyncio, "open_connection", connect),
         ):
             await compute_main.wait_for_internal_server(
                 compute_main.INTERNAL_WS_HOST,

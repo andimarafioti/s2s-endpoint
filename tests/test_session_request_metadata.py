@@ -30,7 +30,7 @@ class SessionRequestMetadataTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejects_declared_oversized_body_without_streaming_it(self):
         request = FakeStreamingRequest(
-            [b'{}'],
+            [b"{}"],
             headers={
                 "content-type": "application/json",
                 "content-length": "4097",
@@ -46,7 +46,7 @@ class SessionRequestMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await reported_hardware_id(request, max_body_bytes=64))
 
     async def test_ignores_slow_body_after_timeout(self):
-        request = FakeStreamingRequest([b'{}'], delay_s=0.05)
+        request = FakeStreamingRequest([b"{}"], delay_s=0.05)
 
         self.assertIsNone(await reported_hardware_id(request, read_timeout_s=0.001))
 

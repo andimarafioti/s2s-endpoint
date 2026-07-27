@@ -3,19 +3,18 @@ import argparse
 import json
 import sys
 
-from huggingface_hub import HfApi
-
 from _endpoint_helpers import (
     DEFAULT_ENDPOINT_TYPE,
     DEFAULT_FRAMEWORK,
-    DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
     DEFAULT_IMAGE_PORT,
+    DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
     DEFAULT_REPOSITORY,
-    build_names,
     build_custom_image,
+    build_names,
     load_json_file,
     parse_key_value_pairs,
 )
+from huggingface_hub import HfApi
 
 
 def resolve_compute_endpoint_names(
@@ -29,38 +28,107 @@ def resolve_compute_endpoint_names(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Create the CPU load-balancer endpoint for the s2s-endpoint app."
-    )
+    parser = argparse.ArgumentParser(description="Create the CPU load-balancer endpoint for the s2s-endpoint app.")
     parser.add_argument("--name", required=True, help="Load-balancer endpoint name")
     parser.add_argument("--namespace", help="Endpoint namespace / org")
     parser.add_argument("--vendor", required=True, help="Cloud vendor, for example aws")
     parser.add_argument("--region", required=True, help="Cloud region")
     parser.add_argument("--instance-size", required=True, help="CPU instance size, for example x2")
     parser.add_argument("--instance-type", required=True, help="CPU instance type, for example intel-icl")
-    parser.add_argument("--image-url", required=True, help="Custom load-balancer image URL built from Dockerfile.load_balancer")
-    parser.add_argument("--image-health-route", default=DEFAULT_LOAD_BALANCER_HEALTH_ROUTE, help="Health route exposed by the load-balancer image")
-    parser.add_argument("--image-port", type=int, default=DEFAULT_IMAGE_PORT, help="Container port exposed by the load-balancer image")
-    parser.add_argument("--session-shared-secret", required=True, help="Shared secret used to mint and validate direct session tokens")
+    parser.add_argument(
+        "--image-url", required=True, help="Custom load-balancer image URL built from Dockerfile.load_balancer"
+    )
+    parser.add_argument(
+        "--image-health-route",
+        default=DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
+        help="Health route exposed by the load-balancer image",
+    )
+    parser.add_argument(
+        "--image-port", type=int, default=DEFAULT_IMAGE_PORT, help="Container port exposed by the load-balancer image"
+    )
+    parser.add_argument(
+        "--session-shared-secret", required=True, help="Shared secret used to mint and validate direct session tokens"
+    )
     parser.add_argument("--compute-endpoint-names", help="Comma-separated compute endpoint names")
-    parser.add_argument("--compute-endpoint-prefix", help="Compute endpoint name prefix, used with --compute-endpoint-count")
-    parser.add_argument("--compute-endpoint-count", type=int, help="Number of compute endpoints, used with --compute-endpoint-prefix")
-    parser.add_argument("--compute-endpoint-slots", type=int, default=1, help="Concurrent sessions each compute endpoint can handle")
+    parser.add_argument(
+        "--compute-endpoint-prefix", help="Compute endpoint name prefix, used with --compute-endpoint-count"
+    )
+    parser.add_argument(
+        "--compute-endpoint-count", type=int, help="Number of compute endpoints, used with --compute-endpoint-prefix"
+    )
+    parser.add_argument(
+        "--compute-endpoint-slots", type=int, default=1, help="Concurrent sessions each compute endpoint can handle"
+    )
     parser.add_argument("--compute-endpoint-min-warm", type=int, default=1, help="Warm compute endpoints to keep ready")
-    parser.add_argument("--compute-endpoint-wake-threshold-slots", type=int, default=1, help="Wake another compute endpoint when total free slots drop to this value")
-    parser.add_argument("--compute-endpoint-idle-park-timeout-s", type=float, default=300, help="Idle timeout before parking a compute endpoint")
-    parser.add_argument("--compute-endpoint-reconcile-interval-s", type=float, default=10, help="Refresh interval for compute endpoint state")
-    parser.add_argument("--compute-endpoint-wait-timeout-s", type=int, default=900, help="Timeout while waiting for resumed compute endpoints")
+    parser.add_argument(
+        "--compute-endpoint-wake-threshold-slots",
+        type=int,
+        default=1,
+        help="Wake another compute endpoint when total free slots drop to this value",
+    )
+    parser.add_argument(
+        "--compute-endpoint-idle-park-timeout-s",
+        type=float,
+        default=300,
+        help="Idle timeout before parking a compute endpoint",
+    )
+    parser.add_argument(
+        "--compute-endpoint-reconcile-interval-s",
+        type=float,
+        default=10,
+        help="Refresh interval for compute endpoint state",
+    )
+    parser.add_argument(
+        "--compute-endpoint-wait-timeout-s",
+        type=int,
+        default=900,
+        help="Timeout while waiting for resumed compute endpoints",
+    )
     parser.add_argument("--compute-endpoint-park-strategy", choices=["pause", "scale_to_zero"], default="pause")
-    parser.add_argument("--compute-endpoint-auto-restart", type=str, choices=["true", "false"], default="true", help="Auto-restart failed compute endpoints")
-    parser.add_argument("--compute-endpoint-max-restart-attempts", type=int, default=3, help="Max consecutive restart attempts before giving up")
-    parser.add_argument("--compute-endpoint-restart-backoff-s", type=float, default=30, help="Initial backoff between restart attempts")
-    parser.add_argument("--compute-endpoint-restart-backoff-max-s", type=float, default=300, help="Max backoff cap between restart attempts")
-    parser.add_argument("--compute-endpoint-restart-stable-running-s", type=float, default=120, help="How long an endpoint must run before restart counter resets")
-    parser.add_argument("--session-pending-timeout-s", type=float, default=60, help="How long a reserved session can remain unused before release")
+    parser.add_argument(
+        "--compute-endpoint-auto-restart",
+        type=str,
+        choices=["true", "false"],
+        default="true",
+        help="Auto-restart failed compute endpoints",
+    )
+    parser.add_argument(
+        "--compute-endpoint-max-restart-attempts",
+        type=int,
+        default=3,
+        help="Max consecutive restart attempts before giving up",
+    )
+    parser.add_argument(
+        "--compute-endpoint-restart-backoff-s", type=float, default=30, help="Initial backoff between restart attempts"
+    )
+    parser.add_argument(
+        "--compute-endpoint-restart-backoff-max-s",
+        type=float,
+        default=300,
+        help="Max backoff cap between restart attempts",
+    )
+    parser.add_argument(
+        "--compute-endpoint-restart-stable-running-s",
+        type=float,
+        default=120,
+        help="How long an endpoint must run before restart counter resets",
+    )
+    parser.add_argument(
+        "--session-pending-timeout-s",
+        type=float,
+        default=60,
+        help="How long a reserved session can remain unused before release",
+    )
     parser.add_argument("--session-token-ttl-s", type=float, default=86400, help="Lifetime of the signed session token")
-    parser.add_argument("--session-reap-interval-s", type=float, default=5, help="Background interval for releasing unused session reservations")
-    parser.add_argument("--hf-endpoint-namespace", help="Namespace that owns the compute endpoints; defaults to --namespace")
+    parser.add_argument(
+        "--session-reap-interval-s",
+        type=float,
+        default=5,
+        help="Background interval for releasing unused session reservations",
+    )
+    parser.add_argument(
+        "--hf-endpoint-namespace", help="Namespace that owns the compute endpoints; defaults to --namespace"
+    )
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY, help=argparse.SUPPRESS)
     parser.add_argument("--account-id", help="Optional account id")
     parser.add_argument("--revision", help="Optional repo revision")

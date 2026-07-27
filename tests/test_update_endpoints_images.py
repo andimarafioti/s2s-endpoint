@@ -10,7 +10,6 @@ from urllib.error import HTTPError, URLError
 import httpx
 from huggingface_hub.errors import HfHubHTTPError
 
-
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -26,17 +25,16 @@ from update_endpoints_images import (  # noqa: E402
     fetch_compute_endpoint_snapshot,
     is_definitive_hf_update_rejection,
     main,
-    wait_for_compute_endpoint_free,
+    request_json,
     resolve_compute_names,
     retry_transient_load_balancer_request,
-    request_json,
     set_compute_endpoint_draining,
     set_compute_endpoint_draining_with_retries,
+    update_many,
     update_one,
     update_one_draining,
-    update_many,
+    wait_for_compute_endpoint_free,
 )
-
 
 TEST_LEASE_ID = "test-rollout-lease-id"
 TEST_LEASE_OWNER = drain_lease_owner_fingerprint(TEST_LEASE_ID)
@@ -159,9 +157,7 @@ class FakeTransitionEndpoint(FakeManagedEndpoint):
 class FakeParallelUpdateApi:
     def __init__(self, names: list[str]):
         self.tracker = ParallelTracker()
-        self.endpoints = {
-            name: FakeManagedEndpoint(name, "andito/s2s-compute:old", self.tracker) for name in names
-        }
+        self.endpoints = {name: FakeManagedEndpoint(name, "andito/s2s-compute:old", self.tracker) for name in names}
 
     def get_inference_endpoint(self, name: str, namespace: str | None = None):
         return self.endpoints[name]
@@ -419,10 +415,13 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             drain_snapshot(active_sessions=0),
         ]
 
-        with patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            side_effect=endpoint_snapshots,
-        ), patch("update_endpoints_images.time.sleep") as sleep:
+        with (
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                side_effect=endpoint_snapshots,
+            ),
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             endpoint = wait_for_compute_endpoint_free(
                 load_balancer_url="https://lb.example",
                 token="token",
@@ -446,10 +445,13 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         )
         ready_endpoint = drain_snapshot()
 
-        with patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            side_effect=[transient_error, ready_endpoint],
-        ), patch("update_endpoints_images.time.sleep") as sleep:
+        with (
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                side_effect=[transient_error, ready_endpoint],
+            ),
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             endpoint = wait_for_compute_endpoint_free(
                 load_balancer_url="https://lb.example",
                 token="token",
@@ -474,10 +476,13 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                     None,
                 )
 
-                with patch(
-                    "update_endpoints_images.fetch_compute_endpoint_snapshot",
-                    side_effect=fatal_error,
-                ), patch("update_endpoints_images.time.sleep") as sleep:
+                with (
+                    patch(
+                        "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                        side_effect=fatal_error,
+                    ),
+                    patch("update_endpoints_images.time.sleep") as sleep,
+                ):
                     with self.assertRaises(HTTPError):
                         wait_for_compute_endpoint_free(
                             load_balancer_url="https://lb.example",
@@ -492,14 +497,15 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 sleep.assert_not_called()
 
     def test_status_poll_keeps_409_fatal(self):
-        conflict = load_balancer_conflict(
-            "Endpoint reachy-s2s-01 has an active control-plane transition: parking"
-        )
+        conflict = load_balancer_conflict("Endpoint reachy-s2s-01 has an active control-plane transition: parking")
 
-        with patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            side_effect=conflict,
-        ), patch("update_endpoints_images.time.sleep") as sleep:
+        with (
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                side_effect=conflict,
+            ),
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             with self.assertRaises(HTTPError):
                 wait_for_compute_endpoint_free(
                     load_balancer_url="https://lb.example",
@@ -514,9 +520,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_initial_drain_acquisition_waits_for_transition_conflict(self):
-        conflict = load_balancer_conflict(
-            "Endpoint reachy-s2s-01 has an active control-plane transition: parking"
-        )
+        conflict = load_balancer_conflict("Endpoint reachy-s2s-01 has an active control-plane transition: parking")
         attempts = [conflict, None]
 
         def operation():
@@ -524,9 +528,11 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             if result is not None:
                 raise result
 
-        with patch("update_endpoints_images.time.monotonic", return_value=0), patch(
-            "update_endpoints_images.time.sleep"
-        ) as sleep, patch("update_endpoints_images.log_progress") as log_progress:
+        with (
+            patch("update_endpoints_images.time.monotonic", return_value=0),
+            patch("update_endpoints_images.time.sleep") as sleep,
+            patch("update_endpoints_images.log_progress") as log_progress,
+        ):
             acquire_compute_endpoint_drain(
                 operation,
                 name="reachy-s2s-01",
@@ -539,17 +545,18 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertIn("parking", str(log_progress.call_args))
 
     def test_initial_drain_acquisition_times_out_on_persistent_conflict(self):
-        conflict = load_balancer_conflict(
-            "Endpoint reachy-s2s-01 has an active control-plane transition: restarting"
-        )
+        conflict = load_balancer_conflict("Endpoint reachy-s2s-01 has an active control-plane transition: restarting")
 
         def always_conflicted():
             raise conflict
 
-        with patch(
-            "update_endpoints_images.time.monotonic",
-            side_effect=[0, 5],
-        ), patch("update_endpoints_images.time.sleep") as sleep:
+        with (
+            patch(
+                "update_endpoints_images.time.monotonic",
+                side_effect=[0, 5],
+            ),
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             with self.assertRaisesRegex(
                 TimeoutError,
                 "Timed out acquiring drain.*restarting",
@@ -564,14 +571,15 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         sleep.assert_called_once_with(5.0)
 
     def test_drain_renewal_keeps_ownership_409_fatal(self):
-        conflict = load_balancer_conflict(
-            "Endpoint reachy-s2s-01 has an active drain lease owned by another rollout"
-        )
+        conflict = load_balancer_conflict("Endpoint reachy-s2s-01 has an active drain lease owned by another rollout")
 
-        with patch(
-            "update_endpoints_images.set_compute_endpoint_draining",
-            side_effect=conflict,
-        ) as set_draining, patch("update_endpoints_images.time.sleep") as sleep:
+        with (
+            patch(
+                "update_endpoints_images.set_compute_endpoint_draining",
+                side_effect=conflict,
+            ) as set_draining,
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             with self.assertRaises(HTTPError):
                 set_compute_endpoint_draining_with_retries(
                     load_balancer_url="https://lb.example",
@@ -595,9 +603,10 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             BytesIO(b'{"detail":"LB admin auth token is not configured"}'),
         )
 
-        with patch("update_endpoints_images.urlopen", side_effect=error) as urlopen, patch(
-            "update_endpoints_images.time.sleep"
-        ) as sleep:
+        with (
+            patch("update_endpoints_images.urlopen", side_effect=error) as urlopen,
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             with self.assertRaises(HTTPError):
                 retry_transient_load_balancer_request(
                     lambda: request_json(
@@ -613,16 +622,20 @@ class UpdateEndpointImagesTests(unittest.TestCase):
 
     def test_wait_for_compute_endpoint_free_accepts_parked_unsynced_endpoint(self):
         for status in ("paused", "scaledToZero"):
-            with self.subTest(status=status), patch(
-                "update_endpoints_images.fetch_compute_endpoint_snapshot",
-                return_value=drain_snapshot(
-                    status=status,
-                    running=False,
-                    require_usage_sync=True,
-                    usage_synced=False,
-                    usage_synced_after_drain=False,
+            with (
+                self.subTest(status=status),
+                patch(
+                    "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                    return_value=drain_snapshot(
+                        status=status,
+                        running=False,
+                        require_usage_sync=True,
+                        usage_synced=False,
+                        usage_synced_after_drain=False,
+                    ),
                 ),
-            ), patch("update_endpoints_images.time.sleep") as sleep:
+                patch("update_endpoints_images.time.sleep") as sleep,
+            ):
                 endpoint = wait_for_compute_endpoint_free(
                     load_balancer_url="https://lb.example",
                     token="token",
@@ -710,9 +723,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
     def test_compute_endpoint_ready_rejects_another_rollout_lease(self):
         with self.assertRaisesRegex(RuntimeError, "owned by another rollout"):
             compute_endpoint_ready_for_update(
-                drain_snapshot(
-                    drain_lease_owner=drain_lease_owner_fingerprint("other-rollout")
-                ),
+                drain_snapshot(drain_lease_owner=drain_lease_owner_fingerprint("other-rollout")),
                 name="reachy-s2s-01",
                 expected_lease_owner=TEST_LEASE_OWNER,
             )
@@ -744,10 +755,13 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         )
         parked_and_clear = {**parked_with_stale_session, "active_sessions": 0}
 
-        with patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            side_effect=[parked_with_stale_session, parked_and_clear],
-        ), patch("update_endpoints_images.time.sleep") as sleep:
+        with (
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                side_effect=[parked_with_stale_session, parked_and_clear],
+            ),
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             endpoint = wait_for_compute_endpoint_free(
                 load_balancer_url="https://lb.example",
                 token="token",
@@ -816,10 +830,13 @@ class UpdateEndpointImagesTests(unittest.TestCase):
     def test_wait_for_compute_endpoint_free_rejects_lost_drain_state(self):
         endpoint = drain_snapshot(draining=False)
 
-        with patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            return_value=endpoint,
-        ), patch("update_endpoints_images.time.sleep") as sleep:
+        with (
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                return_value=endpoint,
+            ),
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             with self.assertRaisesRegex(RuntimeError, "no longer draining"):
                 wait_for_compute_endpoint_free(
                     load_balancer_url="https://lb.example",
@@ -839,10 +856,13 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             drain_snapshot(usage_synced=True),
         ]
 
-        with patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            side_effect=endpoint_snapshots,
-        ), patch("update_endpoints_images.time.sleep") as sleep:
+        with (
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                side_effect=endpoint_snapshots,
+            ),
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             endpoint = wait_for_compute_endpoint_free(
                 load_balancer_url="https://lb.example",
                 token="token",
@@ -863,10 +883,13 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         ]
         renewals: list[bool] = []
 
-        with patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            side_effect=endpoint_snapshots,
-        ), patch("update_endpoints_images.time.sleep"):
+        with (
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                side_effect=endpoint_snapshots,
+            ),
+            patch("update_endpoints_images.time.sleep"),
+        ):
             wait_for_compute_endpoint_free(
                 load_balancer_url="https://lb.example",
                 token="token",
@@ -886,10 +909,13 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             drain_snapshot(usage_synced_after_drain=True),
         ]
 
-        with patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            side_effect=endpoint_snapshots,
-        ), patch("update_endpoints_images.time.sleep") as sleep:
+        with (
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                side_effect=endpoint_snapshots,
+            ),
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             endpoint = wait_for_compute_endpoint_free(
                 load_balancer_url="https://lb.example",
                 token="token",
@@ -919,12 +945,16 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             drain_calls.append(kwargs["draining"])
             return {"status": "ok"}
 
-        with patch("update_endpoints_images.set_compute_endpoint_draining", fake_set_draining), patch(
-            "update_endpoints_images.wait_for_compute_endpoint_free",
-            return_value={"name": "reachy-s2s-01", "active_sessions": 0, "draining": True},
-        ), patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            return_value=drain_snapshot(),
+        with (
+            patch("update_endpoints_images.set_compute_endpoint_draining", fake_set_draining),
+            patch(
+                "update_endpoints_images.wait_for_compute_endpoint_free",
+                return_value={"name": "reachy-s2s-01", "active_sessions": 0, "draining": True},
+            ),
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                return_value=drain_snapshot(),
+            ),
         ):
             result = update_one_draining(
                 api=api,
@@ -960,11 +990,10 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         )
         api = FakeTransitionUpdateApi(endpoint)
 
-        with patch(
-            "update_endpoints_images.set_compute_endpoint_draining"
-        ) as set_draining, patch(
-            "update_endpoints_images.wait_for_compute_endpoint_free"
-        ) as wait_for_free:
+        with (
+            patch("update_endpoints_images.set_compute_endpoint_draining") as set_draining,
+            patch("update_endpoints_images.wait_for_compute_endpoint_free") as wait_for_free,
+        ):
             result = update_one_draining(
                 api=api,
                 namespace="HuggingFaceM4",
@@ -1007,15 +1036,19 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             self.assertEqual(api.update_calls, 0)
             return drain_snapshot(draining=False)
 
-        with patch(
-            "update_endpoints_images.set_compute_endpoint_draining",
-            side_effect=fake_set_draining,
-        ), patch(
-            "update_endpoints_images.wait_for_compute_endpoint_free",
-            return_value={"name": "reachy-s2s-01", "active_sessions": 0, "draining": True},
-        ), patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            side_effect=fetch_after_endpoint_read,
+        with (
+            patch(
+                "update_endpoints_images.set_compute_endpoint_draining",
+                side_effect=fake_set_draining,
+            ),
+            patch(
+                "update_endpoints_images.wait_for_compute_endpoint_free",
+                return_value={"name": "reachy-s2s-01", "active_sessions": 0, "draining": True},
+            ),
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                side_effect=fetch_after_endpoint_read,
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "no longer draining"):
                 update_one_draining(
@@ -1057,12 +1090,14 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                 raise TimeoutError("drain response was lost")
             return {"status": "ok"}
 
-        with patch(
-            "update_endpoints_images.set_compute_endpoint_draining",
-            side_effect=fake_set_draining,
-        ), patch("update_endpoints_images.wait_for_compute_endpoint_free") as wait_for_free, patch(
-            "update_endpoints_images.time.sleep"
-        ) as sleep:
+        with (
+            patch(
+                "update_endpoints_images.set_compute_endpoint_draining",
+                side_effect=fake_set_draining,
+            ),
+            patch("update_endpoints_images.wait_for_compute_endpoint_free") as wait_for_free,
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             with self.assertRaisesRegex(TimeoutError, "response was lost"):
                 update_one_draining(
                     api=api,
@@ -1108,16 +1143,21 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         api.update_inference_endpoint = accepted_but_response_lost
         ready_endpoint = drain_snapshot()
 
-        with patch(
-            "update_endpoints_images.set_compute_endpoint_draining",
-            side_effect=fake_set_draining,
-        ), patch(
-            "update_endpoints_images.wait_for_compute_endpoint_free",
-            return_value=ready_endpoint,
-        ), patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            return_value=ready_endpoint,
-        ), patch("update_endpoints_images.log_progress") as log_progress:
+        with (
+            patch(
+                "update_endpoints_images.set_compute_endpoint_draining",
+                side_effect=fake_set_draining,
+            ),
+            patch(
+                "update_endpoints_images.wait_for_compute_endpoint_free",
+                return_value=ready_endpoint,
+            ),
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                return_value=ready_endpoint,
+            ),
+            patch("update_endpoints_images.log_progress") as log_progress,
+        ):
             with self.assertRaisesRegex(TimeoutError, "response was lost"):
                 update_one_draining(
                     api=api,
@@ -1137,9 +1177,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual(drain_calls, [True, True])
         self.assertEqual(api.update_calls, 1)
         self.assertEqual(endpoint._image_url, "andito/s2s-compute:new")
-        self.assertTrue(
-            any("leaving the endpoint drained" in str(call) for call in log_progress.call_args_list)
-        )
+        self.assertTrue(any("leaving the endpoint drained" in str(call) for call in log_progress.call_args_list))
 
     def test_update_one_draining_clears_drain_after_hf_rejects_update(self):
         tracker = ParallelTracker()
@@ -1169,15 +1207,19 @@ class UpdateEndpointImagesTests(unittest.TestCase):
                     drain_calls.append(kwargs["draining"])
                     return {"status": "ok"}
 
-                with patch(
-                    "update_endpoints_images.set_compute_endpoint_draining",
-                    side_effect=fake_set_draining,
-                ), patch(
-                    "update_endpoints_images.wait_for_compute_endpoint_free",
-                    return_value=ready_endpoint,
-                ), patch(
-                    "update_endpoints_images.fetch_compute_endpoint_snapshot",
-                    return_value=ready_endpoint,
+                with (
+                    patch(
+                        "update_endpoints_images.set_compute_endpoint_draining",
+                        side_effect=fake_set_draining,
+                    ),
+                    patch(
+                        "update_endpoints_images.wait_for_compute_endpoint_free",
+                        return_value=ready_endpoint,
+                    ),
+                    patch(
+                        "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                        return_value=ready_endpoint,
+                    ),
                 ):
                     with self.assertRaises(HfHubHTTPError):
                         update_one_draining(
@@ -1201,11 +1243,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         request = httpx.Request("PUT", "https://api.endpoints.huggingface.cloud/update")
         response = httpx.Response(503, request=request)
 
-        self.assertFalse(
-            is_definitive_hf_update_rejection(
-                HfHubHTTPError("update failed", response=response)
-            )
-        )
+        self.assertFalse(is_definitive_hf_update_rejection(HfHubHTTPError("update failed", response=response)))
 
     def test_update_one_draining_leaves_drain_when_update_wait_fails(self):
         tracker = ParallelTracker()
@@ -1229,16 +1267,21 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         endpoint.wait = failed_wait
         ready_endpoint = drain_snapshot()
 
-        with patch(
-            "update_endpoints_images.set_compute_endpoint_draining",
-            side_effect=fake_set_draining,
-        ), patch(
-            "update_endpoints_images.wait_for_compute_endpoint_free",
-            return_value=ready_endpoint,
-        ), patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            return_value=ready_endpoint,
-        ), patch("update_endpoints_images.log_progress") as log_progress:
+        with (
+            patch(
+                "update_endpoints_images.set_compute_endpoint_draining",
+                side_effect=fake_set_draining,
+            ),
+            patch(
+                "update_endpoints_images.wait_for_compute_endpoint_free",
+                return_value=ready_endpoint,
+            ),
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                return_value=ready_endpoint,
+            ),
+            patch("update_endpoints_images.log_progress") as log_progress,
+        ):
             with self.assertRaisesRegex(TimeoutError, "completion was not confirmed"):
                 update_one_draining(
                     api=api,
@@ -1257,9 +1300,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
 
         self.assertEqual(drain_calls, [True, True])
         self.assertEqual(api.update_calls, 1)
-        self.assertTrue(
-            any("leaving the endpoint drained" in str(call) for call in log_progress.call_args_list)
-        )
+        self.assertTrue(any("leaving the endpoint drained" in str(call) for call in log_progress.call_args_list))
 
     def test_update_one_draining_retries_transient_drain_clear_failures(self):
         tracker = ParallelTracker()
@@ -1284,16 +1325,21 @@ class UpdateEndpointImagesTests(unittest.TestCase):
             return {"status": "ok"}
 
         ready_endpoint = drain_snapshot()
-        with patch(
-            "update_endpoints_images.set_compute_endpoint_draining",
-            side_effect=fake_set_draining,
-        ), patch(
-            "update_endpoints_images.wait_for_compute_endpoint_free",
-            return_value=ready_endpoint,
-        ), patch(
-            "update_endpoints_images.fetch_compute_endpoint_snapshot",
-            return_value=ready_endpoint,
-        ), patch("update_endpoints_images.time.sleep") as sleep:
+        with (
+            patch(
+                "update_endpoints_images.set_compute_endpoint_draining",
+                side_effect=fake_set_draining,
+            ),
+            patch(
+                "update_endpoints_images.wait_for_compute_endpoint_free",
+                return_value=ready_endpoint,
+            ),
+            patch(
+                "update_endpoints_images.fetch_compute_endpoint_snapshot",
+                return_value=ready_endpoint,
+            ),
+            patch("update_endpoints_images.time.sleep") as sleep,
+        ):
             result = update_one_draining(
                 api=api,
                 namespace="HuggingFaceM4",
@@ -1312,6 +1358,7 @@ class UpdateEndpointImagesTests(unittest.TestCase):
         self.assertEqual(result["image_after"], "andito/s2s-compute:new")
         self.assertEqual(drain_calls, [True, True, False, False, False])
         self.assertEqual(sleep.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

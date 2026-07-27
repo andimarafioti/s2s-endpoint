@@ -39,12 +39,8 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_anonymous_requests_are_grouped_by_hashed_forwarded_ip(self):
         resolver = RequesterIdentityResolver(hash_secret="stable-secret", whoami_fn=lambda token: {})
-        first = resolver.identify(
-            FakeRequest(headers={"x-forwarded-for": "203.0.113.8, 10.0.0.4"})
-        )
-        second = resolver.identify(
-            FakeRequest(headers={"x-forwarded-for": "203.0.113.8"}, client_host="10.0.0.9")
-        )
+        first = resolver.identify(FakeRequest(headers={"x-forwarded-for": "203.0.113.8, 10.0.0.4"}))
+        second = resolver.identify(FakeRequest(headers={"x-forwarded-for": "203.0.113.8"}, client_host="10.0.0.9"))
 
         self.assertEqual(first.actor_id, second.actor_id)
         self.assertEqual(first.kind, "anonymous")
@@ -127,9 +123,7 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
             on_identity_update=on_update,
         )
         raw_token = "hf_a_reachy_header_token"
-        request = FakeRequest(
-            headers={"x-reachy-mini-authorization": f"Bearer {raw_token}"}
-        )
+        request = FakeRequest(headers={"x-reachy-mini-authorization": f"Bearer {raw_token}"})
 
         pending = resolver.identify(request)
         await asyncio.wait_for(updated.wait(), timeout=1)
@@ -144,9 +138,7 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
     async def test_reachy_conversation_app_user_agent_is_classified(self):
         resolver = RequesterIdentityResolver(hash_secret="stable-secret")
 
-        identity = resolver.identify(
-            FakeRequest(headers={"user-agent": "reachy-mini-conversation-app"})
-        )
+        identity = resolver.identify(FakeRequest(headers={"user-agent": "reachy-mini-conversation-app"}))
 
         self.assertEqual(identity.client_kind, "reachy-mini")
 
@@ -193,9 +185,7 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
         )
         raw_token = "oauth-token-without-hf-prefix"
 
-        pending = resolver.identify(
-            FakeRequest(headers={"authorization": f"Bearer {raw_token}"})
-        )
+        pending = resolver.identify(FakeRequest(headers={"authorization": f"Bearer {raw_token}"}))
         await asyncio.wait_for(updated.wait(), timeout=1)
         resolved = resolver.latest_identity(pending)
 
@@ -212,9 +202,7 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
             whoami_fn=lambda token: calls.append(token) or {},
         )
 
-        identity = resolver.identify(
-            FakeRequest(headers={"authorization": f"Bearer {'x' * 4097}"})
-        )
+        identity = resolver.identify(FakeRequest(headers={"authorization": f"Bearer {'x' * 4097}"}))
         await asyncio.sleep(0)
 
         self.assertEqual(identity.kind, "unverified_token")
@@ -236,14 +224,10 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
             await release_first_validation.wait()
 
         resolver._validate_token = blocked_validation
-        first = resolver.identify(
-            FakeRequest(headers={"authorization": "Bearer hf_first_token"})
-        )
+        first = resolver.identify(FakeRequest(headers={"authorization": "Bearer hf_first_token"}))
         await first_validation_started.wait()
 
-        rejected = resolver.identify(
-            FakeRequest(headers={"authorization": "Bearer hf_second_token"})
-        )
+        rejected = resolver.identify(FakeRequest(headers={"authorization": "Bearer hf_second_token"}))
 
         self.assertEqual(first.verification, "pending")
         self.assertEqual(rejected.verification, "unavailable")
@@ -254,9 +238,7 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
         while resolver.status()["pending_token_validations"]:
             await asyncio.sleep(0)
 
-        retried = resolver.identify(
-            FakeRequest(headers={"authorization": "Bearer hf_second_token"})
-        )
+        retried = resolver.identify(FakeRequest(headers={"authorization": "Bearer hf_second_token"}))
         self.assertEqual(retried.verification, "pending")
 
         await resolver.stop()

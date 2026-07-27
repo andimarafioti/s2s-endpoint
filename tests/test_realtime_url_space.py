@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import sys
 import importlib.util
+import sys
 from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi.testclient import TestClient
-
 
 SPACE_APP_PATH = Path(__file__).resolve().parents[1] / "spaces" / "reachy-mini-realtime-url" / "app.py"
 

@@ -6,7 +6,6 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
-
 logger = logging.getLogger("s2s-endpoint")
 
 
@@ -77,13 +76,9 @@ class SessionRouter:
         if not self._ready:
             raise RuntimeError("speech-to-speech pipeline is not ready")
         if self._process is not None and self._process.poll() is not None:
-            raise RuntimeError(
-                f"speech-to-speech process exited with code {self._process.returncode}"
-            )
+            raise RuntimeError(f"speech-to-speech process exited with code {self._process.returncode}")
         if self._active_sessions >= self.max_sessions:
-            raise RuntimeError(
-                f"all {self.max_sessions} pipeline session(s) are in use"
-            )
+            raise RuntimeError(f"all {self.max_sessions} pipeline session(s) are in use")
         self._active_sessions += 1
         return self._slot
 

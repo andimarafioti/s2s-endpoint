@@ -138,9 +138,7 @@ class RequesterRateLimiter:
             retry_after_s = _retry_after(state.blocked_until_s - now_s)
         elif len(state.request_times_s) > self.config.max_requests_per_window:
             reason = "request_rate"
-            retry_after_s = _retry_after(
-                state.request_times_s[0] + self.config.request_window_s - now_s
-            )
+            retry_after_s = _retry_after(state.request_times_s[0] + self.config.request_window_s - now_s)
         elif self._active_allocations(state) >= self.config.max_parallel_allocations:
             reason = "parallel_allocations"
             retry_after_s = self._parallel_retry_after(state, now_s)
@@ -236,9 +234,7 @@ class RequesterRateLimiter:
             )
 
         resolved_duration_s = max(
-            float(duration_s)
-            if duration_s is not None
-            else now_s - allocation.connected_at_s,
+            float(duration_s) if duration_s is not None else now_s - allocation.connected_at_s,
             0.0,
         )
         short_session = resolved_duration_s <= self.config.short_session_threshold_s
@@ -246,10 +242,7 @@ class RequesterRateLimiter:
             if penalize:
                 state.consecutive_short_sessions += 1
                 self._totals["short_sessions"] += 1
-                if (
-                    state.consecutive_short_sessions
-                    >= self.config.max_consecutive_short_sessions
-                ):
+                if state.consecutive_short_sessions >= self.config.max_consecutive_short_sessions:
                     self._activate_cooldown(state, now_s)
         else:
             state.consecutive_short_sessions = 0
@@ -269,9 +262,7 @@ class RequesterRateLimiter:
         return {
             "enabled": self.config.enabled,
             "tracked_actors": len(self._actors),
-            "blocked_actors": sum(
-                1 for state in self._actors.values() if state.blocked_until_s > now_s
-            ),
+            "blocked_actors": sum(1 for state in self._actors.values() if state.blocked_until_s > now_s),
             "active_allocations": active_allocations,
             "totals": dict(sorted(self._totals.items())),
             "rejection_reasons": dict(sorted(self._rejection_reasons.items())),
@@ -383,9 +374,7 @@ class RequesterRateLimiter:
 
     def _parallel_retry_after(self, state: _ActorState, now_s: float) -> int:
         pending_expirations = [
-            allocation.expires_at_s
-            for allocation in state.allocations.values()
-            if allocation.connected_at_s is None
+            allocation.expires_at_s for allocation in state.allocations.values() if allocation.connected_at_s is None
         ]
         if pending_expirations:
             return _retry_after(min(pending_expirations) - now_s)

@@ -49,10 +49,6 @@ class SessionRequesterTracker:
         return len(self._entries)
 
     def _prune(self, now_s: float) -> None:
-        expired = [
-            session_id
-            for session_id, entry in self._entries.items()
-            if entry.expires_at_s <= now_s
-        ]
+        expired = [session_id for session_id, entry in self._entries.items() if entry.expires_at_s <= now_s]
         for session_id in expired:
             self._entries.pop(session_id, None)

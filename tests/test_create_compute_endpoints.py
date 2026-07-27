@@ -4,7 +4,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -131,14 +130,22 @@ class CreateEndpointMainTests(unittest.TestCase):
 
         argv = [
             "create_compute_endpoints",
-            "--names", "test-endpoint",
-            "--vendor", "aws",
-            "--region", "us-east-1",
-            "--instance-size", "x1",
-            "--instance-type", "nvidia-a10g",
-            "--image-url", "registry/myimage:latest",
-            "--num-pipelines", "4",
-            "--session-shared-secret", "my-secret",
+            "--names",
+            "test-endpoint",
+            "--vendor",
+            "aws",
+            "--region",
+            "us-east-1",
+            "--instance-size",
+            "x1",
+            "--instance-type",
+            "nvidia-a10g",
+            "--image-url",
+            "registry/myimage:latest",
+            "--num-pipelines",
+            "4",
+            "--session-shared-secret",
+            "my-secret",
         ]
 
         with (

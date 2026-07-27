@@ -137,9 +137,7 @@ async def wait_for_internal_server(
 
     while True:
         if process is not None and process.poll() is not None:
-            raise RuntimeError(
-                f"speech-to-speech process exited early with code {process.returncode}"
-            )
+            raise RuntimeError(f"speech-to-speech process exited early with code {process.returncode}")
 
         try:
             await asyncio.to_thread(_http_get_json, http_url)
@@ -150,8 +148,7 @@ async def wait_for_internal_server(
 
         if asyncio.get_running_loop().time() - start > timeout_s:
             raise RuntimeError(
-                f"Timed out waiting for internal realtime server at {http_url}. "
-                f"Last error: {last_error}"
+                f"Timed out waiting for internal realtime server at {http_url}. Last error: {last_error}"
             )
 
         await asyncio.sleep(2.0)

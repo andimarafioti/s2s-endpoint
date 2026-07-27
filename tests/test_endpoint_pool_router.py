@@ -11,19 +11,16 @@ from app.endpoint_pool_router import (
     EndpointSnapshot,
     EndpointTransitionConflictError,
     ManagedEndpoint,
-    drain_lease_owner_fingerprint,
     _to_health_url,
     _to_ws_url,
+    drain_lease_owner_fingerprint,
     fetch_compute_active_sessions,
 )
 
 
 class FakeEndpointController:
     def __init__(self, initial_states):
-        self.states = {
-            name: {"status": status, "url": url}
-            for name, status, url in initial_states
-        }
+        self.states = {name: {"status": status, "url": url} for name, status, url in initial_states}
         self.wake_calls = []
         self.park_calls = []
         self.force_restart_calls = []
@@ -355,9 +352,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_drain_requires_usage_request_started_after_acquisition(self):
         endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
-        controller = FakeEndpointController(
-            [("endpoint-a", "running", endpoint_url)]
-        )
+        controller = FakeEndpointController([("endpoint-a", "running", endpoint_url)])
         self.router = EndpointPoolRouter(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
@@ -488,9 +483,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("allocator-drained" in line for line in first_warning.output))
 
         async with self.router._condition:
-            self.router._endpoints["endpoint-a"].last_drain_warning_at = (
-                time.monotonic() - 301
-            )
+            self.router._endpoints["endpoint-a"].last_drain_warning_at = time.monotonic() - 301
         with self.assertLogs("s2s-endpoint", level="WARNING") as recurring_warning:
             await self.router._maintain_drain_leases()
         self.assertTrue(any("allocator-drained" in line for line in recurring_warning.output))
@@ -780,9 +773,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         snapshot = await self.router.snapshot()
         self.assertEqual(snapshot["free_slots"], 0)
-        self.assertFalse(
-            next(ep for ep in snapshot["endpoints"] if ep["name"] == "endpoint-a")["usage_synced"]
-        )
+        self.assertFalse(next(ep for ep in snapshot["endpoints"] if ep["name"] == "endpoint-a")["usage_synced"])
 
         # The reconcile loop cannot help within this timeout (interval 3600s):
         # acquire itself must spawn the wake before suspending.
@@ -1343,9 +1334,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         await self.router._schedule_parks_if_needed()
         await asyncio.sleep(0.05)
 
-        idle_endpoint_name = (
-            {"endpoint-a", "endpoint-b"} - {lease.endpoint_name}
-        ).pop()
+        idle_endpoint_name = ({"endpoint-a", "endpoint-b"} - {lease.endpoint_name}).pop()
         self.assertEqual(controller.park_calls, [idle_endpoint_name])
         snapshot = await self.router.snapshot()
         endpoints = {endpoint["name"]: endpoint for endpoint in snapshot["endpoints"]}
@@ -1457,9 +1446,7 @@ class EndpointSelectionTests(unittest.TestCase):
         for endpoint in router._endpoints.values():
             endpoint.status = "running"
             endpoint.raw_status = "running"
-            endpoint.url = (
-                f"https://{endpoint.name}.example.endpoints.huggingface.cloud"
-            )
+            endpoint.url = f"https://{endpoint.name}.example.endpoints.huggingface.cloud"
         return router
 
     def test_prefers_partially_used_endpoint_over_idle_endpoint(self):
@@ -1720,9 +1707,7 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
             endpoint_names=["endpoint-a"],
             drain_restart_timeout_s=0,
         )
-        self.router._fetch_pool_units = lambda url: [
-            {"state": "draining", "draining_for_s": 999}
-        ]
+        self.router._fetch_pool_units = lambda url: [{"state": "draining", "draining_for_s": 999}]
 
         await self.router.start()
         await self.router.set_draining("endpoint-a", True, lease_id="rollout-a")
@@ -1740,9 +1725,7 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
             endpoint_names=["endpoint-a"],
             drain_restart_timeout_s=0,
         )
-        self.router._fetch_pool_units = lambda url: [
-            {"state": "draining", "draining_for_s": 999}
-        ]
+        self.router._fetch_pool_units = lambda url: [{"state": "draining", "draining_for_s": 999}]
         await self.router.start()
 
         async def mark_draining_during_poll(function, *args):

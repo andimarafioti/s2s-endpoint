@@ -10,7 +10,6 @@ from typing import Optional
 
 from app.dashboard_history import DashboardHistoryStore, SwarmHistoryBucket, _bucket_start_epoch_s
 
-
 logger = logging.getLogger("s2s-endpoint")
 
 
@@ -106,10 +105,7 @@ class HuggingFaceBucketHistoryStore:
                 max_bucket=max_bucket,
                 existing_bucket_starts=set(loaded_by_start),
             )
-            days_with_new_minute_buckets = {
-                _day_start_epoch_s(bucket.bucket_start_s)
-                for bucket in minute_buckets
-            }
+            days_with_new_minute_buckets = {_day_start_epoch_s(bucket.bucket_start_s) for bucket in minute_buckets}
             for bucket in minute_buckets:
                 loaded_by_start[bucket.bucket_start_s] = bucket
             days_to_cache = [
@@ -174,8 +170,7 @@ class HuggingFaceBucketHistoryStore:
         open_partial_day_starts: set[int] = set()
         with tempfile.TemporaryDirectory() as tmpdir:
             local_files = [
-                (day_start_s, path, Path(tmpdir) / f"{day_start_s}.json")
-                for day_start_s, path in candidates
+                (day_start_s, path, Path(tmpdir) / f"{day_start_s}.json") for day_start_s, path in candidates
             ]
             self._download_bucket_files(
                 self.bucket_id,
@@ -190,8 +185,7 @@ class HuggingFaceBucketHistoryStore:
                 try:
                     payload = json.loads(local_path.read_text())
                     day_buckets = [
-                        SwarmHistoryBucket.from_dict(bucket_payload)
-                        for bucket_payload in payload.get("buckets", [])
+                        SwarmHistoryBucket.from_dict(bucket_payload) for bucket_payload in payload.get("buckets", [])
                     ]
                     loaded.extend(day_buckets)
                     if self._day_payload_is_complete(payload, day_buckets):
@@ -262,9 +256,7 @@ class HuggingFaceBucketHistoryStore:
             )
             if bucket_start_s not in existing_bucket_starts
         ]
-        return self._download_minute_bucket_candidates(
-            candidates
-        )
+        return self._download_minute_bucket_candidates(candidates)
 
     def _list_minute_candidates_for_days(
         self,
@@ -545,11 +537,7 @@ class HuggingFaceBucketHistoryStore:
     def write_day_buckets(self, *, day_start_s: int, buckets: list[SwarmHistoryBucket]) -> Optional[str]:
         day_start = _day_start_epoch_s(day_start_s)
         day_buckets = sorted(
-            [
-                bucket
-                for bucket in buckets
-                if _day_start_epoch_s(bucket.bucket_start_s) == day_start
-            ],
+            [bucket for bucket in buckets if _day_start_epoch_s(bucket.bucket_start_s) == day_start],
             key=lambda bucket: bucket.bucket_start_s,
         )
         if len(day_buckets) != 24 * 60:
@@ -721,8 +709,8 @@ class HuggingFaceBucketHistoryStore:
                 token=self.token,
             )
             deleted_duplicate_days.append({"day": _day_key(day_start), "count": len(duplicate_paths)})
-            result["deleted_legacy_duplicate_files"] = (
-                int(result["deleted_legacy_duplicate_files"]) + len(duplicate_paths)
+            result["deleted_legacy_duplicate_files"] = int(result["deleted_legacy_duplicate_files"]) + len(
+                duplicate_paths
             )
 
         result["moved_days"] = moved_days
@@ -748,10 +736,7 @@ class HuggingFaceBucketHistoryStore:
         if not candidates:
             return 0
 
-        copy = [
-            ("bucket", self.bucket_id, xet_hash, target_path)
-            for _, _, target_path, xet_hash in candidates
-        ]
+        copy = [("bucket", self.bucket_id, xet_hash, target_path) for _, _, target_path, xet_hash in candidates]
         delete = [legacy_path for _, legacy_path, _, _ in candidates]
         self._batch_bucket_files(
             self.bucket_id,
@@ -769,8 +754,7 @@ class HuggingFaceBucketHistoryStore:
         moved_count = 0
         with tempfile.TemporaryDirectory() as tmpdir:
             downloads = [
-                (legacy_path, Path(tmpdir) / f"{bucket_start_s}.json")
-                for bucket_start_s, legacy_path, _ in candidates
+                (legacy_path, Path(tmpdir) / f"{bucket_start_s}.json") for bucket_start_s, legacy_path, _ in candidates
             ]
             self._download_bucket_files(
                 self.bucket_id,
@@ -821,10 +805,7 @@ class HuggingFaceBucketHistoryStore:
         counts: dict[int, int] = {}
         for bucket_start_s, _ in candidates:
             counts[_day_start_epoch_s(bucket_start_s)] = counts.get(_day_start_epoch_s(bucket_start_s), 0) + 1
-        return [
-            {"day": _day_key(day_start), "count": count}
-            for day_start, count in sorted(counts.items())
-        ]
+        return [{"day": _day_key(day_start), "count": count} for day_start, count in sorted(counts.items())]
 
     def backfill_day_files(
         self,
@@ -851,14 +832,10 @@ class HuggingFaceBucketHistoryStore:
             day_start for day_start in day_starts if day_start not in loaded_days.authoritative_day_starts
         ]
         skipped_current_or_future = [
-            _day_key(day_start)
-            for day_start in days_without_authoritative_day_files
-            if day_start >= current_day_start
+            _day_key(day_start) for day_start in days_without_authoritative_day_files if day_start >= current_day_start
         ]
         backfillable_day_starts = [
-            day_start
-            for day_start in days_without_authoritative_day_files
-            if day_start < current_day_start
+            day_start for day_start in days_without_authoritative_day_files if day_start < current_day_start
         ]
         logger.info(
             "Dashboard day backfill found %s complete day files, %s finalized partial day files, "
@@ -903,10 +880,7 @@ class HuggingFaceBucketHistoryStore:
             )
             minute_buckets = self._download_minute_bucket_candidates(day_candidates)
             minute_buckets_loaded += len(minute_buckets)
-            day_bucket_map = {
-                bucket.bucket_start_s: bucket
-                for bucket in existing_day_buckets
-            }
+            day_bucket_map = {bucket.bucket_start_s: bucket for bucket in existing_day_buckets}
             for bucket in minute_buckets:
                 day_bucket_map[bucket.bucket_start_s] = bucket
             day_buckets = list(day_bucket_map.values())
@@ -1032,7 +1006,7 @@ class HuggingFaceBucketHistoryStore:
         prefix = self._minutes_prefix().strip("/")
         if not normalized.startswith(f"{prefix}/"):
             return None
-        suffix = normalized[len(prefix) + 1:]
+        suffix = normalized[len(prefix) + 1 :]
         if "/" in suffix:
             return None
         match = re.fullmatch(r"(\d+)\.json", suffix)
