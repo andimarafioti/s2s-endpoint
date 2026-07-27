@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from app.endpoint_pool_router import (
+    ComputeUsage,
     ComputeUsageSchemaError,
     EndpointDrainLeaseConflictError,
     EndpointPoolRouter,
@@ -14,7 +15,7 @@ from app.endpoint_pool_router import (
     drain_lease_owner_fingerprint,
     _to_health_url,
     _to_ws_url,
-    fetch_compute_active_sessions,
+    fetch_compute_usage,
 )
 
 
@@ -67,7 +68,7 @@ class FakeComputeUsageFetcher:
         self.busy_by_url = dict(busy_by_url)
         self.calls = []
 
-    def __call__(self, url: str) -> int:
+    def __call__(self, url: str) -> object:
         self.calls.append(url)
         return self.busy_by_url.get(url, 0)
 
@@ -92,34 +93,48 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         if router is not None:
             await router.stop()
 
-    def test_fetch_compute_active_sessions_reads_active_sessions_from_health(self):
+    def test_fetch_compute_usage_reads_sessions_and_capacity_from_health(self):
         with patch(
             "app.endpoint_pool_router.urllib.request.urlopen",
-            return_value=FakeUrlopenResponse({"router": {"active_sessions": 2}}),
+            return_value=FakeUrlopenResponse(
+                {"router": {"active_sessions": 2, "max_sessions": 4}}
+            ),
         ):
-            active_sessions = fetch_compute_active_sessions("https://compute.example")
+            usage = fetch_compute_usage("https://compute.example")
 
-        self.assertEqual(active_sessions, 2)
+        self.assertEqual(usage, ComputeUsage(active_sessions=2, max_sessions=4))
 
-    def test_fetch_compute_active_sessions_supports_legacy_ready_busy(self):
+    def test_fetch_compute_usage_supports_legacy_ready_busy(self):
         with patch(
             "app.endpoint_pool_router.urllib.request.urlopen",
-            return_value=FakeUrlopenResponse({"router": {"ready_busy": 1}}),
+            return_value=FakeUrlopenResponse(
+                {"router": {"ready_busy": 1, "max_sessions": 3}}
+            ),
         ):
-            active_sessions = fetch_compute_active_sessions("https://compute.example")
+            usage = fetch_compute_usage("https://compute.example")
 
-        self.assertEqual(active_sessions, 1)
+        self.assertEqual(usage, ComputeUsage(active_sessions=1, max_sessions=3))
 
-    def test_fetch_compute_active_sessions_raises_on_missing_session_count(self):
+    def test_fetch_compute_usage_raises_on_missing_session_count(self):
         # Regression guard for the 2026-06-07 incident: a schema drift in the
         # compute health payload must fail loudly instead of silently reading
         # 0 sessions and letting the LB treat busy nodes as free.
         with patch(
             "app.endpoint_pool_router.urllib.request.urlopen",
-            return_value=FakeUrlopenResponse({"router": {"ready": True, "starting": False}}),
+            return_value=FakeUrlopenResponse(
+                {"router": {"ready": True, "starting": False, "max_sessions": 2}}
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "did not include a session count"):
-                fetch_compute_active_sessions("https://compute.example")
+                fetch_compute_usage("https://compute.example")
+
+    def test_fetch_compute_usage_raises_on_missing_capacity(self):
+        with patch(
+            "app.endpoint_pool_router.urllib.request.urlopen",
+            return_value=FakeUrlopenResponse({"router": {"active_sessions": 1}}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not include 'max_sessions'"):
+                fetch_compute_usage("https://compute.example")
 
     async def test_start_ensures_minimum_warm_endpoints(self):
         controller = FakeEndpointController(
@@ -745,6 +760,61 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(healthy)
         self.assertIsNone(detail)
 
+    async def test_discovers_and_updates_capacity_per_compute_endpoint(self):
+        endpoint_a_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
+        endpoint_b_url = "https://endpoint-b.example.endpoints.huggingface.cloud"
+        usage_fetcher = FakeComputeUsageFetcher(
+            {
+                endpoint_a_url: ComputeUsage(active_sessions=1, max_sessions=2),
+                endpoint_b_url: ComputeUsage(active_sessions=1, max_sessions=4),
+            }
+        )
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", endpoint_a_url),
+                ("endpoint-b", "running", endpoint_b_url),
+            ]
+        )
+        self.router = EndpointPoolRouter(
+            endpoint_names=["endpoint-a", "endpoint-b"],
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=usage_fetcher,
+        )
+
+        await self.router.start()
+
+        snapshot = await self.router.snapshot()
+        endpoints = {item["name"]: item for item in snapshot["endpoints"]}
+        self.assertEqual(endpoints["endpoint-a"]["max_sessions"], 2)
+        self.assertEqual(endpoints["endpoint-a"]["free_slots"], 1)
+        self.assertEqual(endpoints["endpoint-b"]["max_sessions"], 4)
+        self.assertEqual(endpoints["endpoint-b"]["free_slots"], 3)
+        self.assertEqual(snapshot["free_slots"], 4)
+
+        usage_fetcher.busy_by_url[endpoint_a_url] = ComputeUsage(
+            active_sessions=1,
+            max_sessions=3,
+        )
+        usage_fetcher.busy_by_url[endpoint_b_url] = ComputeUsage(
+            active_sessions=1,
+            max_sessions=1,
+        )
+        await self.router.refresh()
+
+        snapshot = await self.router.snapshot()
+        endpoints = {item["name"]: item for item in snapshot["endpoints"]}
+        self.assertEqual(endpoints["endpoint-a"]["max_sessions"], 3)
+        self.assertEqual(endpoints["endpoint-a"]["free_slots"], 2)
+        self.assertEqual(endpoints["endpoint-b"]["max_sessions"], 1)
+        self.assertEqual(endpoints["endpoint-b"]["free_slots"], 0)
+        self.assertEqual(snapshot["free_slots"], 2)
+
     async def test_acquire_wakes_parked_node_when_running_nodes_are_unsynced(self):
         # Regression: acquire() used to mark parked endpoints as waking, then
         # suspend on the condition BEFORE spawning the wake task. Nothing else
@@ -753,9 +823,11 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         # waiter. With unsynced-running being a normal post-restart state,
         # acquire must wake parked capacity on its own, without the reconcile
         # loop's help.
-        class AlwaysFailingFetcher:
-            def __call__(self, url: str) -> int:
-                raise RuntimeError("health unreachable")
+        class PerEndpointFetcher:
+            def __call__(self, url: str) -> ComputeUsage:
+                if "endpoint-a" in url:
+                    raise RuntimeError("health unreachable")
+                return ComputeUsage(active_sessions=0, max_sessions=1)
 
         controller = FakeEndpointController(
             [
@@ -773,7 +845,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             waking_capacity_timeout_s=300,
             park_cooldown_s=0,
             controller=controller,
-            compute_usage_fetcher=AlwaysFailingFetcher(),
+            compute_usage_fetcher=PerEndpointFetcher(),
         )
 
         await self.router.start()
@@ -1062,9 +1134,9 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["observed_active_sessions"], 1)
         self.assertEqual(snapshot["free_slots"], 1)
 
-    async def test_woken_endpoint_counts_as_synced_without_health_poll(self):
-        # A node the LB wakes itself is a fresh process with zero sessions,
-        # so it must offer capacity even if its /health is not yet reachable.
+    async def test_woken_endpoint_waits_for_capacity_health_poll(self):
+        # A node the LB wakes itself is a fresh process, but its configured
+        # capacity is unknown until /health answers.
         class AlwaysFailingFetcher:
             def __call__(self, url: str) -> int:
                 raise RuntimeError("health unreachable")
@@ -1076,7 +1148,6 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.router = EndpointPoolRouter(
             endpoint_names=["endpoint-a"],
-            endpoint_slots=1,
             min_warm_endpoints=1,
             wake_threshold_slots=1,
             idle_park_timeout_s=60,
@@ -1092,11 +1163,12 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         snapshot = await self.router.snapshot()
         self.assertEqual(snapshot["running_endpoints"], 1)
-        self.assertTrue(snapshot["endpoints"][0]["usage_synced"])
-        self.assertEqual(snapshot["free_slots"], 1)
+        self.assertFalse(snapshot["endpoints"][0]["usage_synced"])
+        self.assertIsNone(snapshot["endpoints"][0]["max_sessions"])
+        self.assertEqual(snapshot["free_slots"], 0)
 
-        lease = await self.router.acquire(timeout_s=0.2)
-        await self.router.release(lease.slot_id, connected=False)
+        with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
+            await self.router.acquire(timeout_s=0.01)
 
     async def test_start_syncs_running_compute_usage(self):
         endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
