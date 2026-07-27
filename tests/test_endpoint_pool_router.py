@@ -964,6 +964,85 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(lease.waited_for_capacity)
         await self.router.release(lease.slot_id, connected=False)
 
+    async def test_wake_stays_pending_until_capacity_sync_finishes(self):
+        class BlockingFetcher:
+            def __init__(self):
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def __call__(self, url: str) -> ComputeUsage:
+                self.started.set()
+                if not self.release.wait(timeout=1):
+                    raise RuntimeError("timed out waiting to release capacity poll")
+                return ComputeUsage(active_sessions=0, max_sessions=2)
+
+        usage_fetcher = BlockingFetcher()
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "paused", None),
+                ("endpoint-b", "paused", None),
+                ("endpoint-c", "paused", None),
+            ]
+        )
+        self.router = _make_test_router(
+            endpoint_names=["endpoint-a", "endpoint-b", "endpoint-c"],
+            min_warm_endpoints=0,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=3600,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=usage_fetcher,
+        )
+        await self.router.refresh()
+
+        acquire_task = asyncio.create_task(self.router.acquire(timeout_s=2))
+        started = await asyncio.to_thread(usage_fetcher.started.wait, 1)
+        self.assertTrue(started)
+        second_acquire_task = asyncio.create_task(self.router.acquire(timeout_s=2))
+        await asyncio.sleep(0.05)
+
+        snapshot = await self.router.snapshot()
+        endpoint_a = next(
+            endpoint
+            for endpoint in snapshot["endpoints"]
+            if endpoint["name"] == "endpoint-a"
+        )
+        self.assertEqual(controller.wake_calls, ["endpoint-a"])
+        self.assertTrue(endpoint_a["running"])
+        self.assertTrue(endpoint_a["waking"])
+        self.assertFalse(endpoint_a["usage_synced"])
+        self.assertIsNone(endpoint_a["max_sessions"])
+        self.assertTrue(endpoint_a["warming_capacity_counted"])
+
+        # Even an unrelated condition notification must not make this one
+        # request fan out to another parked endpoint while its first capacity
+        # poll is still in flight.
+        async with self.router._condition:
+            self.router._condition.notify_all()
+        await asyncio.sleep(0.05)
+        self.assertEqual(controller.wake_calls, ["endpoint-a"])
+
+        usage_fetcher.release.set()
+        leases = await asyncio.gather(acquire_task, second_acquire_task)
+        self.assertEqual(
+            [lease.endpoint_name for lease in leases],
+            ["endpoint-a", "endpoint-a"],
+        )
+        self.assertEqual(controller.wake_calls, ["endpoint-a"])
+
+        snapshot = await self.router.snapshot()
+        endpoint_a = next(
+            endpoint
+            for endpoint in snapshot["endpoints"]
+            if endpoint["name"] == "endpoint-a"
+        )
+        self.assertFalse(endpoint_a["waking"])
+        self.assertTrue(endpoint_a["usage_synced"])
+        for lease in leases:
+            await self.router.release(lease.slot_id, connected=False)
+
     async def test_schema_error_revokes_capacity_after_successful_sync(self):
         # A node that synced once must go conservative again when the health
         # schema breaks at runtime, instead of allocating on stale data.

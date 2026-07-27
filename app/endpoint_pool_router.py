@@ -819,8 +819,12 @@ class EndpointPoolRouter:
                 endpoint.raw_status = result.raw_status
                 endpoint.url = result.url
                 if endpoint.running:
-                    endpoint.waking = False
-                    endpoint.wake_capacity_until = None
+                    # A controller-driven wake keeps this transition marked
+                    # until its first capacity sync finishes. Clearing it here
+                    # would let a concurrent refresh expose an unsynced running
+                    # endpoint as missing warming capacity.
+                    if not endpoint.waking:
+                        endpoint.wake_capacity_until = None
                     if not was_running:
                         endpoint.running_since = now
                         endpoint.drain_restarting = False
@@ -867,8 +871,6 @@ class EndpointPoolRouter:
                     endpoint.last_error = None
                 self._last_error = None
 
-            self._condition.notify_all()
-
         if self._on_endpoint_down is not None:
             for name in downed_endpoints:
                 try:
@@ -876,7 +878,9 @@ class EndpointPoolRouter:
                 except Exception:
                     logger.exception("on_endpoint_down callback failed for %s", name)
 
-        await self._sync_compute_usage()
+        await self._sync_compute_usage(notify=False)
+        async with self._condition:
+            self._condition.notify_all()
 
     async def ensure_min_warm(self) -> None:
         while True:
@@ -892,14 +896,14 @@ class EndpointPoolRouter:
 
             await asyncio.gather(*(self._wake_endpoint(name) for name in wake_names))
 
-    async def _sync_compute_usage(self) -> None:
+    async def _sync_compute_usage(self, *, notify: bool = True) -> None:
         # Wake, restart, refresh, and startup paths can all request a usage
         # sync concurrently. Serialize complete poll/apply cycles so an older,
         # slower response can never overwrite a newer observation.
         async with self._usage_sync_lock:
-            await self._sync_compute_usage_serialized()
+            await self._sync_compute_usage_serialized(notify=notify)
 
-    async def _sync_compute_usage_serialized(self) -> None:
+    async def _sync_compute_usage_serialized(self, *, notify: bool) -> None:
         async with self._condition:
             targets = [
                 (endpoint.name, endpoint.url, endpoint.drain_generation)
@@ -1022,7 +1026,8 @@ class EndpointPoolRouter:
                 if observed_active_sessions:
                     endpoint.last_used_at = now
 
-            self._condition.notify_all()
+            if notify:
+                self._condition.notify_all()
 
     async def _wake_endpoint(self, name: str) -> None:
         try:
@@ -1043,8 +1048,6 @@ class EndpointPoolRouter:
             endpoint.status = snapshot.status
             endpoint.raw_status = snapshot.raw_status
             endpoint.url = snapshot.url
-            endpoint.waking = False
-            endpoint.wake_capacity_until = None
             endpoint.parking = False
             endpoint.last_error = None
             endpoint.observed_active_sessions = 0
@@ -1054,9 +1057,15 @@ class EndpointPoolRouter:
             endpoint.usage_synced = False
             endpoint.last_usage_sync_at = None
             self._last_error = None
-            self._condition.notify_all()
 
-        await self._sync_compute_usage()
+        try:
+            await self._sync_compute_usage(notify=False)
+        finally:
+            async with self._condition:
+                endpoint = self._endpoints[name]
+                endpoint.waking = False
+                endpoint.wake_capacity_until = None
+                self._condition.notify_all()
         logger.info("Endpoint %s is ready at %s", name, snapshot.url)
 
     async def _park_endpoint(self, name: str) -> None:
@@ -1209,7 +1218,6 @@ class EndpointPoolRouter:
             endpoint.status = snapshot.status
             endpoint.raw_status = snapshot.raw_status
             endpoint.url = snapshot.url
-            endpoint.restarting = False
             endpoint.last_error = None
             self._last_error = None
             if endpoint.running:
@@ -1217,9 +1225,14 @@ class EndpointPoolRouter:
                 endpoint.observed_active_sessions = 0
                 endpoint.usage_synced = False
                 endpoint.last_usage_sync_at = None
-            self._condition.notify_all()
 
-        await self._sync_compute_usage()
+        try:
+            await self._sync_compute_usage(notify=False)
+        finally:
+            async with self._condition:
+                endpoint = self._endpoints[name]
+                endpoint.restarting = False
+                self._condition.notify_all()
         logger.info(
             "Restart action completed for endpoint %s (status: %s)",
             name,
@@ -1242,6 +1255,7 @@ class EndpointPoolRouter:
         force: bool = False,
         target_count: Optional[int] = None,
     ) -> list[str]:
+        now = time.monotonic()
         effective_free_slots = self._effective_free_slots_unlocked()
         if not force and target_count is None:
             # Keep the warm floor, but don't spin up extra endpoints while the
@@ -1249,10 +1263,17 @@ class EndpointPoolRouter:
             # actual allocated session pressure.
             if self._active_sessions_unlocked() == 0:
                 return []
-            if effective_free_slots >= self.wake_threshold_slots:
+            if (
+                effective_free_slots >= self.wake_threshold_slots
+                or self._has_pending_unknown_capacity_wake_unlocked(now)
+            ):
                 return []
-        elif force and target_count is None and effective_free_slots > 0:
-            return []
+        elif force and target_count is None:
+            if (
+                effective_free_slots > 0
+                or self._has_pending_wake_unlocked(now)
+            ):
+                return []
 
         if target_count is None:
             target_count = 1
@@ -1387,13 +1408,31 @@ class EndpointPoolRouter:
 
     def _counts_as_warming_capacity(self, endpoint: ManagedEndpoint, now: float) -> bool:
         return (
-            endpoint.waking
+            self._is_pending_wake(endpoint, now)
             and not endpoint.parking
             and not endpoint.draining
             and not endpoint.drain_restarting
-            and not endpoint.running
+            and (not endpoint.running or not endpoint.usage_synced)
+        )
+
+    @staticmethod
+    def _is_pending_wake(endpoint: ManagedEndpoint, now: float) -> bool:
+        return (
+            endpoint.waking
             and endpoint.wake_capacity_until is not None
             and now < endpoint.wake_capacity_until
+        )
+
+    def _has_pending_wake_unlocked(self, now: float) -> bool:
+        return any(
+            self._is_pending_wake(endpoint, now)
+            for endpoint in self._endpoints.values()
+        )
+
+    def _has_pending_unknown_capacity_wake_unlocked(self, now: float) -> bool:
+        return any(
+            endpoint.slots == 0 and self._is_pending_wake(endpoint, now)
+            for endpoint in self._endpoints.values()
         )
 
     def _spawn_wake_tasks(self, names: list[str]) -> None:
