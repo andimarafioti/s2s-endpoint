@@ -1,18 +1,26 @@
-"""App-level tests for the compute replica's LLM proxy passthrough.
+"""App-level tests for the compute replica's LLM proxy passthrough and gate.
 
-The replica forwards POST /v1/chat/completions and POST /v1/responses to its
-internal speech-to-speech pipeline, which owns the whole contract (session
-gating, rate limits, 501 reasons). These tests drive compute_main's app with
-a stub internal pipeline HTTP server on an ephemeral port.
+The replica owns access control for POST /v1/chat/completions and
+POST /v1/responses: the api key must be the HF token a currently connected
+realtime session was created with (checked by HMAC fingerprint against the
+session token's claim), throttled per fingerprint. Authorized requests are
+forwarded to the internal speech-to-speech pipeline, which owns the OpenAI
+contract itself. These tests drive compute_main's app with a stub internal
+pipeline HTTP server on an ephemeral port and a faked pipeline websocket for
+the realtime connections that open the access window.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
+from types import SimpleNamespace
+from typing import Any, Callable, Iterator
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -20,6 +28,15 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from app import compute_main
+from app.session_tokens import create_session_token, llm_token_fingerprint
+
+SECRET = "compute-test-secret"
+HF_TOKEN = "hf_faketesttoken1234"
+OTHER_HF_TOKEN = "hf_otherfaketoken5678"
+
+
+def _auth(token: str = HF_TOKEN) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
 class StubInternalPipeline:
@@ -94,9 +111,107 @@ class StubInternalPipeline:
         self._thread.join(timeout=5)
 
 
-def _client_against(monkeypatch: Any, stub: StubInternalPipeline) -> TestClient:
-    monkeypatch.setattr(compute_main, "INTERNAL_HTTP_BASE_URL", stub.base_url)
-    return TestClient(compute_main.app)
+class _IdleUpstreamWS:
+    """Fake pipeline websocket that stays open until the client disconnects."""
+
+    async def recv(self):
+        await asyncio.Event().wait()
+
+    async def send(self, data) -> None:
+        pass
+
+
+class _FakeUpstreamConnect:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> _IdleUpstreamWS:
+        return _IdleUpstreamWS()
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+def _mint_session_token(
+    *,
+    host: str = "testserver",
+    hf_token: str | None = HF_TOKEN,
+    secret: str = SECRET,
+    session_id: str = "session-under-test",
+) -> str:
+    return create_session_token(
+        secret,
+        session_id=session_id,
+        websocket_url=f"ws://{host}/v1/realtime",
+        callback_url=f"http://lb.internal/internal/sessions/{session_id}/event",
+        ttl_s=600.0,
+        llm_fingerprint=llm_token_fingerprint(secret, hf_token) if hf_token else None,
+    )
+
+
+@contextlib.contextmanager
+def _gated_client(
+    monkeypatch: Any,
+    stub: StubInternalPipeline | None,
+    *,
+    rate_limit_rpm: int = 100,
+) -> Iterator[TestClient]:
+    """compute_main's app with the gate armed and the realtime path faked.
+
+    The session router hands out fake leases and the pipeline websocket is an
+    idle fake, so TestClient websocket connections exercise the real route —
+    session token verification, fingerprint registration, LB notifications
+    (stubbed) — without spawning a speech-to-speech process.
+    """
+    monkeypatch.setattr(compute_main, "SESSION_SHARED_SECRET", SECRET)
+    if stub is not None:
+        monkeypatch.setattr(compute_main, "INTERNAL_HTTP_BASE_URL", stub.base_url)
+    monkeypatch.setattr(
+        compute_main, "_connected_llm_fingerprints", compute_main._ConnectedFingerprintRegistry()
+    )
+    monkeypatch.setattr(
+        compute_main, "_llm_rate_limiter", compute_main._FingerprintRateLimiter(rate_limit_rpm)
+    )
+
+    async def _fake_acquire():
+        return SimpleNamespace(slot_id=0, ws_url="ws://127.0.0.1:1/v1/realtime")
+
+    async def _fake_release(slot_id) -> None:
+        pass
+
+    async def _no_lb_callback(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr(compute_main.session_router, "acquire", _fake_acquire)
+    monkeypatch.setattr(compute_main.session_router, "release", _fake_release)
+    monkeypatch.setattr(compute_main, "_notify_lb_session_event", _no_lb_callback)
+    with patch("app.ws_proxy.websockets.connect", _FakeUpstreamConnect):
+        # Never entered as a context manager: the app lifespan would spawn a
+        # real speech-to-speech process.
+        yield TestClient(compute_main.app)
+
+
+@contextlib.contextmanager
+def _connected_session(client: TestClient, **mint_kwargs: Any) -> Iterator[None]:
+    token = _mint_session_token(**mint_kwargs)
+    with client.websocket_connect(f"/v1/realtime?session_token={token}"):
+        yield
+
+
+def _post_until_401(client: TestClient, deadline_s: float = 5.0) -> Any:
+    """Post until the access window closes: the websocket route's teardown runs
+    asynchronously after the client-side close, so the 401 is eventual."""
+    deadline = time.monotonic() + deadline_s
+    while True:
+        response = client.post("/v1/chat/completions", content=b"{}", headers=_auth())
+        if response.status_code == 401 or time.monotonic() > deadline:
+            return response
+        time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# Authorized passthrough
+# ---------------------------------------------------------------------------
 
 
 def test_chat_completions_reaches_internal_pipeline_verbatim(monkeypatch: Any) -> None:
@@ -106,16 +221,13 @@ def test_chat_completions_reaches_internal_pipeline_verbatim(monkeypatch: Any) -
             200,
             {"id": "chatcmpl-1", "choices": [{"message": {"content": "hi"}}]},
         )
-        client = _client_against(monkeypatch, stub)
-
-        response = client.post(
-            "/v1/chat/completions",
-            content=b'{"messages":[{"role":"user","content":"hi"}],"custom_field":1}',
-            headers={
-                "Authorization": "Bearer realtime-session-id",
-                "Content-Type": "application/json",
-            },
-        )
+        with _gated_client(monkeypatch, stub) as client:
+            with _connected_session(client):
+                response = client.post(
+                    "/v1/chat/completions",
+                    content=b'{"messages":[{"role":"user","content":"hi"}],"custom_field":1}',
+                    headers=_auth(),
+                )
 
         assert response.status_code == 200
         assert response.json() == {"id": "chatcmpl-1", "choices": [{"message": {"content": "hi"}}]}
@@ -123,8 +235,23 @@ def test_chat_completions_reaches_internal_pipeline_verbatim(monkeypatch: Any) -
         seen = stub.requests[0]
         assert seen["method"] == "POST"
         assert seen["path"] == "/v1/chat/completions"
-        assert seen["headers"]["authorization"] == "Bearer realtime-session-id"
         assert seen["body"] == b'{"messages":[{"role":"user","content":"hi"}],"custom_field":1}'
+    finally:
+        stub.close()
+
+
+def test_api_key_is_never_forwarded_to_the_pipeline(monkeypatch: Any) -> None:
+    """The api key is a user's HF token — a real credential — so it must stop
+    at the replica."""
+    stub = StubInternalPipeline()
+    try:
+        with _gated_client(monkeypatch, stub) as client:
+            with _connected_session(client):
+                client.post("/v1/chat/completions", content=b"{}", headers=_auth())
+
+        seen = stub.requests[0]
+        assert "authorization" not in seen["headers"]
+        assert HF_TOKEN not in json.dumps(seen["headers"])
     finally:
         stub.close()
 
@@ -133,13 +260,13 @@ def test_responses_path_forwards_to_internal_responses(monkeypatch: Any) -> None
     stub = StubInternalPipeline()
     try:
         stub.responder = lambda path: (200, {"id": "resp_1", "output": []})
-        client = _client_against(monkeypatch, stub)
-
-        response = client.post(
-            "/v1/responses",
-            content=b'{"input":"hello"}',
-            headers={"Authorization": "Bearer sid", "Content-Type": "application/json"},
-        )
+        with _gated_client(monkeypatch, stub) as client:
+            with _connected_session(client):
+                response = client.post(
+                    "/v1/responses",
+                    content=b'{"input":"hello"}',
+                    headers=_auth(),
+                )
 
         assert response.status_code == 200
         assert response.json() == {"id": "resp_1", "output": []}
@@ -150,22 +277,18 @@ def test_responses_path_forwards_to_internal_responses(monkeypatch: Any) -> None
 
 @pytest.mark.parametrize(
     "status, error_type",
-    [(401, "invalid_session"), (429, "rate_limit_exceeded"), (501, "not_implemented")],
+    [(400, "invalid_request_error"), (501, "not_implemented"), (500, "server_error")],
 )
 def test_pipeline_answers_pass_through_unchanged(monkeypatch: Any, status: int, error_type: str) -> None:
-    """The contract clients see is the pipeline's own: the replica must not
-    reinterpret 401/429/501 answers."""
+    """Beyond the gate, the contract clients see is the pipeline's own: the
+    replica must not reinterpret its answers."""
     stub = StubInternalPipeline()
     try:
         payload = {"error": {"message": "from the pipeline", "type": error_type}}
         stub.responder = lambda path: (status, payload)
-        client = _client_against(monkeypatch, stub)
-
-        response = client.post(
-            "/v1/chat/completions",
-            content=b"{}",
-            headers={"Authorization": "Bearer sid", "Content-Type": "application/json"},
-        )
+        with _gated_client(monkeypatch, stub) as client:
+            with _connected_session(client):
+                response = client.post("/v1/chat/completions", content=b"{}", headers=_auth())
 
         assert response.status_code == status
         assert response.json() == payload
@@ -182,13 +305,13 @@ def test_sse_stream_passes_through_verbatim(monkeypatch: Any) -> None:
     stub = StubInternalPipeline()
     try:
         stub.responder = lambda path: (200, "text/event-stream", frames)
-        client = _client_against(monkeypatch, stub)
-
-        response = client.post(
-            "/v1/chat/completions",
-            content=b'{"stream":true}',
-            headers={"Authorization": "Bearer sid", "Content-Type": "application/json"},
-        )
+        with _gated_client(monkeypatch, stub) as client:
+            with _connected_session(client):
+                response = client.post(
+                    "/v1/chat/completions",
+                    content=b'{"stream":true}',
+                    headers=_auth(),
+                )
 
         assert response.status_code == 200
         assert response.headers["content-type"] == "text/event-stream"
@@ -200,7 +323,9 @@ def test_sse_stream_passes_through_verbatim(monkeypatch: Any) -> None:
 def test_streamed_frames_arrive_as_produced(monkeypatch: Any) -> None:
     """Frames separated upstream by a delay must reach the client separated
     too — the replica forwards the stream, it does not buffer it. TestClient
-    buffers whole ASGI responses, so this one runs over a real server."""
+    buffers whole ASGI responses, so this one runs over a real server, with
+    the access window opened directly on the registry (the websocket wiring
+    is covered by the TestClient tests)."""
     frames = [
         (0.0, b"data: first\n\n"),
         (0.4, b"data: second\n\n"),
@@ -210,6 +335,11 @@ def test_streamed_frames_arrive_as_produced(monkeypatch: Any) -> None:
     try:
         stub.responder = lambda path: (200, "text/event-stream", frames)
         monkeypatch.setattr(compute_main, "INTERNAL_HTTP_BASE_URL", stub.base_url)
+        monkeypatch.setattr(compute_main, "SESSION_SHARED_SECRET", SECRET)
+        registry = compute_main._ConnectedFingerprintRegistry()
+        registry.add(llm_token_fingerprint(SECRET, HF_TOKEN))
+        monkeypatch.setattr(compute_main, "_connected_llm_fingerprints", registry)
+        monkeypatch.setattr(compute_main, "_llm_rate_limiter", compute_main._FingerprintRateLimiter(100))
 
         arrivals: list[tuple[float, bytes]] = []
         with httpx.Client(timeout=10.0) as client:
@@ -217,7 +347,7 @@ def test_streamed_frames_arrive_as_produced(monkeypatch: Any) -> None:
                 "POST",
                 f"{live.base_url}/v1/chat/completions",
                 content=b'{"stream":true}',
-                headers={"Authorization": "Bearer sid", "Content-Type": "application/json"},
+                headers=_auth(),
             ) as response:
                 assert response.status_code == 200
                 for chunk in response.iter_raw():
@@ -235,14 +365,9 @@ def test_streamed_frames_arrive_as_produced(monkeypatch: Any) -> None:
 def test_unreachable_internal_pipeline_answers_502(monkeypatch: Any) -> None:
     stub = StubInternalPipeline()
     stub.close()  # a port that was just bound and freed: connection refused
-    monkeypatch.setattr(compute_main, "INTERNAL_HTTP_BASE_URL", stub.base_url)
-    client = TestClient(compute_main.app)
-
-    response = client.post(
-        "/v1/chat/completions",
-        content=b"{}",
-        headers={"Authorization": "Bearer sid", "Content-Type": "application/json"},
-    )
+    with _gated_client(monkeypatch, stub) as client:
+        with _connected_session(client):
+            response = client.post("/v1/chat/completions", content=b"{}", headers=_auth())
 
     assert response.status_code == 502
     assert response.json()["error"]["type"] == "upstream_unreachable"
@@ -251,20 +376,215 @@ def test_unreachable_internal_pipeline_answers_502(monkeypatch: Any) -> None:
 def test_only_post_is_exposed_on_proxy_paths(monkeypatch: Any) -> None:
     stub = StubInternalPipeline()
     try:
-        client = _client_against(monkeypatch, stub)
-
-        for path in ("/v1/chat/completions", "/v1/responses"):
-            assert client.get(path).status_code == 405
+        with _gated_client(monkeypatch, stub) as client:
+            for path in ("/v1/chat/completions", "/v1/responses"):
+                assert client.get(path).status_code == 405
 
         assert stub.requests == []
     finally:
         stub.close()
 
 
+# ---------------------------------------------------------------------------
+# The HF token gate
+# ---------------------------------------------------------------------------
+
+
+def test_missing_api_key_is_401(monkeypatch: Any) -> None:
+    stub = StubInternalPipeline()
+    try:
+        with _gated_client(monkeypatch, stub) as client:
+            with _connected_session(client):
+                response = client.post(
+                    "/v1/chat/completions",
+                    content=b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+
+        assert response.status_code == 401
+        assert response.json()["error"]["type"] == "invalid_api_key"
+        assert stub.requests == []
+    finally:
+        stub.close()
+
+
+def test_wrong_api_key_is_401(monkeypatch: Any) -> None:
+    stub = StubInternalPipeline()
+    try:
+        with _gated_client(monkeypatch, stub) as client:
+            with _connected_session(client):
+                response = client.post(
+                    "/v1/chat/completions",
+                    content=b"{}",
+                    headers=_auth("hf_not_the_sessions_token"),
+                )
+
+        assert response.status_code == 401
+        assert stub.requests == []
+    finally:
+        stub.close()
+
+
+def test_api_key_without_a_connected_session_is_401(monkeypatch: Any) -> None:
+    stub = StubInternalPipeline()
+    try:
+        with _gated_client(monkeypatch, stub) as client:
+            response = client.post("/v1/chat/completions", content=b"{}", headers=_auth())
+
+        assert response.status_code == 401
+        assert stub.requests == []
+    finally:
+        stub.close()
+
+
+def test_session_created_without_hf_token_carries_no_access(monkeypatch: Any) -> None:
+    """A session whose token has no claim (created anonymously or with a junk
+    token) never opens the LLM paths, even to the key its holder guesses."""
+    stub = StubInternalPipeline()
+    try:
+        with _gated_client(monkeypatch, stub) as client:
+            with _connected_session(client, hf_token=None):
+                response = client.post("/v1/chat/completions", content=b"{}", headers=_auth())
+
+        assert response.status_code == 401
+        assert stub.requests == []
+    finally:
+        stub.close()
+
+
+def test_disconnect_closes_the_access_window(monkeypatch: Any) -> None:
+    stub = StubInternalPipeline()
+    try:
+        with _gated_client(monkeypatch, stub) as client:
+            with _connected_session(client):
+                assert client.post("/v1/chat/completions", content=b"{}", headers=_auth()).status_code == 200
+
+            assert _post_until_401(client).status_code == 401
+    finally:
+        stub.close()
+
+
+def test_same_token_with_two_sessions_keeps_the_window_open(monkeypatch: Any) -> None:
+    """The registry refcounts: closing one of a token's sessions must not cut
+    off the other."""
+    stub = StubInternalPipeline()
+    try:
+        with _gated_client(monkeypatch, stub) as client:
+            with _connected_session(client, session_id="session-a"):
+                with _connected_session(client, session_id="session-b"):
+                    pass
+                # session-b closed; session-a still holds the window open. The
+                # teardown is asynchronous, so give it a beat to run first.
+                time.sleep(0.2)
+                response = client.post("/v1/chat/completions", content=b"{}", headers=_auth())
+                assert response.status_code == 200
+
+            assert _post_until_401(client).status_code == 401
+    finally:
+        stub.close()
+
+
+def test_missing_shared_secret_fails_closed(monkeypatch: Any) -> None:
+    stub = StubInternalPipeline()
+    try:
+        monkeypatch.setattr(compute_main, "SESSION_SHARED_SECRET", "")
+        monkeypatch.setattr(compute_main, "INTERNAL_HTTP_BASE_URL", stub.base_url)
+        client = TestClient(compute_main.app)
+
+        response = client.post("/v1/chat/completions", content=b"{}", headers=_auth())
+
+        assert response.status_code == 401
+        assert stub.requests == []
+    finally:
+        stub.close()
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting per fingerprint
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limit_answers_429_and_other_users_are_unaffected(monkeypatch: Any) -> None:
+    stub = StubInternalPipeline()
+    try:
+        with _gated_client(monkeypatch, stub, rate_limit_rpm=2) as client:
+            with _connected_session(client, session_id="session-a"):
+                with _connected_session(client, session_id="session-b", hf_token=OTHER_HF_TOKEN):
+                    assert client.post("/v1/chat/completions", content=b"{}", headers=_auth()).status_code == 200
+                    assert client.post("/v1/chat/completions", content=b"{}", headers=_auth()).status_code == 200
+                    throttled = client.post("/v1/chat/completions", content=b"{}", headers=_auth())
+                    assert throttled.status_code == 429
+                    assert throttled.json()["error"]["type"] == "rate_limit_exceeded"
+                    # The other user still has their own budget.
+                    other = client.post(
+                        "/v1/chat/completions", content=b"{}", headers=_auth(OTHER_HF_TOKEN)
+                    )
+                    assert other.status_code == 200
+
+        # The throttled request never reached the pipeline.
+        assert len(stub.requests) == 3
+    finally:
+        stub.close()
+
+
+def test_rate_limit_window_slides_and_recovers(monkeypatch: Any) -> None:
+    stub = StubInternalPipeline()
+    try:
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(compute_main, "_now", lambda: clock["now"])
+        with _gated_client(monkeypatch, stub, rate_limit_rpm=2) as client:
+            with _connected_session(client):
+                assert client.post("/v1/chat/completions", content=b"{}", headers=_auth()).status_code == 200
+                clock["now"] += 30.0
+                assert client.post("/v1/chat/completions", content=b"{}", headers=_auth()).status_code == 200
+                assert client.post("/v1/chat/completions", content=b"{}", headers=_auth()).status_code == 429
+                # 61s after the first hit, one slot has slid out of the window.
+                clock["now"] += 31.0
+                assert client.post("/v1/chat/completions", content=b"{}", headers=_auth()).status_code == 200
+                assert client.post("/v1/chat/completions", content=b"{}", headers=_auth()).status_code == 429
+    finally:
+        stub.close()
+
+
+def test_zero_rate_limit_closes_the_route(monkeypatch: Any) -> None:
+    stub = StubInternalPipeline()
+    try:
+        with _gated_client(monkeypatch, stub, rate_limit_rpm=0) as client:
+            with _connected_session(client):
+                response = client.post("/v1/chat/completions", content=b"{}", headers=_auth())
+
+        assert response.status_code == 429
+        assert stub.requests == []
+    finally:
+        stub.close()
+
+
+def test_denied_requests_consume_no_budget(monkeypatch: Any) -> None:
+    stub = StubInternalPipeline()
+    try:
+        with _gated_client(monkeypatch, stub, rate_limit_rpm=1) as client:
+            with _connected_session(client):
+                for _ in range(3):
+                    assert (
+                        client.post(
+                            "/v1/chat/completions", content=b"{}", headers=_auth("hf_unknown")
+                        ).status_code
+                        == 401
+                    )
+                assert client.post("/v1/chat/completions", content=b"{}", headers=_auth()).status_code == 200
+    finally:
+        stub.close()
+
+
+# ---------------------------------------------------------------------------
+# Pool passthrough
+# ---------------------------------------------------------------------------
+
+
 def test_pool_passthrough_redacts_session_ids(monkeypatch: Any) -> None:
-    """Session ids double as bearer tokens for the LLM proxy paths, so the
-    replica's pool passthrough must strip them. The LB's stuck-unit recovery
-    only reads unit states and durations, which stay intact."""
+    """Session ids are private to their holders, so the replica's pool
+    passthrough strips them. The LB's stuck-unit recovery only reads unit
+    states and durations, which stay intact."""
     stub = StubInternalPipeline()
     try:
         pool_payload = {
