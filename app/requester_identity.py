@@ -12,7 +12,6 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Optional
 
-
 logger = logging.getLogger("s2s-endpoint")
 IdentityUpdateHandler = Callable[["RequesterIdentity"], Awaitable[None]]
 WhoAmIFunction = Callable[[str], dict[str, object]]
@@ -88,11 +87,7 @@ class RequesterIdentityResolver:
 
         configured_secret = (hash_secret or "").strip()
         self.stable_fingerprints = bool(configured_secret)
-        self._hash_key = (
-            configured_secret.encode("utf-8")
-            if configured_secret
-            else secrets.token_bytes(32)
-        )
+        self._hash_key = configured_secret.encode("utf-8") if configured_secret else secrets.token_bytes(32)
         if not self.stable_fingerprints:
             logger.warning(
                 "REQUEST_USAGE_HASH_SECRET and SESSION_SHARED_SECRET are unset; "
@@ -130,9 +125,7 @@ class RequesterIdentityResolver:
             identity = RequesterIdentity(
                 actor_id=f"anonymous:{fingerprint}",
                 label=(
-                    f"Anonymous IP •{fingerprint[:8]}"
-                    if fingerprint != "unknown"
-                    else "Anonymous / IP unavailable"
+                    f"Anonymous IP •{fingerprint[:8]}" if fingerprint != "unknown" else "Anonymous / IP unavailable"
                 ),
                 kind="anonymous",
                 verification="not_provided",
@@ -360,11 +353,7 @@ def _header(request: object, name: str) -> Optional[str]:
 
 
 def is_validatable_hf_token(token: str) -> bool:
-    return (
-        0 < len(token) <= 4096
-        and token.isprintable()
-        and not any(character.isspace() for character in token)
-    )
+    return 0 < len(token) <= 4096 and token.isprintable() and not any(character.isspace() for character in token)
 
 
 def _safe_text(value: object, *, max_length: int) -> Optional[str]:

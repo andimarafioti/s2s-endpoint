@@ -9,7 +9,6 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-
 SERVICE_NAME = "reachy-mini-realtime-url"
 UPSTREAM_ENV_NAME = "UPSTREAM_SESSION_URL"
 DEFAULT_TIMEOUT_SECONDS = 10.0

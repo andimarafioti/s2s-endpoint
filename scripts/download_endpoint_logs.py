@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 import argparse
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
 
 from _endpoint_helpers import build_names, current_model_env
-
 
 DEFAULT_ENDPOINTS_API_BASE = "https://api.endpoints.huggingface.cloud"
 DEFAULT_LOAD_BALANCER_NAME = "reachy-s2s-lb"
@@ -42,9 +41,7 @@ def log_progress(message: str, *, verbose: bool = False) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Download Hugging Face Inference Endpoint logs into a local folder."
-    )
+    parser = argparse.ArgumentParser(description="Download Hugging Face Inference Endpoint logs into a local folder.")
     parser.add_argument(
         "--namespace",
         default=os.getenv("HF_ENDPOINT_NAMESPACE") or os.getenv("HF_NAMESPACE"),
@@ -60,7 +57,9 @@ def main() -> None:
         default=os.getenv("HF_TOKEN") or os.getenv("HF_CONTROL_TOKEN"),
         help="Hugging Face token. Defaults to HF_TOKEN or HF_CONTROL_TOKEN.",
     )
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help=f"Folder to write logs into (default: {DEFAULT_OUTPUT_DIR})")
+    parser.add_argument(
+        "--output-dir", default=DEFAULT_OUTPUT_DIR, help=f"Folder to write logs into (default: {DEFAULT_OUTPUT_DIR})"
+    )
     parser.add_argument(
         "--names",
         nargs="*",
@@ -103,7 +102,9 @@ def main() -> None:
         help="Log API to use. Defaults to v3 for --all-replicas or --since/--until, otherwise v2.",
     )
     parser.add_argument("--v3-limit", type=int, default=5000, help="Max rows per v3 logs page (default: 5000)")
-    parser.add_argument("--max-pages", type=int, default=100, help="Max v3 log pages per endpoint/replica (default: 100)")
+    parser.add_argument(
+        "--max-pages", type=int, default=100, help="Max v3 log pages per endpoint/replica (default: 100)"
+    )
     parser.add_argument(
         "--parallelism",
         type=int,
@@ -662,10 +663,7 @@ def post_json(*, url: str, token: str, payload: dict[str, object], timeout_s: fl
 
 
 def build_endpoint_url(*, api_base: str, namespace: str, name: str) -> str:
-    return (
-        f"{api_base.rstrip('/')}/v2/endpoint/"
-        f"{quote(namespace, safe='')}/{quote(name, safe='')}"
-    )
+    return f"{api_base.rstrip('/')}/v2/endpoint/{quote(namespace, safe='')}/{quote(name, safe='')}"
 
 
 def build_replica_ids_url(*, api_base: str, namespace: str, name: str) -> str:
@@ -760,11 +758,7 @@ def structured_log_lines(data: bytes) -> list[str]:
         if not isinstance(entry, dict):
             continue
         timestamp = str(
-            entry.get("timestamp")
-            or entry.get("time")
-            or entry.get("date")
-            or entry.get("ts")
-            or ""
+            entry.get("timestamp") or entry.get("time") or entry.get("date") or entry.get("ts") or ""
         ).strip()
         message = str(
             entry.get("message")

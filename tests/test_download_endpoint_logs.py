@@ -4,7 +4,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -119,6 +118,7 @@ class DownloadEndpointLogsTests(unittest.TestCase):
 
     def test_download_one_writes_endpoint_log_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+
             def fake_run_curl_to_file(**kwargs):
                 kwargs["path"].write_bytes(b"line 1\nline 2\n")
 
@@ -168,8 +168,7 @@ class DownloadEndpointLogsTests(unittest.TestCase):
 
     def test_structured_log_lines_converts_json_entries_to_existing_text_shape(self):
         payload = (
-            b'[{"timestamp":"2026-05-06T08:00:00Z","message":"hello"},'
-            b'{"time":"2026-05-06T08:00:01Z","line":"world"}]'
+            b'[{"timestamp":"2026-05-06T08:00:00Z","message":"hello"},{"time":"2026-05-06T08:00:01Z","line":"world"}]'
         )
 
         self.assertEqual(

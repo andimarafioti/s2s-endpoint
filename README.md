@@ -273,9 +273,16 @@ minute buckets are present.
 
 ## Load Balancer Env Vars
 
+Each compute endpoint owns its capacity through `NUM_PIPELINES`. Its `/health`
+response publishes that value as `router.max_sessions`, and the load balancer
+learns it independently for every running endpoint alongside the active session
+count. Updating and restarting a compute endpoint is therefore enough to change
+its capacity; the load balancer picks up the new value on its next reconciliation
+without a configuration change or restart. The former `COMPUTE_ENDPOINT_SLOTS`
+load-balancer variable is ignored and can be removed from existing deployments.
+
 - `HF_ENDPOINT_NAMESPACE`: namespace that owns the compute endpoints
 - `COMPUTE_ENDPOINT_NAMES`: comma-separated endpoint names
-- `COMPUTE_ENDPOINT_SLOTS`: concurrent sessions each compute endpoint can handle
 - `COMPUTE_ENDPOINT_MIN_WARM`: number of compute endpoints that should stay warm
 - `COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS`: when total free slots drop to this level,
   the LB starts waking another parked endpoint
@@ -319,6 +326,27 @@ minute buckets are present.
   burst signal (defaults to 20)
 - `REQUEST_USAGE_MANY_NETWORKS`: distinct network fingerprints for one requester
   that raise a many-networks signal (defaults to 5)
+- `REQUEST_RATE_LIMIT_ENABLED`: enforce requester rate limits (defaults to `true`).
+  When disabled, the limiter continues tracking outcomes without rejecting requests.
+  Limiter state is local to the load-balancer process and resets when it restarts.
+- `REQUEST_RATE_LIMIT_WINDOW_S`: rolling request-rate window (defaults to 60 seconds)
+- `REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW`: maximum `POST /session` attempts from
+  one requester in the rolling window (defaults to 20)
+- `REQUEST_RATE_LIMIT_MAX_PARALLEL`: maximum simultaneous allocation calls, pending
+  joins, and connected sessions from one requester (defaults to 10)
+- `REQUEST_RATE_LIMIT_NO_CONNECTS`: consecutive allocated sessions that can expire
+  or disconnect without joining before a cooldown starts (defaults to 5)
+- `REQUEST_RATE_LIMIT_SHORT_SESSION_S`: connected duration at or below which a
+  session counts toward reconnect-loop detection (defaults to 10 seconds)
+- `REQUEST_RATE_LIMIT_SHORT_SESSIONS`: consecutive short connected sessions before
+  a cooldown starts (defaults to 8). A longer session resets this streak.
+- `REQUEST_RATE_LIMIT_COOLDOWN_S`: behavioral cooldown duration after repeated
+  no-connect allocations or short sessions (defaults to 900 seconds)
+- `REQUEST_RATE_LIMIT_ACTOR_RETENTION_S`: idle requester limiter state retention
+  (defaults to 3,600 seconds)
+- `REQUEST_RATE_LIMIT_MAX_ACTORS`: maximum in-memory requester limiter states
+  (defaults to 10,000). Retention-expired inactive states are evicted first; if
+  the table remains full of fresh state, previously unseen requesters fail closed.
 - `DASHBOARD_SAMPLE_INTERVAL_S`: how often the LB samples swarm state for history
 - `DASHBOARD_RETENTION_MINUTES`: in-memory history retention for dashboard data
   (defaults to 28 days so the 14d/28d dashboard windows can load persisted history)
@@ -349,6 +377,8 @@ minute buckets are present.
 - `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
   endpoint/session data instead of connecting to real compute endpoints. You can
   also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.
+  Synthetic endpoints retain their own last-known `max_sessions` capacity
+  through initializing, paused, and updating states.
   If `DASHBOARD_BUCKET_ID` is set, preview mode loads existing dashboard history
   from the bucket read-only and never writes preview data back to the bucket.
 - `DASHBOARD_BUCKET_ID`: optional HF storage bucket id used to persist dashboard history
@@ -433,9 +463,12 @@ For the direct-session architecture, compute endpoints are usually created as
 `public` endpoints so clients can connect directly after the LB assigns them a
 session token.
 
-With the current defaults, compute endpoints also need an `HF_TOKEN` or
-`RESPONSES_API_API_KEY` secret at runtime because the speech-to-speech wrapper
-defaults to `LLM=responses-api`.
+When targeting a third-party service protected by an API key, compute endpoints must also be configured with an `HF_TOKEN` or `RESPONSES_API_API_KEY` secret at runtime.
+
+The speech-to-speech wrapper defaults to `LLM=chat-completions`. To use the Hugging Face router, for example, set the following environment variables:
+`MODEL_NAME=google/gemma-4-31B-it:cerebras`,
+`RESPONSES_API_BASE_URL=https://router.huggingface.co/v1`, and
+`RESPONSES_API_REASONING_EFFORT=none`.
 
 ## Update Compute Endpoint Env
 
@@ -446,7 +479,10 @@ uv run --with-requirements requirements.txt python scripts/update_compute_endpoi
   --namespace your-org \
   --prefix reachy-s2s \
   --count 8 \
-  --env RESPONSES_API_MODEL_NAME=Qwen/Qwen3.5-72B:together \
+  --env MODEL_NAME=Qwen/Qwen3.5-72B:together \
+  --env LLM=chat-completions \
+  --env RESPONSES_API_BASE_URL=https://router.huggingface.co/v1 \
+  --env RESPONSES_API_REASONING_EFFORT=none \
   --wait
 ```
 
@@ -516,7 +552,6 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --region us-east-1 \
   --compute-endpoint-prefix reachy-s2s \
   --compute-endpoint-count 3 \
-  --compute-endpoint-slots 1 \
   --compute-endpoint-min-warm 1 \
   --compute-endpoint-wake-threshold-slots 1 \
   --compute-endpoint-idle-park-timeout-s 300 \

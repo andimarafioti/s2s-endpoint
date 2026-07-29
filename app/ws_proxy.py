@@ -3,10 +3,9 @@ import json
 import logging
 from typing import Awaitable, Callable, Optional, Protocol
 
-from fastapi import WebSocket, WebSocketDisconnect
 import websockets
+from fastapi import WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
-
 
 logger = logging.getLogger("s2s-endpoint")
 
@@ -47,13 +46,17 @@ async def proxy_websocket(
     except Exception as exc:
         try:
             await client_ws.accept()
-            await client_ws.send_text(json.dumps({
-                "type": "error",
-                "error": {
-                    "type": "session_limit_reached",
-                    "message": no_capacity_reason,
-                },
-            }))
+            await client_ws.send_text(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "session_limit_reached",
+                            "message": no_capacity_reason,
+                        },
+                    }
+                )
+            )
         except Exception:
             pass
         try:

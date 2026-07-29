@@ -203,13 +203,11 @@ def parse_args() -> ListenAndPlayWSArguments:
 def require_runtime_dependencies() -> None:
     if websockets is None:
         raise SystemExit(
-            "websockets is required for listen_and_play_ws.py. "
-            "Install it locally with `pip install websockets`."
+            "websockets is required for listen_and_play_ws.py. Install it locally with `pip install websockets`."
         )
     if sd is None:
         raise SystemExit(
-            "sounddevice is required for listen_and_play_ws.py. "
-            "Install it locally with `pip install sounddevice`."
+            "sounddevice is required for listen_and_play_ws.py. Install it locally with `pip install sounddevice`."
         )
 
 
@@ -258,9 +256,7 @@ async def listen_and_play_ws(args: ListenAndPlayWSArguments) -> None:
             print(f"Input stream status: {status}", file=sys.stderr)
         if stop_event.is_set():
             return
-        if not args.allow_barge_in and (
-            playback.has_data() or time.monotonic() < speaker_active_until[0]
-        ):
+        if not args.allow_barge_in and (playback.has_data() or time.monotonic() < speaker_active_until[0]):
             return
         loop.call_soon_threadsafe(queue_microphone_frame, bytes(indata))
 
@@ -340,20 +336,23 @@ async def listen_and_play_ws(args: ListenAndPlayWSArguments) -> None:
             await ws.send(build_session_update_event(args))
             print("Streaming microphone audio. Press Enter to stop.")
 
-            with sd.RawInputStream(
-                samplerate=args.send_rate,
-                channels=args.channels,
-                dtype="int16",
-                blocksize=args.chunk_size,
-                device=args.input_device,
-                callback=input_callback,
-            ), sd.RawOutputStream(
-                samplerate=args.recv_rate,
-                channels=args.channels,
-                dtype="int16",
-                blocksize=args.chunk_size,
-                device=args.output_device,
-                callback=output_callback,
+            with (
+                sd.RawInputStream(
+                    samplerate=args.send_rate,
+                    channels=args.channels,
+                    dtype="int16",
+                    blocksize=args.chunk_size,
+                    device=args.input_device,
+                    callback=input_callback,
+                ),
+                sd.RawOutputStream(
+                    samplerate=args.recv_rate,
+                    channels=args.channels,
+                    dtype="int16",
+                    blocksize=args.chunk_size,
+                    device=args.output_device,
+                    callback=output_callback,
+                ),
             ):
                 tasks = [
                     asyncio.create_task(send_audio(ws)),

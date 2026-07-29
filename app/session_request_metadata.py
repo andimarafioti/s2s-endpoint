@@ -7,7 +7,6 @@ from starlette.requests import ClientDisconnect, Request
 
 from app.requester_identity import normalize_hardware_id
 
-
 MAX_SESSION_METADATA_BODY_BYTES = 4096
 SESSION_METADATA_READ_TIMEOUT_S = 1.0
 

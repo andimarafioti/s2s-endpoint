@@ -4,8 +4,6 @@ import concurrent.futures
 import json
 import sys
 
-from huggingface_hub import HfApi
-
 from _endpoint_helpers import (
     DEFAULT_FRAMEWORK,
     DEFAULT_HEALTH_ROUTE,
@@ -17,6 +15,7 @@ from _endpoint_helpers import (
     load_json_file,
     parse_key_value_pairs,
 )
+from huggingface_hub import HfApi
 
 DEFAULT_COMPUTE_INDEX_WIDTH = 2
 
@@ -126,32 +125,47 @@ def build_endpoint_env(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Create GPU compute endpoints for the s2s-endpoint app."
-    )
+    parser = argparse.ArgumentParser(description="Create GPU compute endpoints for the s2s-endpoint app.")
     parser.add_argument("--namespace", help="Endpoint namespace / org")
     parser.add_argument("--prefix", help="Endpoint name prefix, used with --count or --target-total")
     parser.add_argument("--count", type=int, help="Number of endpoints to create, used with --prefix")
-    parser.add_argument("--target-total", type=int, help="Create only the missing tail needed for this total sequential pool size")
+    parser.add_argument(
+        "--target-total", type=int, help="Create only the missing tail needed for this total sequential pool size"
+    )
     parser.add_argument("--names", nargs="*", default=[], help="Explicit endpoint names")
     parser.add_argument("--vendor", required=True, help="Cloud vendor, for example aws")
     parser.add_argument("--region", required=True, help="Cloud region")
     parser.add_argument("--instance-size", required=True, help="Instance size, for example x1")
     parser.add_argument("--instance-type", required=True, help="GPU instance type, for example nvidia-a10g")
     parser.add_argument("--image-url", required=True, help="Custom compute image URL built from Dockerfile.compute")
-    parser.add_argument("--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the compute image")
-    parser.add_argument("--image-port", type=int, default=DEFAULT_IMAGE_PORT, help="Container port exposed by the compute image")
-    parser.add_argument("--copy-env-from", help="Copy readable env vars from this existing compute endpoint before applying --env overrides")
+    parser.add_argument(
+        "--image-health-route", default=DEFAULT_HEALTH_ROUTE, help="Health route exposed by the compute image"
+    )
+    parser.add_argument(
+        "--image-port", type=int, default=DEFAULT_IMAGE_PORT, help="Container port exposed by the compute image"
+    )
+    parser.add_argument(
+        "--copy-env-from",
+        help="Copy readable env vars from this existing compute endpoint before applying --env overrides",
+    )
     parser.add_argument("--session-shared-secret", help="Shared secret used to validate LB-issued session tokens")
-    parser.add_argument("--lb-callback-auth-token", help="Optional bearer token used by compute endpoints when notifying the LB")
+    parser.add_argument(
+        "--lb-callback-auth-token", help="Optional bearer token used by compute endpoints when notifying the LB"
+    )
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY, help=argparse.SUPPRESS)
     parser.add_argument("--account-id", help="Optional account id")
     parser.add_argument("--revision", help="Optional repo revision")
-    parser.add_argument("--type", default="public", help="Endpoint type; direct client connections usually require public compute endpoints")
+    parser.add_argument(
+        "--type",
+        default="public",
+        help="Endpoint type; direct client connections usually require public compute endpoints",
+    )
     parser.add_argument("--min-replica", type=int, default=0, help="Initial min replica count")
     parser.add_argument("--max-replica", type=int, default=1, help="Initial max replica count")
     parser.add_argument("--scale-to-zero-timeout", type=int, help="Optional scale-to-zero timeout")
-    parser.add_argument("--num-pipelines", type=int, help="Concurrent realtime sessions per s2s pipeline process (--num_pipelines)")
+    parser.add_argument(
+        "--num-pipelines", type=int, help="Concurrent realtime sessions per s2s pipeline process (--num_pipelines)"
+    )
     parser.add_argument("--env-file", help="JSON file with extra env vars")
     parser.add_argument("--secret-file", help="JSON file with secrets")
     parser.add_argument("--env", action="append", default=[], help="Extra env var in KEY=VALUE form")
@@ -182,13 +196,17 @@ def main() -> None:
     env.update(parse_key_value_pairs(args.env))
     secrets.update(parse_key_value_pairs(args.secret))
 
-    llm_backend = str(env.get("LLM", "responses-api")).strip() or "responses-api"
-    if llm_backend == "responses-api" and not (
-        secrets.get("RESPONSES_API_API_KEY") or secrets.get("HF_TOKEN") or env.get("RESPONSES_API_API_KEY") or env.get("HF_TOKEN")
-    ):
+    llm_backend = str(env.get("LLM", "chat-completions")).strip() or "chat-completions"
+    has_llm_api_credentials = bool(
+        secrets.get("RESPONSES_API_API_KEY")
+        or secrets.get("HF_TOKEN")
+        or env.get("RESPONSES_API_API_KEY")
+        or env.get("HF_TOKEN")
+    )
+    if llm_backend in {"chat-completions", "responses-api"} and not has_llm_api_credentials:
         print(
-            "warning: compute endpoints default to LLM=responses-api, but neither RESPONSES_API_API_KEY nor HF_TOKEN was provided. "
-            "The container will start, but runtime requests will fail when the speech-to-speech pipeline calls the Responses API.",
+            f"warning: compute endpoints use LLM={llm_backend}, but neither RESPONSES_API_API_KEY nor HF_TOKEN was provided. "
+            "The container will start, but runtime requests will fail when the speech-to-speech pipeline calls the LLM API.",
             file=sys.stderr,
         )
 

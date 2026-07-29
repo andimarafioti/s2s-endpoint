@@ -11,7 +11,6 @@ from app.app_utils import elapsed_ms, http_base_url_from_ws_url
 from app.endpoint_pool_router import EndpointLease, EndpointPoolRouter
 from app.session_tokens import attach_session_token, create_session_token, verify_session_token
 
-
 logger = logging.getLogger("s2s-endpoint")
 SessionReleaseHandler = Callable[[dict[str, object]], Awaitable[None]]
 TicketExpiredHandler = Callable[[str], Awaitable[None]]
@@ -32,6 +31,7 @@ class QueueTicket:
     is created (queue polls are bodyless GETs that carry no Authorization), so
     the eventual grant can embed the LLM proxy claim without a raw token ever
     being stored."""
+
     ticket_id: str
     created_at: float
     last_seen: float
@@ -130,9 +130,7 @@ class DirectSessionManager:
 
         await self.endpoint_router.stop()
 
-    async def allocate(
-        self, lb_base_url: str, *, llm_fingerprint: Optional[str] = None
-    ) -> dict[str, object]:
+    async def allocate(self, lb_base_url: str, *, llm_fingerprint: Optional[str] = None) -> dict[str, object]:
         """Grant a session if a slot is free *and* nobody is waiting; otherwise
         mint a queue ticket. Never blocks — the waiting lives in the queue, polled
         via ``poll``. Raises ``QueueAtCapacityError`` when the queue itself is full.
@@ -160,9 +158,7 @@ class DirectSessionManager:
                     # depth of 0 disables the waiting room entirely — every caller
                     # that can't be granted immediately is turned away at capacity.
                     if len(self._queue) >= self.queue_max_depth:
-                        raise QueueAtCapacityError(
-                            f"queue is full ({self.queue_max_depth} waiting)"
-                        )
+                        raise QueueAtCapacityError(f"queue is full ({self.queue_max_depth} waiting)")
                     now = monotonic()
                     ticket_id = secrets.token_urlsafe(18)
                     self._queue[ticket_id] = QueueTicket(
@@ -466,9 +462,7 @@ class DirectSessionManager:
                 try:
                     await self._ticket_expired_handler(ticket_id)
                 except Exception:
-                    logger.exception(
-                        "Ticket-expired handler failed for ticket %s", ticket_id
-                    )
+                    logger.exception("Ticket-expired handler failed for ticket %s", ticket_id)
             logger.info(
                 "Dropped abandoned queue ticket %s (no poll within %.0fs TTL)",
                 ticket_id,
@@ -519,8 +513,7 @@ class DirectSessionManager:
                 endpoint_name,
                 session.connected,
             )
-            if session.connected:
-                await self._record_abnormal_disconnect(result)
+            await self._record_abnormal_disconnect(result)
 
     def _release_result(self, session: DirectSession, *, release_reason: str) -> dict[str, object]:
         conversation_duration_s = 0.0

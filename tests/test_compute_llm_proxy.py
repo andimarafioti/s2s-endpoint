@@ -166,12 +166,8 @@ def _gated_client(
     monkeypatch.setattr(compute_main, "SESSION_SHARED_SECRET", SECRET)
     if stub is not None:
         monkeypatch.setattr(compute_main, "INTERNAL_HTTP_BASE_URL", stub.base_url)
-    monkeypatch.setattr(
-        compute_main, "_connected_llm_fingerprints", compute_main._ConnectedFingerprintRegistry()
-    )
-    monkeypatch.setattr(
-        compute_main, "_llm_rate_limiter", compute_main._FingerprintRateLimiter(rate_limit_rpm)
-    )
+    monkeypatch.setattr(compute_main, "_connected_llm_fingerprints", compute_main._ConnectedFingerprintRegistry())
+    monkeypatch.setattr(compute_main, "_llm_rate_limiter", compute_main._FingerprintRateLimiter(rate_limit_rpm))
 
     async def _fake_acquire():
         return SimpleNamespace(slot_id=0, ws_url="ws://127.0.0.1:1/v1/realtime")
@@ -516,9 +512,7 @@ def test_rate_limit_answers_429_and_other_users_are_unaffected(monkeypatch: Any)
                     assert throttled.status_code == 429
                     assert throttled.json()["error"]["type"] == "rate_limit_exceeded"
                     # The other user still has their own budget.
-                    other = client.post(
-                        "/v1/chat/completions", content=b"{}", headers=_auth(OTHER_HF_TOKEN)
-                    )
+                    other = client.post("/v1/chat/completions", content=b"{}", headers=_auth(OTHER_HF_TOKEN))
                     assert other.status_code == 200
 
         # The throttled request never reached the pipeline.
@@ -566,9 +560,7 @@ def test_denied_requests_consume_no_budget(monkeypatch: Any) -> None:
             with _connected_session(client):
                 for _ in range(3):
                     assert (
-                        client.post(
-                            "/v1/chat/completions", content=b"{}", headers=_auth("hf_unknown")
-                        ).status_code
+                        client.post("/v1/chat/completions", content=b"{}", headers=_auth("hf_unknown")).status_code
                         == 401
                     )
                 assert client.post("/v1/chat/completions", content=b"{}", headers=_auth()).status_code == 200

@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_REPOSITORY = "andito/s2s"
 DEFAULT_FRAMEWORK = "custom"
 DEFAULT_ENDPOINT_TYPE = "protected"
@@ -70,11 +69,10 @@ def current_custom_image(raw: dict[str, Any]) -> dict[str, str | int]:
     if not url:
         raise ValueError("endpoint does not have a custom image url")
 
-    health_route = str(
-        custom.get("health_route")
-        or custom.get("healthRoute")
+    health_route = (
+        str(custom.get("health_route") or custom.get("healthRoute") or DEFAULT_HEALTH_ROUTE).strip()
         or DEFAULT_HEALTH_ROUTE
-    ).strip() or DEFAULT_HEALTH_ROUTE
+    )
 
     port_value = custom.get("port", DEFAULT_IMAGE_PORT)
     try:

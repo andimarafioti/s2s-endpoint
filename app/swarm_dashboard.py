@@ -16,7 +16,6 @@ from app.requester_dashboard_ui import inject_requester_dashboard
 from app.requester_identity import RequesterIdentity
 from app.requester_usage import RequesterUsageService, RequesterUsageThresholds
 
-
 SnapshotProvider = Callable[[], Awaitable[tuple[bool, Optional[str], dict[str, object]]]]
 ROLLING_VIEW_WINDOWS: tuple[tuple[str, int], ...] = (
     ("1h", 60),
@@ -53,8 +52,6 @@ def _parse_window_minutes(window: str | None) -> int:
     return amount * 24 * 60
 
 
-
-
 @dataclass
 class SwarmBucketAggregate:
     sample_count: int = 0
@@ -73,6 +70,7 @@ class SwarmBucketAggregate:
     session_requests: int = 0
     session_allocation_successes: int = 0
     session_allocation_failures: int = 0
+    session_rate_limited: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
     completed_conversations: int = 0
@@ -102,6 +100,7 @@ class SwarmBucketAggregate:
             aggregate.session_requests += bucket.session_requests
             aggregate.session_allocation_successes += bucket.session_allocation_successes
             aggregate.session_allocation_failures += bucket.session_allocation_failures
+            aggregate.session_rate_limited += bucket.session_rate_limited
             aggregate.session_connected_events += bucket.session_connected_events
             aggregate.session_disconnected_events += bucket.session_disconnected_events
             aggregate.completed_conversations += bucket.completed_conversations
@@ -134,6 +133,7 @@ class SwarmBucketAggregate:
             "session_requests": self.session_requests,
             "session_allocation_successes": self.session_allocation_successes,
             "session_allocation_failures": self.session_allocation_failures,
+            "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
@@ -163,6 +163,7 @@ class SwarmBucketAggregate:
             "session_requests": self.session_requests,
             "session_allocation_successes": self.session_allocation_successes,
             "session_allocation_failures": self.session_allocation_failures,
+            "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
@@ -278,11 +279,27 @@ class SwarmDashboard:
     async def record_session_allocation_failure(self, requester: RequesterIdentity | None = None) -> None:
         await self.requesters.record("failure", requester)
 
+    async def record_session_rate_limited(self, requester: RequesterIdentity | None = None) -> None:
+        await self.requesters.record("rate_limited", requester)
+
     async def record_session_request_abandoned(self, requester: RequesterIdentity | None = None) -> None:
         await self.requesters.record("abandoned", requester)
 
     async def record_requester_session_connected(self, requester: RequesterIdentity) -> None:
         await self.requesters.record("connected", requester)
+
+    async def record_requester_session_disconnected(
+        self,
+        requester: RequesterIdentity,
+        *,
+        duration_s: float,
+        short_session: bool,
+    ) -> None:
+        await self.requesters.record_session_outcome(
+            requester,
+            duration_s=duration_s,
+            short_session=short_session,
+        )
 
     async def update_requester_identity(self, requester: RequesterIdentity) -> None:
         await self.requesters.update_identity(requester)
@@ -306,9 +323,7 @@ class SwarmDashboard:
 
     async def data(self, *, window: str | None, resolution: str | None) -> dict[str, object]:
         window_minutes = _parse_window_minutes(window)
-        resolved_resolution = (resolution or "").strip().lower() or (
-            "minute" if window_minutes <= 24 * 60 else "hour"
-        )
+        resolved_resolution = (resolution or "").strip().lower() or ("minute" if window_minutes <= 24 * 60 else "hour")
         if resolved_resolution not in {"minute", "hour"}:
             raise ValueError("resolution must be 'minute' or 'hour'")
 
@@ -330,10 +345,7 @@ class SwarmDashboard:
             "summary": summary,
             "requesters": requesters,
             "series": series,
-            "rolling_windows": [
-                {"label": label, "minutes": minutes}
-                for label, minutes in ROLLING_VIEW_WINDOWS
-            ],
+            "rolling_windows": [{"label": label, "minutes": minutes} for label, minutes in ROLLING_VIEW_WINDOWS],
             "rolling_series": rolling_series,
             "retention_minutes": self.retention_minutes,
             "history_restore": self.history_restore_status(),
@@ -351,6 +363,7 @@ class SwarmDashboard:
             "session_requests_window": selected["session_requests"],
             "session_failures_window": selected["session_allocation_failures"],
             "session_successes_window": selected["session_allocation_successes"],
+            "session_rate_limited_window": selected["session_rate_limited"],
             "session_connects_window": selected["session_connected_events"],
             "session_disconnects_window": selected["session_disconnected_events"],
             "conversations_started_window": selected["session_connected_events"],
@@ -372,9 +385,7 @@ class SwarmDashboard:
         end_bucket = _bucket_start_epoch_s(now, 1)
         start_bucket = end_bucket - (window_minutes - 1) * 60
         minute_map = {
-            bucket.bucket_start_s: bucket
-            for bucket in minute_buckets
-            if bucket.bucket_start_s >= start_bucket
+            bucket.bucket_start_s: bucket for bucket in minute_buckets if bucket.bucket_start_s >= start_bucket
         }
 
         if resolution == "minute":
@@ -399,6 +410,7 @@ class SwarmDashboard:
                             "session_requests": 0,
                             "session_allocation_successes": 0,
                             "session_allocation_failures": 0,
+                            "session_rate_limited": 0,
                             "session_connected_events": 0,
                             "session_disconnected_events": 0,
                             "completed_conversations": 0,
@@ -481,7 +493,6 @@ class SwarmDashboard:
         except asyncio.CancelledError:
             raise
 
-
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()
         min_bucket = _bucket_start_epoch_s(now, 1) - (window_minutes - 1) * 60
@@ -510,7 +521,6 @@ class SwarmDashboard:
             current_hour_s += 3600
 
         return points
-
 
 
 def _dashboard_html(*, history_persisted: bool = False) -> str:
@@ -1654,6 +1664,7 @@ __REQUESTER_DASHBOARD_SCRIPT__
         { key: 'session_requests', color: '#182125' },
         { key: 'session_allocation_successes', color: '#117a65' },
         { key: 'session_allocation_failures', color: '#bb2d3b' },
+        { key: 'session_rate_limited', color: '#8e44ad' },
         { key: 'session_connected_events', color: '#0b5cab' },
         { key: 'session_disconnected_events', color: '#d9822b' },
       ]);

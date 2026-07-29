@@ -179,9 +179,7 @@ class LoadBalancerFingerprintTests(unittest.TestCase):
 
     def test_hf_shaped_bearer_yields_the_shared_fingerprint(self):
         module = self._import_load_balancer()
-        result = module._llm_proxy_fingerprint(
-            self._request({"authorization": f"Bearer {HF_TOKEN}"})
-        )
+        result = module._llm_proxy_fingerprint(self._request({"authorization": f"Bearer {HF_TOKEN}"}))
         self.assertEqual(result, llm_token_fingerprint(SECRET, HF_TOKEN))
 
     def test_reachy_authorization_header_wins_over_authorization(self):
@@ -203,18 +201,12 @@ class LoadBalancerFingerprintTests(unittest.TestCase):
     def test_unvalidatable_token_yields_no_claim(self):
         module = self._import_load_balancer()
         self.assertIsNone(
-            module._llm_proxy_fingerprint(
-                self._request({"authorization": "Bearer bad token with spaces"})
-            )
+            module._llm_proxy_fingerprint(self._request({"authorization": "Bearer bad token with spaces"}))
         )
 
     def test_no_shared_secret_yields_no_claim(self):
         module = self._import_load_balancer(secret="")
-        self.assertIsNone(
-            module._llm_proxy_fingerprint(
-                self._request({"authorization": f"Bearer {HF_TOKEN}"})
-            )
-        )
+        self.assertIsNone(module._llm_proxy_fingerprint(self._request({"authorization": f"Bearer {HF_TOKEN}"})))
 
 
 if __name__ == "__main__":

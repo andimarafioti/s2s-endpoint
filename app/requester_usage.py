@@ -38,6 +38,21 @@ class RequesterUsageService:
             metadata=requester.history_metadata() if requester is not None else None,
         )
 
+    async def record_session_outcome(
+        self,
+        requester: RequesterIdentity,
+        *,
+        duration_s: float,
+        short_session: bool,
+    ) -> None:
+        await self.history.record_requester_event(
+            "disconnected",
+            actor_id=requester.actor_id,
+            metadata=requester.history_metadata(),
+            duration_s=duration_s,
+            short_session=short_session,
+        )
+
     async def update_identity(self, requester: RequesterIdentity) -> None:
         await self.history.update_requester_identity(
             requester.actor_id,
@@ -94,11 +109,7 @@ def aggregate_requester_usage(
         verification = str(actor["verification"])
         account_name = actor.get("account_name")
         network_ids = actor["network_ids"] if isinstance(actor["network_ids"], set) else set()
-        reported_robot_ids = (
-            actor["reported_robot_ids"]
-            if isinstance(actor["reported_robot_ids"], set)
-            else set()
-        )
+        reported_robot_ids = actor["reported_robot_ids"] if isinstance(actor["reported_robot_ids"], set) else set()
         client_kinds = dict(actor["client_kinds"]) if isinstance(actor["client_kinds"], dict) else {}
         automated_requests = sum(
             count for client_kind, count in client_kinds.items() if client_kind.startswith("automation:")
@@ -108,10 +119,7 @@ def aggregate_requester_usage(
         if requests > 0 and actor_id != "overflow":
             if actor_id.startswith("token:"):
                 token_actors.add(actor_id)
-            authenticated_accounts.update(
-                str(value)
-                for value in actor["authenticated_account_names"]
-            )
+            authenticated_accounts.update(str(value) for value in actor["authenticated_account_names"])
             authenticated_requests += int(actor["authenticated_requests"])
             anonymous_requests += int(actor["anonymous_requests"])
             invalid_token_requests += int(actor["invalid_token_requests"])
@@ -121,7 +129,10 @@ def aggregate_requester_usage(
             reported_robot_requests += int(actor["reported_robot_requests"])
 
         successes = int(actor["successes"])
+        rate_limited = int(actor["rate_limited"])
         connections = int(actor["connections"])
+        completed_sessions = int(actor["completed_sessions"])
+        duration_total_s = float(actor["connected_duration_total_s"])
         if actor_id != "overflow":
             if successes > 0:
                 allocated_requesters.add(actor_id)
@@ -129,8 +140,7 @@ def aggregate_requester_usage(
                 connected_requesters.add(actor_id)
                 attributed_connections += connections
                 connected_authenticated_accounts.update(
-                    str(value)
-                    for value in actor["connected_authenticated_account_names"]
+                    str(value) for value in actor["connected_authenticated_account_names"]
                 )
 
         peak_requests_per_minute = int(actor["peak_requests_per_minute"])
@@ -143,13 +153,15 @@ def aggregate_requester_usage(
             network_ids_overflow=bool(actor["network_ids_overflow"]),
             automated_requests=automated_requests,
             invalid_token_requests=int(actor["invalid_token_requests"]),
+            rate_limited=rate_limited,
+            completed_sessions=completed_sessions,
+            short_sessions=int(actor["short_sessions"]),
             peer_count=len(peer_request_counts),
             relative_threshold=relative_threshold,
             thresholds=thresholds,
         )
         high_risk = any(
-            signal.startswith(("high volume", "burst", "dominant traffic share"))
-            for signal in signals
+            signal.startswith(("high volume", "burst", "dominant traffic share", "rate limited")) for signal in signals
         )
         rows.append(
             {
@@ -162,8 +174,18 @@ def aggregate_requester_usage(
                 "requests": requests,
                 "successes": successes,
                 "failures": int(actor["failures"]),
+                "rate_limited": rate_limited,
                 "abandoned": int(actor["abandoned"]),
                 "connections": connections,
+                "completed_sessions": completed_sessions,
+                "short_sessions": int(actor["short_sessions"]),
+                "avg_connected_duration_s": (
+                    round(duration_total_s / completed_sessions, 2) if completed_sessions else 0.0
+                ),
+                "max_connected_duration_s": round(
+                    float(actor["connected_duration_max_s"]),
+                    2,
+                ),
                 "success_rate_pct": round((successes / requests) * 100.0, 1) if requests else 0.0,
                 "traffic_share_pct": traffic_share_pct,
                 "requests_per_hour": round(requests / window_hours, 2),
@@ -188,9 +210,7 @@ def aggregate_requester_usage(
     unattributed_requests = max(total_session_requests - tracked_requests, 0)
     summary = {
         "unique_requesters_window": sum(
-            1
-            for row in rows
-            if row["actor_id"] != "overflow" and int(row["requests"]) > 0
+            1 for row in rows if row["actor_id"] != "overflow" and int(row["requests"]) > 0
         ),
         "authenticated_users_window": len(authenticated_accounts),
         "tokens_window": len(token_actors),
@@ -201,14 +221,11 @@ def aggregate_requester_usage(
         "connected_requesters_window": len(connected_requesters),
         "authenticated_users_connected_window": len(connected_authenticated_accounts),
         "attributed_connections_window": attributed_connections,
-        "token_requests_window": sum(
-            int(row["requests"])
-            for row in rows
-            if str(row["actor_id"]).startswith("token:")
-        ),
+        "token_requests_window": sum(int(row["requests"]) for row in rows if str(row["actor_id"]).startswith("token:")),
         "authenticated_requests_window": authenticated_requests,
         "anonymous_requests_window": anonymous_requests,
         "invalid_token_requests_window": invalid_token_requests,
+        "rate_limited_requests_window": sum(int(row["rate_limited"]) for row in rows),
         "unattributed_requests_window": unattributed_requests,
         "unusual_requesters_window": sum(1 for row in rows if row["risk"] != "normal"),
     }
@@ -237,9 +254,28 @@ def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str
             actor["requests"] = int(actor["requests"]) + requests
             actor["successes"] = int(actor["successes"]) + max(int(record.get("successes", 0)), 0)
             actor["failures"] = int(actor["failures"]) + max(int(record.get("failures", 0)), 0)
+            actor["rate_limited"] = int(actor["rate_limited"]) + max(
+                int(record.get("rate_limited", 0)),
+                0,
+            )
             actor["abandoned"] = int(actor["abandoned"]) + max(int(record.get("abandoned", 0)), 0)
             connections = max(int(record.get("connections", 0)), 0)
             actor["connections"] = int(actor["connections"]) + connections
+            actor["completed_sessions"] = int(actor["completed_sessions"]) + max(
+                int(record.get("completed_sessions", 0)),
+                0,
+            )
+            actor["short_sessions"] = int(actor["short_sessions"]) + max(
+                int(record.get("short_sessions", 0)),
+                0,
+            )
+            actor["connected_duration_total_s"] = float(actor["connected_duration_total_s"]) + max(
+                float(record.get("connected_duration_total_s", 0.0)), 0.0
+            )
+            actor["connected_duration_max_s"] = max(
+                float(actor["connected_duration_max_s"]),
+                max(float(record.get("connected_duration_max_s", 0.0)), 0.0),
+            )
             actor["peak_requests_per_minute"] = max(int(actor["peak_requests_per_minute"]), requests)
             actor["first_seen_s"] = min(int(actor["first_seen_s"]), bucket.bucket_start_s)
             actor["last_seen_s"] = max(int(actor["last_seen_s"]), bucket.bucket_start_s)
@@ -270,12 +306,9 @@ def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str
             )
             reported_robot_ids = actor["reported_robot_ids"]
             if isinstance(reported_robot_ids, set):
-                reported_robot_ids.update(
-                    str(item) for item in list(record.get("reported_robot_ids") or [])
-                )
+                reported_robot_ids.update(str(item) for item in list(record.get("reported_robot_ids") or []))
             actor["reported_robot_ids_overflow"] = bool(
-                actor["reported_robot_ids_overflow"]
-                or record.get("reported_robot_ids_overflow", False)
+                actor["reported_robot_ids_overflow"] or record.get("reported_robot_ids_overflow", False)
             )
             client_kinds = actor["client_kinds"]
             if isinstance(client_kinds, dict):
@@ -295,8 +328,13 @@ def _new_actor(actor_id: str, record: dict[str, object], bucket_start_s: int) ->
         "requests": 0,
         "successes": 0,
         "failures": 0,
+        "rate_limited": 0,
         "abandoned": 0,
         "connections": 0,
+        "completed_sessions": 0,
+        "short_sessions": 0,
+        "connected_duration_total_s": 0.0,
+        "connected_duration_max_s": 0.0,
         "authenticated_requests": 0,
         "anonymous_requests": 0,
         "invalid_token_requests": 0,
@@ -319,11 +357,7 @@ def _set_actor_identity(actor: dict[str, object], record: dict[str, object]) -> 
     actor["kind"] = str(record.get("kind") or actor["kind"])
     actor["verification"] = str(record.get("verification") or "unknown")
     actor["fingerprint"] = str(record.get("fingerprint") or actor["fingerprint"])
-    actor["account_name"] = (
-        str(record["account_name"])
-        if record.get("account_name") is not None
-        else None
-    )
+    actor["account_name"] = str(record["account_name"]) if record.get("account_name") is not None else None
 
 
 def _usage_signals(
@@ -336,6 +370,9 @@ def _usage_signals(
     network_ids_overflow: bool,
     automated_requests: int,
     invalid_token_requests: int,
+    rate_limited: int,
+    completed_sessions: int,
+    short_sessions: int,
     peer_count: int,
     relative_threshold: int,
     thresholds: RequesterUsageThresholds,
@@ -355,6 +392,11 @@ def _usage_signals(
         signals.append("mostly automation-like clients")
     if verification == "invalid" or invalid_token_requests > 0:
         signals.append("invalid HF token")
+    if rate_limited > 0:
+        noun = "request" if rate_limited == 1 else "requests"
+        signals.append(f"rate limited: {rate_limited:,} {noun}")
+    if completed_sessions >= 3 and short_sessions / completed_sessions >= 0.8:
+        signals.append(f"mostly short sessions: {short_sessions:,}/{completed_sessions:,}")
     return signals
 
 

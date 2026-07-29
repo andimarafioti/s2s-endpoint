@@ -1,4 +1,3 @@
-import asyncio
 import unittest
 
 from app.session_router import SessionRouter

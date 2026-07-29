@@ -34,10 +34,7 @@ class FakeSnapshotProvider:
 
 class FakeHistoryStore:
     def __init__(self, initial_buckets=None):
-        self.saved = {
-            bucket.bucket_start_s: bucket.to_dict()
-            for bucket in (initial_buckets or [])
-        }
+        self.saved = {bucket.bucket_start_s: bucket.to_dict() for bucket in (initial_buckets or [])}
         self.write_calls = []
         self.load_calls = 0
         self.load_requests = []
@@ -199,7 +196,9 @@ class FakeBucketApi:
                 self.files.pop(path, None)
 
 
-def _health_snapshot(*, connected: int, pending: int, running: int, waking: int, free_slots: int, effective_free_slots: int):
+def _health_snapshot(
+    *, connected: int, pending: int, running: int, waking: int, free_slots: int, effective_free_slots: int
+):
     endpoints = [
         {
             "name": "reachy-s2s-01",
@@ -296,6 +295,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         await dashboard.capture_sample()
         await dashboard.record_session_request()
         await dashboard.record_session_allocation_success()
+        await dashboard.record_session_rate_limited()
         await dashboard.record_session_event("connected")
         await dashboard.record_session_event(
             "disconnected",
@@ -312,12 +312,14 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current["parked_endpoints"], 1)
         self.assertEqual(point["session_requests"], 1)
         self.assertEqual(point["session_allocation_successes"], 1)
+        self.assertEqual(point["session_rate_limited"], 1)
         self.assertEqual(point["session_connected_events"], 1)
         self.assertEqual(point["completed_conversations"], 1)
         self.assertEqual(point["avg_conversation_duration_s"], 150.0)
         self.assertEqual(point["max_conversation_duration_min"], 2.5)
         self.assertEqual(payload["summary"]["window_label"], "60m")
         self.assertEqual(payload["summary"]["session_requests_window"], 1)
+        self.assertEqual(payload["summary"]["session_rate_limited_window"], 1)
         self.assertEqual(payload["summary"]["conversations_completed_window"], 1)
         self.assertEqual(payload["summary"]["active_conversation_minutes_window"], 2.0)
         self.assertEqual(payload["summary"]["active_conversation_hours_window"], 0.03)
@@ -331,14 +333,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
     async def test_hourly_series_averages_state_metrics_and_sums_events(self):
         clock = FakeClock(3 * 3600)
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=0,
-                waking=0,
-                free_slots=0,
-                effective_free_slots=0,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=0,
+                    waking=0,
+                    free_slots=0,
+                    effective_free_slots=0,
+                )
+            ),
             sample_interval_s=15,
             retention_minutes=24 * 60,
             time_fn=clock.now,
@@ -411,14 +415,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
 
     def test_dashboard_html_generates_rolling_charts_from_descriptors(self):
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=0,
-                waking=0,
-                free_slots=0,
-                effective_free_slots=0,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=0,
+                    waking=0,
+                    free_slots=0,
+                    effective_free_slots=0,
+                )
+            ),
         )
 
         html = dashboard.html()
@@ -428,17 +434,20 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Maximum Connected Users", html)
         self.assertIn("Median Duration", html)
         self.assertIn("renderRollingChartCards();", html)
+
     async def test_summary_peak_connected_sessions_uses_bucket_max(self):
         now_s = 6 * 3600
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=0,
-                waking=0,
-                free_slots=0,
-                effective_free_slots=0,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=0,
+                    waking=0,
+                    free_slots=0,
+                    effective_free_slots=0,
+                )
+            ),
             time_fn=FakeClock(now_s).now,
         )
         bucket = SwarmHistoryBucket(bucket_start_s=now_s)
@@ -456,14 +465,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         now_s = 48 * 3600
         clock = FakeClock(now_s)
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=0,
-                waking=0,
-                free_slots=0,
-                effective_free_slots=0,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=0,
+                    waking=0,
+                    free_slots=0,
+                    effective_free_slots=0,
+                )
+            ),
             sample_interval_s=15,
             retention_minutes=48 * 60,
             time_fn=clock.now,
@@ -547,14 +558,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
     async def test_prunes_buckets_older_than_retention_window(self):
         clock = FakeClock(10 * 3600)
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             sample_interval_s=15,
             retention_minutes=60,
             time_fn=clock.now,
@@ -607,14 +620,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 3600)
         store = FakeHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=1,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=1,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             sample_interval_s=15,
             retention_minutes=24 * 60,
             history_store=store,
@@ -680,14 +695,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(5 * 60)
         store = FakeHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             retention_minutes=60,
             history_store=store,
             flush_batch_size=2,
@@ -710,14 +727,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 60)
         store = BlockingFirstWriteHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             retention_minutes=60,
             history_store=store,
             flush_timeout_s=0.01,
@@ -903,14 +922,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(0)
         store = FakeHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             retention_minutes=60,
             history_store=store,
             time_fn=clock.now,
@@ -953,14 +974,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
     async def test_merge_releases_lock_between_comparison_chunks(self):
         clock = FakeClock(2 * 60)
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             retention_minutes=60,
             time_fn=clock.now,
         )
@@ -986,9 +1009,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         inspector_task = asyncio.create_task(inspect_between_chunks())
         with patch("app.dashboard_history.HISTORY_MERGE_COMPARISON_CHUNK_SIZE", 1):
-            updated_bucket_count = await dashboard.history._merge_persisted_history_buckets(
-                persisted_buckets
-            )
+            updated_bucket_count = await dashboard.history._merge_persisted_history_buckets(persisted_buckets)
 
         self.assertTrue(await inspector_task)
         self.assertEqual(updated_bucket_count, 2)
@@ -998,14 +1019,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 60)
         store = BlockingFirstWriteHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             retention_minutes=60,
             history_store=store,
             flush_timeout_s=0.01,
@@ -1035,14 +1058,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 60)
         store = BlockingFirstWriteHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             retention_minutes=60,
             history_store=store,
             time_fn=clock.now,
@@ -1077,14 +1102,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 60)
         store = FakeHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             retention_minutes=60,
             history_store=store,
             time_fn=clock.now,
@@ -1126,14 +1153,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 60)
         store = BlockingFirstWriteHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             retention_minutes=60,
             history_store=store,
             flush_timeout_s=10,
@@ -1170,14 +1199,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
     async def test_warns_when_dirty_dashboard_buckets_are_stale(self):
         clock = FakeClock(10 * 60)
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             retention_minutes=60,
             history_store=FakeHistoryStore(),
             dirty_bucket_warning_age_s=300,
@@ -1211,14 +1242,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(4 * 3600 + 60)
         store = FakeHistoryStore(initial_buckets=[bucket])
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=2,
-                pending=0,
-                running=2,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=2,
+                    pending=0,
+                    running=2,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             sample_interval_s=3600,
             retention_minutes=24 * 60,
             history_store=store,
@@ -1239,14 +1272,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(day_start + 24 * 60 * 60 + 120)
         store = DayRolloverHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             sample_interval_s=3600,
             retention_minutes=2 * 24 * 60,
             history_store=store,
@@ -1271,14 +1306,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(day_start + 24 * 60 * 60 + 120)
         store = DayRolloverHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             sample_interval_s=3600,
             retention_minutes=2 * 24 * 60,
             history_store=store,
@@ -1305,14 +1342,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(4 * 3600 + 60)
         store = SlowHistoryStore(delay_s=0.15, initial_buckets=[bucket])
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             sample_interval_s=3600,
             retention_minutes=24 * 60,
             history_store=store,
@@ -1356,14 +1395,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(now_epoch_s)
         store = FakeHistoryStore()
         dashboard = SwarmDashboard(
-            snapshot_provider=FakeSnapshotProvider(_health_snapshot(
-                connected=0,
-                pending=0,
-                running=1,
-                waking=0,
-                free_slots=1,
-                effective_free_slots=1,
-            )),
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
             sample_interval_s=3600,
             retention_minutes=28 * 24 * 60,
             history_store=store,
@@ -1386,14 +1427,15 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             await dashboard.stop()
 
         self.assertEqual(store.load_calls, 3)
-        self.assertEqual(store.load_requests, [
-            (28 * 24 * 60, now_epoch_s),
-            (24 * 60 + 4 * 60 + 2, now_epoch_s),
-            (24 * 60 + 4 * 60 + 2, now_epoch_s),
-        ])
-        self.assertIn(previous_day_bucket.bucket_start_s, {
-            bucket.bucket_start_s for bucket in snapshot
-        })
+        self.assertEqual(
+            store.load_requests,
+            [
+                (28 * 24 * 60, now_epoch_s),
+                (24 * 60 + 4 * 60 + 2, now_epoch_s),
+                (24 * 60 + 4 * 60 + 2, now_epoch_s),
+            ],
+        )
+        self.assertIn(previous_day_bucket.bucket_start_s, {bucket.bucket_start_s for bucket in snapshot})
         self.assertEqual([point["running_endpoints"] for point in series], [3, 1])
         self.assertEqual(status["status"], "complete")
         self.assertEqual(status["scheduled_passes"], 2)
@@ -1439,14 +1481,15 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await history.stop()
 
-        self.assertIn(late_bucket.bucket_start_s, {
-            bucket.bucket_start_s for bucket in snapshot
-        })
-        self.assertEqual(store.load_requests, [
-            (28 * 24 * 60, now_epoch_s),
-            (24 * 60 + 4 * 60 + 2, now_epoch_s),
-            (24 * 60 + 4 * 60 + 2, now_epoch_s),
-        ])
+        self.assertIn(late_bucket.bucket_start_s, {bucket.bucket_start_s for bucket in snapshot})
+        self.assertEqual(
+            store.load_requests,
+            [
+                (28 * 24 * 60, now_epoch_s),
+                (24 * 60 + 4 * 60 + 2, now_epoch_s),
+                (24 * 60 + 4 * 60 + 2, now_epoch_s),
+            ],
+        )
         self.assertEqual(status["status"], "complete")
         self.assertEqual(status["scheduled_passes"], 2)
         self.assertEqual(status["completed_passes"], 2)
@@ -1546,8 +1589,7 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         current_day_start = previous_day_start + 24 * 60 * 60
         now_epoch_s = current_day_start + 4 * 3600 + 60
         previous_day_buckets = [
-            SwarmHistoryBucket(bucket_start_s=previous_day_start + minute * 60)
-            for minute in range(24 * 60)
+            SwarmHistoryBucket(bucket_start_s=previous_day_start + minute * 60) for minute in range(24 * 60)
         ]
         recent_bucket = SwarmHistoryBucket(
             bucket_start_s=now_epoch_s - 60,
@@ -1629,10 +1671,13 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         self.assertEqual([bucket.bucket_start_s for bucket in loaded], [day_start, day_start + 60])
         self.assertEqual([bucket.running_endpoints_last for bucket in loaded], [2, 4])
         self.assertIn("reachy-s2s-lb/minutes/2026-05-18", api.list_prefixes)
-        self.assertEqual([remote_path for remote_path, _ in api.downloads], [
-            "reachy-s2s-lb/days/2026-05-18.json",
-            f"reachy-s2s-lb/minutes/2026-05-18/{day_start + 60}.json",
-        ])
+        self.assertEqual(
+            [remote_path for remote_path, _ in api.downloads],
+            [
+                "reachy-s2s-lb/days/2026-05-18.json",
+                f"reachy-s2s-lb/minutes/2026-05-18/{day_start + 60}.json",
+            ],
+        )
         self.assertEqual(api.batch_adds[0][1], "reachy-s2s-lb/days/2026-05-18.json")
         self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["finalized"], True)
         self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["minute_bucket_count"], 2)
@@ -1673,10 +1718,13 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         self.assertEqual([bucket.bucket_start_s for bucket in loaded], [day_start, day_start + 60])
         self.assertEqual([bucket.running_endpoints_last for bucket in loaded], [2, 4])
         self.assertIn("reachy-s2s-lb/minutes/2026-05-18", api.list_prefixes)
-        self.assertEqual([remote_path for remote_path, _ in api.downloads], [
-            "reachy-s2s-lb/days/2026-05-18.json",
-            f"reachy-s2s-lb/minutes/2026-05-18/{day_start + 60}.json",
-        ])
+        self.assertEqual(
+            [remote_path for remote_path, _ in api.downloads],
+            [
+                "reachy-s2s-lb/days/2026-05-18.json",
+                f"reachy-s2s-lb/minutes/2026-05-18/{day_start + 60}.json",
+            ],
+        )
         self.assertEqual(len(api.batch_adds), 1)
         self.assertEqual(api.files["reachy-s2s-lb/days/2026-05-18.json"]["minute_bucket_count"], 2)
 

@@ -4,10 +4,10 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from datetime import datetime, timezone
 from typing import Callable, Optional, Protocol
-
 
 logger = logging.getLogger("s2s-endpoint")
 DAY_MINUTES = 24 * 60
@@ -47,14 +47,11 @@ def _isoformat(epoch_s: int | float) -> str:
 
 
 class DashboardHistoryStore(Protocol):
-    def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list["SwarmHistoryBucket"]:
-        ...
+    def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list["SwarmHistoryBucket"]: ...
 
-    def write_buckets(self, buckets: list["SwarmHistoryBucket"]) -> None:
-        ...
+    def write_buckets(self, buckets: list["SwarmHistoryBucket"]) -> None: ...
 
-    def write_day_buckets(self, *, day_start_s: int, buckets: list["SwarmHistoryBucket"]) -> Optional[str]:
-        ...
+    def write_day_buckets(self, *, day_start_s: int, buckets: list["SwarmHistoryBucket"]) -> Optional[str]: ...
 
 
 @dataclass
@@ -163,6 +160,7 @@ class SwarmHistoryBucket:
     session_requests: int = 0
     session_allocation_successes: int = 0
     session_allocation_failures: int = 0
+    session_rate_limited: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
     completed_conversations: int = 0
@@ -214,6 +212,7 @@ class SwarmHistoryBucket:
             "session_requests": self.session_requests,
             "session_allocation_successes": self.session_allocation_successes,
             "session_allocation_failures": self.session_allocation_failures,
+            "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
@@ -273,6 +272,7 @@ _HISTORY_BUCKET_INT_FIELDS = {
     "session_requests",
     "session_allocation_successes",
     "session_allocation_failures",
+    "session_rate_limited",
     "session_connected_events",
     "session_disconnected_events",
     "completed_conversations",
@@ -322,16 +322,10 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             continue
         actor_id = str(raw_actor_id)[:128]
         network_ids = [str(item)[:128] for item in list(raw_record.get("network_ids") or [])[:32]]
-        reported_robot_ids = [
-            str(item)[:128]
-            for item in list(raw_record.get("reported_robot_ids") or [])[:32]
-        ]
+        reported_robot_ids = [str(item)[:128] for item in list(raw_record.get("reported_robot_ids") or [])[:32]]
         raw_client_kinds = raw_record.get("client_kinds") or {}
         client_kinds = (
-            {
-                str(kind)[:80]: max(int(count), 0)
-                for kind, count in raw_client_kinds.items()
-            }
+            {str(kind)[:80]: max(int(count), 0) for kind, count in raw_client_kinds.items()}
             if isinstance(raw_client_kinds, dict)
             else {}
         )
@@ -341,15 +335,24 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "verification": str(raw_record.get("verification") or "unknown")[:40],
             "fingerprint": str(raw_record.get("fingerprint") or "")[:40],
             "account_name": (
-                str(raw_record["account_name"])[:80]
-                if raw_record.get("account_name") is not None
-                else None
+                str(raw_record["account_name"])[:80] if raw_record.get("account_name") is not None else None
             ),
             "requests": max(int(raw_record.get("requests", 0)), 0),
             "successes": max(int(raw_record.get("successes", 0)), 0),
             "failures": max(int(raw_record.get("failures", 0)), 0),
+            "rate_limited": max(int(raw_record.get("rate_limited", 0)), 0),
             "abandoned": max(int(raw_record.get("abandoned", 0)), 0),
             "connections": max(int(raw_record.get("connections", 0)), 0),
+            "completed_sessions": max(int(raw_record.get("completed_sessions", 0)), 0),
+            "short_sessions": max(int(raw_record.get("short_sessions", 0)), 0),
+            "connected_duration_total_s": max(
+                float(raw_record.get("connected_duration_total_s", 0.0)),
+                0.0,
+            ),
+            "connected_duration_max_s": max(
+                float(raw_record.get("connected_duration_max_s", 0.0)),
+                0.0,
+            ),
             "network_ids": network_ids,
             "network_ids_overflow": bool(raw_record.get("network_ids_overflow", False)),
             "reported_robot_requests": max(
@@ -357,9 +360,7 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
                 0,
             ),
             "reported_robot_ids": reported_robot_ids,
-            "reported_robot_ids_overflow": bool(
-                raw_record.get("reported_robot_ids_overflow", False)
-            ),
+            "reported_robot_ids_overflow": bool(raw_record.get("reported_robot_ids_overflow", False)),
             "client_kinds": client_kinds,
         }
     return usage
@@ -387,8 +388,13 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
         "requests": 0,
         "successes": 0,
         "failures": 0,
+        "rate_limited": 0,
         "abandoned": 0,
         "connections": 0,
+        "completed_sessions": 0,
+        "short_sessions": 0,
+        "connected_duration_total_s": 0.0,
+        "connected_duration_max_s": 0.0,
         "network_ids": [],
         "network_ids_overflow": False,
         "reported_robot_requests": 0,
@@ -507,15 +513,9 @@ class DashboardHistory:
         self._history_restore_started_at_s: Optional[float] = None
         self._history_restore_finished_at_s: Optional[float] = None
         self._history_restore_bucket_count = 0
-        self._startup_merge_status = (
-            "disabled"
-            if history_store is None or startup_merge_delay_s == 0
-            else "pending"
-        )
+        self._startup_merge_status = "disabled" if history_store is None or startup_merge_delay_s == 0 else "pending"
         self._startup_merge_scheduled_passes = (
-            0
-            if history_store is None or startup_merge_delay_s == 0
-            else STARTUP_MERGE_PASS_COUNT
+            0 if history_store is None or startup_merge_delay_s == 0 else STARTUP_MERGE_PASS_COUNT
         )
         self._startup_merge_attempted_passes = 0
         self._startup_merge_completed_passes = 0
@@ -608,11 +608,7 @@ class DashboardHistory:
             "detail": self._history_restore_detail,
             "bucket_count": self._history_restore_bucket_count,
             "background": self.restore_history_in_background,
-            "elapsed_s": (
-                round((finished_at_s or now_s) - started_at_s, 2)
-                if started_at_s is not None
-                else None
-            ),
+            "elapsed_s": (round((finished_at_s or now_s) - started_at_s, 2) if started_at_s is not None else None),
         }
 
     def persistence_status(self) -> dict[str, object]:
@@ -646,37 +642,27 @@ class DashboardHistory:
                 else None
             ),
             "last_flush_started_at": (
-                _isoformat(self._last_flush_started_at_s)
-                if self._last_flush_started_at_s is not None
-                else None
+                _isoformat(self._last_flush_started_at_s) if self._last_flush_started_at_s is not None else None
             ),
             "last_flush_finished_at": (
-                _isoformat(self._last_flush_finished_at_s)
-                if self._last_flush_finished_at_s is not None
-                else None
+                _isoformat(self._last_flush_finished_at_s) if self._last_flush_finished_at_s is not None else None
             ),
             "last_flush_error": self._last_flush_error,
             "flush_task_age_s": flush_task_age_s,
             "flush_write_in_flight": flush_write_in_flight,
             "flush_stalled": self._flush_stalled_started_at_monotonic_s is not None,
             "flush_stalled_since_at": (
-                _isoformat(self._flush_stalled_started_at_s)
-                if self._flush_stalled_started_at_s is not None
-                else None
+                _isoformat(self._flush_stalled_started_at_s) if self._flush_stalled_started_at_s is not None else None
             ),
             "flush_stalled_age_s": flush_stalled_age_s,
             "flush_retry_backoff": self._flush_retry_not_before_monotonic_s is not None,
             "flush_retry_failure_count": self._flush_retry_failure_count,
             "flush_retry_delay_s": self._flush_retry_delay_s,
             "flush_retry_next_at": (
-                _isoformat(self._flush_retry_next_at_s)
-                if self._flush_retry_next_at_s is not None
-                else None
+                _isoformat(self._flush_retry_next_at_s) if self._flush_retry_next_at_s is not None else None
             ),
             "flush_retry_delay_remaining_s": (
-                round(flush_retry_delay_remaining_s, 2)
-                if flush_retry_delay_remaining_s is not None
-                else None
+                round(flush_retry_delay_remaining_s, 2) if flush_retry_delay_remaining_s is not None else None
             ),
             "flush_retry_initial_delay_s": FLUSH_RETRY_INITIAL_DELAY_S,
             "flush_retry_max_delay_s": FLUSH_RETRY_MAX_DELAY_S,
@@ -702,7 +688,6 @@ class DashboardHistory:
             "updated_bucket_count": self._startup_merge_updated_bucket_count,
             "last_error": self._startup_merge_last_error,
         }
-
 
     async def _persistence_loop(self) -> None:
         while True:
@@ -760,13 +745,17 @@ class DashboardHistory:
         *,
         actor_id: str | None,
         metadata: dict[str, object] | None,
+        duration_s: float | None = None,
+        short_session: bool = False,
     ) -> None:
         counter_fields = {
             "request": ("session_requests", "requests"),
             "success": ("session_allocation_successes", "successes"),
             "failure": ("session_allocation_failures", "failures"),
+            "rate_limited": ("session_rate_limited", "rate_limited"),
             "abandoned": (None, "abandoned"),
             "connected": (None, "connections"),
+            "disconnected": (None, "completed_sessions"),
         }
         if event not in counter_fields:
             raise ValueError(f"Unknown requester event: {event}")
@@ -799,6 +788,17 @@ class DashboardHistory:
                     self._requester_record_count += 1
                 _merge_requester_identity(record, resolved_metadata)
                 record[requester_field] = int(record.get(requester_field, 0)) + 1
+                if event == "disconnected":
+                    resolved_duration_s = max(float(duration_s or 0.0), 0.0)
+                    record["connected_duration_total_s"] = (
+                        float(record.get("connected_duration_total_s", 0.0)) + resolved_duration_s
+                    )
+                    record["connected_duration_max_s"] = max(
+                        float(record.get("connected_duration_max_s", 0.0)),
+                        resolved_duration_s,
+                    )
+                    if short_session:
+                        record["short_sessions"] = int(record.get("short_sessions", 0)) + 1
                 if event == "request" and resolved_actor_id != "overflow":
                     _record_request_context(record, resolved_metadata)
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
@@ -866,10 +866,7 @@ class DashboardHistory:
             return
 
     def _recount_requester_records_unlocked(self) -> None:
-        self._requester_record_count = sum(
-            len(bucket.requester_usage)
-            for bucket in self._history.values()
-        )
+        self._requester_record_count = sum(len(bucket.requester_usage) for bucket in self._history.values())
 
     def _enforce_requester_record_limit_unlocked(self) -> None:
         while self._requester_record_count > self.max_requester_records:
@@ -987,8 +984,7 @@ class DashboardHistory:
                 self._startup_merge_bucket_count += len(buckets)
                 self._startup_merge_updated_bucket_count += updated_bucket_count
                 logger.info(
-                    "Completed dashboard startup history merge pass %s/%s: "
-                    "loaded %s buckets, updated %s in %.2fs",
+                    "Completed dashboard startup history merge pass %s/%s: loaded %s buckets, updated %s in %.2fs",
                     pass_number,
                     self._startup_merge_scheduled_passes,
                     len(buckets),
@@ -1016,11 +1012,7 @@ class DashboardHistory:
             return []
         return await asyncio.to_thread(
             self.history_store.load_recent,
-            retention_minutes=(
-                self.retention_minutes
-                if retention_minutes is None
-                else retention_minutes
-            ),
+            retention_minutes=(self.retention_minutes if retention_minutes is None else retention_minutes),
             now_epoch_s=self._time_fn() if now_epoch_s is None else now_epoch_s,
         )
 
@@ -1028,10 +1020,8 @@ class DashboardHistory:
         merge_candidates: list[tuple[SwarmHistoryBucket, Optional[SwarmHistoryBucket]]] = []
         sorted_buckets = sorted(buckets, key=lambda item: item.bucket_start_s)
         for chunk_start in range(0, len(sorted_buckets), HISTORY_MERGE_COMPARISON_CHUNK_SIZE):
-            chunk = sorted_buckets[chunk_start:chunk_start + HISTORY_MERGE_COMPARISON_CHUNK_SIZE]
-            serialized_buckets = [
-                (bucket, bucket.to_dict()) for bucket in chunk
-            ]
+            chunk = sorted_buckets[chunk_start : chunk_start + HISTORY_MERGE_COMPARISON_CHUNK_SIZE]
+            serialized_buckets = [(bucket, bucket.to_dict()) for bucket in chunk]
             async with self._lock:
                 for bucket, serialized_bucket in serialized_buckets:
                     if (
@@ -1130,18 +1120,14 @@ class DashboardHistory:
         if self.history_store is None:
             return False
 
-        write_task = asyncio.create_task(
-            asyncio.to_thread(self.history_store.write_buckets, buckets)
-        )
+        write_task = asyncio.create_task(asyncio.to_thread(self.history_store.write_buckets, buckets))
         self._flush_write_task = write_task
         timed_out = False
         try:
             done, _ = await asyncio.wait({write_task}, timeout=self.flush_timeout_s)
             if not done:
                 timed_out = True
-                self._last_flush_error = (
-                    f"Dashboard history flush stalled after {self.flush_timeout_s:g}s"
-                )
+                self._last_flush_error = f"Dashboard history flush stalled after {self.flush_timeout_s:g}s"
                 self._flush_stalled_started_at_s = self._time_fn()
                 self._flush_stalled_started_at_monotonic_s = time.monotonic()
                 logger.error(
@@ -1258,7 +1244,10 @@ class DashboardHistory:
         for day_start in day_starts:
             day_buckets = sorted(buckets_by_day.get(day_start, []), key=lambda bucket: bucket.bucket_start_s)
             if not day_buckets:
-                logger.info("Skipping live dashboard day rollover for %s because no minute buckets are in memory", _day_key(day_start))
+                logger.info(
+                    "Skipping live dashboard day rollover for %s because no minute buckets are in memory",
+                    _day_key(day_start),
+                )
                 continue
             if len(day_buckets) < DAY_MINUTES:
                 logger.warning(
@@ -1285,6 +1274,5 @@ class DashboardHistory:
         return [
             SwarmHistoryBucket.from_dict(self._history[bucket_start_s].to_dict())
             for bucket_start_s in sorted(self._dirty_bucket_starts)
-            if bucket_start_s in self._history
-            and (include_open_bucket or bucket_start_s < current_bucket_start_s)
+            if bucket_start_s in self._history and (include_open_bucket or bucket_start_s < current_bucket_start_s)
         ][: self.flush_batch_size]
