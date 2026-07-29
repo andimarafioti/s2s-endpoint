@@ -591,10 +591,15 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await self.router.start()
-        await asyncio.sleep(0.15)
 
-        snapshot = await self.router.snapshot()
-        self.assertEqual(snapshot["running_endpoints"], 1)
+        async def wait_for_idle_park():
+            while True:
+                snapshot = await self.router.snapshot()
+                if snapshot["running_endpoints"] == 1:
+                    return snapshot
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_idle_park(), timeout=1)
         self.assertEqual(len(controller.park_calls), 1)
 
     async def test_refresh_after_idle_park_with_no_sessions_does_not_report_endpoint_down(self):
