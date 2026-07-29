@@ -3,10 +3,11 @@ import json
 import os
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
 
 from app.app_utils import build_lifespan, setup_logging
@@ -64,6 +65,16 @@ INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_USAGE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_USAGE_PATH}"
 INTERNAL_POOL_PATH = "/v1/pool"
 INTERNAL_POOL_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_POOL_PATH}"
+INTERNAL_VOICES_URL_TEMPLATE = (
+    f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}/v1/realtime/sessions/{{session_id}}/voices"
+)
+# The internal speech-to-speech route caps reference audio at 10 MB; the extra
+# headroom covers multipart framing so its own 413 stays authoritative.
+VOICES_MAX_UPLOAD_BYTES = 12 * 1024 * 1024
+VOICES_GET_TIMEOUT_S = 15.0
+# Generous: with a hub-backed voice store the internal server pushes the new
+# voice to the Hugging Face Hub before answering 201.
+VOICES_POST_TIMEOUT_S = 60.0
 
 
 def _add_bool_flag(cmd: list[str], enabled: bool, flag: str) -> None:
@@ -213,6 +224,99 @@ async def pool():
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return JSONResponse(data)
+
+
+def _internal_voices_url(session_id: str) -> str:
+    return INTERNAL_VOICES_URL_TEMPLATE.format(session_id=urllib.parse.quote(session_id, safe=""))
+
+
+@app.get("/v1/realtime/sessions/{session_id}/voices")
+async def list_session_voices(session_id: str):
+    """Relay the cloned-voice listing from the internal realtime server.
+
+    Clients use this route as the voice-cloning capability probe, so every
+    internal answer is relayed verbatim: 200 with the voice list, 404 for an
+    unknown session, 409 when the pipeline's TTS backend has no voice store.
+    Like the internal server, possession of a live session id is the access
+    requirement; ids are only ever issued over the session grant path.
+    """
+    try:
+        status_code, body, content_type = await asyncio.to_thread(
+            _voices_relay,
+            _internal_voices_url(session_id),
+            method="GET",
+            timeout_s=VOICES_GET_TIMEOUT_S,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return Response(content=body, status_code=status_code, media_type=content_type)
+
+
+@app.post("/v1/realtime/sessions/{session_id}/voices")
+async def create_session_voice(session_id: str, request: Request):
+    """Relay a cloned-voice upload to the internal realtime server.
+
+    The body (multipart form: audio, ref_text, name) passes through untouched;
+    validation, dedup, and hub persistence all live in the internal server and
+    its answer is relayed verbatim. Only the size cap runs here, so an
+    oversized upload dies before it is buffered onward.
+    """
+    body = await request.body()
+    if len(body) > VOICES_MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            {
+                "error": {
+                    "message": f"Upload is too large (max {VOICES_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
+                    "code": "upload_too_large",
+                }
+            },
+            status_code=413,
+        )
+    try:
+        status_code, response_body, content_type = await asyncio.to_thread(
+            _voices_relay,
+            _internal_voices_url(session_id),
+            method="POST",
+            body=body,
+            content_type=request.headers.get("content-type", ""),
+            timeout_s=VOICES_POST_TIMEOUT_S,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return Response(content=response_body, status_code=status_code, media_type=content_type)
+
+
+def _voices_relay(
+    url: str,
+    *,
+    method: str,
+    body: Optional[bytes] = None,
+    content_type: str = "",
+    timeout_s: float,
+) -> tuple[int, bytes, str]:
+    """One internal HTTP round trip, returning (status, body, content type).
+
+    4xx/5xx answers from the internal server are results to relay, not
+    errors; only transport failures raise.
+    """
+    headers = {"Accept": "application/json"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            return (
+                getattr(response, "status", 200),
+                response.read(),
+                response.headers.get("Content-Type") or "application/json",
+            )
+    except urllib.error.HTTPError as exc:
+        with exc:
+            error_body = exc.read()
+        error_content_type = exc.headers.get("Content-Type") if exc.headers else None
+        return exc.code, error_body, error_content_type or "application/json"
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"internal voices request failed: {exc.reason}") from exc
 
 
 @app.websocket("/v1/realtime")
