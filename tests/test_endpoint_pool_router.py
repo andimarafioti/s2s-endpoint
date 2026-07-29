@@ -9,23 +9,22 @@ from app.endpoint_pool_router import (
     ComputeUsage,
     ComputeUsageSchemaError,
     EndpointDrainLeaseConflictError,
-    EndpointPoolRouter as ProductionEndpointPoolRouter,
     EndpointSnapshot,
     EndpointTransitionConflictError,
     ManagedEndpoint,
-    drain_lease_owner_fingerprint,
     _to_health_url,
     _to_ws_url,
+    drain_lease_owner_fingerprint,
     fetch_compute_usage,
+)
+from app.endpoint_pool_router import (
+    EndpointPoolRouter as ProductionEndpointPoolRouter,
 )
 
 
 class FakeEndpointController:
     def __init__(self, initial_states):
-        self.states = {
-            name: {"status": status, "url": url}
-            for name, status, url in initial_states
-        }
+        self.states = {name: {"status": status, "url": url} for name, status, url in initial_states}
         self.wake_calls = []
         self.park_calls = []
         self.force_restart_calls = []
@@ -139,9 +138,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
     def test_fetch_compute_usage_reads_sessions_and_capacity_from_health(self):
         with patch(
             "app.endpoint_pool_router.urllib.request.urlopen",
-            return_value=FakeUrlopenResponse(
-                {"router": {"active_sessions": 2, "max_sessions": 4}}
-            ),
+            return_value=FakeUrlopenResponse({"router": {"active_sessions": 2, "max_sessions": 4}}),
         ):
             usage = fetch_compute_usage("https://compute.example")
 
@@ -150,9 +147,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
     def test_fetch_compute_usage_supports_legacy_ready_busy(self):
         with patch(
             "app.endpoint_pool_router.urllib.request.urlopen",
-            return_value=FakeUrlopenResponse(
-                {"router": {"ready_busy": 1, "max_sessions": 3}}
-            ),
+            return_value=FakeUrlopenResponse({"router": {"ready_busy": 1, "max_sessions": 3}}),
         ):
             usage = fetch_compute_usage("https://compute.example")
 
@@ -164,9 +159,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         # 0 sessions and letting the LB treat busy nodes as free.
         with patch(
             "app.endpoint_pool_router.urllib.request.urlopen",
-            return_value=FakeUrlopenResponse(
-                {"router": {"ready": True, "starting": False, "max_sessions": 2}}
-            ),
+            return_value=FakeUrlopenResponse({"router": {"ready": True, "starting": False, "max_sessions": 2}}),
         ):
             with self.assertRaisesRegex(RuntimeError, "did not include a session count"):
                 fetch_compute_usage("https://compute.example")
@@ -413,9 +406,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_drain_requires_usage_request_started_after_acquisition(self):
         endpoint_url = "https://endpoint-a.example.endpoints.huggingface.cloud"
-        controller = FakeEndpointController(
-            [("endpoint-a", "running", endpoint_url)]
-        )
+        controller = FakeEndpointController([("endpoint-a", "running", endpoint_url)])
         self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
@@ -546,9 +537,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("allocator-drained" in line for line in first_warning.output))
 
         async with self.router._condition:
-            self.router._endpoints["endpoint-a"].last_drain_warning_at = (
-                time.monotonic() - 301
-            )
+            self.router._endpoints["endpoint-a"].last_drain_warning_at = time.monotonic() - 301
         with self.assertLogs("s2s-endpoint", level="WARNING") as recurring_warning:
             await self.router._maintain_drain_leases()
         self.assertTrue(any("allocator-drained" in line for line in recurring_warning.output))
@@ -602,10 +591,15 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await self.router.start()
-        await asyncio.sleep(0.15)
 
-        snapshot = await self.router.snapshot()
-        self.assertEqual(snapshot["running_endpoints"], 1)
+        async def wait_for_idle_park():
+            while True:
+                snapshot = await self.router.snapshot()
+                if snapshot["running_endpoints"] == 1:
+                    return snapshot
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_idle_park(), timeout=1)
         self.assertEqual(len(controller.park_calls), 1)
 
     async def test_refresh_after_idle_park_with_no_sessions_does_not_report_endpoint_down(self):
@@ -877,9 +871,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
                 return ComputeUsage(active_sessions=1, max_sessions=2)
 
         usage_fetcher = ReverseCompletionFetcher()
-        controller = FakeEndpointController(
-            [("endpoint-a", "running", endpoint_url)]
-        )
+        controller = FakeEndpointController([("endpoint-a", "running", endpoint_url)])
         self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             min_warm_endpoints=1,
@@ -953,9 +945,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         snapshot = await self.router.snapshot()
         self.assertEqual(snapshot["free_slots"], 0)
-        self.assertFalse(
-            next(ep for ep in snapshot["endpoints"] if ep["name"] == "endpoint-a")["usage_synced"]
-        )
+        self.assertFalse(next(ep for ep in snapshot["endpoints"] if ep["name"] == "endpoint-a")["usage_synced"])
 
         # The reconcile loop cannot help within this timeout (interval 3600s):
         # acquire itself must spawn the wake before suspending.
@@ -1004,11 +994,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
 
         snapshot = await self.router.snapshot()
-        endpoint_a = next(
-            endpoint
-            for endpoint in snapshot["endpoints"]
-            if endpoint["name"] == "endpoint-a"
-        )
+        endpoint_a = next(endpoint for endpoint in snapshot["endpoints"] if endpoint["name"] == "endpoint-a")
         self.assertEqual(controller.wake_calls, ["endpoint-a"])
         self.assertTrue(endpoint_a["running"])
         self.assertTrue(endpoint_a["waking"])
@@ -1033,11 +1019,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.wake_calls, ["endpoint-a"])
 
         snapshot = await self.router.snapshot()
-        endpoint_a = next(
-            endpoint
-            for endpoint in snapshot["endpoints"]
-            if endpoint["name"] == "endpoint-a"
-        )
+        endpoint_a = next(endpoint for endpoint in snapshot["endpoints"] if endpoint["name"] == "endpoint-a")
         self.assertFalse(endpoint_a["waking"])
         self.assertTrue(endpoint_a["usage_synced"])
         for lease in leases:
@@ -1595,9 +1577,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         await self.router._schedule_parks_if_needed()
         await asyncio.sleep(0.05)
 
-        idle_endpoint_name = (
-            {"endpoint-a", "endpoint-b"} - {lease.endpoint_name}
-        ).pop()
+        idle_endpoint_name = ({"endpoint-a", "endpoint-b"} - {lease.endpoint_name}).pop()
         self.assertEqual(controller.park_calls, [idle_endpoint_name])
         snapshot = await self.router.snapshot()
         endpoints = {endpoint["name"]: endpoint for endpoint in snapshot["endpoints"]}
@@ -1709,9 +1689,7 @@ class EndpointSelectionTests(unittest.TestCase):
         for endpoint in router._endpoints.values():
             endpoint.status = "running"
             endpoint.raw_status = "running"
-            endpoint.url = (
-                f"https://{endpoint.name}.example.endpoints.huggingface.cloud"
-            )
+            endpoint.url = f"https://{endpoint.name}.example.endpoints.huggingface.cloud"
         return router
 
     def test_prefers_partially_used_endpoint_over_idle_endpoint(self):
@@ -1972,9 +1950,7 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
             endpoint_names=["endpoint-a"],
             drain_restart_timeout_s=0,
         )
-        self.router._fetch_pool_units = lambda url: [
-            {"state": "draining", "draining_for_s": 999}
-        ]
+        self.router._fetch_pool_units = lambda url: [{"state": "draining", "draining_for_s": 999}]
 
         await self.router.start()
         await self.router.set_draining("endpoint-a", True, lease_id="rollout-a")
@@ -1992,9 +1968,7 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
             endpoint_names=["endpoint-a"],
             drain_restart_timeout_s=0,
         )
-        self.router._fetch_pool_units = lambda url: [
-            {"state": "draining", "draining_for_s": 999}
-        ]
+        self.router._fetch_pool_units = lambda url: [{"state": "draining", "draining_for_s": 999}]
         await self.router.start()
 
         async def mark_draining_during_poll(function, *args):
@@ -2048,9 +2022,7 @@ class DrainRestartTests(unittest.IsolatedAsyncioTestCase):
                 return ComputeUsage(active_sessions=0, max_sessions=1)
 
         usage_fetcher = RestartCapacityFetcher()
-        controller = FakeEndpointController(
-            [("endpoint-a", "running", endpoint_url)]
-        )
+        controller = FakeEndpointController([("endpoint-a", "running", endpoint_url)])
         self.router = _make_drain_router(
             controller,
             endpoint_names=["endpoint-a"],

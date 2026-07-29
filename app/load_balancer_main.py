@@ -40,18 +40,18 @@ HF_ENDPOINT_NAMESPACE = os.getenv("HF_ENDPOINT_NAMESPACE", "").strip() or None
 COMPUTE_ENDPOINT_NAMES_ENV = os.getenv("COMPUTE_ENDPOINT_NAMES", "").strip()
 COMPUTE_ENDPOINT_NAMES = [name.strip() for name in COMPUTE_ENDPOINT_NAMES_ENV.split(",") if name.strip()]
 COMPUTE_ENDPOINT_MIN_WARM = int(os.getenv("COMPUTE_ENDPOINT_MIN_WARM", "1"))
-COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS = int(
-    os.getenv("COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS", "1")
-)
+COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS = int(os.getenv("COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS", "1"))
 COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "600"))
 COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S", "10"))
-COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S = float(
-    os.getenv("COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S", "300")
-)
+COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S", "300"))
 COMPUTE_ENDPOINT_PARK_COOLDOWN_S = float(os.getenv("COMPUTE_ENDPOINT_PARK_COOLDOWN_S", "180"))
 COMPUTE_ENDPOINT_WAIT_TIMEOUT_S = int(os.getenv("COMPUTE_ENDPOINT_WAIT_TIMEOUT_S", "900"))
 COMPUTE_ENDPOINT_PARK_STRATEGY = os.getenv("COMPUTE_ENDPOINT_PARK_STRATEGY", "pause").strip().lower()
-COMPUTE_ENDPOINT_AUTO_RESTART = os.getenv("COMPUTE_ENDPOINT_AUTO_RESTART", "true").strip().lower() in {"true", "1", "yes"}
+COMPUTE_ENDPOINT_AUTO_RESTART = os.getenv("COMPUTE_ENDPOINT_AUTO_RESTART", "true").strip().lower() in {
+    "true",
+    "1",
+    "yes",
+}
 COMPUTE_ENDPOINT_MAX_RESTART_ATTEMPTS = int(os.getenv("COMPUTE_ENDPOINT_MAX_RESTART_ATTEMPTS", "3"))
 COMPUTE_ENDPOINT_RESTART_BACKOFF_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_BACKOFF_S", "30"))
 COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S", "300"))
@@ -82,11 +82,7 @@ QUEUE_MAX_DEPTH = int(os.getenv("QUEUE_MAX_DEPTH", "100"))
 QUEUE_TICKET_TTL_S = float(os.getenv("QUEUE_TICKET_TTL_S", "8"))
 QUEUE_POLL_INTERVAL_S = float(os.getenv("QUEUE_POLL_INTERVAL_S", "2"))
 QUEUE_REAP_INTERVAL_S = float(os.getenv("QUEUE_REAP_INTERVAL_S", "2"))
-REQUEST_USAGE_HASH_SECRET = (
-    os.getenv("REQUEST_USAGE_HASH_SECRET", "").strip()
-    or SESSION_SHARED_SECRET
-    or None
-)
+REQUEST_USAGE_HASH_SECRET = os.getenv("REQUEST_USAGE_HASH_SECRET", "").strip() or SESSION_SHARED_SECRET or None
 REQUEST_USAGE_TRUST_PROXY_HEADERS = os.getenv(
     "REQUEST_USAGE_TRUST_PROXY_HEADERS",
     "true",
@@ -103,19 +99,13 @@ REQUEST_RATE_LIMIT_ENABLED = os.getenv(
     "true",
 ).strip().lower() in {"true", "1", "yes"}
 REQUEST_RATE_LIMIT_WINDOW_S = float(os.getenv("REQUEST_RATE_LIMIT_WINDOW_S", "60"))
-REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW = int(
-    os.getenv("REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW", "20")
-)
+REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW = int(os.getenv("REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW", "20"))
 REQUEST_RATE_LIMIT_MAX_PARALLEL = int(os.getenv("REQUEST_RATE_LIMIT_MAX_PARALLEL", "10"))
 REQUEST_RATE_LIMIT_NO_CONNECTS = int(os.getenv("REQUEST_RATE_LIMIT_NO_CONNECTS", "5"))
-REQUEST_RATE_LIMIT_SHORT_SESSION_S = float(
-    os.getenv("REQUEST_RATE_LIMIT_SHORT_SESSION_S", "10")
-)
+REQUEST_RATE_LIMIT_SHORT_SESSION_S = float(os.getenv("REQUEST_RATE_LIMIT_SHORT_SESSION_S", "10"))
 REQUEST_RATE_LIMIT_SHORT_SESSIONS = int(os.getenv("REQUEST_RATE_LIMIT_SHORT_SESSIONS", "8"))
 REQUEST_RATE_LIMIT_COOLDOWN_S = float(os.getenv("REQUEST_RATE_LIMIT_COOLDOWN_S", "900"))
-REQUEST_RATE_LIMIT_ACTOR_RETENTION_S = float(
-    os.getenv("REQUEST_RATE_LIMIT_ACTOR_RETENTION_S", "3600")
-)
+REQUEST_RATE_LIMIT_ACTOR_RETENTION_S = float(os.getenv("REQUEST_RATE_LIMIT_ACTOR_RETENTION_S", "3600"))
 REQUEST_RATE_LIMIT_MAX_ACTORS = int(os.getenv("REQUEST_RATE_LIMIT_MAX_ACTORS", "10000"))
 DASHBOARD_SAMPLE_INTERVAL_S = float(os.getenv("DASHBOARD_SAMPLE_INTERVAL_S", "15"))
 DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(28 * 24 * 60)))
@@ -337,9 +327,7 @@ def _log_session_allocation_outcome(
         "requester_kind": requester.kind if requester is not None else None,
         "requester_verification": requester.verification if requester is not None else None,
         "requester_network_id": requester.network_id if requester is not None else None,
-        "requester_reported_robot_id": (
-            requester.reported_robot_id if requester is not None else None
-        ),
+        "requester_reported_robot_id": (requester.reported_robot_id if requester is not None else None),
         "requester_client_kind": requester.client_kind if requester is not None else None,
     }
     message = (
@@ -593,9 +581,7 @@ async def queue_status(queue_id: str, request: Request):
     if requester is None:
         hardware_id = await reported_hardware_id(request)
         requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
-    return await _deliver_grant(
-        request, result, poll_started_at, requester, http_route="GET /queue/{queue_id}"
-    )
+    return await _deliver_grant(request, result, poll_started_at, requester, http_route="GET /queue/{queue_id}")
 
 
 @app.delete("/queue/{queue_id}")
@@ -632,9 +618,7 @@ async def _deliver_grant(
         requester_rate_limiter.record_allocation(
             session_id,
             requester,
-            pending_timeout_s=float(
-                allocation.get("pending_timeout_s") or SESSION_PENDING_TIMEOUT_S
-            ),
+            pending_timeout_s=float(allocation.get("pending_timeout_s") or SESSION_PENDING_TIMEOUT_S),
         )
     else:
         requester_rate_limiter.record_allocation_failure(requester)
@@ -711,8 +695,7 @@ async def session_event(session_id: str, payload: dict[str, Any]):
             session_id,
             duration_s=_optional_float(result.get("conversation_duration_s")),
             penalize=(
-                bool(result.get("conversation_counted"))
-                and result.get("release_reason") != "endpoint_unavailable"
+                bool(result.get("conversation_counted")) and result.get("release_reason") != "endpoint_unavailable"
             ),
         )
         if outcome is not None and outcome.connected and outcome.duration_s is not None:
@@ -752,9 +735,7 @@ async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str
     if type(draining) is not bool:
         raise HTTPException(status_code=422, detail="draining must be a boolean")
     lease_ttl_s = payload.get("lease_ttl_s")
-    if lease_ttl_s is not None and (
-        type(lease_ttl_s) not in (int, float) or lease_ttl_s <= 0
-    ):
+    if lease_ttl_s is not None and (type(lease_ttl_s) not in (int, float) or lease_ttl_s <= 0):
         raise HTTPException(status_code=422, detail="lease_ttl_s must be a positive number")
     lease_id = payload.get("lease_id")
     force = payload.get("force", False)
@@ -802,11 +783,7 @@ async def get_endpoint_snapshot(endpoint_name: str) -> dict[str, object]:
     router_snapshot = snapshot.get("router", {})
     endpoints = router_snapshot.get("endpoints", []) if isinstance(router_snapshot, dict) else []
     endpoint_snapshot = next(
-        (
-            endpoint
-            for endpoint in endpoints
-            if isinstance(endpoint, dict) and endpoint.get("name") == endpoint_name
-        ),
+        (endpoint for endpoint in endpoints if isinstance(endpoint, dict) and endpoint.get("name") == endpoint_name),
         None,
     )
     if endpoint_snapshot is None:
@@ -835,7 +812,9 @@ def _bearer_token(authorization: str | None) -> str | None:
 
 @app.websocket("/ws")
 async def deprecated_websocket_route(client_ws: WebSocket):
-    await client_ws.close(code=1008, reason="Use POST /session and connect directly to the returned compute websocket URL")
+    await client_ws.close(
+        code=1008, reason="Use POST /session and connect directly to the returned compute websocket URL"
+    )
 
 
 @app.get("/dashboard")

@@ -295,9 +295,7 @@ class SessionQueueTests(unittest.IsolatedAsyncioTestCase):
 
         # A grant failure after the optimistic pop must not evict the head:
         # the ticket goes back to the front and the next poll retries.
-        with patch.object(
-            manager, "_grant_from_lease", side_effect=RuntimeError("token minting broke")
-        ):
+        with patch.object(manager, "_grant_from_lease", side_effect=RuntimeError("token minting broke")):
             with self.assertRaises(RuntimeError):
                 await manager.poll(first["queue_id"], "https://lb.example")
 
@@ -416,9 +414,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(allocation["allocation_wait_ms"], int)
         self.assertFalse(allocation["waited_for_capacity"])
         self.assertTrue(allocation["connect_url"].startswith(allocation["websocket_url"]))
-        self.assertTrue(
-            websocket_host_matches(payload["ws_url"], "endpoint-1.example.endpoints.huggingface.cloud")
-        )
+        self.assertTrue(websocket_host_matches(payload["ws_url"], "endpoint-1.example.endpoints.huggingface.cloud"))
 
         with patch("app.direct_session_manager.monotonic", new=monotonic_sequence(100.0, 105.0, 112.5)):
             connected = await self.manager.handle_event(
@@ -525,7 +521,6 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["pending_sessions"], 1)
         self.assertEqual(snapshot["connected_sessions"], 1)
         self.assertEqual(snapshot["router"], {"running_endpoints": 1, "active_sessions": 2})
-
 
     async def test_cancel_pending_session_releases_slot_immediately(self):
         router = FakeLeaseRouter()
@@ -709,9 +704,7 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["active_allocations"], 0)
         self.assertNotIn("no_connects", status["totals"])
         self.assertEqual(len(recorded_disconnects), 5)
-        self.assertTrue(
-            all(not result["conversation_counted"] for result in recorded_disconnects)
-        )
+        self.assertTrue(all(not result["conversation_counted"] for result in recorded_disconnects))
         self.assertTrue(limiter.acquire(requester).allowed)
 
     async def test_endpoint_down_after_clean_disconnect_records_no_abnormal_disconnect(self):

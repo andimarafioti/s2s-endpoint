@@ -22,9 +22,7 @@ def create_session_token(
         "sid": session_id,
         "ws_url": websocket_url,
     }
-    encoded_payload = _b64encode(
-        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    )
+    encoded_payload = _b64encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     signature = _sign(secret, encoded_payload)
     return f"{encoded_payload}.{signature}"
 

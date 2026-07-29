@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 import argparse
-from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.app_utils import setup_logging  # noqa: E402
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore  # noqa: E402
-
 
 logger = logging.getLogger("s2s-endpoint")
 
@@ -117,8 +116,7 @@ def main() -> None:
         parser.error("--start-day must be on or before --end-day")
 
     requested_days = [
-        (start_day + timedelta(days=offset)).strftime("%Y-%m-%d")
-        for offset in range((end_day - start_day).days + 1)
+        (start_day + timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range((end_day - start_day).days + 1)
     ]
     logger.info(
         "Preparing dashboard history for %s through %s (%s completed UTC days)",

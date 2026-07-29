@@ -137,9 +137,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("burst: 3/min", leaderboard[0]["signals"])
         self.assertIn("many networks: 2", leaderboard[0]["signals"])
         self.assertIn("rate limited: 1 request", leaderboard[0]["signals"])
-        self.assertFalse(
-            any(signal.startswith("mostly short sessions") for signal in leaderboard[0]["signals"])
-        )
+        self.assertFalse(any(signal.startswith("mostly short sessions") for signal in leaderboard[0]["signals"]))
 
     async def test_resolved_identity_updates_and_round_trips_existing_history(self):
         service = self._service(FakeClock(2 * 3600))

@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 import argparse
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import json
 import sys
 import time
-
-from huggingface_hub import HfApi
-from huggingface_hub.errors import InferenceEndpointError, InferenceEndpointTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 
 from _endpoint_helpers import (
     build_names,
@@ -15,6 +12,8 @@ from _endpoint_helpers import (
     merge_env_updates,
     parse_key_value_pairs,
 )
+from huggingface_hub import HfApi
+from huggingface_hub.errors import InferenceEndpointError, InferenceEndpointTimeoutError
 
 FAILED_UPDATE_STATUSES = {"failed", "updateFailed"}
 PARKED_STATUSES = {"paused", "scaledToZero"}
@@ -69,7 +68,10 @@ def main() -> None:
     parser.add_argument("--prefix", help="Endpoint name prefix, used with --count")
     parser.add_argument("--count", type=int, help="Number of endpoints to update, used with --prefix")
     parser.add_argument("--names", nargs="*", default=[], help="Explicit endpoint names")
-    parser.add_argument("--copy-env-from", help="Replace selected endpoint envs with readable env vars from this existing compute endpoint")
+    parser.add_argument(
+        "--copy-env-from",
+        help="Replace selected endpoint envs with readable env vars from this existing compute endpoint",
+    )
     parser.add_argument("--env-file", help="JSON file with env vars to set or overwrite")
     parser.add_argument("--env", action="append", default=[], help="Env var to set in KEY=VALUE form")
     parser.add_argument("--unset-env", action="append", default=[], help="Env var key to remove")
@@ -113,7 +115,9 @@ def main() -> None:
     secret_updates.update(parse_key_value_pairs(args.secret))
 
     if not env_updates and not unset_env and not secret_updates:
-        raise ValueError("Provide at least one --env/--env-file entry, one --unset-env key, or one --secret/--secret-file entry")
+        raise ValueError(
+            "Provide at least one --env/--env-file entry, one --unset-env key, or one --secret/--secret-file entry"
+        )
 
     results = update_many(
         api=api,
@@ -261,11 +265,7 @@ def update_one(
     current_env = current_model_env(endpoint.raw)
     updated_env = merge_env_updates({} if replace_env else current_env, env_updates, unset_env)
 
-    changed = {
-        key: updated_env[key]
-        for key in sorted(updated_env)
-        if current_env.get(key) != updated_env[key]
-    }
+    changed = {key: updated_env[key] for key in sorted(updated_env) if current_env.get(key) != updated_env[key]}
     removed = sorted(key for key in current_env if key not in updated_env)
     secrets_set = sorted(secret_updates.keys())
 

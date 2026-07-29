@@ -92,11 +92,7 @@ class DashboardPreviewSessionManager:
             )
 
         free_slots = sum(int(endpoint["free_slots"]) for endpoint in endpoints)
-        warming_slots = sum(
-            self._last_known_capacities[name]
-            for name, _, waking, _ in endpoint_states
-            if waking
-        )
+        warming_slots = sum(self._last_known_capacities[name] for name, _, waking, _ in endpoint_states if waking)
         effective_free_slots = free_slots + warming_slots
         snapshot = {
             "pending_sessions": pending_sessions,

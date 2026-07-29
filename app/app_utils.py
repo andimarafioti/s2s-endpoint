@@ -11,11 +11,9 @@ class SuppressHealthcheckAccessFilter(logging.Filter):
 
 
 class LifecycleManager(Protocol):
-    async def start(self) -> None:
-        ...
+    async def start(self) -> None: ...
 
-    async def stop(self) -> None:
-        ...
+    async def stop(self) -> None: ...
 
 
 def setup_logging() -> logging.Logger:

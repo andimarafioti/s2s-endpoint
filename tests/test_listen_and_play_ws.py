@@ -2,12 +2,12 @@ import base64
 import unittest
 
 from listen_and_play_ws import (
+    ListenAndPlayWSArguments,
     PlaybackBuffer,
     build_input_audio_append_event,
     build_session_update_event,
     decode_output_audio_delta,
     handle_realtime_event,
-    ListenAndPlayWSArguments,
     parse_realtime_event,
 )
 

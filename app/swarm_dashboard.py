@@ -16,7 +16,6 @@ from app.requester_dashboard_ui import inject_requester_dashboard
 from app.requester_identity import RequesterIdentity
 from app.requester_usage import RequesterUsageService, RequesterUsageThresholds
 
-
 SnapshotProvider = Callable[[], Awaitable[tuple[bool, Optional[str], dict[str, object]]]]
 ROLLING_VIEW_WINDOWS: tuple[tuple[str, int], ...] = (
     ("1h", 60),
@@ -51,8 +50,6 @@ def _parse_window_minutes(window: str | None) -> int:
     if unit == "h":
         return amount * 60
     return amount * 24 * 60
-
-
 
 
 @dataclass
@@ -326,9 +323,7 @@ class SwarmDashboard:
 
     async def data(self, *, window: str | None, resolution: str | None) -> dict[str, object]:
         window_minutes = _parse_window_minutes(window)
-        resolved_resolution = (resolution or "").strip().lower() or (
-            "minute" if window_minutes <= 24 * 60 else "hour"
-        )
+        resolved_resolution = (resolution or "").strip().lower() or ("minute" if window_minutes <= 24 * 60 else "hour")
         if resolved_resolution not in {"minute", "hour"}:
             raise ValueError("resolution must be 'minute' or 'hour'")
 
@@ -350,10 +345,7 @@ class SwarmDashboard:
             "summary": summary,
             "requesters": requesters,
             "series": series,
-            "rolling_windows": [
-                {"label": label, "minutes": minutes}
-                for label, minutes in ROLLING_VIEW_WINDOWS
-            ],
+            "rolling_windows": [{"label": label, "minutes": minutes} for label, minutes in ROLLING_VIEW_WINDOWS],
             "rolling_series": rolling_series,
             "retention_minutes": self.retention_minutes,
             "history_restore": self.history_restore_status(),
@@ -393,9 +385,7 @@ class SwarmDashboard:
         end_bucket = _bucket_start_epoch_s(now, 1)
         start_bucket = end_bucket - (window_minutes - 1) * 60
         minute_map = {
-            bucket.bucket_start_s: bucket
-            for bucket in minute_buckets
-            if bucket.bucket_start_s >= start_bucket
+            bucket.bucket_start_s: bucket for bucket in minute_buckets if bucket.bucket_start_s >= start_bucket
         }
 
         if resolution == "minute":
@@ -503,7 +493,6 @@ class SwarmDashboard:
         except asyncio.CancelledError:
             raise
 
-
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()
         min_bucket = _bucket_start_epoch_s(now, 1) - (window_minutes - 1) * 60
@@ -532,7 +521,6 @@ class SwarmDashboard:
             current_hour_s += 3600
 
         return points
-
 
 
 def _dashboard_html(*, history_persisted: bool = False) -> str:

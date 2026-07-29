@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 import argparse
-from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
 import secrets
 import sys
 import time
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-
-from huggingface_hub import HfApi, get_token
-from huggingface_hub.errors import HfHubHTTPError, InferenceEndpointError, InferenceEndpointTimeoutError
 
 from _endpoint_helpers import (
     DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
@@ -22,7 +19,8 @@ from _endpoint_helpers import (
     current_custom_image,
     current_model_env,
 )
-
+from huggingface_hub import HfApi, get_token
+from huggingface_hub.errors import HfHubHTTPError, InferenceEndpointError, InferenceEndpointTimeoutError
 
 DEFAULT_LOAD_BALANCER_NAME = "reachy-s2s-lb"
 DEFAULT_COMPUTE_INDEX_START = 1
@@ -124,9 +122,7 @@ def main() -> None:
     if args.compute_drain and not args.wait:
         raise ValueError("--compute-drain cannot be combined with --no-wait")
     if args.compute_drain and not args.dry_run and not args.load_balancer_admin_token:
-        raise ValueError(
-            "--compute-drain requires --load-balancer-admin-token or LB_ADMIN_AUTH_TOKEN"
-        )
+        raise ValueError("--compute-drain requires --load-balancer-admin-token or LB_ADMIN_AUTH_TOKEN")
 
     api = HfApi(token=args.token or None)
     results: dict[str, object] = {}
@@ -329,8 +325,7 @@ def discover_sequential_compute_names(
                 raise
             if index == DEFAULT_COMPUTE_INDEX_START:
                 raise ValueError(
-                    f"Could not discover compute endpoints with prefix {prefix!r}. "
-                    f"Expected to find {name!r} first."
+                    f"Could not discover compute endpoints with prefix {prefix!r}. Expected to find {name!r} first."
                 ) from exc
             break
         names.append(name)
@@ -429,9 +424,7 @@ def update_many(
             for future in as_completed(futures):
                 index, name = futures[future]
                 result = future.result()
-                log_progress(
-                    f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
-                )
+                log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
                 results[index - 1] = result
         except BaseException:
             for pending_future in futures:
@@ -520,9 +513,7 @@ def update_many_draining(
             for future in as_completed(futures):
                 index, name = futures[future]
                 result = future.result()
-                log_progress(
-                    f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
-                )
+                log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
                 results[index - 1] = result
         except BaseException:
             for pending_future in futures:
@@ -558,9 +549,7 @@ def update_many_sequential(
             wait_refresh_every_s=wait_refresh_every_s,
             dry_run=dry_run,
         )
-        log_progress(
-            f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
-        )
+        log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
         results.append(result)
     return results
 
@@ -598,9 +587,7 @@ def update_many_draining_sequential(
             drain_refresh_every_s=drain_refresh_every_s,
             request_timeout_s=request_timeout_s,
         )
-        log_progress(
-            f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}"
-        )
+        log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
         results.append(result)
     return results
 
@@ -644,10 +631,7 @@ def update_one(
         "skipped": False,
     }
 
-    if (
-        current_image["url"] == image_url
-        and current_image["health_route"] == updated_image["health_route"]
-    ):
+    if current_image["url"] == image_url and current_image["health_route"] == updated_image["health_route"]:
         result["skipped"] = True
         result["status_after"] = str(endpoint.status)
         return result
@@ -672,10 +656,7 @@ def update_one(
             custom_image=updated_image,
         )
     except Exception as exc:
-        if (
-            on_update_submission_rejected is not None
-            and is_definitive_hf_update_rejection(exc)
-        ):
+        if on_update_submission_rejected is not None and is_definitive_hf_update_rejection(exc):
             on_update_submission_rejected()
         raise
     if on_update_submitted is not None:
@@ -814,9 +795,7 @@ def update_one_draining(
         final_drain_snapshot = pre_update_snapshot or drain_snapshot
         result["drain"] = {
             "load_balancer_url": load_balancer_url,
-            "active_sessions_before_update": int(
-                final_drain_snapshot.get("active_sessions", 0) or 0
-            ),
+            "active_sessions_before_update": int(final_drain_snapshot.get("active_sessions", 0) or 0),
             "draining_before_update": bool(final_drain_snapshot.get("draining", False)),
         }
         return result
@@ -927,15 +906,9 @@ def wait_for_compute_endpoint_free(
             return endpoint
 
         if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"Timed out waiting for compute endpoint {name} to become free "
-                f"({detail})."
-            )
+            raise TimeoutError(f"Timed out waiting for compute endpoint {name} to become free ({detail}).")
 
-        log_progress(
-            f"{name} is not yet safe to update ({detail}); "
-            f"waiting {refresh_every_s}s before checking again"
-        )
+        log_progress(f"{name} is not yet safe to update ({detail}); waiting {refresh_every_s}s before checking again")
         time.sleep(refresh_every_s)
 
 
@@ -958,25 +931,19 @@ def acquire_compute_endpoint_drain(
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
                 raise TimeoutError(
-                    f"Timed out acquiring drain for compute endpoint {name}; "
-                    f"last load-balancer conflict: {detail}"
+                    f"Timed out acquiring drain for compute endpoint {name}; last load-balancer conflict: {detail}"
                 ) from exc
 
             delay_s = min(float(refresh_every_s), remaining_s)
             log_progress(
-                f"{name} drain acquisition is temporarily blocked ({detail}); "
-                f"waiting {delay_s:g}s before trying again"
+                f"{name} drain acquisition is temporarily blocked ({detail}); waiting {delay_s:g}s before trying again"
             )
             time.sleep(delay_s)
 
 
 def is_waitable_drain_acquisition_conflict(exc: HTTPError) -> bool:
     detail = getattr(exc, "load_balancer_detail", None)
-    return (
-        exc.code == 409
-        and isinstance(detail, str)
-        and "active control-plane transition:" in detail
-    )
+    return exc.code == 409 and isinstance(detail, str) and "active control-plane transition:" in detail
 
 
 def compute_endpoint_ready_for_update(
@@ -1002,46 +969,33 @@ def compute_endpoint_ready_for_update(
     )
     for field in boolean_fields:
         if type(endpoint.get(field)) is not bool:
-            raise ValueError(
-                f"Compute endpoint {name} status snapshot field {field!r} "
-                "must be a present boolean"
-            )
+            raise ValueError(f"Compute endpoint {name} status snapshot field {field!r} must be a present boolean")
 
     active_sessions_value = endpoint.get("active_sessions")
     if type(active_sessions_value) is not int or active_sessions_value < 0:
         raise ValueError(
-            f"Compute endpoint {name} status snapshot field 'active_sessions' "
-            "must be a present non-negative integer"
+            f"Compute endpoint {name} status snapshot field 'active_sessions' must be a present non-negative integer"
         )
 
     draining = endpoint["draining"]
     if draining is not True:
         raise RuntimeError(
-            f"Compute endpoint {name} is no longer draining; "
-            "the load balancer may have restarted. Refusing to update."
+            f"Compute endpoint {name} is no longer draining; the load balancer may have restarted. Refusing to update."
         )
 
     drain_lease_remaining_value = endpoint.get("drain_lease_remaining_s")
-    if (
-        type(drain_lease_remaining_value) not in (int, float)
-        or drain_lease_remaining_value <= 0
-    ):
+    if type(drain_lease_remaining_value) not in (int, float) or drain_lease_remaining_value <= 0:
         raise ValueError(
-            f"Compute endpoint {name} status snapshot field "
-            "'drain_lease_remaining_s' must be a present positive number"
+            f"Compute endpoint {name} status snapshot field 'drain_lease_remaining_s' must be a present positive number"
         )
 
     drain_lease_owner = endpoint.get("drain_lease_owner")
     if not isinstance(drain_lease_owner, str) or not drain_lease_owner:
         raise ValueError(
-            f"Compute endpoint {name} status snapshot field 'drain_lease_owner' "
-            "must be a present non-empty string"
+            f"Compute endpoint {name} status snapshot field 'drain_lease_owner' must be a present non-empty string"
         )
     if drain_lease_owner != expected_lease_owner:
-        raise RuntimeError(
-            f"Compute endpoint {name} drain lease is owned by another rollout; "
-            "refusing to update"
-        )
+        raise RuntimeError(f"Compute endpoint {name} drain lease is owned by another rollout; refusing to update")
 
     running = endpoint["running"]
     require_usage_sync = endpoint["require_usage_sync"]
@@ -1060,8 +1014,7 @@ def compute_endpoint_ready_for_update(
     if status in PARKED_STATUSES:
         if running is not False:
             raise ValueError(
-                f"Compute endpoint {name} status snapshot is inconsistent: "
-                f"status is {status!r} but running is true"
+                f"Compute endpoint {name} status snapshot is inconsistent: status is {status!r} but running is true"
             )
         if active_sessions != 0:
             return (
@@ -1179,11 +1132,7 @@ def retry_transient_load_balancer_request(
 
 def is_transient_load_balancer_error(exc: Exception) -> bool:
     if isinstance(exc, HTTPError):
-        if (
-            exc.code == 503
-            and getattr(exc, "load_balancer_detail", None)
-            in PERMANENT_LOAD_BALANCER_503_DETAILS
-        ):
+        if exc.code == 503 and getattr(exc, "load_balancer_detail", None) in PERMANENT_LOAD_BALANCER_503_DETAILS:
             return False
         return exc.code in TRANSIENT_LOAD_BALANCER_HTTP_STATUSES
     return isinstance(exc, (URLError, TimeoutError))

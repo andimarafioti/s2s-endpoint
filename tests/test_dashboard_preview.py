@@ -1,5 +1,5 @@
-import json
 import importlib
+import json
 import sys
 import unittest
 from types import SimpleNamespace
@@ -83,10 +83,7 @@ class DashboardPreviewSessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         _, _, snapshot = await manager.healthcheck()
 
-        endpoints = {
-            endpoint["name"]: endpoint
-            for endpoint in snapshot["router"]["endpoints"]
-        }
+        endpoints = {endpoint["name"]: endpoint for endpoint in snapshot["router"]["endpoints"]}
         self.assertEqual(endpoints["preview-compute-01"]["max_sessions"], 1)
         self.assertEqual(endpoints["preview-compute-02"]["max_sessions"], 3)
         self.assertEqual(endpoints["preview-compute-03"]["max_sessions"], 4)
@@ -259,17 +256,21 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
             endpoint_router = ConflictingRouter()
 
             async def healthcheck(self):
-                return True, None, {
-                    "router": {
-                        "endpoints": [
-                            {
-                                "name": "reachy-s2s-01",
-                                "status": "running",
-                                "draining": False,
-                            }
-                        ]
-                    }
-                }
+                return (
+                    True,
+                    None,
+                    {
+                        "router": {
+                            "endpoints": [
+                                {
+                                    "name": "reachy-s2s-01",
+                                    "status": "running",
+                                    "draining": False,
+                                }
+                            ]
+                        }
+                    },
+                )
 
         module.session_manager = ConflictingSessionManager()
         client = TestClient(module.app)
@@ -318,18 +319,22 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
                 self.endpoint_router = RecordingRouter()
 
             async def healthcheck(self):
-                return True, None, {
-                    "router": {
-                        "endpoints": [
-                            {
-                                "name": "reachy-s2s-01",
-                                "status": "running",
-                                "draining": self.endpoint_router.draining,
-                                "drain_lease_remaining_s": self.endpoint_router.lease_ttl_s,
-                            }
-                        ]
-                    }
-                }
+                return (
+                    True,
+                    None,
+                    {
+                        "router": {
+                            "endpoints": [
+                                {
+                                    "name": "reachy-s2s-01",
+                                    "status": "running",
+                                    "draining": self.endpoint_router.draining,
+                                    "drain_lease_remaining_s": self.endpoint_router.lease_ttl_s,
+                                }
+                            ]
+                        }
+                    },
+                )
 
         session_manager = RecordingSessionManager()
         module.session_manager = session_manager
@@ -816,9 +821,7 @@ class FakeSessionManager:
             "state": "connected" if event == "connected" else "released",
             "release_reason": "client_disconnected" if event == "disconnected" else None,
             "conversation_counted": event == "disconnected" and was_connected,
-            "conversation_duration_s": (
-                6.0 if event == "disconnected" and was_connected else None
-            ),
+            "conversation_duration_s": (6.0 if event == "disconnected" and was_connected else None),
         }
 
 

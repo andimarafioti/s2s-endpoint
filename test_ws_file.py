@@ -1,8 +1,8 @@
 import asyncio
 import sys
 import wave
-import websockets
 
+import websockets
 
 CHUNK_SAMPLES = 512  # matches the old endpoint handler chunking pattern nicely
 SAMPLE_RATE = 16000
@@ -17,9 +17,7 @@ def read_wav_pcm16_mono(path: str) -> bytes:
         ch = wf.getnchannels()
 
         if sr != SAMPLE_RATE or sw != SAMPLE_WIDTH or ch != CHANNELS:
-            raise ValueError(
-                f"Expected WAV mono/16kHz/16-bit PCM, got sr={sr}, sw={sw}, ch={ch}"
-            )
+            raise ValueError(f"Expected WAV mono/16kHz/16-bit PCM, got sr={sr}, sw={sw}, ch={ch}")
 
         return wf.readframes(wf.getnframes())
 
