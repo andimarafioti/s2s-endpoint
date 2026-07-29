@@ -154,7 +154,7 @@ class RequesterIdentityResolver:
                 client_kind=client_kind,
             )
 
-        token_is_validatable = _is_validatable_hf_token(token)
+        token_is_validatable = is_validatable_hf_token(token)
         identity = RequesterIdentity(
             actor_id=actor_id,
             label=f"HF token •{fingerprint[:8]}",
@@ -359,7 +359,7 @@ def _header(request: object, name: str) -> Optional[str]:
     return str(value) if value is not None else None
 
 
-def _is_validatable_hf_token(token: str) -> bool:
+def is_validatable_hf_token(token: str) -> bool:
     return (
         0 < len(token) <= 4096
         and token.isprintable()

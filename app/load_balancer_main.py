@@ -23,8 +23,10 @@ from app.requester_identity import (
     RequesterIdentity,
     RequesterIdentityResolver,
     bearer_token,
+    is_validatable_hf_token,
 )
 from app.session_request_metadata import reported_hardware_id
+from app.session_tokens import llm_token_fingerprint
 from app.session_requester_tracker import SessionRequesterTracker
 from app.swarm_dashboard import SwarmDashboard
 
@@ -347,6 +349,25 @@ async def _refresh_requester_identity(requester: RequesterIdentity) -> Requester
     return latest
 
 
+def _llm_proxy_fingerprint(request: Request) -> str | None:
+    """Fingerprint of the HF token a session is being created with, or None.
+
+    Embedded as a claim in the signed session token; the compute replica
+    opens its LLM proxy paths to api keys matching it while the session's
+    websocket is connected. Sessions created without a plausible HF token
+    get no claim, so their holders get 401 from the LLM paths for the
+    session's lifetime. The raw token is never stored or forwarded.
+    """
+    if not SESSION_SHARED_SECRET:
+        return None
+    token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
+    if token is None:
+        token = bearer_token(request.headers.get("authorization"))
+    if token is None or not is_validatable_hf_token(token):
+        return None
+    return llm_token_fingerprint(SESSION_SHARED_SECRET, token)
+
+
 @app.get("/")
 async def root():
     return {
@@ -404,7 +425,10 @@ async def create_session(request: Request):
     requester = await _refresh_requester_identity(requester)
     allocation_started_at = monotonic()
     try:
-        allocation = await session_manager.allocate(public_base_url(request))
+        allocation = await session_manager.allocate(
+            public_base_url(request),
+            llm_fingerprint=_llm_proxy_fingerprint(request),
+        )
     except QueueAtCapacityError as exc:
         requester = await _refresh_requester_identity(requester)
         allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())

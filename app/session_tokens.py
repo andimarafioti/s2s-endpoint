@@ -14,6 +14,7 @@ def create_session_token(
     websocket_url: str,
     callback_url: str,
     ttl_s: float,
+    llm_fingerprint: str | None = None,
 ) -> str:
     expires_at = int(time.time() + ttl_s)
     payload = {
@@ -22,6 +23,12 @@ def create_session_token(
         "sid": session_id,
         "ws_url": websocket_url,
     }
+    if llm_fingerprint:
+        # Fingerprint of the HF token the session was created with (see
+        # llm_token_fingerprint). The compute replica opens its LLM proxy
+        # paths to api keys matching this claim while the session's
+        # websocket is connected. Never a raw token.
+        payload["llmf"] = llm_fingerprint
     encoded_payload = _b64encode(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     )
@@ -48,6 +55,18 @@ def verify_session_token(token: str, secret: str) -> dict[str, Any]:
         raise ValueError("session token expired")
 
     return payload
+
+
+def llm_token_fingerprint(secret: str, token: str) -> str:
+    """HMAC fingerprint of an HF token, keyed by the session shared secret.
+
+    Computed by the load balancer when a session is created and again by the
+    compute replica on every LLM proxy request, so the two can agree that an
+    api key matches the token a session was created with, without either
+    side storing or forwarding the raw token.
+    """
+    digest = hmac.new(secret.encode("utf-8"), f"llm-proxy\0{token}".encode("utf-8"), hashlib.sha256)
+    return digest.hexdigest()
 
 
 def attach_session_token(websocket_url: str, session_token: str) -> str:

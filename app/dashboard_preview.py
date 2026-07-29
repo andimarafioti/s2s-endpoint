@@ -22,7 +22,9 @@ class DashboardPreviewSessionManager:
     async def stop(self) -> None:
         self._running = False
 
-    async def allocate(self, lb_base_url: str) -> dict[str, object]:
+    async def allocate(
+        self, lb_base_url: str, *, llm_fingerprint: Optional[str] = None
+    ) -> dict[str, object]:
         raise RuntimeError("session allocation is disabled in dashboard preview mode")
 
     async def handle_event(self, session_id: str, session_token: str, event: str) -> dict[str, object]:

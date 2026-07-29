@@ -26,10 +26,16 @@ class QueueTicket:
     """A held place in the waiting line. Not a session — only a promise of a spot.
 
     ``last_seen`` is refreshed on every poll; a ticket that goes un-polled past
-    the TTL is how we detect a caller who abandoned the queue."""
+    the TTL is how we detect a caller who abandoned the queue.
+
+    ``llm_fingerprint`` is computed from the caller's HF token when the ticket
+    is created (queue polls are bodyless GETs that carry no Authorization), so
+    the eventual grant can embed the LLM proxy claim without a raw token ever
+    being stored."""
     ticket_id: str
     created_at: float
     last_seen: float
+    llm_fingerprint: Optional[str] = None
 
 
 @dataclass
@@ -124,7 +130,9 @@ class DirectSessionManager:
 
         await self.endpoint_router.stop()
 
-    async def allocate(self, lb_base_url: str) -> dict[str, object]:
+    async def allocate(
+        self, lb_base_url: str, *, llm_fingerprint: Optional[str] = None
+    ) -> dict[str, object]:
         """Grant a session if a slot is free *and* nobody is waiting; otherwise
         mint a queue ticket. Never blocks — the waiting lives in the queue, polled
         via ``poll``. Raises ``QueueAtCapacityError`` when the queue itself is full.
@@ -157,7 +165,12 @@ class DirectSessionManager:
                         )
                     now = monotonic()
                     ticket_id = secrets.token_urlsafe(18)
-                    self._queue[ticket_id] = QueueTicket(ticket_id, created_at=now, last_seen=now)
+                    self._queue[ticket_id] = QueueTicket(
+                        ticket_id,
+                        created_at=now,
+                        last_seen=now,
+                        llm_fingerprint=llm_fingerprint,
+                    )
                     position = len(self._queue)  # just appended, so it's last in line
 
             if lease is None:
@@ -177,6 +190,7 @@ class DirectSessionManager:
             allocated_at=granted_at,
             allocation_wait_ms=elapsed_ms(started_at, granted_at),
             waited_for_capacity=lease.waited_for_capacity,
+            llm_fingerprint=llm_fingerprint,
         )
 
     async def poll(self, ticket_id: str, lb_base_url: str) -> dict[str, object]:
@@ -216,6 +230,7 @@ class DirectSessionManager:
                     allocated_at=now,
                     allocation_wait_ms=elapsed_ms(created_at, now),
                     waited_for_capacity=True,
+                    llm_fingerprint=ticket.llm_fingerprint,
                 )
             except BaseException:
                 # The ticket was popped optimistically under the lock; a grant
@@ -259,6 +274,7 @@ class DirectSessionManager:
         allocated_at: float,
         allocation_wait_ms: int = 0,
         waited_for_capacity: bool = False,
+        llm_fingerprint: Optional[str] = None,
     ) -> dict[str, object]:
         session_id = secrets.token_urlsafe(18)
         callback_url = _build_callback_url(lb_base_url, session_id)
@@ -268,6 +284,7 @@ class DirectSessionManager:
             websocket_url=lease.ws_url,
             callback_url=callback_url,
             ttl_s=self.session_token_ttl_s,
+            llm_fingerprint=llm_fingerprint,
         )
         pending_expires_at = allocated_at + self.pending_timeout_s
 

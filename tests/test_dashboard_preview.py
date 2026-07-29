@@ -633,7 +633,7 @@ class FakeSessionManager:
         self.cancelled_session_ids = []
         self.allocation_wait_ms = allocation_wait_ms
 
-    async def allocate(self, lb_base_url):
+    async def allocate(self, lb_base_url, *, llm_fingerprint=None):
         # Mirrors DirectSessionManager._grant_from_lease, which stamps
         # "state": "granted" on every grant it returns.
         return {
@@ -664,7 +664,7 @@ class FakeFailingSessionManager:
     def __init__(self, exc=None):
         self.exc = exc or RuntimeError("no capacity")
 
-    async def allocate(self, lb_base_url):
+    async def allocate(self, lb_base_url, *, llm_fingerprint=None):
         raise self.exc
 
 
