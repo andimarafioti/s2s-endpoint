@@ -323,7 +323,14 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_merges_verified_tokens_for_same_account_across_persisted_buckets(self):
         clock = FakeClock(2 * 3600)
-        service = self._service(clock)
+        service = self._service(
+            clock,
+            thresholds=RequesterUsageThresholds(
+                high_volume_requests=3,
+                burst_requests_per_minute=2,
+                many_networks=2,
+            ),
+        )
         first_token = RequesterIdentity(
             actor_id="token:first",
             label="@Andito · token •first",
@@ -362,7 +369,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         await service.record_session_outcome(second_token, duration_s=30, short_session=False)
 
         persisted = [SwarmHistoryBucket.from_dict(bucket.to_dict()) for bucket in await service.history.snapshot()]
-        restored = self._service(clock)
+        restored = self._service(clock, thresholds=service.thresholds)
         await restored.history._merge_persisted_history_buckets(persisted)
 
         payload = await restored.data(window_minutes=60)
@@ -393,6 +400,11 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
             row["client_kinds"],
             {"browser": 2, "automation:httpx": 1},
         )
+        self.assertEqual(row["risk"], "high")
+        self.assertIn("high volume: 3 requests", row["signals"])
+        self.assertIn("burst: 2/min", row["signals"])
+        self.assertIn("many networks: 2", row["signals"])
+        self.assertIn("rate limited: 1 request", row["signals"])
         self.assertEqual(summary["unique_requesters_window"], 1)
         self.assertEqual(summary["authenticated_users_window"], 1)
         self.assertEqual(summary["tokens_window"], 2)
