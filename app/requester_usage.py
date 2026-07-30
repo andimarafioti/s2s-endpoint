@@ -109,6 +109,14 @@ def aggregate_requester_usage(
         kind = str(actor["kind"])
         verification = str(actor["verification"])
         account_name = actor.get("account_name")
+        token_actor_ids = actor["token_actor_ids"] if isinstance(actor["token_actor_ids"], set) else set()
+        requesting_token_actor_ids = (
+            actor["requesting_token_actor_ids"] if isinstance(actor["requesting_token_actor_ids"], set) else set()
+        )
+        token_fingerprints = sorted(
+            str(value)
+            for value in (actor["token_fingerprints"] if isinstance(actor["token_fingerprints"], set) else set())
+        )
         network_ids = actor["network_ids"] if isinstance(actor["network_ids"], set) else set()
         reported_robot_ids = actor["reported_robot_ids"] if isinstance(actor["reported_robot_ids"], set) else set()
         client_kinds = dict(actor["client_kinds"]) if isinstance(actor["client_kinds"], dict) else {}
@@ -118,9 +126,10 @@ def aggregate_requester_usage(
         traffic_share_pct = round((requests / total_session_requests) * 100.0, 1) if total_session_requests else 0.0
 
         if requests > 0 and actor_id != "overflow":
-            if actor_id.startswith("token:"):
-                token_actors.add(actor_id)
+            token_actors.update(str(value) for value in requesting_token_actor_ids)
             authenticated_accounts.update(str(value) for value in actor["authenticated_account_names"])
+            if kind == "authenticated" and verification == "verified":
+                authenticated_accounts.add(_normalized_account_name(account_name) or actor_id)
             authenticated_requests += int(actor["authenticated_requests"])
             anonymous_requests += int(actor["anonymous_requests"])
             invalid_token_requests += int(actor["invalid_token_requests"])
@@ -143,6 +152,8 @@ def aggregate_requester_usage(
                 connected_authenticated_accounts.update(
                     str(value) for value in actor["connected_authenticated_account_names"]
                 )
+                if kind == "authenticated" and verification == "verified":
+                    connected_authenticated_accounts.add(_normalized_account_name(account_name) or actor_id)
 
         peak_requests_per_minute = int(actor["peak_requests_per_minute"])
         signals = _usage_signals(
@@ -170,7 +181,9 @@ def aggregate_requester_usage(
                 "label": actor["label"],
                 "kind": kind,
                 "verification": verification,
-                "fingerprint": actor["fingerprint"],
+                "fingerprint": token_fingerprints[0] if token_fingerprints else actor["fingerprint"],
+                "token_count": len(token_actor_ids),
+                "token_fingerprints": token_fingerprints,
                 "account_name": account_name,
                 "requests": requests,
                 "successes": successes,
@@ -222,7 +235,7 @@ def aggregate_requester_usage(
         "connected_requesters_window": len(connected_requesters),
         "authenticated_users_connected_window": len(connected_authenticated_accounts),
         "attributed_connections_window": attributed_connections,
-        "token_requests_window": sum(int(row["requests"]) for row in rows if str(row["actor_id"]).startswith("token:")),
+        "token_requests_window": sum(int(actor["token_requests"]) for actor in actors.values()),
         "authenticated_requests_window": authenticated_requests,
         "anonymous_requests_window": anonymous_requests,
         "invalid_token_requests_window": invalid_token_requests,
@@ -245,11 +258,15 @@ def aggregate_requester_usage(
 
 
 def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str, object]]:
+    ordered_buckets = sorted(buckets, key=lambda item: item.bucket_start_s)
+    identities = _collect_actor_identities(ordered_buckets)
     actors: dict[str, dict[str, object]] = {}
-    for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
-        for actor_id, record in bucket.requester_usage.items():
-            actor = actors.setdefault(actor_id, _new_actor(actor_id, record, bucket.bucket_start_s))
-            _merge_requester_identity(actor, record)
+    for bucket in ordered_buckets:
+        bucket_requests: dict[str, int] = {}
+        for source_actor_id, record in bucket.requester_usage.items():
+            actor_id, identity = _aggregation_identity(source_actor_id, identities[source_actor_id])
+            actor = actors.setdefault(actor_id, _new_actor(actor_id, identity, bucket.bucket_start_s))
+            _merge_requester_identity(actor, identity)
 
             requests = max(int(record.get("requests", 0)), 0)
             actor["requests"] = int(actor["requests"]) + requests
@@ -277,19 +294,37 @@ def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str
                 float(actor["connected_duration_max_s"]),
                 max(float(record.get("connected_duration_max_s", 0.0)), 0.0),
             )
-            actor["peak_requests_per_minute"] = max(int(actor["peak_requests_per_minute"]), requests)
+            bucket_requests[actor_id] = bucket_requests.get(actor_id, 0) + requests
             actor["first_seen_s"] = min(int(actor["first_seen_s"]), bucket.bucket_start_s)
             actor["last_seen_s"] = max(int(actor["last_seen_s"]), bucket.bucket_start_s)
+
+            if source_actor_id.startswith("token:"):
+                token_actor_ids = actor["token_actor_ids"]
+                if isinstance(token_actor_ids, set):
+                    token_actor_ids.add(source_actor_id)
+                requesting_token_actor_ids = actor["requesting_token_actor_ids"]
+                if requests > 0 and isinstance(requesting_token_actor_ids, set):
+                    requesting_token_actor_ids.add(source_actor_id)
+                token_fingerprints = actor["token_fingerprints"]
+                if isinstance(token_fingerprints, set):
+                    fingerprint = str(
+                        record.get("fingerprint")
+                        or identities[source_actor_id].get("fingerprint")
+                        or source_actor_id.removeprefix("token:")
+                    )
+                    if fingerprint:
+                        token_fingerprints.add(fingerprint)
+                actor["token_requests"] = int(actor["token_requests"]) + requests
 
             kind = str(record.get("kind") or "unknown")
             if kind == "authenticated":
                 actor["authenticated_requests"] = int(actor["authenticated_requests"]) + requests
                 account_names = actor["authenticated_account_names"]
                 if isinstance(account_names, set) and requests > 0:
-                    account_names.add(str(record.get("account_name") or actor_id))
+                    account_names.add(_normalized_account_name(record.get("account_name")) or actor_id)
                 connected_account_names = actor["connected_authenticated_account_names"]
                 if isinstance(connected_account_names, set) and connections > 0:
-                    connected_account_names.add(str(record.get("account_name") or actor_id))
+                    connected_account_names.add(_normalized_account_name(record.get("account_name")) or actor_id)
             elif kind == "anonymous":
                 actor["anonymous_requests"] = int(actor["anonymous_requests"]) + requests
             elif kind == "invalid_token":
@@ -315,7 +350,56 @@ def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str
             if isinstance(client_kinds, dict):
                 for kind, count in dict(record.get("client_kinds") or {}).items():
                     client_kinds[str(kind)] = int(client_kinds.get(str(kind), 0)) + max(int(count), 0)
+        for actor_id, requests in bucket_requests.items():
+            actor = actors[actor_id]
+            actor["peak_requests_per_minute"] = max(int(actor["peak_requests_per_minute"]), requests)
     return actors
+
+
+def _collect_actor_identities(
+    buckets: Iterable[SwarmHistoryBucket],
+) -> dict[str, dict[str, object]]:
+    identities: dict[str, dict[str, object]] = {}
+    for bucket in buckets:
+        for actor_id, record in bucket.requester_usage.items():
+            identity = identities.setdefault(
+                actor_id,
+                {
+                    "label": str(record.get("label") or "Unknown requester"),
+                    "kind": str(record.get("kind") or "unknown"),
+                    "verification": str(record.get("verification") or "unknown"),
+                    "fingerprint": str(record.get("fingerprint") or ""),
+                    "account_name": record.get("account_name"),
+                },
+            )
+            _merge_requester_identity(identity, record)
+    return identities
+
+
+def _aggregation_identity(
+    actor_id: str,
+    identity: dict[str, object],
+) -> tuple[str, dict[str, object]]:
+    account_name = _normalized_account_name(identity.get("account_name"))
+    if (
+        str(identity.get("kind") or "") == "authenticated"
+        and str(identity.get("verification") or "") == "verified"
+        and account_name is not None
+    ):
+        return (
+            f"hf:{account_name}",
+            {
+                **identity,
+                "label": f"@{account_name}",
+                "account_name": account_name,
+            },
+        )
+    return actor_id, identity
+
+
+def _normalized_account_name(value: object) -> str | None:
+    account_name = str(value).strip().casefold() if value is not None else ""
+    return account_name or None
 
 
 def _new_actor(actor_id: str, record: dict[str, object], bucket_start_s: int) -> dict[str, object]:
@@ -339,6 +423,10 @@ def _new_actor(actor_id: str, record: dict[str, object], bucket_start_s: int) ->
         "authenticated_requests": 0,
         "anonymous_requests": 0,
         "invalid_token_requests": 0,
+        "token_actor_ids": set(),
+        "requesting_token_actor_ids": set(),
+        "token_fingerprints": set(),
+        "token_requests": 0,
         "authenticated_account_names": set(),
         "connected_authenticated_account_names": set(),
         "peak_requests_per_minute": 0,
