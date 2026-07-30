@@ -181,12 +181,18 @@ class RequesterIdentityResolver:
         Bounded by ``timeout_s``: on timeout the validation keeps running in
         the background and the identity is returned in whatever state it is
         in, so verification-gated decisions fail closed instead of blocking.
+        A validation task that itself fails (e.g. a broken identity-update
+        handler) is treated the same way: the caller gets the latest known
+        identity, never the task's exception — a broken side channel must
+        deny the claim, not the whole request that awaited it.
         """
         task = self._validation_tasks.get(identity.actor_id)
         if task is not None:
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout_s)
-            except asyncio.TimeoutError:
+            except asyncio.CancelledError:
+                raise
+            except Exception:
                 pass
         return self.latest_identity(identity)
 

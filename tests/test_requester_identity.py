@@ -288,6 +288,29 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_wait_for_verification_swallows_a_failing_validation_task(self):
+        # A broken side channel (e.g. the identity-update handler raising)
+        # must deny the verification-gated decision, never blow up the
+        # request that awaited it.
+        async def broken_update(identity):
+            raise RuntimeError("dashboard hiccup")
+
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=lambda token: {"name": "reachy-user"},
+            on_identity_update=broken_update,
+        )
+        pending = resolver.identify(FakeRequest(headers={"authorization": "Bearer hf_token_value"}))
+        self.assertEqual(pending.verification, "pending")
+
+        resolved = await resolver.wait_for_verification(pending, timeout_s=1)
+
+        # The verdict itself was cached before the handler blew up, and the
+        # await surfaced no exception.
+        self.assertEqual(resolved.verification, "verified")
+
+        await resolver.stop()
+
 
 class BearerTokenTests(unittest.TestCase):
     def test_extracts_case_insensitive_bearer_token(self):
