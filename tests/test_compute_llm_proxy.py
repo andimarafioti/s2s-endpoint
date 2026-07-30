@@ -171,7 +171,8 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         self.stub = StubInternalPipeline()
         self.addCleanup(self.stub.close)
 
-    def gated_client(self, *, rate_limit_rpm: int = 100) -> TestClient:
+    def gated_client(self, *, rate_limit_rpm: int = 100, enable_llm_proxy: bool = True) -> TestClient:
+        self.enterContext(patch.object(compute_main, "ENABLE_LLM_PROXY", enable_llm_proxy))
         self.enterContext(patch.object(compute_main, "SESSION_SHARED_SECRET", SECRET))
         self.enterContext(patch.object(compute_main, "INTERNAL_HTTP_BASE_URL", self.stub.base_url))
         self.enterContext(
@@ -297,6 +298,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
             (0.4, b"data: second\n\n"),
         ]
         self.stub.responder = lambda path: (200, "text/event-stream", frames)
+        self.enterContext(patch.object(compute_main, "ENABLE_LLM_PROXY", True))
         self.enterContext(patch.object(compute_main, "INTERNAL_HTTP_BASE_URL", self.stub.base_url))
         self.enterContext(patch.object(compute_main, "SESSION_SHARED_SECRET", SECRET))
         registry = compute_main._ConnectedFingerprintRegistry()
@@ -398,6 +400,7 @@ class HfTokenGateTests(ComputeLlmProxyTestCase):
         self.assertEqual(self.post_until_401(client).status_code, 401)
 
     def test_missing_shared_secret_fails_closed(self) -> None:
+        self.enterContext(patch.object(compute_main, "ENABLE_LLM_PROXY", True))
         self.enterContext(patch.object(compute_main, "SESSION_SHARED_SECRET", ""))
         self.enterContext(patch.object(compute_main, "INTERNAL_HTTP_BASE_URL", self.stub.base_url))
         client = TestClient(compute_main.app)
@@ -406,6 +409,28 @@ class HfTokenGateTests(ComputeLlmProxyTestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(self.stub.requests, [])
+
+
+class DisabledLlmProxyTests(ComputeLlmProxyTestCase):
+    def test_disabled_proxy_answers_404_even_for_a_connected_session(self) -> None:
+        # An authorized key changes nothing: the check runs before auth, so a
+        # disabled replica never touches the gate or the pipeline.
+        client = self.gated_client(enable_llm_proxy=False)
+        with _connected_session(client):
+            for path in ("/v1/chat/completions", "/v1/responses"):
+                response = client.post(path, content=b"{}", headers=_auth())
+                self.assertEqual(response.status_code, 404)
+
+        self.assertEqual(self.stub.requests, [])
+
+    def test_disabled_proxy_404_is_indistinguishable_from_an_unknown_route(self) -> None:
+        client = self.gated_client(enable_llm_proxy=False)
+
+        disabled = client.post("/v1/chat/completions", content=b"{}", headers=_auth())
+        unknown = client.post("/v1/does-not-exist", content=b"{}", headers=_auth())
+
+        self.assertEqual(disabled.status_code, unknown.status_code)
+        self.assertEqual(disabled.json(), unknown.json())
 
 
 class FingerprintRateLimitTests(ComputeLlmProxyTestCase):

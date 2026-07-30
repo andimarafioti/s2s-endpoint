@@ -39,6 +39,16 @@ class BuildS2SCommandTests(unittest.TestCase):
         self.assertNotIn("--responses_api_base_url", command)
         self.assertNotIn("--responses_api_reasoning_effort", command)
 
+    def test_llm_proxy_is_off_by_default(self):
+        command = self.build_command_with_env({})
+
+        self.assertNotIn("--enable_llm_proxy", command)
+
+    def test_enable_llm_proxy_env_passes_the_flag(self):
+        command = self.build_command_with_env({"ENABLE_LLM_PROXY": "1"})
+
+        self.assertIn("--enable_llm_proxy", command)
+
 
 class WaitForInternalRealtimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_wait_for_internal_server_uses_usage_endpoint(self):

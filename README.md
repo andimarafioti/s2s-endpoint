@@ -300,6 +300,10 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S`: interval between repeated
   long-running drain warnings (defaults to 300 seconds)
 - `SESSION_SHARED_SECRET`: shared secret used to mint and validate direct session tokens
+- `LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S`: how long session creation waits for a
+  first-seen HF token's `whoami` validation before minting the session's LLM
+  proxy claim (defaults to 5 seconds). On timeout the session is created
+  normally but without LLM proxy access.
 - `SESSION_PENDING_TIMEOUT_S`: how long an unused reservation stays alive
 - `SESSION_TOKEN_TTL_S`: lifetime of the signed session token
 - `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations
@@ -390,6 +394,13 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `NUM_PIPELINES`: concurrent realtime sessions the `speech-to-speech` process handles internally (default `1`)
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
+- `ENABLE_LLM_PROXY`: master switch for the LLM proxy feature — passes
+  `--enable_llm_proxy` to the internal `speech-to-speech` server and opens the
+  replica's `/v1/chat/completions` and `/v1/responses` proxy paths. Defaults
+  off, in which case those paths answer 404, indistinguishable from a build
+  without the feature.
+- `LLM_PROXY_REQUESTS_PER_MINUTE`: per-token sliding-window rate limit on the
+  replica's LLM proxy paths (defaults to 20; zero or negative closes the paths)
 
 The compute endpoint serves `/v1/realtime`. The LB now serves `POST /session` for allocation.
 

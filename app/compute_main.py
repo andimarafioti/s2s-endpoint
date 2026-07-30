@@ -39,6 +39,11 @@ TTS = os.getenv("TTS", "qwen3").strip()
 # General module flags
 ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().lower() in {"1", "true", "yes"}
 LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
+# Master switch for the LLM proxy feature: passes --enable_llm_proxy to the
+# internal speech-to-speech server (which defaults the routes off) and opens
+# the replica's /v1/chat/completions and /v1/responses proxy paths. When off,
+# those paths answer 404, indistinguishable from a build without the feature.
+ENABLE_LLM_PROXY = os.getenv("ENABLE_LLM_PROXY", "0").strip().lower() in {"1", "true", "yes"}
 
 # Responses API / HF router
 MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
@@ -118,6 +123,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     ]
 
     _add_str_flag(cmd, NUM_PIPELINES, "--num_pipelines")
+    _add_bool_flag(cmd, ENABLE_LLM_PROXY, "--enable_llm_proxy")
     _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
     _add_str_flag(cmd, MODEL_NAME, "--model_name")
@@ -363,9 +369,15 @@ async def _proxy_llm_request(request: Request, path: str) -> Response:
     the upstream provider key). An authorized request is forwarded with its
     method and body unchanged — the api key is a user's HF token, so it is
     dropped here and never travels further — and the answer streams back
-    frame by frame, whatever its status. The replica only synthesizes 401
-    and 429 (denials) and 502 (internal pipeline unreachable).
+    frame by frame, whatever its status. The replica only synthesizes 404
+    (feature disabled), 401 and 429 (denials), and 502 (internal pipeline
+    unreachable).
     """
+    if not ENABLE_LLM_PROXY:
+        # Checked before auth: a disabled replica reveals nothing, answering
+        # exactly like an app where these routes were never registered.
+        raise HTTPException(status_code=404)
+
     denial = _llm_proxy_denial(request)
     if denial is not None:
         return denial
