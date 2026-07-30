@@ -173,6 +173,23 @@ class RequesterIdentityResolver:
             client_kind=identity.client_kind,
         )
 
+    async def wait_for_verification(self, identity: RequesterIdentity, *, timeout_s: float) -> RequesterIdentity:
+        """Wait for the identity's in-flight token validation, then return the latest identity.
+
+        For callers that need a trusted verification verdict now rather than
+        eventually (e.g. minting an LLM proxy claim at session creation).
+        Bounded by ``timeout_s``: on timeout the validation keeps running in
+        the background and the identity is returned in whatever state it is
+        in, so verification-gated decisions fail closed instead of blocking.
+        """
+        task = self._validation_tasks.get(identity.actor_id)
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout_s)
+            except asyncio.TimeoutError:
+                pass
+        return self.latest_identity(identity)
+
     async def stop(self) -> None:
         tasks = list(self._validation_tasks.values())
         for task in tasks:

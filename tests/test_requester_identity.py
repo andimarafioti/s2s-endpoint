@@ -243,6 +243,51 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_wait_for_verification_returns_the_resolved_identity(self):
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=lambda token: {"name": "reachy-user"},
+        )
+        pending = resolver.identify(FakeRequest(headers={"authorization": "Bearer hf_token_value"}))
+        self.assertEqual(pending.verification, "pending")
+
+        resolved = await resolver.wait_for_verification(pending, timeout_s=1)
+
+        self.assertEqual(resolved.verification, "verified")
+        self.assertEqual(resolved.account_name, "reachy-user")
+
+        await resolver.stop()
+
+    async def test_wait_for_verification_timeout_leaves_the_validation_running(self):
+        validation_started = asyncio.Event()
+        release_validation = asyncio.Event()
+        resolver = RequesterIdentityResolver(hash_secret="stable-secret")
+
+        async def blocked_validation(token, identity):
+            validation_started.set()
+            await release_validation.wait()
+            resolver._cache_identity(
+                # Minimal stand-in for the resolved identity the real
+                # validation would cache once whoami answers.
+                identity.with_request_context(network_id=None, reported_robot_id=None, client_kind="unknown"),
+                ttl_s=60,
+            )
+
+        resolver._validate_token = blocked_validation
+        pending = resolver.identify(FakeRequest(headers={"authorization": "Bearer hf_token_value"}))
+        await validation_started.wait()
+
+        timed_out = await resolver.wait_for_verification(pending, timeout_s=0.01)
+
+        self.assertEqual(timed_out.verification, "pending")
+        self.assertIn(pending.actor_id, resolver._validation_tasks)
+
+        release_validation.set()
+        await resolver.wait_for_verification(pending, timeout_s=1)
+        self.assertNotIn(pending.actor_id, resolver._validation_tasks)
+
+        await resolver.stop()
+
 
 class BearerTokenTests(unittest.TestCase):
     def test_extracts_case_insensitive_bearer_token(self):

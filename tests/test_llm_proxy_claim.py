@@ -2,19 +2,23 @@
 
 At session creation the load balancer fingerprints the caller's HF token
 (HMAC keyed by the session shared secret) and embeds it in the signed session
-token, for the compute replica to gate its LLM proxy paths against. Sessions
-created without a plausible HF token carry no claim. Raw tokens are never
-stored anywhere.
+token, for the compute replica to gate its LLM proxy paths against. The claim
+is minted only for tokens HF whoami has verified: sessions created without a
+token, or with one that cannot be verified, carry no claim. Raw tokens are
+never stored anywhere.
 """
 
+import asyncio
 import importlib
 import sys
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointLease
+from app.requester_identity import RequesterIdentity, RequesterIdentityResolver
 from app.session_tokens import (
     create_session_token,
     llm_token_fingerprint,
@@ -156,7 +160,13 @@ class GrantEmbedsClaimTests(unittest.IsolatedAsyncioTestCase):
             await manager.stop()
 
 
-class LoadBalancerFingerprintTests(unittest.TestCase):
+class _FakeHubError(RuntimeError):
+    def __init__(self, status_code: int):
+        super().__init__(f"HF status {status_code}")
+        self.response = SimpleNamespace(status_code=status_code)
+
+
+class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         sys.modules.pop("app.load_balancer_main", None)
 
@@ -177,36 +187,122 @@ class LoadBalancerFingerprintTests(unittest.TestCase):
     def _request(self, headers: dict[str, str]) -> SimpleNamespace:
         return SimpleNamespace(headers=headers)
 
-    def test_hf_shaped_bearer_yields_the_shared_fingerprint(self):
+    def _requester(self, verification: str) -> RequesterIdentity:
+        return RequesterIdentity(
+            actor_id="token:abcdef0123456789",
+            label="HF token •abcdef01",
+            kind="authenticated" if verification == "verified" else "unverified_token",
+            verification=verification,
+            fingerprint="abcdef0123456789",
+        )
+
+    async def test_verified_hf_bearer_yields_the_shared_fingerprint(self):
         module = self._import_load_balancer()
-        result = module._llm_proxy_fingerprint(self._request({"authorization": f"Bearer {HF_TOKEN}"}))
+        result = await module._llm_proxy_fingerprint(
+            self._request({"authorization": f"Bearer {HF_TOKEN}"}),
+            self._requester("verified"),
+        )
         self.assertEqual(result, llm_token_fingerprint(SECRET, HF_TOKEN))
 
-    def test_reachy_authorization_header_wins_over_authorization(self):
+    async def test_reachy_authorization_header_wins_over_authorization(self):
         module = self._import_load_balancer()
-        result = module._llm_proxy_fingerprint(
+        result = await module._llm_proxy_fingerprint(
             self._request(
                 {
                     "x-reachy-mini-authorization": f"Bearer {HF_TOKEN}",
                     "authorization": "Bearer hf_other",
                 }
-            )
+            ),
+            self._requester("verified"),
         )
         self.assertEqual(result, llm_token_fingerprint(SECRET, HF_TOKEN))
 
-    def test_missing_bearer_yields_no_claim(self):
+    async def test_missing_bearer_yields_no_claim(self):
         module = self._import_load_balancer()
-        self.assertIsNone(module._llm_proxy_fingerprint(self._request({})))
+        self.assertIsNone(await module._llm_proxy_fingerprint(self._request({}), self._requester("verified")))
 
-    def test_unvalidatable_token_yields_no_claim(self):
+    async def test_unvalidatable_token_yields_no_claim(self):
         module = self._import_load_balancer()
         self.assertIsNone(
-            module._llm_proxy_fingerprint(self._request({"authorization": "Bearer bad token with spaces"}))
+            await module._llm_proxy_fingerprint(
+                self._request({"authorization": "Bearer bad token with spaces"}),
+                self._requester("verified"),
+            )
         )
 
-    def test_no_shared_secret_yields_no_claim(self):
+    async def test_no_shared_secret_yields_no_claim(self):
         module = self._import_load_balancer(secret="")
-        self.assertIsNone(module._llm_proxy_fingerprint(self._request({"authorization": f"Bearer {HF_TOKEN}"})))
+        self.assertIsNone(
+            await module._llm_proxy_fingerprint(
+                self._request({"authorization": f"Bearer {HF_TOKEN}"}),
+                self._requester("verified"),
+            )
+        )
+
+    async def test_unverified_token_yields_no_claim(self):
+        # The gate the whole claim rests on: an invented-but-plausible bearer
+        # must not mint a claim, or it would get LLM proxy access and, when
+        # rotated, a fresh per-fingerprint rate-limit identity each time.
+        module = self._import_load_balancer()
+        for verification in ("pending", "invalid", "unavailable", "unrecognized"):
+            with self.subTest(verification=verification):
+                self.assertIsNone(
+                    await module._llm_proxy_fingerprint(
+                        self._request({"authorization": f"Bearer {HF_TOKEN}"}),
+                        self._requester(verification),
+                    )
+                )
+
+    async def test_pending_token_waits_for_whoami_and_mints_the_claim(self):
+        # First-seen tokens are still validating when the session is created;
+        # the claim decision waits for the verdict instead of failing closed.
+        module = self._import_load_balancer()
+        resolver = RequesterIdentityResolver(hash_secret=SECRET, whoami_fn=lambda token: {"name": "reachy-user"})
+        request = self._request({"authorization": f"Bearer {HF_TOKEN}"})
+        try:
+            with patch.object(module, "requester_identity_resolver", resolver):
+                pending = resolver.identify(request)
+                self.assertEqual(pending.verification, "pending")
+                result = await module._llm_proxy_fingerprint(request, pending)
+            self.assertEqual(result, llm_token_fingerprint(SECRET, HF_TOKEN))
+        finally:
+            await resolver.stop()
+
+    async def test_pending_token_rejected_by_whoami_yields_no_claim(self):
+        def whoami(token):
+            raise _FakeHubError(401)
+
+        module = self._import_load_balancer()
+        resolver = RequesterIdentityResolver(hash_secret=SECRET, whoami_fn=whoami)
+        request = self._request({"authorization": f"Bearer {HF_TOKEN}"})
+        try:
+            with patch.object(module, "requester_identity_resolver", resolver):
+                pending = resolver.identify(request)
+                self.assertIsNone(await module._llm_proxy_fingerprint(request, pending))
+        finally:
+            await resolver.stop()
+
+    async def test_slow_whoami_fails_closed_without_blocking_session_creation(self):
+        def whoami(token):
+            time.sleep(0.5)
+            return {"name": "reachy-user"}
+
+        module = self._import_load_balancer()
+        resolver = RequesterIdentityResolver(hash_secret=SECRET, whoami_fn=whoami)
+        request = self._request({"authorization": f"Bearer {HF_TOKEN}"})
+        try:
+            with (
+                patch.object(module, "requester_identity_resolver", resolver),
+                patch.object(module, "LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S", 0.05),
+            ):
+                pending = resolver.identify(request)
+                started = asyncio.get_running_loop().time()
+                result = await module._llm_proxy_fingerprint(request, pending)
+                waited_s = asyncio.get_running_loop().time() - started
+            self.assertIsNone(result)
+            self.assertLess(waited_s, 0.4)
+        finally:
+            await resolver.stop()
 
 
 if __name__ == "__main__":
