@@ -428,6 +428,19 @@ async def _proxy_llm_request(request: Request, path: str) -> Response:
         await upstream.aclose()
         await client.aclose()
 
+    async def _stream_and_cleanup():
+        # The generator owns the cleanup: Starlette only runs background
+        # tasks after a successful send, so a pipeline crash mid-stream
+        # would otherwise leak the httpx client and its connection. The
+        # finally runs on normal exhaustion, on upstream errors, and on
+        # client-disconnect cancellation alike; the BackgroundTask below is
+        # a harmless second aclose on the successful path.
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await _cleanup()
+
     # The content type rides along as a raw header: a media_type would get a
     # charset appended by Starlette, and the answer must stay verbatim.
     response_headers = {}
@@ -436,7 +449,7 @@ async def _proxy_llm_request(request: Request, path: str) -> Response:
         response_headers["content-type"] = upstream_content_type
 
     return StreamingResponse(
-        upstream.aiter_raw(),
+        _stream_and_cleanup(),
         status_code=upstream.status_code,
         headers=response_headers,
         background=BackgroundTask(_cleanup),
