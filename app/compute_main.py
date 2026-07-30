@@ -2,16 +2,21 @@ import asyncio
 import json
 import os
 import subprocess
+import time
 import urllib.error
 import urllib.request
+from collections import defaultdict, deque
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket
-from fastapi.responses import JSONResponse
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from app.app_utils import build_lifespan, setup_logging
+from app.requester_identity import bearer_token
 from app.session_router import SessionRouter
-from app.session_tokens import verify_session_token, websocket_host_matches
+from app.session_tokens import llm_token_fingerprint, verify_session_token, websocket_host_matches
 from app.ws_proxy import proxy_websocket
 
 logger = setup_logging()
@@ -34,6 +39,11 @@ TTS = os.getenv("TTS", "qwen3").strip()
 # General module flags
 ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().lower() in {"1", "true", "yes"}
 LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
+# Master switch for the LLM proxy feature: passes --enable_llm_proxy to the
+# internal speech-to-speech server (which defaults the routes off) and opens
+# the replica's /v1/chat/completions and /v1/responses proxy paths. When off,
+# those paths answer 404, indistinguishable from a build without the feature.
+ENABLE_LLM_PROXY = os.getenv("ENABLE_LLM_PROXY", "0").strip().lower() in {"1", "true", "yes"}
 
 # Responses API / HF router
 MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
@@ -64,6 +74,14 @@ INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_USAGE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_USAGE_PATH}"
 INTERNAL_POOL_PATH = "/v1/pool"
 INTERNAL_POOL_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_POOL_PATH}"
+INTERNAL_HTTP_BASE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}"
+LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
+# Sliding-window ceiling per HF token fingerprint. Zero or negative closes
+# the LLM proxy paths entirely (every request answers 429).
+LLM_PROXY_REQUESTS_PER_MINUTE = int(os.getenv("LLM_PROXY_REQUESTS_PER_MINUTE", "20"))
+
+if not SESSION_SHARED_SECRET:
+    logger.warning("SESSION_SHARED_SECRET is unset; the LLM proxy paths fail closed and answer 401 for every request")
 
 
 def _add_bool_flag(cmd: list[str], enabled: bool, flag: str) -> None:
@@ -105,6 +123,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     ]
 
     _add_str_flag(cmd, NUM_PIPELINES, "--num_pipelines")
+    _add_bool_flag(cmd, ENABLE_LLM_PROXY, "--enable_llm_proxy")
     _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
     _add_str_flag(cmd, MODEL_NAME, "--model_name")
@@ -212,7 +231,229 @@ async def pool():
         data = await asyncio.to_thread(_http_get_json, INTERNAL_POOL_URL)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return JSONResponse(data)
+    return JSONResponse(_redact_pool_payload(data))
+
+
+def _redact_pool_payload(data: dict[str, object]) -> dict[str, object]:
+    """Strip session ids from the pool payload before it leaves the replica.
+
+    Session ids are private to their holders; nothing on this surface needs
+    them, so they don't leave the replica. The load balancer's stuck-unit
+    recovery reads only unit states and durations, which pass through
+    untouched.
+    """
+    units = data.get("units")
+    if isinstance(units, list):
+        for unit in units:
+            if isinstance(unit, dict):
+                unit.pop("session_id", None)
+    return data
+
+
+class _ConnectedFingerprintRegistry:
+    """HF token fingerprints with a currently connected realtime session.
+
+    Membership is the LLM proxy access window: a fingerprint is added when
+    its session's websocket connects and removed when it disconnects.
+    Refcounted because one token may hold several concurrent sessions.
+    Single event loop, so no locking.
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {}
+
+    def add(self, fingerprint: str) -> None:
+        self._counts[fingerprint] = self._counts.get(fingerprint, 0) + 1
+
+    def remove(self, fingerprint: str) -> None:
+        count = self._counts.get(fingerprint, 0) - 1
+        if count > 0:
+            self._counts[fingerprint] = count
+        else:
+            self._counts.pop(fingerprint, None)
+
+    def __contains__(self, fingerprint: str) -> bool:
+        return fingerprint in self._counts
+
+
+def _now() -> float:
+    # Module-level so tests can monkeypatch the clock instead of sleeping.
+    return time.monotonic()
+
+
+_RATE_LIMIT_WINDOW_S = 60.0
+
+
+class _FingerprintRateLimiter:
+    """In-memory sliding window per HF token fingerprint, replica-local."""
+
+    def __init__(self, limit_rpm: int):
+        self.limit_rpm = limit_rpm
+        self._hits: dict[str, deque[float]] = defaultdict(deque)
+
+    def allow(self, fingerprint: str) -> bool:
+        if self.limit_rpm <= 0:
+            return False
+        now = _now()
+        hits = self._hits[fingerprint]
+        while hits and now - hits[0] >= _RATE_LIMIT_WINDOW_S:
+            hits.popleft()
+        if len(hits) >= self.limit_rpm:
+            return False
+        hits.append(now)
+        # Sessions are short-lived relative to the process; drop fingerprints
+        # whose newest hit fell out of the window so dead ones don't
+        # accumulate forever (their deques are only ever popped above, on
+        # their own requests).
+        if len(self._hits) > 1024:
+            self._hits = defaultdict(
+                deque,
+                {k: v for k, v in self._hits.items() if v and now - v[-1] < _RATE_LIMIT_WINDOW_S},
+            )
+        return True
+
+
+_connected_llm_fingerprints = _ConnectedFingerprintRegistry()
+_llm_rate_limiter = _FingerprintRateLimiter(LLM_PROXY_REQUESTS_PER_MINUTE)
+
+
+def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
+    return JSONResponse({"error": {"message": message, "type": error_type}}, status_code=status_code)
+
+
+def _llm_proxy_denial(request: Request) -> Optional[JSONResponse]:
+    """Access check for the LLM proxy paths; None means forward the request.
+
+    The api key must be the HF token the session was created with, checked by
+    fingerprint against the sessions whose websocket is currently connected.
+    Without a shared secret the replica cannot verify anything, so the paths
+    fail closed. Checked once at request start: an answer already streaming
+    when its session disconnects finishes undisturbed.
+
+    The key is read from ``x-reachy-mini-authorization`` first, then from
+    ``Authorization`` — the same precedence the load balancer uses at session
+    creation, and for the same reason: the HF Inference Endpoints ingress
+    consumes the standard Authorization header before it reaches the app, so
+    SDK clients on that infrastructure carry the token in the custom header
+    (``default_headers``) alongside their normal ``api_key``.
+    """
+    if SESSION_SHARED_SECRET:
+        token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
+        if token is None:
+            token = bearer_token(request.headers.get("authorization"))
+        if token is not None:
+            fingerprint = llm_token_fingerprint(SESSION_SHARED_SECRET, token)
+            if fingerprint in _connected_llm_fingerprints:
+                if _llm_rate_limiter.allow(fingerprint):
+                    return None
+                return _llm_proxy_error(
+                    429,
+                    f"Rate limit exceeded: {_llm_rate_limiter.limit_rpm} requests per minute "
+                    "per user. Back off and retry.",
+                    "rate_limit_exceeded",
+                )
+    return _llm_proxy_error(
+        401,
+        "Invalid API key: pass the HF token this session was created with, "
+        "while the session's realtime websocket is connected.",
+        "invalid_api_key",
+    )
+
+
+@app.post("/v1/chat/completions")
+async def llm_proxy_chat_completions(request: Request) -> Response:
+    return await _proxy_llm_request(request, "/v1/chat/completions")
+
+
+@app.post("/v1/responses")
+async def llm_proxy_responses(request: Request) -> Response:
+    return await _proxy_llm_request(request, "/v1/responses")
+
+
+async def _proxy_llm_request(request: Request, path: str) -> Response:
+    """Pass an authorized LLM proxy request through to the internal pipeline.
+
+    The replica owns access control (see ``_llm_proxy_denial``); the pipeline
+    behind it owns the OpenAI contract itself (501 reasons, upstream errors,
+    the upstream provider key). An authorized request is forwarded with its
+    method and body unchanged — the api key is a user's HF token, so it is
+    dropped here and never travels further — and the answer streams back
+    frame by frame, whatever its status. The replica only synthesizes 404
+    (feature disabled), 401 and 429 (denials), and 502 (internal pipeline
+    unreachable).
+    """
+    if not ENABLE_LLM_PROXY:
+        # Checked before auth: a disabled replica reveals nothing, answering
+        # exactly like an app where these routes were never registered.
+        raise HTTPException(status_code=404)
+
+    denial = _llm_proxy_denial(request)
+    if denial is not None:
+        return denial
+
+    headers = {}
+    content_type = request.headers.get("content-type")
+    if content_type:
+        headers["content-type"] = content_type
+
+    # Connects are loopback so a short timeout is safe; reads get none at
+    # all, because a proxied generation can legitimately take minutes.
+    timeout = httpx.Timeout(None, connect=LLM_PROXY_CONNECT_TIMEOUT_S)
+    client = httpx.AsyncClient(timeout=timeout)
+    try:
+        upstream_request = client.build_request(
+            "POST",
+            INTERNAL_HTTP_BASE_URL + path,
+            content=await request.body(),
+            headers=headers,
+        )
+        upstream = await client.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        logger.warning("LLM proxy: internal pipeline unreachable: %s", exc)
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "The internal pipeline is unreachable.",
+                    "type": "upstream_unreachable",
+                }
+            },
+            status_code=502,
+        )
+    except Exception:
+        await client.aclose()
+        raise
+
+    async def _cleanup() -> None:
+        await upstream.aclose()
+        await client.aclose()
+
+    async def _stream_and_cleanup():
+        # The generator owns the cleanup: Starlette only runs background
+        # tasks after a successful send, so a pipeline crash mid-stream
+        # would otherwise leak the httpx client and its connection. The
+        # finally runs on normal exhaustion, on upstream errors, and on
+        # client-disconnect cancellation alike; the BackgroundTask below is
+        # a harmless second aclose on the successful path.
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await _cleanup()
+
+    # The content type rides along as a raw header: a media_type would get a
+    # charset appended by Starlette, and the answer must stay verbatim.
+    response_headers = {}
+    upstream_content_type = upstream.headers.get("content-type")
+    if upstream_content_type:
+        response_headers["content-type"] = upstream_content_type
+
+    return StreamingResponse(
+        _stream_and_cleanup(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @app.websocket("/v1/realtime")
@@ -222,6 +463,13 @@ async def websocket_proxy(client_ws: WebSocket):
     if SESSION_SHARED_SECRET and session_payload is None:
         await client_ws.close(code=1008, reason="Missing or invalid session token")
         return
+
+    llm_fingerprint: Optional[str] = None
+    if session_payload is not None:
+        claim = session_payload.get("llmf")
+        if isinstance(claim, str) and claim:
+            llm_fingerprint = claim
+    llm_fingerprint_registered = False
 
     async def _notify_connected() -> None:
         # Runs only after a pipeline slot is actually secured. Notifying the
@@ -235,6 +483,12 @@ async def websocket_proxy(client_ws: WebSocket):
             session_payload["session_token"],
             "connected",
         )
+        # The LLM proxy access window opens with the connection; it closes in
+        # the finally below, alongside the disconnected notification.
+        nonlocal llm_fingerprint_registered
+        if llm_fingerprint is not None:
+            _connected_llm_fingerprints.add(llm_fingerprint)
+            llm_fingerprint_registered = True
 
     try:
         await proxy_websocket(
@@ -253,6 +507,8 @@ async def websocket_proxy(client_ws: WebSocket):
         except Exception:
             pass
     finally:
+        if llm_fingerprint_registered and llm_fingerprint is not None:
+            _connected_llm_fingerprints.remove(llm_fingerprint)
         if session_payload is not None:
             # Always tell the LB the session is over. For a normal session this
             # completes the conversation; for a capacity rejection it releases

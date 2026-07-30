@@ -23,6 +23,7 @@ from app.requester_identity import (
     RequesterIdentity,
     RequesterIdentityResolver,
     bearer_token,
+    is_validatable_hf_token,
 )
 from app.requester_rate_limiter import (
     RateLimitDecision,
@@ -31,6 +32,7 @@ from app.requester_rate_limiter import (
 )
 from app.session_request_metadata import reported_hardware_id
 from app.session_requester_tracker import SessionRequesterTracker
+from app.session_tokens import llm_token_fingerprint
 from app.swarm_dashboard import SwarmDashboard
 
 logger = setup_logging()
@@ -64,6 +66,10 @@ HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TO
 LB_ADMIN_AUTH_TOKEN = os.getenv("LB_ADMIN_AUTH_TOKEN", "").strip() or None
 
 SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
+# How long session creation waits for a first-seen HF token's whoami validation
+# before minting the LLM proxy claim. On timeout the claim fails closed: the
+# session is created normally but without LLM proxy access.
+LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S = float(os.getenv("LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S", "5"))
 SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
 SESSION_TOKEN_TTL_S = float(os.getenv("SESSION_TOKEN_TTL_S", "86400"))
 SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
@@ -416,6 +422,7 @@ def _public_session_allocation(allocation: dict[str, object]) -> dict[str, objec
         for key in (
             "session_id",
             "websocket_url",
+            "http_base_url",
             "connect_url",
             "session_token",
             "pending_timeout_s",
@@ -430,6 +437,35 @@ async def _refresh_requester_identity(requester: RequesterIdentity) -> Requester
     if latest != requester:
         await dashboard.update_requester_identity(latest)
     return latest
+
+
+async def _llm_proxy_fingerprint(request: Request, requester: RequesterIdentity) -> str | None:
+    """Fingerprint of the verified HF token a session is being created with, or None.
+
+    Embedded as a claim in the signed session token; the compute replica
+    opens its LLM proxy paths to api keys matching it while the session's
+    websocket is connected. The claim is minted only for tokens HF whoami
+    has actually accepted (requester verification "verified"): any invented
+    bearer value would otherwise get proxy access, and each rotation a fresh
+    per-fingerprint rate-limit identity. A first-seen token's background
+    validation is awaited briefly; sessions whose token cannot be verified
+    in time get no claim, so their holders get 401 from the LLM paths for
+    the session's lifetime. The raw token is never stored or forwarded.
+    """
+    if not SESSION_SHARED_SECRET:
+        return None
+    token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
+    if token is None:
+        token = bearer_token(request.headers.get("authorization"))
+    if token is None or not is_validatable_hf_token(token):
+        return None
+    if requester.verification == "pending":
+        requester = await requester_identity_resolver.wait_for_verification(
+            requester, timeout_s=LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S
+        )
+    if requester.verification != "verified":
+        return None
+    return llm_token_fingerprint(SESSION_SHARED_SECRET, token)
 
 
 @app.get("/")
@@ -504,7 +540,10 @@ async def create_session(request: Request):
         )
     allocation_started_at = monotonic()
     try:
-        allocation = await session_manager.allocate(public_base_url(request))
+        allocation = await session_manager.allocate(
+            public_base_url(request),
+            llm_fingerprint=await _llm_proxy_fingerprint(request, requester),
+        )
     except QueueAtCapacityError as exc:
         requester_rate_limiter.record_allocation_failure(requester)
         requester = await _refresh_requester_identity(requester)

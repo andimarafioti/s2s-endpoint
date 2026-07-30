@@ -147,7 +147,7 @@ class RequesterIdentityResolver:
                 client_kind=client_kind,
             )
 
-        token_is_validatable = _is_validatable_hf_token(token)
+        token_is_validatable = is_validatable_hf_token(token)
         identity = RequesterIdentity(
             actor_id=actor_id,
             label=f"HF token •{fingerprint[:8]}",
@@ -172,6 +172,29 @@ class RequesterIdentityResolver:
             reported_robot_id=identity.reported_robot_id,
             client_kind=identity.client_kind,
         )
+
+    async def wait_for_verification(self, identity: RequesterIdentity, *, timeout_s: float) -> RequesterIdentity:
+        """Wait for the identity's in-flight token validation, then return the latest identity.
+
+        For callers that need a trusted verification verdict now rather than
+        eventually (e.g. minting an LLM proxy claim at session creation).
+        Bounded by ``timeout_s``: on timeout the validation keeps running in
+        the background and the identity is returned in whatever state it is
+        in, so verification-gated decisions fail closed instead of blocking.
+        A validation task that itself fails (e.g. a broken identity-update
+        handler) is treated the same way: the caller gets the latest known
+        identity, never the task's exception — a broken side channel must
+        deny the claim, not the whole request that awaited it.
+        """
+        task = self._validation_tasks.get(identity.actor_id)
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout_s)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        return self.latest_identity(identity)
 
     async def stop(self) -> None:
         tasks = list(self._validation_tasks.values())
@@ -352,7 +375,7 @@ def _header(request: object, name: str) -> Optional[str]:
     return str(value) if value is not None else None
 
 
-def _is_validatable_hf_token(token: str) -> bool:
+def is_validatable_hf_token(token: str) -> bool:
     return 0 < len(token) <= 4096 and token.isprintable() and not any(character.isspace() for character in token)
 
 
