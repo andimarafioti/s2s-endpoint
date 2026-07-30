@@ -329,9 +329,18 @@ def _llm_proxy_denial(request: Request) -> Optional[JSONResponse]:
     Without a shared secret the replica cannot verify anything, so the paths
     fail closed. Checked once at request start: an answer already streaming
     when its session disconnects finishes undisturbed.
+
+    The key is read from ``x-reachy-mini-authorization`` first, then from
+    ``Authorization`` — the same precedence the load balancer uses at session
+    creation, and for the same reason: the HF Inference Endpoints ingress
+    consumes the standard Authorization header before it reaches the app, so
+    SDK clients on that infrastructure carry the token in the custom header
+    (``default_headers``) alongside their normal ``api_key``.
     """
     if SESSION_SHARED_SECRET:
-        token = bearer_token(request.headers.get("authorization"))
+        token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
+        if token is None:
+            token = bearer_token(request.headers.get("authorization"))
         if token is not None:
             fingerprint = llm_token_fingerprint(SESSION_SHARED_SECRET, token)
             if fingerprint in _connected_llm_fingerprints:

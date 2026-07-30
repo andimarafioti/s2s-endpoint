@@ -360,6 +360,39 @@ class HfTokenGateTests(ComputeLlmProxyTestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(self.stub.requests, [])
 
+    def test_api_key_in_reachy_authorization_header_opens_the_gate(self) -> None:
+        """The HF Inference Endpoints ingress consumes the standard
+        Authorization header, so SDK clients on that infrastructure carry the
+        token in x-reachy-mini-authorization instead."""
+        client = self.gated_client()
+        with _connected_session(client):
+            response = self.post_chat(
+                client,
+                headers={
+                    "x-reachy-mini-authorization": f"Bearer {HF_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.stub.requests), 1)
+
+    def test_reachy_authorization_header_wins_over_authorization(self) -> None:
+        # Same precedence as the load balancer at session creation: the custom
+        # header is the one that survives the ingress, so it is the one read.
+        client = self.gated_client()
+        with _connected_session(client):
+            response = self.post_chat(
+                client,
+                headers={
+                    "x-reachy-mini-authorization": f"Bearer {HF_TOKEN}",
+                    "Authorization": "Bearer hf_not_the_sessions_token",
+                    "Content-Type": "application/json",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+
     def test_api_key_without_a_connected_session_is_401(self) -> None:
         client = self.gated_client()
         response = self.post_chat(client)
