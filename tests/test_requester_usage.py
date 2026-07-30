@@ -178,6 +178,45 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["connections"], 1)
         self.assertEqual(record["client_kinds"], {"browser": 1})
 
+    async def test_stale_disconnect_cannot_downgrade_verified_identity(self):
+        clock = FakeClock(2 * 3600)
+        service = self._service(clock)
+        pending = RequesterIdentity(
+            actor_id="token:abc123",
+            label="HF token •abc123",
+            kind="unverified_token",
+            verification="pending",
+            fingerprint="abc123",
+        )
+        verified = RequesterIdentity(
+            actor_id="token:abc123",
+            label="@reachy-user · token •abc123",
+            kind="authenticated",
+            verification="verified",
+            fingerprint="abc123",
+            account_name="reachy-user",
+        )
+
+        await service.record("request", pending)
+        await service.update_identity(verified)
+        await service.record("connected", verified)
+        clock.set(2 * 3600 + 60)
+        await service.record_session_outcome(
+            pending,
+            duration_s=297,
+            short_session=False,
+        )
+
+        payload = await service.data(window_minutes=60)
+        row = payload["leaderboard"][0]
+
+        self.assertEqual(payload["summary"]["authenticated_users_window"], 1)
+        self.assertEqual(payload["summary"]["authenticated_users_connected_window"], 1)
+        self.assertEqual(row["label"], "@reachy-user · token •abc123")
+        self.assertEqual(row["kind"], "authenticated")
+        self.assertEqual(row["verification"], "verified")
+        self.assertEqual(row["account_name"], "reachy-user")
+
     async def test_compacts_oldest_requester_details_at_retention_wide_limit(self):
         clock = FakeClock(2 * 3600)
         service = self._service(clock, max_requester_records=2)
@@ -240,7 +279,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored[0].requester_usage, {})
         self.assertEqual(service.history.persistence_status()["requester_record_count"], 2)
 
-    async def test_counts_each_bucket_using_its_own_token_state(self):
+    async def test_counts_each_bucket_without_downgrading_stronger_identity(self):
         clock = FakeClock(2 * 3600)
         service = self._service(clock)
         verified = RequesterIdentity(
@@ -272,8 +311,9 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["authenticated_requests_window"], 10)
         self.assertEqual(summary["invalid_token_requests_window"], 5)
         self.assertEqual(row["requests"], 15)
-        self.assertEqual(row["kind"], "invalid_token")
-        self.assertEqual(row["verification"], "invalid")
+        self.assertEqual(row["kind"], "authenticated")
+        self.assertEqual(row["verification"], "verified")
+        self.assertEqual(row["account_name"], "reachy-user")
         self.assertEqual(row["invalid_token_requests"], 5)
         self.assertIn("invalid HF token", row["signals"])
 

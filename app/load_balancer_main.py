@@ -253,8 +253,9 @@ async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
             penalize=False,
         )
         if outcome is not None and outcome.connected and outcome.duration_s is not None:
+            requester = await _refresh_requester_identity(outcome.requester)
             await dashboard.record_requester_session_disconnected(
-                outcome.requester,
+                requester,
                 duration_s=outcome.duration_s,
                 short_session=False,
             )
@@ -699,8 +700,9 @@ async def session_event(session_id: str, payload: dict[str, Any]):
             ),
         )
         if outcome is not None and outcome.connected and outcome.duration_s is not None:
+            requester = await _refresh_requester_identity(outcome.requester)
             await dashboard.record_requester_session_disconnected(
-                outcome.requester,
+                requester,
                 duration_s=outcome.duration_s,
                 short_session=outcome.short_session,
             )
