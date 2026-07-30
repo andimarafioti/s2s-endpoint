@@ -115,7 +115,10 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["anonymous_requests_window"], 1)
         self.assertEqual(summary["rate_limited_requests_window"], 1)
         self.assertEqual(summary["unattributed_requests_window"], 0)
-        self.assertEqual(leaderboard[0]["label"], "@reachy-user · token •abc123")
+        self.assertEqual(leaderboard[0]["actor_id"], "hf:reachy-user")
+        self.assertEqual(leaderboard[0]["label"], "@reachy-user")
+        self.assertEqual(leaderboard[0]["token_count"], 1)
+        self.assertEqual(leaderboard[0]["token_fingerprints"], ["abc123"])
         self.assertEqual(leaderboard[0]["requests"], 3)
         self.assertEqual(leaderboard[0]["network_count"], 2)
         self.assertEqual(leaderboard[0]["reported_robot_count"], 2)
@@ -212,7 +215,8 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["summary"]["authenticated_users_window"], 1)
         self.assertEqual(payload["summary"]["authenticated_users_connected_window"], 1)
-        self.assertEqual(row["label"], "@reachy-user · token •abc123")
+        self.assertEqual(row["actor_id"], "hf:reachy-user")
+        self.assertEqual(row["label"], "@reachy-user")
         self.assertEqual(row["kind"], "authenticated")
         self.assertEqual(row["verification"], "verified")
         self.assertEqual(row["account_name"], "reachy-user")
@@ -245,7 +249,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["unattributed_requests"], 1)
         self.assertEqual(
             {row["actor_id"] for row in payload["leaderboard"]},
-            {"token:1", "token:2"},
+            {"hf:user-1", "hf:user-2"},
         )
         self.assertEqual(service.history.persistence_status()["requester_record_count"], 2)
         self.assertEqual(service.history.persistence_status()["max_requester_records"], 2)
@@ -317,6 +321,165 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["invalid_token_requests"], 5)
         self.assertIn("invalid HF token", row["signals"])
 
+    async def test_merges_verified_tokens_for_same_account_across_persisted_buckets(self):
+        clock = FakeClock(2 * 3600)
+        service = self._service(
+            clock,
+            thresholds=RequesterUsageThresholds(
+                high_volume_requests=3,
+                burst_requests_per_minute=2,
+                many_networks=2,
+            ),
+        )
+        first_token = RequesterIdentity(
+            actor_id="token:first",
+            label="@Andito · token •first",
+            kind="authenticated",
+            verification="verified",
+            fingerprint="first",
+            account_name="Andito",
+            network_id="net:first",
+            reported_robot_id="robot:first",
+            client_kind="browser",
+        )
+        second_token = RequesterIdentity(
+            actor_id="token:second",
+            label="@andito · token •second",
+            kind="authenticated",
+            verification="verified",
+            fingerprint="second",
+            account_name="andito",
+            network_id="net:second",
+            reported_robot_id="robot:second",
+            client_kind="automation:httpx",
+        )
+
+        await service.record("request", first_token)
+        await service.record("success", first_token)
+        await service.record("failure", first_token)
+        await service.record("connected", first_token)
+        await service.record_session_outcome(first_token, duration_s=10, short_session=True)
+        clock.set(2 * 3600 + 60)
+        await service.record("request", first_token)
+        await service.record("request", second_token)
+        await service.record("success", second_token)
+        await service.record("rate_limited", second_token)
+        await service.record("abandoned", second_token)
+        await service.record("connected", second_token)
+        await service.record_session_outcome(second_token, duration_s=30, short_session=False)
+
+        persisted = [SwarmHistoryBucket.from_dict(bucket.to_dict()) for bucket in await service.history.snapshot()]
+        restored = self._service(clock, thresholds=service.thresholds)
+        await restored.history._merge_persisted_history_buckets(persisted)
+
+        payload = await restored.data(window_minutes=60)
+        summary = payload["summary"]
+        self.assertEqual(len(payload["leaderboard"]), 1)
+        row = payload["leaderboard"][0]
+
+        self.assertEqual(row["actor_id"], "hf:andito")
+        self.assertEqual(row["label"], "@andito")
+        self.assertEqual(row["account_name"], "andito")
+        self.assertEqual(row["token_count"], 2)
+        self.assertEqual(row["token_fingerprints"], ["first", "second"])
+        self.assertEqual(row["requests"], 3)
+        self.assertEqual(row["successes"], 2)
+        self.assertEqual(row["failures"], 1)
+        self.assertEqual(row["rate_limited"], 1)
+        self.assertEqual(row["abandoned"], 1)
+        self.assertEqual(row["connections"], 2)
+        self.assertEqual(row["completed_sessions"], 2)
+        self.assertEqual(row["short_sessions"], 1)
+        self.assertEqual(row["avg_connected_duration_s"], 20.0)
+        self.assertEqual(row["max_connected_duration_s"], 30.0)
+        self.assertEqual(row["peak_requests_per_minute"], 2)
+        self.assertEqual(row["network_count"], 2)
+        self.assertEqual(row["reported_robot_count"], 2)
+        self.assertEqual(row["reported_robot_requests"], 3)
+        self.assertEqual(
+            row["client_kinds"],
+            {"browser": 2, "automation:httpx": 1},
+        )
+        self.assertEqual(row["risk"], "high")
+        self.assertIn("high volume: 3 requests", row["signals"])
+        self.assertIn("burst: 2/min", row["signals"])
+        self.assertIn("many networks: 2", row["signals"])
+        self.assertIn("rate limited: 1 request", row["signals"])
+        self.assertEqual(summary["unique_requesters_window"], 1)
+        self.assertEqual(summary["authenticated_users_window"], 1)
+        self.assertEqual(summary["tokens_window"], 2)
+        self.assertEqual(summary["token_requests_window"], 3)
+        self.assertEqual(summary["allocated_requesters_window"], 1)
+        self.assertEqual(summary["connected_requesters_window"], 1)
+        self.assertEqual(summary["authenticated_users_connected_window"], 1)
+
+    async def test_keeps_verified_accounts_separate(self):
+        service = self._service(FakeClock(2 * 3600))
+        for fingerprint, account_name in (
+            ("first", "andito"),
+            ("second", "reachy-user"),
+        ):
+            await service.record(
+                "request",
+                RequesterIdentity(
+                    actor_id=f"token:{fingerprint}",
+                    label=f"@{account_name} · token •{fingerprint}",
+                    kind="authenticated",
+                    verification="verified",
+                    fingerprint=fingerprint,
+                    account_name=account_name,
+                ),
+            )
+
+        payload = await service.data(window_minutes=60)
+
+        self.assertEqual(
+            {row["actor_id"] for row in payload["leaderboard"]},
+            {"hf:andito", "hf:reachy-user"},
+        )
+        self.assertEqual(payload["summary"]["authenticated_users_window"], 2)
+        self.assertEqual(payload["summary"]["tokens_window"], 2)
+
+    async def test_keeps_unverified_and_invalid_tokens_as_distinct_actors(self):
+        service = self._service(FakeClock(2 * 3600))
+        requesters = (
+            RequesterIdentity(
+                actor_id="token:verified",
+                label="@andito · token •verified",
+                kind="authenticated",
+                verification="verified",
+                fingerprint="verified",
+                account_name="andito",
+            ),
+            RequesterIdentity(
+                actor_id="token:pending",
+                label="HF token •pending",
+                kind="unverified_token",
+                verification="pending",
+                fingerprint="pending",
+            ),
+            RequesterIdentity(
+                actor_id="token:invalid",
+                label="Invalid token •invalid",
+                kind="invalid_token",
+                verification="invalid",
+                fingerprint="invalid",
+            ),
+        )
+        for requester in requesters:
+            await service.record("request", requester)
+
+        payload = await service.data(window_minutes=60)
+
+        self.assertEqual(
+            {row["actor_id"] for row in payload["leaderboard"]},
+            {"hf:andito", "token:pending", "token:invalid"},
+        )
+        self.assertTrue(all(row["token_count"] == 1 for row in payload["leaderboard"]))
+        self.assertEqual(payload["summary"]["authenticated_users_window"], 1)
+        self.assertEqual(payload["summary"]["tokens_window"], 3)
+        self.assertEqual(payload["summary"]["invalid_token_requests_window"], 1)
+
 
 class RequesterDashboardUiTests(unittest.TestCase):
     def test_injects_requester_dashboard_fragments(self):
@@ -338,4 +501,6 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertIn("Connected requesters", html)
         self.assertIn("first compute websocket callback", html)
         self.assertIn("not hardware attestation", html)
+        self.assertIn("function requesterCredentialSummary(row)", html)
+        self.assertIn("row.token_fingerprints", html)
         self.assertIn("function renderRequesterUsage(requesters, summary)", html)
