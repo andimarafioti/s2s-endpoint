@@ -1,4 +1,8 @@
+import asyncio
+import subprocess
+import threading
 import unittest
+from unittest.mock import patch
 
 from app.session_router import SessionRouter
 
@@ -9,6 +13,25 @@ async def fake_wait_for_ready(host, port, process, timeout_s):
 
 def fake_build_command(host, port):
     return ["echo", f"{host}:{port}"]
+
+
+class FakeProcess:
+    def __init__(self):
+        self.pid = 123
+        self.returncode = None
+        self._exited = threading.Event()
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if not self._exited.wait(timeout):
+            raise subprocess.TimeoutExpired("fake-process", timeout)
+        return self.returncode
+
+    def exit(self, returncode):
+        self.returncode = returncode
+        self._exited.set()
 
 
 class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
@@ -106,6 +129,39 @@ class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
         healthy, detail, _ = await self.router.healthcheck()
         self.assertFalse(healthy)
         self.assertEqual(detail, "process crashed")
+
+    async def test_process_exit_revokes_readiness_and_capacity(self):
+        process = FakeProcess()
+        process.exit(134)
+        self.router._process = process
+        self.router._ready = True
+
+        healthy, detail, snapshot = await self.router.healthcheck()
+
+        self.assertFalse(healthy)
+        self.assertEqual(detail, "speech-to-speech process exited with code 134")
+        self.assertFalse(snapshot["ready"])
+        self.assertEqual(snapshot["free_sessions"], 0)
+        self.assertEqual(snapshot["errors"], ["speech-to-speech process exited with code 134"])
+
+        with self.assertRaisesRegex(RuntimeError, "process exited with code 134"):
+            await self.router.acquire()
+
+    async def test_watchdog_records_unexpected_process_exit(self):
+        process = FakeProcess()
+        with patch("app.session_router.subprocess.Popen", return_value=process):
+            await self.router.start()
+
+        process.exit(134)
+        for _ in range(100):
+            if self.router._last_error is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertFalse(self.router._ready)
+        self.assertEqual(self.router._last_error, "speech-to-speech process exited with code 134")
+        snapshot = await self.router.snapshot()
+        self.assertEqual(snapshot["free_sessions"], 0)
 
 
 if __name__ == "__main__":
