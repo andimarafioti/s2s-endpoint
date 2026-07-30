@@ -489,4 +489,6 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertIn("Connected requesters", html)
         self.assertIn("first compute websocket callback", html)
         self.assertIn("not hardware attestation", html)
+        self.assertIn("function requesterCredentialSummary(row)", html)
+        self.assertIn("row.token_fingerprints", html)
         self.assertIn("function renderRequesterUsage(requesters, summary)", html)

@@ -90,6 +90,18 @@ REQUESTER_DASHBOARD_SCRIPT = """
       return fingerprints.length ? `${countLabel} · ${fingerprints.join(', ')}` : countLabel;
     }
 
+    function requesterCredentialSummary(row) {
+      const tokenCount = Number(row.token_count || 0);
+      if (!tokenCount) return '';
+      const fingerprints = (row.token_fingerprints || []).slice(0, 3).map((value) => {
+        return `•${String(value).replace(/^token:/, '').slice(0, 8)}`;
+      });
+      const omittedCount = Math.max(tokenCount - fingerprints.length, 0);
+      const tokenLabel = `${prettyNumber(tokenCount)} token${tokenCount === 1 ? '' : 's'}`;
+      if (!fingerprints.length) return tokenLabel;
+      return `${tokenLabel} · ${fingerprints.join(', ')}${omittedCount ? `, +${prettyNumber(omittedCount)}` : ''}`;
+    }
+
     function renderRequesterUsage(requesters, summary) {
       const rows = requesters?.leaderboard || [];
       const windowLabel = summary.window_label || '6h';
@@ -107,11 +119,13 @@ REQUESTER_DASHBOARD_SCRIPT = """
         const statusClass = requesterStatusClass(row);
         const networks = `${prettyNumber(row.network_count || 0)}${row.network_count_overflow ? '+' : ''}`;
         const signals = (row.signals || []).join(' · ') || 'No unusual signal';
+        const credentials = requesterCredentialSummary(row);
         return `
           <tr>
             <td class="requester-label">
               <div><strong>${htmlEscape(row.label || 'Unknown requester')}</strong></div>
               <div class="muted mono" style="margin-top:4px;">${htmlEscape(row.actor_id || '')}</div>
+              ${credentials ? `<div class="muted mono" style="margin-top:4px;">${htmlEscape(credentials)}</div>` : ''}
             </td>
             <td>
               <span class="status-pill ${statusClass}">${htmlEscape(requesterStatusLabel(row))}</span>
