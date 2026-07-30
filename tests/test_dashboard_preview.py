@@ -12,6 +12,7 @@ from app.dashboard_history import SwarmHistoryBucket
 from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
 from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointTransitionConflictError
+from app.requester_identity import RequesterIdentity
 from app.requester_rate_limiter import RequesterRateLimitConfig, RequesterRateLimiter
 from tests.helpers import monotonic_sequence
 
@@ -659,6 +660,52 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
             [(fake_dashboard.requesters[0], 6.0, True)],
         )
 
+    async def test_disconnected_callback_refreshes_stale_allocation_identity(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dashboard = fake_dashboard
+        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+        pending = RequesterIdentity(
+            actor_id="token:abc123",
+            label="HF token •abc123",
+            kind="unverified_token",
+            verification="pending",
+            fingerprint="abc123",
+        )
+        verified = RequesterIdentity(
+            actor_id="token:abc123",
+            label="@reachy-user · token •abc123",
+            kind="authenticated",
+            verification="verified",
+            fingerprint="abc123",
+            account_name="reachy-user",
+        )
+
+        with (
+            patch.object(module.requester_identity_resolver, "identify", return_value=pending),
+            patch.object(
+                module.requester_identity_resolver,
+                "latest_identity",
+                side_effect=[pending, verified, verified, verified],
+            ),
+            patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)),
+        ):
+            await module.create_session(FakeConnectedRequest())
+            await module.session_event(
+                "session-123",
+                {"session_token": "session-token", "event": "connected"},
+            )
+            await module.session_event(
+                "session-123",
+                {"session_token": "session-token", "event": "disconnected"},
+            )
+
+        self.assertEqual(fake_dashboard.connected_requesters, [verified])
+        self.assertEqual(
+            fake_dashboard.disconnected_requesters,
+            [(verified, 6.0, True)],
+        )
+
     async def test_pre_connect_compute_rejection_does_not_penalize_requester(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
@@ -749,6 +796,7 @@ class FakeDashboard:
         self.session_events = []
         self.connected_requesters = []
         self.disconnected_requesters = []
+        self.identity_updates = []
 
     async def record_session_request(self, requester=None):
         self.calls.append("request")
@@ -780,6 +828,9 @@ class FakeDashboard:
         short_session,
     ):
         self.disconnected_requesters.append((requester, duration_s, short_session))
+
+    async def update_requester_identity(self, requester):
+        self.identity_updates.append(requester)
 
 
 class FakeSessionManager:

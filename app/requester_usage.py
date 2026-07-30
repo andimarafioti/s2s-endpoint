@@ -8,6 +8,7 @@ from app.dashboard_history import (
     SwarmHistoryBucket,
     _bucket_start_epoch_s,
     _isoformat,
+    _merge_requester_identity,
 )
 from app.requester_identity import RequesterIdentity
 
@@ -248,7 +249,7 @@ def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str
     for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
         for actor_id, record in bucket.requester_usage.items():
             actor = actors.setdefault(actor_id, _new_actor(actor_id, record, bucket.bucket_start_s))
-            _set_actor_identity(actor, record)
+            _merge_requester_identity(actor, record)
 
             requests = max(int(record.get("requests", 0)), 0)
             actor["requests"] = int(actor["requests"]) + requests
@@ -350,14 +351,6 @@ def _new_actor(actor_id: str, record: dict[str, object], bucket_start_s: int) ->
         "first_seen_s": bucket_start_s,
         "last_seen_s": bucket_start_s,
     }
-
-
-def _set_actor_identity(actor: dict[str, object], record: dict[str, object]) -> None:
-    actor["label"] = str(record.get("label") or actor["label"])
-    actor["kind"] = str(record.get("kind") or actor["kind"])
-    actor["verification"] = str(record.get("verification") or "unknown")
-    actor["fingerprint"] = str(record.get("fingerprint") or actor["fingerprint"])
-    actor["account_name"] = str(record["account_name"]) if record.get("account_name") is not None else None
 
 
 def _usage_signals(
