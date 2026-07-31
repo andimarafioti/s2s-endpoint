@@ -411,7 +411,6 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
 
         self.assertEqual(health.status_code, 503)
         self.assertEqual(health.json()["status"], "unhealthy")
-        self.assertIn("sessions", health.json())
         self.assertEqual(
             health.json()["sessions"]["router"]["endpoints"][0]["name"],
             "reachy-s2s-01",
