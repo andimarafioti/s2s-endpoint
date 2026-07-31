@@ -346,6 +346,7 @@ class ManagedEndpoint:
     drain_lease_id: Optional[str] = None
     last_drain_warning_at: Optional[float] = None
     last_sync_failure_log_at: Optional[float] = None
+
     @property
     def running(self) -> bool:
         return _is_running_status(self.status) and self.url is not None
@@ -608,9 +609,7 @@ class EndpointPoolRouter:
         try:
             return await asyncio.wait_for(asyncio.shield(async_future), timeout=timeout)
         except asyncio.TimeoutError as exc:
-            raise EndpointControlTimeoutError(
-                f"{kind} operation for {endpoint_name} exceeded {timeout:.1f}s"
-            ) from exc
+            raise EndpointControlTimeoutError(f"{kind} operation for {endpoint_name} exceeded {timeout:.1f}s") from exc
 
     def _finish_control_operation(self, operation_id: int, future) -> None:
         operation = self._in_flight_control_operations.pop(operation_id, None)
@@ -623,8 +622,7 @@ class EndpointPoolRouter:
             except BaseException as exc:
                 late_error = exc
             logger.warning(
-                "Endpoint control operation %s for %s finished after its deadline "
-                "(id=%d, elapsed=%.1fs, error=%s)",
+                "Endpoint control operation %s for %s finished after its deadline (id=%d, elapsed=%.1fs, error=%s)",
                 operation.kind,
                 operation.endpoint_name,
                 operation.operation_id,
@@ -892,9 +890,7 @@ class EndpointPoolRouter:
         if self._last_error and not errors:
             errors.append({"endpoint": None, "error": self._last_error})
         reconcile_age_s = (
-            max(now - last_reconcile_success_monotonic, 0.0)
-            if last_reconcile_success_monotonic is not None
-            else None
+            max(now - last_reconcile_success_monotonic, 0.0) if last_reconcile_success_monotonic is not None else None
         )
         reconciliation_stale = reconcile_age_s is None or reconcile_age_s > self.reconcile_stale_after_s
         control_operation_rows = [
@@ -926,9 +922,7 @@ class EndpointPoolRouter:
             "reconciliation_stale": reconciliation_stale,
             "reconciliation_in_progress": reconcile_in_progress_since is not None,
             "reconciliation_in_progress_for_s": (
-                max(now - reconcile_in_progress_since, 0.0)
-                if reconcile_in_progress_since is not None
-                else None
+                max(now - reconcile_in_progress_since, 0.0) if reconcile_in_progress_since is not None else None
             ),
             "in_flight_control_operations": len(control_operation_rows),
             "control_operations": control_operation_rows,
@@ -1008,10 +1002,7 @@ class EndpointPoolRouter:
             try:
                 async with self._condition:
                     self._expire_stale_wakes_unlocked(time.monotonic())
-                    targets = [
-                        (endpoint.name, endpoint.state_generation)
-                        for endpoint in self._endpoints.values()
-                    ]
+                    targets = [(endpoint.name, endpoint.state_generation) for endpoint in self._endpoints.values()]
 
                 tasks = [
                     asyncio.create_task(self._fetch_endpoint_for_refresh(name, generation))
@@ -1311,8 +1302,7 @@ class EndpointPoolRouter:
                 endpoint = self._endpoints[name]
                 if endpoint.state_generation != generation:
                     logger.warning(
-                        "Ignoring failure from stale wake operation for %s "
-                        "(generation %d, current %d): %s",
+                        "Ignoring failure from stale wake operation for %s (generation %d, current %d): %s",
                         name,
                         generation,
                         endpoint.state_generation,
@@ -1377,8 +1367,7 @@ class EndpointPoolRouter:
                 endpoint = self._endpoints[name]
                 if endpoint.state_generation != generation:
                     logger.warning(
-                        "Ignoring failure from stale park operation for %s "
-                        "(generation %d, current %d): %s",
+                        "Ignoring failure from stale park operation for %s (generation %d, current %d): %s",
                         name,
                         generation,
                         endpoint.state_generation,
@@ -1430,9 +1419,7 @@ class EndpointPoolRouter:
                     async with self._condition:
                         self._last_error = f"endpoint reconciliation failed: {exc}"
                         self._condition.notify_all()
-                    logger.exception(
-                        "Endpoint reconciliation cycle failed; the supervisor will retry next cycle"
-                    )
+                    logger.exception("Endpoint reconciliation cycle failed; the supervisor will retry next cycle")
         except asyncio.CancelledError:
             raise
 
@@ -1541,8 +1528,7 @@ class EndpointPoolRouter:
                 endpoint = self._endpoints[name]
                 if endpoint.state_generation != generation:
                     logger.warning(
-                        "Ignoring failure from stale restart operation for %s "
-                        "(generation %d, current %d): %s",
+                        "Ignoring failure from stale restart operation for %s (generation %d, current %d): %s",
                         name,
                         generation,
                         endpoint.state_generation,
@@ -1653,11 +1639,7 @@ class EndpointPoolRouter:
     def _expire_stale_wakes_unlocked(self, now: float) -> int:
         expired = 0
         for endpoint in self._endpoints.values():
-            if (
-                not endpoint.waking
-                or endpoint.wake_capacity_until is None
-                or now < endpoint.wake_capacity_until
-            ):
+            if not endpoint.waking or endpoint.wake_capacity_until is None or now < endpoint.wake_capacity_until:
                 continue
             waking_for_s = (
                 max(now - endpoint.wake_started_at, 0.0)
@@ -1668,9 +1650,7 @@ class EndpointPoolRouter:
             endpoint.waking = False
             endpoint.wake_started_at = None
             endpoint.wake_capacity_until = None
-            endpoint.last_error = (
-                f"wake attempt expired after {waking_for_s:.1f}s; endpoint is retryable"
-            )
+            endpoint.last_error = f"wake attempt expired after {waking_for_s:.1f}s; endpoint is retryable"
             self._last_error = endpoint.last_error
             expired += 1
             logger.error("Endpoint %s %s", endpoint.name, endpoint.last_error)
@@ -1919,8 +1899,7 @@ class EndpointPoolRouter:
                 ep = self._endpoints[name]
                 if ep.state_generation != generation:
                     logger.warning(
-                        "Ignoring failure from stale drain restart for %s "
-                        "(generation %d, current %d): %s",
+                        "Ignoring failure from stale drain restart for %s (generation %d, current %d): %s",
                         name,
                         generation,
                         ep.state_generation,

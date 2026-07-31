@@ -1865,9 +1865,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         controller.release_blocked.set()
 
     async def test_health_fails_when_reconciliation_is_stale(self):
-        controller = FakeEndpointController(
-            [("endpoint-a", "running", "https://endpoint-a.example")]
-        )
+        controller = FakeEndpointController([("endpoint-a", "running", "https://endpoint-a.example")])
         self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
@@ -1917,9 +1915,7 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("control plane unavailable", snapshot["endpoints"][0]["last_error"])
 
     async def test_reconcile_loop_retries_after_unexpected_cycle_failure(self):
-        controller = FakeEndpointController(
-            [("endpoint-a", "running", "https://endpoint-a.example")]
-        )
+        controller = FakeEndpointController([("endpoint-a", "running", "https://endpoint-a.example")])
         self.router = _make_test_router(
             endpoint_names=["endpoint-a"],
             endpoint_slots=1,
