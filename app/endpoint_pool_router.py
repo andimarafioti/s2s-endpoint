@@ -65,6 +65,10 @@ class ComputeUsageSchemaError(RuntimeError):
     """
 
 
+class ComputeUnhealthyError(RuntimeError):
+    """The compute endpoint explicitly reported that it is not ready."""
+
+
 def fetch_compute_usage(base_url: str) -> ComputeUsage:
     request = urllib.request.Request(
         _to_health_url(base_url),
@@ -75,6 +79,8 @@ def fetch_compute_usage(base_url: str) -> ComputeUsage:
         with urllib.request.urlopen(request, timeout=5) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        if exc.code == 503:
+            raise ComputeUnhealthyError("compute health returned HTTP 503") from exc
         raise RuntimeError(f"compute health returned HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"compute health request failed: {exc.reason}") from exc
@@ -883,7 +889,17 @@ class EndpointPoolRouter:
                 if endpoint is None or endpoint.url != url or not endpoint.running:
                     continue
                 if isinstance(result, Exception):
-                    if isinstance(result, ComputeUsageSchemaError):
+                    if isinstance(result, ComputeUnhealthyError):
+                        logger.error(
+                            "Compute endpoint %s reported unhealthy, endpoint offers no capacity until sync recovers: %s",
+                            name,
+                            result,
+                        )
+                        endpoint.usage_synced = False
+                        endpoint.last_usage_sync_at = None
+                        endpoint.usage_sync_drain_generation = None
+                        endpoint.last_error = str(result)
+                    elif isinstance(result, ComputeUsageSchemaError):
                         # Every future poll will fail the same way; stale
                         # observations must not keep granting capacity. Log
                         # unconditionally: on a freshly restarted LB the node
@@ -968,6 +984,7 @@ class EndpointPoolRouter:
                 endpoint.last_usage_sync_at = now
                 endpoint.usage_sync_drain_generation = drain_generation
                 endpoint.last_sync_failure_log_at = None
+                endpoint.last_error = None
                 if observed_increase:
                     endpoint.unobserved_connected_sessions = max(
                         endpoint.unobserved_connected_sessions - observed_increase,

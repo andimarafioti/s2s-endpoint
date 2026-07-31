@@ -3,9 +3,11 @@ import json
 import threading
 import time
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from app.endpoint_pool_router import (
+    ComputeUnhealthyError,
     ComputeUsage,
     ComputeUsageSchemaError,
     EndpointDrainLeaseConflictError,
@@ -170,6 +172,18 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             return_value=FakeUrlopenResponse({"router": {"active_sessions": 1}}),
         ):
             with self.assertRaisesRegex(RuntimeError, "did not include 'max_sessions'"):
+                fetch_compute_usage("https://compute.example")
+
+    def test_fetch_compute_usage_distinguishes_explicit_unhealthy_response(self):
+        error = urllib.error.HTTPError(
+            "https://compute.example/health",
+            503,
+            "Service Unavailable",
+            {},
+            None,
+        )
+        with patch("app.endpoint_pool_router.urllib.request.urlopen", side_effect=error):
+            with self.assertRaisesRegex(ComputeUnhealthyError, "HTTP 503"):
                 fetch_compute_usage("https://compute.example")
 
     async def test_start_ensures_minimum_warm_endpoints(self):
@@ -1072,6 +1086,50 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
         healthy, detail, _ = await self.router.healthcheck()
         self.assertFalse(healthy)
         self.assertIn("have not synced usage", detail)
+
+    async def test_explicit_unhealthy_response_immediately_revokes_capacity(self):
+        class UnhealthyAfterFirstFetcher:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, url: str) -> int:
+                self.calls += 1
+                if self.calls <= 1:
+                    return 0
+                raise ComputeUnhealthyError("compute health returned HTTP 503")
+
+        controller = FakeEndpointController(
+            [
+                ("endpoint-a", "running", "https://endpoint-a.example.endpoints.huggingface.cloud"),
+            ]
+        )
+        self.router = _make_test_router(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=2,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=controller,
+            compute_usage_fetcher=UnhealthyAfterFirstFetcher(),
+            usage_sync_stale_ttl_s=3600,
+        )
+
+        await self.router.start()
+        snapshot = await self.router.snapshot()
+        self.assertTrue(snapshot["endpoints"][0]["usage_synced"])
+        self.assertEqual(snapshot["free_slots"], 2)
+
+        await self.router.refresh()
+
+        snapshot = await self.router.snapshot()
+        endpoint = snapshot["endpoints"][0]
+        self.assertFalse(endpoint["usage_synced"])
+        self.assertEqual(endpoint["free_slots"], 0)
+        self.assertEqual(endpoint["last_error"], "compute health returned HTTP 503")
+        self.assertEqual(snapshot["free_slots"], 0)
 
     async def test_transient_sync_failure_keeps_capacity_within_ttl(self):
         class FailAfterFirstFetcher:
