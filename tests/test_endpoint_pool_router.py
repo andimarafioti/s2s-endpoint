@@ -146,6 +146,33 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(usage, ComputeUsage(active_sessions=2, max_sessions=4))
 
+    def test_huggingface_controller_uses_an_isolated_bounded_http_client(self):
+        from huggingface_hub import get_session
+
+        from app.dashboard_history_store import _configure_huggingface_http_timeout
+        from app.endpoint_pool_router import HuggingFaceEndpointController
+
+        shared_client = get_session()
+        original_timeout = shared_client.timeout
+        controller = HuggingFaceEndpointController(namespace="test", token="token", http_timeout_s=7)
+        try:
+            _configure_huggingface_http_timeout(60)
+            self.assertIsNot(controller._client, shared_client)
+            self.assertEqual(controller._client.timeout.connect, 7)
+            self.assertEqual(controller._client.timeout.read, 7)
+            self.assertEqual(controller._client.timeout.write, 7)
+            self.assertEqual(controller._client.timeout.pool, 7)
+            self.assertEqual(shared_client.timeout.read, 60)
+        finally:
+            shared_client.timeout = original_timeout
+            controller.close()
+
+    def test_huggingface_controller_rejects_nonpositive_operation_timeout(self):
+        from app.endpoint_pool_router import HuggingFaceEndpointController
+
+        with self.assertRaisesRegex(ValueError, "wait_timeout_s must be > 0"):
+            HuggingFaceEndpointController(namespace="test", token="token", wait_timeout_s=0)
+
     def test_fetch_compute_usage_supports_legacy_ready_busy(self):
         with patch(
             "app.endpoint_pool_router.urllib.request.urlopen",
@@ -1684,6 +1711,222 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
             endpoint_b.wake_capacity_until = now - 1
             self.assertEqual(self.router._mark_endpoints_to_wake_unlocked(), ["endpoint-c"])
+
+    async def test_failed_wake_is_retryable_when_warming_timeout_is_zero(self):
+        class FailingFirstWakeController(FakeEndpointController):
+            def __init__(self):
+                super().__init__([("endpoint-a", "paused", None)])
+
+            def wake(self, name: str) -> EndpointSnapshot:
+                self.wake_calls.append(name)
+                if len(self.wake_calls) == 1:
+                    raise TimeoutError("bounded endpoint request timed out")
+                time.sleep(0.01)
+                self.states[name] = {"status": "running", "url": "https://endpoint-a.example"}
+                return self.fetch(name)
+
+        controller = FailingFirstWakeController()
+        self.router = _make_test_router(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=0,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=0,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        async with self.router._condition:
+            endpoint = self.router._endpoints["endpoint-a"]
+            endpoint.status = "paused"
+            endpoint.raw_status = "paused"
+            wake_names = self.router._mark_endpoints_to_wake_unlocked(force=True)
+        self.router._spawn_wake_tasks(wake_names)
+
+        async def wait_until_not_waking():
+            while True:
+                snapshot = await self.router.snapshot()
+                if not snapshot["endpoints"][0]["waking"]:
+                    return snapshot
+                await asyncio.sleep(0.01)
+
+        failed = await asyncio.wait_for(wait_until_not_waking(), timeout=1)
+        self.assertIn("bounded endpoint request timed out", failed["endpoints"][0]["last_error"])
+
+        async with self.router._condition:
+            retry_names = self.router._mark_endpoints_to_wake_unlocked(force=True)
+        self.assertEqual(retry_names, ["endpoint-a"])
+        self.router._spawn_wake_tasks(retry_names)
+
+        async def wake_applied():
+            while True:
+                snapshot = await self.router.snapshot()
+                if snapshot["endpoints"][0]["running"] and not snapshot["endpoints"][0]["waking"]:
+                    return snapshot
+                await asyncio.sleep(0.01)
+
+        final = await asyncio.wait_for(wake_applied(), timeout=1)
+        self.assertEqual(controller.wake_calls, ["endpoint-a", "endpoint-a"])
+        self.assertIsNone(final["endpoints"][0]["last_error"])
+
+    async def test_running_park_remains_quarantined_until_worker_finishes(self):
+        class BlockingParkController(FakeEndpointController):
+            def __init__(self):
+                super().__init__([("endpoint-a", "running", "https://endpoint-a.example")])
+                self.park_started = threading.Event()
+                self.release_park = threading.Event()
+
+            def park(self, name: str) -> EndpointSnapshot:
+                self.park_started.set()
+                self.release_park.wait(timeout=2)
+                return super().park(name)
+
+        controller = BlockingParkController()
+        self.router = _make_test_router(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=0,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=0,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=0,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        async with self.router._condition:
+            endpoint = self.router._endpoints["endpoint-a"]
+            endpoint.status = "running"
+            endpoint.raw_status = "running"
+            endpoint.url = "https://endpoint-a.example"
+            park_names = self.router._mark_endpoints_to_park_unlocked()
+        self.router._spawn_park_tasks(park_names)
+
+        self.assertTrue(await asyncio.to_thread(controller.park_started.wait, 1))
+        await asyncio.sleep(0.02)
+        in_flight = await self.router.snapshot()
+        self.assertTrue(in_flight["endpoints"][0]["parking"])
+        self.assertIsNone(await self.router.try_acquire())
+
+        controller.release_park.set()
+
+        async def park_applied():
+            while True:
+                snapshot = await self.router.snapshot()
+                if not snapshot["endpoints"][0]["parking"]:
+                    return snapshot
+                await asyncio.sleep(0.01)
+
+        final = await asyncio.wait_for(park_applied(), timeout=1)
+        self.assertFalse(final["endpoints"][0]["running"])
+        self.assertEqual(controller.park_calls, ["endpoint-a"])
+
+    async def test_stalled_fetch_does_not_block_other_results_or_default_executor(self):
+        class PartiallyBlockedFetchController(FakeEndpointController):
+            def __init__(self):
+                super().__init__(
+                    [
+                        ("endpoint-a", "paused", None),
+                        ("endpoint-b", "running", "https://endpoint-b.example"),
+                    ]
+                )
+                self.blocked_started = threading.Event()
+                self.release_blocked = threading.Event()
+
+            def fetch(self, name: str) -> EndpointSnapshot:
+                if name == "endpoint-a":
+                    self.blocked_started.set()
+                    self.release_blocked.wait(timeout=2)
+                return super().fetch(name)
+
+        controller = PartiallyBlockedFetchController()
+        self.router = _make_test_router(
+            endpoint_names=["endpoint-a", "endpoint-b"],
+            endpoint_slots=1,
+            min_warm_endpoints=0,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=1,
+            park_cooldown_s=0,
+            controller=controller,
+            control_fetch_timeout_s=0.2,
+        )
+        refresh_task = asyncio.create_task(self.router.refresh())
+        self.assertTrue(await asyncio.to_thread(controller.blocked_started.wait, 1))
+
+        async def fast_result_applied():
+            while True:
+                snapshot = await self.router.snapshot()
+                endpoint_b = next(item for item in snapshot["endpoints"] if item["name"] == "endpoint-b")
+                if endpoint_b["running"]:
+                    return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(fast_result_applied(), timeout=0.1)
+        self.assertFalse(refresh_task.done())
+        self.assertEqual(await asyncio.wait_for(asyncio.to_thread(lambda: "free"), timeout=0.1), "free")
+        await asyncio.wait_for(refresh_task, timeout=0.3)
+        timed_out = await self.router.snapshot()
+        endpoint_a = next(item for item in timed_out["endpoints"] if item["name"] == "endpoint-a")
+        self.assertIn("exceeded 0.2s", endpoint_a["last_error"])
+        controller.release_blocked.set()
+
+    async def test_health_fails_when_reconciliation_is_stale(self):
+        controller = FakeEndpointController([("endpoint-a", "running", "https://endpoint-a.example")])
+        self.router = _make_test_router(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=1,
+            park_cooldown_s=0,
+            controller=controller,
+            reconcile_stale_after_s=0.1,
+        )
+        await self.router.refresh()
+        healthy, _, _ = await self.router.healthcheck()
+        self.assertTrue(healthy)
+
+        self.router._last_reconcile_success_monotonic = time.monotonic() - 1
+        healthy, detail, snapshot = await self.router.healthcheck()
+        self.assertFalse(healthy)
+        self.assertIn("reconciliation is stale", detail)
+        self.assertTrue(snapshot["reconciliation_stale"])
+
+    async def test_reconcile_loop_retries_after_unexpected_failure(self):
+        controller = FakeEndpointController([("endpoint-a", "running", "https://endpoint-a.example")])
+        self.router = _make_test_router(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=1,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=0.01,
+            waking_capacity_timeout_s=1,
+            park_cooldown_s=0,
+            controller=controller,
+        )
+        await self.router.start()
+        original_refresh = self.router.refresh
+        retried = asyncio.Event()
+        calls = 0
+
+        async def fail_once_then_refresh():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("unexpected reconciliation failure")
+            retried.set()
+            await original_refresh()
+
+        self.router.refresh = fail_once_then_refresh
+        with self.assertLogs("s2s-endpoint", level="ERROR"):
+            await asyncio.wait_for(retried.wait(), timeout=1)
+        self.assertGreaterEqual(calls, 2)
+        self.assertFalse(self.router._reconcile_task.done())
 
     async def test_reconcile_parks_one_endpoint_per_cycle_with_cooldown(self):
         controller = FakeEndpointController(

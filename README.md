@@ -289,6 +289,14 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S`: how long an idle compute endpoint stays warm
   before being parked
 - `COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S`: background refresh interval
+- `COMPUTE_ENDPOINT_RECONCILE_STALE_AFTER_S`: maximum age of the last completed
+  reconciliation before `/health` reports the router unhealthy
+- `COMPUTE_ENDPOINT_HTTP_TIMEOUT_S`: timeout applied to Hugging Face
+  endpoint-control HTTP requests (defaults to 10 seconds)
+- `COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S`: total deadline for one endpoint
+  status refresh (defaults to 30 seconds)
+- `COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S`: positive deadline for waiting
+  for a wake to become ready (defaults to `COMPUTE_ENDPOINT_WAIT_TIMEOUT_S`)
 - `COMPUTE_ENDPOINT_PARK_STRATEGY`: `pause` or `scale_to_zero`
 - `HF_CONTROL_TOKEN`: token used to call the Inference Endpoints API
 - `LB_ADMIN_AUTH_TOKEN`: dedicated bearer token required by the internal endpoint

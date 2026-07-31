@@ -7,6 +7,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional, Protocol
 from urllib.parse import urlparse, urlunparse
@@ -157,6 +158,13 @@ class EndpointSnapshot:
     url: Optional[str]
 
 
+@dataclass(frozen=True)
+class _EndpointControlState:
+    status: str
+    url: Optional[str]
+    health_route: str
+
+
 class EndpointController(Protocol):
     def fetch(self, name: str) -> EndpointSnapshot: ...
 
@@ -175,13 +183,23 @@ class HuggingFaceEndpointController:
         *,
         namespace: Optional[str],
         token: Optional[str],
-        wait_timeout_s: int = 900,
+        wait_timeout_s: float = 900,
         wait_refresh_every_s: int = 5,
         active_min_replica: int = 1,
         active_max_replica: int = 1,
         park_strategy: str = "pause",
+        http_timeout_s: float = 10.0,
     ) -> None:
-        from huggingface_hub import get_inference_endpoint
+        if http_timeout_s <= 0:
+            raise ValueError("http_timeout_s must be > 0")
+        if wait_timeout_s <= 0:
+            raise ValueError("wait_timeout_s must be > 0")
+        if wait_refresh_every_s <= 0:
+            raise ValueError("wait_refresh_every_s must be > 0")
+
+        import httpx
+        from huggingface_hub import InferenceEndpointError, InferenceEndpointTimeoutError, constants
+        from huggingface_hub.utils import build_hf_headers, hf_raise_for_status
 
         if park_strategy not in {"pause", "scale_to_zero"}:
             raise ValueError("park_strategy must be 'pause' or 'scale_to_zero'")
@@ -193,11 +211,19 @@ class HuggingFaceEndpointController:
         self.active_min_replica = active_min_replica
         self.active_max_replica = active_max_replica
         self.park_strategy = park_strategy
-        self._get_inference_endpoint = get_inference_endpoint
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(http_timeout_s),
+            follow_redirects=True,
+        )
+        self._headers = build_hf_headers(token=token)
+        self._endpoint_error = InferenceEndpointError
+        self._endpoint_timeout_error = InferenceEndpointTimeoutError
+        self._hf_raise_for_status = hf_raise_for_status
+        self._hub_url = constants.ENDPOINT
+        self._endpoint_api_url = constants.INFERENCE_ENDPOINTS_ENDPOINT
 
     def fetch(self, name: str) -> EndpointSnapshot:
         endpoint = self._get(name)
-        endpoint.fetch()
         return self._snapshot(name, endpoint)
 
     def wake(self, name: str) -> EndpointSnapshot:
@@ -205,20 +231,13 @@ class HuggingFaceEndpointController:
         status = _normalize_status(getattr(endpoint, "status", ""))
 
         if status == "paused":
-            endpoint.resume(running_ok=True)
+            endpoint = self._resume(name, running_ok=True)
         elif _is_parked_status(status):
-            endpoint.update(
-                min_replica=self.active_min_replica,
-                max_replica=self.active_max_replica,
-            )
+            endpoint = self._update(name)
         elif not _is_running_status(status):
-            endpoint.wait(timeout=self.wait_timeout_s, refresh_every=self.wait_refresh_every_s)
-            endpoint.fetch()
-            return self._snapshot(name, endpoint)
+            return self._snapshot(name, self._wait(name, endpoint))
 
-        endpoint.wait(timeout=self.wait_timeout_s, refresh_every=self.wait_refresh_every_s)
-        endpoint.fetch()
-        return self._snapshot(name, endpoint)
+        return self._snapshot(name, self._wait(name, endpoint))
 
     def park(self, name: str) -> EndpointSnapshot:
         endpoint = self._get(name)
@@ -226,47 +245,119 @@ class HuggingFaceEndpointController:
 
         if self.park_strategy == "pause":
             if status != "paused":
-                endpoint.pause()
+                self._request_endpoint("POST", name, suffix="/pause")
         else:
             if not _is_parked_status(status):
-                endpoint.scale_to_zero()
+                self._request_endpoint("POST", name, suffix="/scale-to-zero")
 
-        endpoint.fetch()
-        return self._snapshot(name, endpoint)
+        return self._snapshot(name, self._get(name))
 
     def restart(self, name: str) -> EndpointSnapshot:
         endpoint = self._get(name)
         status = _normalize_status(getattr(endpoint, "status", ""))
 
         if _is_running_status(status):
-            endpoint.fetch()
             return self._snapshot(name, endpoint)
 
         try:
-            endpoint.pause()
+            self._request_endpoint("POST", name, suffix="/pause")
         except Exception:
             pass
-        endpoint.resume(running_ok=True)
+        self._resume(name, running_ok=True)
 
-        endpoint.fetch()
-        return self._snapshot(name, endpoint)
+        return self._snapshot(name, self._get(name))
 
     def force_restart(self, name: str) -> EndpointSnapshot:
         """Pause then resume regardless of current status (used for drain recovery)."""
-        endpoint = self._get(name)
         try:
-            endpoint.pause()
+            self._request_endpoint("POST", name, suffix="/pause")
         except Exception:
             pass
-        endpoint.resume(running_ok=True)
-        endpoint.fetch()
-        return self._snapshot(name, endpoint)
+        self._resume(name, running_ok=True)
+        return self._snapshot(name, self._get(name))
+
+    def close(self) -> None:
+        self._client.close()
 
     def _get(self, name: str):
-        return self._get_inference_endpoint(
+        return self._request_endpoint("GET", name)
+
+    def _resume(self, name: str, *, running_ok: bool):
+        namespace = self._namespace()
+        response = self._client.post(
+            f"{self._endpoint_api_url}/endpoint/{namespace}/{name}/resume",
+            headers=self._headers,
+        )
+        if running_ok and response.status_code == 400 and "already running" in response.text:
+            return self._get(name)
+        self._hf_raise_for_status(response)
+        return self._endpoint_from_payload(response.json())
+
+    def _update(self, name: str):
+        return self._request_endpoint(
+            "PUT",
             name,
-            namespace=self.namespace,
-            token=self.token or None,
+            json={
+                "compute": {
+                    "scaling": {
+                        "minReplica": self.active_min_replica,
+                        "maxReplica": self.active_max_replica,
+                    }
+                }
+            },
+        )
+
+    def _wait(self, name: str, endpoint):
+        deadline = time.monotonic() + self.wait_timeout_s
+        while True:
+            status = _normalize_status(getattr(endpoint, "status", ""))
+            if _is_failed_status(status):
+                raise self._endpoint_error(f"Inference Endpoint {name} failed to deploy")
+            if _is_running_status(status) and endpoint.url is not None:
+                health_url = f"{endpoint.url.rstrip('/')}/{endpoint.health_route.lstrip('/')}"
+                if self._client.get(health_url, headers=self._headers).status_code == 200:
+                    return endpoint
+            if time.monotonic() >= deadline:
+                raise self._endpoint_timeout_error("Timeout while waiting for Inference Endpoint to be deployed.")
+            time.sleep(self.wait_refresh_every_s)
+            endpoint = self._get(name)
+
+    def _request_endpoint(
+        self,
+        method: str,
+        name: str,
+        *,
+        suffix: str = "",
+        json: Optional[dict] = None,
+    ):
+        namespace = self._namespace()
+        response = self._client.request(
+            method,
+            f"{self._endpoint_api_url}/endpoint/{namespace}/{name}{suffix}",
+            headers=self._headers,
+            json=json,
+        )
+        self._hf_raise_for_status(response)
+        return self._endpoint_from_payload(response.json())
+
+    def _namespace(self) -> str:
+        if self.namespace is not None:
+            return self.namespace
+        response = self._client.get(f"{self._hub_url}/api/whoami-v2", headers=self._headers)
+        self._hf_raise_for_status(response)
+        payload = response.json()
+        if payload.get("type") != "user" or not payload.get("name"):
+            raise ValueError("Cannot determine default endpoint namespace")
+        self.namespace = str(payload["name"])
+        return self.namespace
+
+    @staticmethod
+    def _endpoint_from_payload(payload: dict) -> _EndpointControlState:
+        status = payload.get("status", {})
+        return _EndpointControlState(
+            status=str(status.get("state", "unknown")),
+            url=status.get("url"),
+            health_route=str(payload.get("healthRoute", "/health")),
         )
 
     def _snapshot(self, name: str, endpoint) -> EndpointSnapshot:
@@ -298,6 +389,7 @@ class ManagedEndpoint:
     last_error: Optional[str] = None
     last_used_at: float = field(default_factory=time.monotonic)
     wake_capacity_until: Optional[float] = None
+    state_generation: int = 0
     restart_attempts: int = 0
     last_restart_at: Optional[float] = None
     running_since: Optional[float] = None
@@ -379,6 +471,8 @@ class EndpointPoolRouter:
         drain_warning_interval_s: float = 300.0,
         compute_usage_fetcher: ComputeUsageFetcher,
         usage_sync_stale_ttl_s: float = 60.0,
+        control_fetch_timeout_s: float = 30.0,
+        reconcile_stale_after_s: Optional[float] = None,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
         if not names:
@@ -397,6 +491,10 @@ class EndpointPoolRouter:
             raise ValueError("endpoint_ws_path must start with '/'")
         if drain_lease_ttl_s <= 0:
             raise ValueError("drain_lease_ttl_s must be > 0")
+        if control_fetch_timeout_s <= 0:
+            raise ValueError("control_fetch_timeout_s must be > 0")
+        if reconcile_stale_after_s is not None and reconcile_stale_after_s <= 0:
+            raise ValueError("reconcile_stale_after_s must be > 0")
 
         self.endpoint_ws_path = endpoint_ws_path
         self.min_warm_endpoints = min_warm_endpoints
@@ -417,6 +515,12 @@ class EndpointPoolRouter:
         self.drain_warning_interval_s = max(drain_warning_interval_s, 0.0)
         self.compute_usage_fetcher = compute_usage_fetcher
         self.usage_sync_stale_ttl_s = max(usage_sync_stale_ttl_s, 0.0)
+        self.control_fetch_timeout_s = control_fetch_timeout_s
+        self.reconcile_stale_after_s = (
+            max(reconcile_interval_s * 3, control_fetch_timeout_s * 2)
+            if reconcile_stale_after_s is None
+            else reconcile_stale_after_s
+        )
 
         self._on_endpoint_down: Optional[Callable[[str], Awaitable[None]]] = None
         self._endpoints = {
@@ -436,6 +540,16 @@ class EndpointPoolRouter:
         self._initial_warm_task: Optional[asyncio.Task] = None
         self._last_error: Optional[str] = None
         self._next_park_allowed_at = 0.0
+        self._last_reconcile_success_at: Optional[float] = None
+        self._last_reconcile_success_monotonic: Optional[float] = None
+        self._control_fetch_executor = ThreadPoolExecutor(
+            max_workers=max(len(names), 1),
+            thread_name_prefix="endpoint-fetch",
+        )
+        self._control_transition_executor = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="endpoint-control",
+        )
 
     async def start(self) -> None:
         await self.refresh()
@@ -471,6 +585,32 @@ class EndpointPoolRouter:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reconcile_task
             self._reconcile_task = None
+
+        self._control_fetch_executor.shutdown(wait=False, cancel_futures=True)
+        self._control_transition_executor.shutdown(wait=False, cancel_futures=True)
+
+    async def _run_controller_call(
+        self,
+        operation: str,
+        name: str,
+        *,
+        fetch: bool = False,
+    ) -> EndpointSnapshot:
+        executor = self._control_fetch_executor if fetch else self._control_transition_executor
+        method = getattr(self.controller, operation)
+        future = asyncio.get_running_loop().run_in_executor(executor, method, name)
+        if not fetch:
+            # Mutating a remote endpoint cannot be cancelled once its worker
+            # thread starts. Keep the transition flag set until the real call
+            # completes so capacity is never routed to a node still changing.
+            return await future
+        try:
+            return await asyncio.wait_for(
+                future,
+                timeout=self.control_fetch_timeout_s,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"{operation} for endpoint {name} exceeded {self.control_fetch_timeout_s:.1f}s") from exc
 
     def _claim_slot_unlocked(self, *, waited_for_capacity: bool) -> tuple[Optional[EndpointLease], list[str]]:
         """Single slot-claim attempt; the caller must hold ``self._condition``.
@@ -641,6 +781,14 @@ class EndpointPoolRouter:
 
     async def healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
         snapshot = await self.snapshot()
+        if snapshot["reconciliation_stale"]:
+            age = snapshot["reconcile_age_s"]
+            detail = (
+                "endpoint reconciliation has never completed"
+                if age is None
+                else f"endpoint reconciliation is stale ({age:.1f}s since last success)"
+            )
+            return False, detail, snapshot
         if snapshot["running_endpoints"]:
             # A running endpoint is not necessarily usable: with a usage
             # fetcher configured it offers zero capacity until its true
@@ -667,6 +815,8 @@ class EndpointPoolRouter:
     async def snapshot(self) -> dict[str, object]:
         async with self._lock:
             endpoints = list(self._endpoints.values())
+            last_reconcile_success_at = self._last_reconcile_success_at
+            last_reconcile_success_monotonic = self._last_reconcile_success_monotonic
 
         running = sum(1 for endpoint in endpoints if endpoint.running)
         unsynced_running = sum(
@@ -689,6 +839,10 @@ class EndpointPoolRouter:
         observed_active_sessions = sum(endpoint.observed_active_sessions for endpoint in endpoints)
         unobserved_connected_sessions = sum(endpoint.unobserved_connected_sessions for endpoint in endpoints)
         busy_sessions = sum(endpoint.busy_sessions for endpoint in endpoints)
+        reconcile_age_s = (
+            max(now - last_reconcile_success_monotonic, 0.0) if last_reconcile_success_monotonic is not None else None
+        )
+        reconciliation_stale = reconcile_age_s is None or reconcile_age_s > self.reconcile_stale_after_s
         errors = [
             {"endpoint": endpoint.name, "error": endpoint.last_error} for endpoint in endpoints if endpoint.last_error
         ]
@@ -700,6 +854,11 @@ class EndpointPoolRouter:
             "wake_threshold_slots": self.wake_threshold_slots,
             "idle_park_timeout_s": self.idle_park_timeout_s,
             "waking_capacity_timeout_s": self.waking_capacity_timeout_s,
+            "control_fetch_timeout_s": self.control_fetch_timeout_s,
+            "last_reconcile_success_at": last_reconcile_success_at,
+            "reconcile_age_s": reconcile_age_s,
+            "reconcile_stale_after_s": self.reconcile_stale_after_s,
+            "reconciliation_stale": reconciliation_stale,
             "park_cooldown_s": self.park_cooldown_s,
             "park_cooldown_remaining_s": max(self._next_park_allowed_at - now, 0.0),
             "auto_restart": self.auto_restart,
@@ -765,19 +924,35 @@ class EndpointPoolRouter:
         }
 
     async def refresh(self) -> None:
-        tasks = [asyncio.to_thread(self.controller.fetch, endpoint.name) for endpoint in self._endpoints.values()]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._lock:
+            targets = [(endpoint.name, endpoint.state_generation) for endpoint in self._endpoints.values()]
 
-        now = time.monotonic()
+        async def fetch_one(name: str, generation: int):
+            try:
+                result = await self._run_controller_call("fetch", name, fetch=True)
+            except Exception as exc:
+                result = exc
+            return name, generation, result
+
+        tasks = [asyncio.create_task(fetch_one(name, generation)) for name, generation in targets]
         downed_endpoints: list[str] = []
+        successful_fetches = 0
 
-        async with self._condition:
-            for endpoint, result in zip(self._endpoints.values(), results):
+        for completed in asyncio.as_completed(tasks):
+            name, generation, result = await completed
+            now = time.monotonic()
+            async with self._condition:
+                endpoint = self._endpoints[name]
+                if endpoint.state_generation != generation:
+                    continue
                 if isinstance(result, Exception):
                     endpoint.last_error = str(result)
                     self._last_error = endpoint.last_error
+                    log = logger.error if isinstance(result, TimeoutError) else logger.warning
+                    log("Failed to fetch endpoint %s: %s", name, result)
                     continue
 
+                successful_fetches += 1
                 was_running = endpoint.running
 
                 endpoint.status = result.status
@@ -843,6 +1018,9 @@ class EndpointPoolRouter:
 
         await self._sync_compute_usage(notify=False)
         async with self._condition:
+            if successful_fetches:
+                self._last_reconcile_success_at = time.time()
+                self._last_reconcile_success_monotonic = time.monotonic()
             self._condition.notify_all()
 
     async def ensure_min_warm(self) -> None:
@@ -998,10 +1176,11 @@ class EndpointPoolRouter:
 
     async def _wake_endpoint(self, name: str) -> None:
         try:
-            snapshot = await asyncio.to_thread(self.controller.wake, name)
+            snapshot = await self._run_controller_call("wake", name)
         except Exception as exc:
             async with self._condition:
                 endpoint = self._endpoints[name]
+                endpoint.state_generation += 1
                 endpoint.waking = False
                 endpoint.wake_capacity_until = None
                 endpoint.last_error = str(exc)
@@ -1012,6 +1191,7 @@ class EndpointPoolRouter:
 
         async with self._condition:
             endpoint = self._endpoints[name]
+            endpoint.state_generation += 1
             endpoint.status = snapshot.status
             endpoint.raw_status = snapshot.raw_status
             endpoint.url = snapshot.url
@@ -1037,10 +1217,11 @@ class EndpointPoolRouter:
 
     async def _park_endpoint(self, name: str) -> None:
         try:
-            snapshot = await asyncio.to_thread(self.controller.park, name)
+            snapshot = await self._run_controller_call("park", name)
         except Exception as exc:
             async with self._condition:
                 endpoint = self._endpoints[name]
+                endpoint.state_generation += 1
                 endpoint.parking = False
                 endpoint.wake_capacity_until = None
                 endpoint.last_error = str(exc)
@@ -1051,6 +1232,7 @@ class EndpointPoolRouter:
 
         async with self._condition:
             endpoint = self._endpoints[name]
+            endpoint.state_generation += 1
             endpoint.status = snapshot.status
             endpoint.raw_status = snapshot.raw_status
             endpoint.url = snapshot.url
@@ -1061,9 +1243,9 @@ class EndpointPoolRouter:
             self._condition.notify_all()
 
     async def _reconcile_loop(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(self.reconcile_interval_s)
+        while True:
+            await asyncio.sleep(self.reconcile_interval_s)
+            try:
                 await self.refresh()
                 await self._maintain_drain_leases()
                 await self._schedule_restarts_if_needed()
@@ -1071,8 +1253,10 @@ class EndpointPoolRouter:
                 await self.ensure_min_warm()
                 await self._schedule_wakes_if_needed()
                 await self._schedule_parks_if_needed()
-        except asyncio.CancelledError:
-            raise
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Endpoint reconciliation failed; retrying on the next cycle")
 
     async def _maintain_drain_leases(self) -> None:
         now = time.monotonic()
@@ -1148,6 +1332,7 @@ class EndpointPoolRouter:
                         continue
 
                 endpoint.restarting = True
+                endpoint.state_generation += 1
                 endpoint.restart_attempts += 1
                 endpoint.last_restart_at = now
                 restart_names.append(endpoint.name)
@@ -1163,10 +1348,11 @@ class EndpointPoolRouter:
 
     async def _restart_endpoint(self, name: str) -> None:
         try:
-            snapshot = await asyncio.to_thread(self.controller.restart, name)
+            snapshot = await self._run_controller_call("restart", name)
         except Exception as exc:
             async with self._condition:
                 endpoint = self._endpoints[name]
+                endpoint.state_generation += 1
                 endpoint.restarting = False
                 endpoint.last_error = str(exc)
                 self._last_error = endpoint.last_error
@@ -1176,6 +1362,7 @@ class EndpointPoolRouter:
 
         async with self._condition:
             endpoint = self._endpoints[name]
+            endpoint.state_generation += 1
             endpoint.status = snapshot.status
             endpoint.raw_status = snapshot.raw_status
             endpoint.url = snapshot.url
@@ -1250,6 +1437,7 @@ class EndpointPoolRouter:
         selected = []
         for endpoint in candidates[:target_count]:
             endpoint.waking = True
+            endpoint.state_generation += 1
             endpoint.wake_capacity_until = time.monotonic() + self.waking_capacity_timeout_s
             endpoint.last_error = None
             selected.append(endpoint.name)
@@ -1268,6 +1456,7 @@ class EndpointPoolRouter:
             if running_count - 1 < self.min_warm_endpoints:
                 return []
             endpoint.parking = True
+            endpoint.state_generation += 1
             self._next_park_allowed_at = now + self.park_cooldown_s
             return [endpoint.name]
         return []
@@ -1459,6 +1648,7 @@ class EndpointPoolRouter:
                 if ep is None or ep.drain_restarting or ep.restarting or ep.parking or ep.waking or ep.draining:
                     continue
                 ep.drain_restarting = True
+                ep.state_generation += 1
                 self._condition.notify_all()
 
             to_restart.append((name, reason))
@@ -1473,10 +1663,11 @@ class EndpointPoolRouter:
 
     async def _drain_restart_endpoint(self, name: str) -> None:
         try:
-            snapshot = await asyncio.to_thread(self.controller.force_restart, name)
+            snapshot = await self._run_controller_call("force_restart", name)
         except Exception as exc:
             async with self._condition:
                 ep = self._endpoints[name]
+                ep.state_generation += 1
                 ep.drain_restarting = False
                 ep.last_error = str(exc)
                 self._last_error = ep.last_error
@@ -1486,6 +1677,7 @@ class EndpointPoolRouter:
 
         async with self._condition:
             ep = self._endpoints[name]
+            ep.state_generation += 1
             ep.status = snapshot.status
             ep.raw_status = snapshot.raw_status
             ep.url = snapshot.url
