@@ -46,6 +46,24 @@ COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS = int(os.getenv("COMPUTE_ENDPOINT_WAKE_THR
 COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "600"))
 COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S", "10"))
 COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S", "300"))
+COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S = float(
+    os.getenv(
+        "COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S",
+        str(COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S),
+    )
+)
+COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S", "30"))
+COMPUTE_ENDPOINT_HTTP_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_HTTP_TIMEOUT_S", "10"))
+COMPUTE_ENDPOINT_RECONCILE_STALE_AFTER_S = float(
+    os.getenv(
+        "COMPUTE_ENDPOINT_RECONCILE_STALE_AFTER_S",
+        str(max(COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S * 3, COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S * 2)),
+    )
+)
+COMPUTE_ENDPOINT_CONTROL_FETCH_WORKERS = int(
+    os.getenv("COMPUTE_ENDPOINT_CONTROL_FETCH_WORKERS", str(max(len(COMPUTE_ENDPOINT_NAMES), 1)))
+)
+COMPUTE_ENDPOINT_CONTROL_TRANSITION_WORKERS = int(os.getenv("COMPUTE_ENDPOINT_CONTROL_TRANSITION_WORKERS", "4"))
 COMPUTE_ENDPOINT_PARK_COOLDOWN_S = float(os.getenv("COMPUTE_ENDPOINT_PARK_COOLDOWN_S", "180"))
 COMPUTE_ENDPOINT_WAIT_TIMEOUT_S = int(os.getenv("COMPUTE_ENDPOINT_WAIT_TIMEOUT_S", "900"))
 COMPUTE_ENDPOINT_PARK_STRATEGY = os.getenv("COMPUTE_ENDPOINT_PARK_STRATEGY", "pause").strip().lower()
@@ -138,10 +156,14 @@ def build_endpoint_router() -> EndpointPoolRouter:
     controller = HuggingFaceEndpointController(
         namespace=HF_ENDPOINT_NAMESPACE,
         token=HF_CONTROL_TOKEN,
-        wait_timeout_s=COMPUTE_ENDPOINT_WAIT_TIMEOUT_S,
+        wait_timeout_s=min(
+            COMPUTE_ENDPOINT_WAIT_TIMEOUT_S,
+            max(int(COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S), 1),
+        ),
         active_min_replica=1,
         active_max_replica=1,
         park_strategy=COMPUTE_ENDPOINT_PARK_STRATEGY,
+        http_timeout_s=COMPUTE_ENDPOINT_HTTP_TIMEOUT_S,
     )
 
     return EndpointPoolRouter(
@@ -169,6 +191,11 @@ def build_endpoint_router() -> EndpointPoolRouter:
         # consecutive failed polls before a synced node loses capacity.
         # Setting it below the reconcile interval revokes on a single blip.
         usage_sync_stale_ttl_s=float(os.getenv("COMPUTE_USAGE_STALE_TTL_S", "60")),
+        control_operation_timeout_s=COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S,
+        control_fetch_timeout_s=COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S,
+        reconcile_stale_after_s=COMPUTE_ENDPOINT_RECONCILE_STALE_AFTER_S,
+        control_fetch_workers=COMPUTE_ENDPOINT_CONTROL_FETCH_WORKERS,
+        control_transition_workers=COMPUTE_ENDPOINT_CONTROL_TRANSITION_WORKERS,
     )
 
 
@@ -501,22 +528,23 @@ async def ready():
 @app.get("/health")
 async def health():
     healthy, detail, snapshot = await session_manager.healthcheck()
-    if not healthy:
-        raise HTTPException(status_code=503, detail=detail or "endpoint router is not ready")
-
     requester_tracking = requester_identity_resolver.status()
     requester_tracking["pending_session_attributions"] = session_requester_tracker.count()
     requester_tracking["rate_limit"] = requester_rate_limiter.status()
+    payload = {
+        "status": "ok" if healthy else "unhealthy",
+        "role": APP_ROLE,
+        "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
+        "dashboard_preview_mode": DASHBOARD_PREVIEW_MODE,
+        "dashboard_history": dashboard.persistence_status(),
+        "requester_tracking": requester_tracking,
+        "sessions": snapshot,
+    }
+    if not healthy:
+        payload["detail"] = detail or "endpoint router is not ready"
     return JSONResponse(
-        {
-            "status": "ok",
-            "role": APP_ROLE,
-            "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
-            "dashboard_preview_mode": DASHBOARD_PREVIEW_MODE,
-            "dashboard_history": dashboard.persistence_status(),
-            "requester_tracking": requester_tracking,
-            "sessions": snapshot,
-        }
+        payload,
+        status_code=200 if healthy else 503,
     )
 
 

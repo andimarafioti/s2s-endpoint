@@ -7,7 +7,9 @@ import re
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Awaitable, Callable, Optional, Protocol
 from urllib.parse import urlparse, urlunparse
 
@@ -32,6 +34,10 @@ class EndpointTransitionConflictError(RuntimeError):
 
 
 class EndpointDrainLeaseConflictError(RuntimeError):
+    pass
+
+
+class EndpointControlTimeoutError(TimeoutError):
     pass
 
 
@@ -180,8 +186,15 @@ class HuggingFaceEndpointController:
         active_min_replica: int = 1,
         active_max_replica: int = 1,
         park_strategy: str = "pause",
+        http_timeout_s: float = 10.0,
     ) -> None:
+        if http_timeout_s <= 0:
+            raise ValueError("http_timeout_s must be > 0")
+
+        import httpx
         from huggingface_hub import get_inference_endpoint
+        from huggingface_hub.utils import set_client_factory
+        from huggingface_hub.utils._http import default_client_factory
 
         if park_strategy not in {"pause", "scale_to_zero"}:
             raise ValueError("park_strategy must be 'pause' or 'scale_to_zero'")
@@ -193,11 +206,22 @@ class HuggingFaceEndpointController:
         self.active_min_replica = active_min_replica
         self.active_max_replica = active_max_replica
         self.park_strategy = park_strategy
+        self.http_timeout_s = http_timeout_s
         self._get_inference_endpoint = get_inference_endpoint
+
+        # huggingface_hub 1.15 deliberately creates its shared API client with
+        # timeout=None. A stalled control-plane socket would therefore pin a
+        # worker forever. Preserve the library's request hooks and redirect
+        # behavior while applying an explicit connect/read/write/pool timeout.
+        def bounded_client_factory() -> httpx.Client:
+            client = default_client_factory()
+            client.timeout = httpx.Timeout(http_timeout_s)
+            return client
+
+        set_client_factory(bounded_client_factory)
 
     def fetch(self, name: str) -> EndpointSnapshot:
         endpoint = self._get(name)
-        endpoint.fetch()
         return self._snapshot(name, endpoint)
 
     def wake(self, name: str) -> EndpointSnapshot:
@@ -298,6 +322,8 @@ class ManagedEndpoint:
     last_error: Optional[str] = None
     last_used_at: float = field(default_factory=time.monotonic)
     wake_capacity_until: Optional[float] = None
+    wake_started_at: Optional[float] = None
+    state_generation: int = 0
     restart_attempts: int = 0
     last_restart_at: Optional[float] = None
     running_since: Optional[float] = None
@@ -320,7 +346,6 @@ class ManagedEndpoint:
     drain_lease_id: Optional[str] = None
     last_drain_warning_at: Optional[float] = None
     last_sync_failure_log_at: Optional[float] = None
-
     @property
     def running(self) -> bool:
         return _is_running_status(self.status) and self.url is not None
@@ -355,6 +380,15 @@ class ManagedEndpoint:
         return _to_ws_url(self.url, self.ws_path)
 
 
+@dataclass(frozen=True)
+class InFlightControlOperation:
+    operation_id: int
+    kind: str
+    endpoint_name: str
+    started_at: float
+    timeout_s: float
+
+
 class EndpointPoolRouter:
     def __init__(
         self,
@@ -379,6 +413,11 @@ class EndpointPoolRouter:
         drain_warning_interval_s: float = 300.0,
         compute_usage_fetcher: ComputeUsageFetcher,
         usage_sync_stale_ttl_s: float = 60.0,
+        control_operation_timeout_s: Optional[float] = None,
+        control_fetch_timeout_s: float = 30.0,
+        reconcile_stale_after_s: Optional[float] = None,
+        control_fetch_workers: Optional[int] = None,
+        control_transition_workers: int = 4,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
         if not names:
@@ -397,6 +436,16 @@ class EndpointPoolRouter:
             raise ValueError("endpoint_ws_path must start with '/'")
         if drain_lease_ttl_s <= 0:
             raise ValueError("drain_lease_ttl_s must be > 0")
+        if control_operation_timeout_s is not None and control_operation_timeout_s <= 0:
+            raise ValueError("control_operation_timeout_s must be > 0")
+        if control_fetch_timeout_s <= 0:
+            raise ValueError("control_fetch_timeout_s must be > 0")
+        if reconcile_stale_after_s is not None and reconcile_stale_after_s <= 0:
+            raise ValueError("reconcile_stale_after_s must be > 0")
+        if control_fetch_workers is not None and control_fetch_workers <= 0:
+            raise ValueError("control_fetch_workers must be > 0")
+        if control_transition_workers <= 0:
+            raise ValueError("control_transition_workers must be > 0")
 
         self.endpoint_ws_path = endpoint_ws_path
         self.min_warm_endpoints = min_warm_endpoints
@@ -417,6 +466,15 @@ class EndpointPoolRouter:
         self.drain_warning_interval_s = max(drain_warning_interval_s, 0.0)
         self.compute_usage_fetcher = compute_usage_fetcher
         self.usage_sync_stale_ttl_s = max(usage_sync_stale_ttl_s, 0.0)
+        self.control_operation_timeout_s = (
+            waking_capacity_timeout_s if control_operation_timeout_s is None else control_operation_timeout_s
+        )
+        self.control_fetch_timeout_s = control_fetch_timeout_s
+        self.reconcile_stale_after_s = (
+            max(reconcile_interval_s * 3, control_fetch_timeout_s * 2)
+            if reconcile_stale_after_s is None
+            else reconcile_stale_after_s
+        )
 
         self._on_endpoint_down: Optional[Callable[[str], Awaitable[None]]] = None
         self._endpoints = {
@@ -431,17 +489,36 @@ class EndpointPoolRouter:
         self._lock = asyncio.Lock()
         self._condition = asyncio.Condition(self._lock)
         self._usage_sync_lock = asyncio.Lock()
+        self._reconcile_lock = asyncio.Lock()
         self._closed = False
         self._reconcile_task: Optional[asyncio.Task] = None
         self._initial_warm_task: Optional[asyncio.Task] = None
         self._last_error: Optional[str] = None
         self._next_park_allowed_at = 0.0
+        self._last_reconcile_success_at: Optional[float] = None
+        self._last_reconcile_success_monotonic: Optional[float] = None
+        self._reconcile_in_progress_since: Optional[float] = None
+        self._next_control_operation_id = 1
+        self._in_flight_control_operations: dict[int, InFlightControlOperation] = {}
+        fetch_workers = control_fetch_workers if control_fetch_workers is not None else max(len(names), 1)
+        self._control_fetch_executor = ThreadPoolExecutor(
+            max_workers=fetch_workers,
+            thread_name_prefix="endpoint-fetch",
+        )
+        self._control_transition_executor = ThreadPoolExecutor(
+            max_workers=control_transition_workers,
+            thread_name_prefix="endpoint-control",
+        )
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         await self.refresh()
         await self._retry_initial_usage_sync()
-        self._initial_warm_task = asyncio.create_task(self.ensure_min_warm())
-        self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+        self._initial_warm_task = self._create_background_task(
+            self.ensure_min_warm(),
+            label="initial-endpoint-warmup",
+        )
+        self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="endpoint-reconcile-loop")
 
     async def _retry_initial_usage_sync(self) -> None:
         """Give unsynced running endpoints a second chance at startup.
@@ -471,6 +548,112 @@ class EndpointPoolRouter:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reconcile_task
             self._reconcile_task = None
+
+        background_tasks = list(self._background_tasks)
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+
+        self._control_fetch_executor.shutdown(wait=False, cancel_futures=True)
+        self._control_transition_executor.shutdown(wait=False, cancel_futures=True)
+
+    async def _run_control_operation(
+        self,
+        kind: str,
+        endpoint_name: str,
+        function: Callable,
+        *args,
+        fetch: bool = False,
+        timeout_s: Optional[float] = None,
+    ):
+        timeout = self.control_fetch_timeout_s if timeout_s is None and fetch else timeout_s
+        if timeout is None:
+            timeout = self.control_operation_timeout_s
+        operation_id = self._next_control_operation_id
+        self._next_control_operation_id += 1
+        operation = InFlightControlOperation(
+            operation_id=operation_id,
+            kind=kind,
+            endpoint_name=endpoint_name,
+            started_at=time.monotonic(),
+            timeout_s=timeout,
+        )
+        self._in_flight_control_operations[operation_id] = operation
+        log_operation_start = logger.debug if fetch else logger.info
+        log_operation_start(
+            "Starting endpoint control operation %s for %s (id=%d, timeout=%.1fs)",
+            kind,
+            endpoint_name,
+            operation_id,
+            timeout,
+        )
+
+        executor = self._control_fetch_executor if fetch else self._control_transition_executor
+        loop = asyncio.get_running_loop()
+        try:
+            concurrent_future = executor.submit(partial(function, *args))
+        except Exception:
+            self._in_flight_control_operations.pop(operation_id, None)
+            raise
+
+        def operation_finished(future) -> None:
+            try:
+                loop.call_soon_threadsafe(self._finish_control_operation, operation_id, future)
+            except RuntimeError:
+                pass
+
+        concurrent_future.add_done_callback(operation_finished)
+        async_future = asyncio.wrap_future(concurrent_future)
+        try:
+            return await asyncio.wait_for(asyncio.shield(async_future), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise EndpointControlTimeoutError(
+                f"{kind} operation for {endpoint_name} exceeded {timeout:.1f}s"
+            ) from exc
+
+    def _finish_control_operation(self, operation_id: int, future) -> None:
+        operation = self._in_flight_control_operations.pop(operation_id, None)
+        if operation is None:
+            return
+        elapsed = max(time.monotonic() - operation.started_at, 0.0)
+        if elapsed >= operation.timeout_s:
+            try:
+                late_error = future.exception()
+            except BaseException as exc:
+                late_error = exc
+            logger.warning(
+                "Endpoint control operation %s for %s finished after its deadline "
+                "(id=%d, elapsed=%.1fs, error=%s)",
+                operation.kind,
+                operation.endpoint_name,
+                operation.operation_id,
+                elapsed,
+                late_error,
+            )
+
+    def _create_background_task(self, coroutine, *, label: str) -> asyncio.Task:
+        task = asyncio.create_task(coroutine, name=label)
+        self._background_tasks.add(task)
+
+        def task_finished(finished: asyncio.Task) -> None:
+            self._background_tasks.discard(finished)
+            if finished.cancelled():
+                return
+            try:
+                error = finished.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                logger.error(
+                    "Background task %s failed: %s",
+                    label,
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(task_finished)
+        return task
 
     def _claim_slot_unlocked(self, *, waited_for_capacity: bool) -> tuple[Optional[EndpointLease], list[str]]:
         """Single slot-claim attempt; the caller must hold ``self._condition``.
@@ -641,6 +824,14 @@ class EndpointPoolRouter:
 
     async def healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
         snapshot = await self.snapshot()
+        if snapshot["reconciliation_stale"]:
+            age = snapshot["reconcile_age_s"]
+            detail = (
+                "endpoint reconciliation has never completed"
+                if age is None
+                else f"endpoint reconciliation is stale ({age:.1f}s since last success)"
+            )
+            return False, detail, snapshot
         if snapshot["running_endpoints"]:
             # A running endpoint is not necessarily usable: with a usage
             # fetcher configured it offers zero capacity until its true
@@ -665,8 +856,15 @@ class EndpointPoolRouter:
         return False, "no compute endpoint is ready", snapshot
 
     async def snapshot(self) -> dict[str, object]:
-        async with self._lock:
+        async with self._condition:
+            now = time.monotonic()
+            if self._expire_stale_wakes_unlocked(now):
+                self._condition.notify_all()
             endpoints = list(self._endpoints.values())
+            control_operations = list(self._in_flight_control_operations.values())
+            last_reconcile_success_at = self._last_reconcile_success_at
+            last_reconcile_success_monotonic = self._last_reconcile_success_monotonic
+            reconcile_in_progress_since = self._reconcile_in_progress_since
 
         running = sum(1 for endpoint in endpoints if endpoint.running)
         unsynced_running = sum(
@@ -679,7 +877,6 @@ class EndpointPoolRouter:
         restarting = sum(1 for endpoint in endpoints if endpoint.restarting)
         free_slots = sum(endpoint.free_slots for endpoint in endpoints)
         warming_slots = 0
-        now = time.monotonic()
         for endpoint in endpoints:
             if self._counts_as_warming_capacity(endpoint, now):
                 warming_slots += endpoint.slots
@@ -694,6 +891,23 @@ class EndpointPoolRouter:
         ]
         if self._last_error and not errors:
             errors.append({"endpoint": None, "error": self._last_error})
+        reconcile_age_s = (
+            max(now - last_reconcile_success_monotonic, 0.0)
+            if last_reconcile_success_monotonic is not None
+            else None
+        )
+        reconciliation_stale = reconcile_age_s is None or reconcile_age_s > self.reconcile_stale_after_s
+        control_operation_rows = [
+            {
+                "id": operation.operation_id,
+                "kind": operation.kind,
+                "endpoint": operation.endpoint_name,
+                "age_s": max(now - operation.started_at, 0.0),
+                "timeout_s": operation.timeout_s,
+                "overdue": now - operation.started_at >= operation.timeout_s,
+            }
+            for operation in sorted(control_operations, key=lambda item: item.operation_id)
+        ]
 
         return {
             "min_warm_endpoints": self.min_warm_endpoints,
@@ -704,6 +918,20 @@ class EndpointPoolRouter:
             "park_cooldown_remaining_s": max(self._next_park_allowed_at - now, 0.0),
             "auto_restart": self.auto_restart,
             "max_restart_attempts": self.max_restart_attempts,
+            "control_operation_timeout_s": self.control_operation_timeout_s,
+            "control_fetch_timeout_s": self.control_fetch_timeout_s,
+            "last_reconcile_success_at": last_reconcile_success_at,
+            "reconcile_age_s": reconcile_age_s,
+            "reconcile_stale_after_s": self.reconcile_stale_after_s,
+            "reconciliation_stale": reconciliation_stale,
+            "reconciliation_in_progress": reconcile_in_progress_since is not None,
+            "reconciliation_in_progress_for_s": (
+                max(now - reconcile_in_progress_since, 0.0)
+                if reconcile_in_progress_since is not None
+                else None
+            ),
+            "in_flight_control_operations": len(control_operation_rows),
+            "control_operations": control_operation_rows,
             "running_endpoints": running,
             "unsynced_running_endpoints": unsynced_running,
             "waking_endpoints": waking,
@@ -756,6 +984,16 @@ class EndpointPoolRouter:
                     "require_usage_sync": endpoint.require_usage_sync,
                     "free_slots": endpoint.free_slots,
                     "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
+                    "waking_for_s": (
+                        max(now - endpoint.wake_started_at, 0.0)
+                        if endpoint.waking and endpoint.wake_started_at is not None
+                        else None
+                    ),
+                    "wake_deadline_remaining_s": (
+                        max(endpoint.wake_capacity_until - now, 0.0)
+                        if endpoint.waking and endpoint.wake_capacity_until is not None
+                        else None
+                    ),
                     "url": endpoint.url,
                     "last_error": endpoint.last_error,
                 }
@@ -765,85 +1003,147 @@ class EndpointPoolRouter:
         }
 
     async def refresh(self) -> None:
-        tasks = [asyncio.to_thread(self.controller.fetch, endpoint.name) for endpoint in self._endpoints.values()]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._reconcile_lock:
+            self._reconcile_in_progress_since = time.monotonic()
+            try:
+                async with self._condition:
+                    self._expire_stale_wakes_unlocked(time.monotonic())
+                    targets = [
+                        (endpoint.name, endpoint.state_generation)
+                        for endpoint in self._endpoints.values()
+                    ]
 
-        now = time.monotonic()
-        downed_endpoints: list[str] = []
-
-        async with self._condition:
-            for endpoint, result in zip(self._endpoints.values(), results):
-                if isinstance(result, Exception):
-                    endpoint.last_error = str(result)
-                    self._last_error = endpoint.last_error
-                    continue
-
-                was_running = endpoint.running
-
-                endpoint.status = result.status
-                endpoint.raw_status = result.raw_status
-                endpoint.url = result.url
-                if endpoint.running:
-                    # A controller-driven wake keeps this transition marked
-                    # until its first capacity sync finishes. Clearing it here
-                    # would let a concurrent refresh expose an unsynced running
-                    # endpoint as missing warming capacity.
-                    if not endpoint.waking:
-                        endpoint.wake_capacity_until = None
-                    if not was_running:
-                        endpoint.running_since = now
-                        endpoint.drain_restarting = False
-                    if (
-                        endpoint.restart_attempts > 0
-                        and endpoint.running_since is not None
-                        and now - endpoint.running_since >= self.restart_stable_running_s
-                    ):
-                        endpoint.restart_attempts = 0
-                        endpoint.last_restart_at = None
-                else:
-                    endpoint.running_since = None
-
-                if _is_parked_status(endpoint.status):
-                    endpoint.parking = False
-
-                local_active_sessions = endpoint.active_sessions
-                if was_running and not endpoint.running:
-                    endpoint.active_sessions = 0
-                    endpoint.connected_sessions = 0
-                    endpoint.observed_active_sessions = 0
-                    endpoint.unobserved_connected_sessions = 0
-                    endpoint.usage_synced = False
-                    endpoint.last_usage_sync_at = None
-                    endpoint.usage_sync_drain_generation = None
-                    if local_active_sessions > 0:
-                        downed_endpoints.append(endpoint.name)
-                elif not endpoint.running:
-                    endpoint.observed_active_sessions = 0
-                    endpoint.unobserved_connected_sessions = 0
-                    endpoint.usage_synced = False
-                    endpoint.last_usage_sync_at = None
-                    endpoint.usage_sync_drain_generation = None
-
-                if (
-                    _is_failed_status(endpoint.status)
-                    and self.auto_restart
-                    and endpoint.restart_attempts >= self.max_restart_attempts
-                ):
-                    endpoint.last_error = f"endpoint failed, {endpoint.restart_attempts} restart attempt(s) exhausted"
-                else:
-                    endpoint.last_error = None
-                self._last_error = None
-
-        if self._on_endpoint_down is not None:
-            for name in downed_endpoints:
+                tasks = [
+                    asyncio.create_task(self._fetch_endpoint_for_refresh(name, generation))
+                    for name, generation in targets
+                ]
+                successful_fetches = 0
                 try:
-                    await self._on_endpoint_down(name)
-                except Exception:
-                    logger.exception("on_endpoint_down callback failed for %s", name)
+                    for task in asyncio.as_completed(tasks):
+                        name, generation, result = await task
+                        if not isinstance(result, Exception):
+                            successful_fetches += 1
+                        await self._apply_refresh_result(name, generation, result)
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
-        await self._sync_compute_usage(notify=False)
+                await self._sync_compute_usage(notify=False)
+                async with self._condition:
+                    if successful_fetches:
+                        self._last_reconcile_success_at = time.time()
+                        self._last_reconcile_success_monotonic = time.monotonic()
+                    else:
+                        self._last_error = "endpoint reconciliation completed without a successful status fetch"
+                        logger.error(self._last_error)
+                    self._condition.notify_all()
+            finally:
+                self._reconcile_in_progress_since = None
+
+    async def _fetch_endpoint_for_refresh(
+        self,
+        name: str,
+        generation: int,
+    ) -> tuple[str, int, EndpointSnapshot | Exception]:
+        try:
+            result = await self._run_control_operation(
+                "fetch",
+                name,
+                self.controller.fetch,
+                name,
+                fetch=True,
+            )
+        except Exception as exc:
+            result = exc
+        return name, generation, result
+
+    async def _apply_refresh_result(
+        self,
+        name: str,
+        generation: int,
+        result: EndpointSnapshot | Exception,
+    ) -> None:
+        endpoint_went_down = False
         async with self._condition:
+            endpoint = self._endpoints[name]
+            if endpoint.state_generation != generation:
+                logger.info(
+                    "Ignoring stale fetch result for %s (generation %d, current %d)",
+                    name,
+                    generation,
+                    endpoint.state_generation,
+                )
+                return
+            if isinstance(result, Exception):
+                endpoint.last_error = str(result)
+                self._last_error = endpoint.last_error
+                logger.error("Failed to refresh endpoint %s status: %s", name, result)
+                self._condition.notify_all()
+                return
+
+            now = time.monotonic()
+            was_running = endpoint.running
+            endpoint.status = result.status
+            endpoint.raw_status = result.raw_status
+            endpoint.url = result.url
+            if endpoint.running:
+                # A controller-driven wake keeps this transition marked until
+                # its first capacity sync finishes. Clearing it here would let
+                # a concurrent refresh lose the warming-capacity signal.
+                if not endpoint.waking:
+                    endpoint.wake_capacity_until = None
+                    endpoint.wake_started_at = None
+                if not was_running:
+                    endpoint.running_since = now
+                    endpoint.drain_restarting = False
+                if (
+                    endpoint.restart_attempts > 0
+                    and endpoint.running_since is not None
+                    and now - endpoint.running_since >= self.restart_stable_running_s
+                ):
+                    endpoint.restart_attempts = 0
+                    endpoint.last_restart_at = None
+            else:
+                endpoint.running_since = None
+
+            if _is_parked_status(endpoint.status):
+                endpoint.parking = False
+
+            local_active_sessions = endpoint.active_sessions
+            if was_running and not endpoint.running:
+                endpoint.active_sessions = 0
+                endpoint.connected_sessions = 0
+                endpoint.observed_active_sessions = 0
+                endpoint.unobserved_connected_sessions = 0
+                endpoint.usage_synced = False
+                endpoint.last_usage_sync_at = None
+                endpoint.usage_sync_drain_generation = None
+                endpoint_went_down = local_active_sessions > 0
+            elif not endpoint.running:
+                endpoint.observed_active_sessions = 0
+                endpoint.unobserved_connected_sessions = 0
+                endpoint.usage_synced = False
+                endpoint.last_usage_sync_at = None
+                endpoint.usage_sync_drain_generation = None
+
+            if (
+                _is_failed_status(endpoint.status)
+                and self.auto_restart
+                and endpoint.restart_attempts >= self.max_restart_attempts
+            ):
+                endpoint.last_error = f"endpoint failed, {endpoint.restart_attempts} restart attempt(s) exhausted"
+            else:
+                endpoint.last_error = None
+            self._last_error = None
             self._condition.notify_all()
+
+        if endpoint_went_down and self._on_endpoint_down is not None:
+            try:
+                await self._on_endpoint_down(name)
+            except Exception:
+                logger.exception("on_endpoint_down callback failed for %s", name)
 
     async def ensure_min_warm(self) -> None:
         while True:
@@ -857,7 +1157,9 @@ class EndpointPoolRouter:
                 if not wake_names:
                     return
 
-            await asyncio.gather(*(self._wake_endpoint(name) for name in wake_names))
+            await asyncio.gather(
+                *(self._wake_endpoint(name, self._endpoints[name].state_generation) for name in wake_names)
+            )
 
     async def _sync_compute_usage(self, *, notify: bool = True) -> None:
         # Wake, restart, refresh, and startup paths can all request a usage
@@ -996,13 +1298,30 @@ class EndpointPoolRouter:
             if notify:
                 self._condition.notify_all()
 
-    async def _wake_endpoint(self, name: str) -> None:
+    async def _wake_endpoint(self, name: str, generation: int) -> None:
         try:
-            snapshot = await asyncio.to_thread(self.controller.wake, name)
+            snapshot = await self._run_control_operation(
+                "wake",
+                name,
+                self.controller.wake,
+                name,
+            )
         except Exception as exc:
             async with self._condition:
                 endpoint = self._endpoints[name]
+                if endpoint.state_generation != generation:
+                    logger.warning(
+                        "Ignoring failure from stale wake operation for %s "
+                        "(generation %d, current %d): %s",
+                        name,
+                        generation,
+                        endpoint.state_generation,
+                        exc,
+                    )
+                    return
+                endpoint.state_generation += 1
                 endpoint.waking = False
+                endpoint.wake_started_at = None
                 endpoint.wake_capacity_until = None
                 endpoint.last_error = str(exc)
                 self._last_error = endpoint.last_error
@@ -1012,6 +1331,14 @@ class EndpointPoolRouter:
 
         async with self._condition:
             endpoint = self._endpoints[name]
+            if endpoint.state_generation != generation:
+                logger.warning(
+                    "Ignoring late wake result for %s (generation %d, current %d)",
+                    name,
+                    generation,
+                    endpoint.state_generation,
+                )
+                return
             endpoint.status = snapshot.status
             endpoint.raw_status = snapshot.raw_status
             endpoint.url = snapshot.url
@@ -1030,17 +1357,35 @@ class EndpointPoolRouter:
         finally:
             async with self._condition:
                 endpoint = self._endpoints[name]
-                endpoint.waking = False
-                endpoint.wake_capacity_until = None
-                self._condition.notify_all()
+                if endpoint.state_generation == generation:
+                    endpoint.waking = False
+                    endpoint.wake_started_at = None
+                    endpoint.wake_capacity_until = None
+                    self._condition.notify_all()
         logger.info("Endpoint %s is ready at %s", name, snapshot.url)
 
-    async def _park_endpoint(self, name: str) -> None:
+    async def _park_endpoint(self, name: str, generation: int) -> None:
         try:
-            snapshot = await asyncio.to_thread(self.controller.park, name)
+            snapshot = await self._run_control_operation(
+                "park",
+                name,
+                self.controller.park,
+                name,
+            )
         except Exception as exc:
             async with self._condition:
                 endpoint = self._endpoints[name]
+                if endpoint.state_generation != generation:
+                    logger.warning(
+                        "Ignoring failure from stale park operation for %s "
+                        "(generation %d, current %d): %s",
+                        name,
+                        generation,
+                        endpoint.state_generation,
+                        exc,
+                    )
+                    return
+                endpoint.state_generation += 1
                 endpoint.parking = False
                 endpoint.wake_capacity_until = None
                 endpoint.last_error = str(exc)
@@ -1051,10 +1396,19 @@ class EndpointPoolRouter:
 
         async with self._condition:
             endpoint = self._endpoints[name]
+            if endpoint.state_generation != generation:
+                logger.warning(
+                    "Ignoring late park result for %s (generation %d, current %d)",
+                    name,
+                    generation,
+                    endpoint.state_generation,
+                )
+                return
             endpoint.status = snapshot.status
             endpoint.raw_status = snapshot.raw_status
             endpoint.url = snapshot.url
             endpoint.parking = False
+            endpoint.wake_started_at = None
             endpoint.wake_capacity_until = None
             endpoint.last_error = None
             self._last_error = None
@@ -1064,13 +1418,21 @@ class EndpointPoolRouter:
         try:
             while True:
                 await asyncio.sleep(self.reconcile_interval_s)
-                await self.refresh()
-                await self._maintain_drain_leases()
-                await self._schedule_restarts_if_needed()
-                await self._check_drain_restarts()
-                await self.ensure_min_warm()
-                await self._schedule_wakes_if_needed()
-                await self._schedule_parks_if_needed()
+                try:
+                    await self.refresh()
+                    await self._maintain_drain_leases()
+                    await self._schedule_restarts_if_needed()
+                    await self._check_drain_restarts()
+                    await self.ensure_min_warm()
+                    await self._schedule_wakes_if_needed()
+                    await self._schedule_parks_if_needed()
+                except Exception as exc:
+                    async with self._condition:
+                        self._last_error = f"endpoint reconciliation failed: {exc}"
+                        self._condition.notify_all()
+                    logger.exception(
+                        "Endpoint reconciliation cycle failed; the supervisor will retry next cycle"
+                    )
         except asyncio.CancelledError:
             raise
 
@@ -1147,6 +1509,7 @@ class EndpointPoolRouter:
                     if now - endpoint.last_restart_at < backoff:
                         continue
 
+                endpoint.state_generation += 1
                 endpoint.restarting = True
                 endpoint.restart_attempts += 1
                 endpoint.last_restart_at = now
@@ -1159,14 +1522,34 @@ class EndpointPoolRouter:
                 self._endpoints[name].restart_attempts,
                 self.max_restart_attempts,
             )
-            asyncio.create_task(self._restart_endpoint(name))
+            generation = self._endpoints[name].state_generation
+            self._create_background_task(
+                self._restart_endpoint(name, generation),
+                label=f"restart-{name}-g{generation}",
+            )
 
-    async def _restart_endpoint(self, name: str) -> None:
+    async def _restart_endpoint(self, name: str, generation: int) -> None:
         try:
-            snapshot = await asyncio.to_thread(self.controller.restart, name)
+            snapshot = await self._run_control_operation(
+                "restart",
+                name,
+                self.controller.restart,
+                name,
+            )
         except Exception as exc:
             async with self._condition:
                 endpoint = self._endpoints[name]
+                if endpoint.state_generation != generation:
+                    logger.warning(
+                        "Ignoring failure from stale restart operation for %s "
+                        "(generation %d, current %d): %s",
+                        name,
+                        generation,
+                        endpoint.state_generation,
+                        exc,
+                    )
+                    return
+                endpoint.state_generation += 1
                 endpoint.restarting = False
                 endpoint.last_error = str(exc)
                 self._last_error = endpoint.last_error
@@ -1176,6 +1559,14 @@ class EndpointPoolRouter:
 
         async with self._condition:
             endpoint = self._endpoints[name]
+            if endpoint.state_generation != generation:
+                logger.warning(
+                    "Ignoring late restart result for %s (generation %d, current %d)",
+                    name,
+                    generation,
+                    endpoint.state_generation,
+                )
+                return
             endpoint.status = snapshot.status
             endpoint.raw_status = snapshot.raw_status
             endpoint.url = snapshot.url
@@ -1192,8 +1583,9 @@ class EndpointPoolRouter:
         finally:
             async with self._condition:
                 endpoint = self._endpoints[name]
-                endpoint.restarting = False
-                self._condition.notify_all()
+                if endpoint.state_generation == generation:
+                    endpoint.restarting = False
+                    self._condition.notify_all()
         logger.info(
             "Restart action completed for endpoint %s (status: %s)",
             name,
@@ -1217,6 +1609,7 @@ class EndpointPoolRouter:
         target_count: Optional[int] = None,
     ) -> list[str]:
         now = time.monotonic()
+        self._expire_stale_wakes_unlocked(now)
         effective_free_slots = self._effective_free_slots_unlocked()
         if not force and target_count is None:
             # Keep the warm floor, but don't spin up extra endpoints while the
@@ -1249,11 +1642,39 @@ class EndpointPoolRouter:
 
         selected = []
         for endpoint in candidates[:target_count]:
+            endpoint.state_generation += 1
             endpoint.waking = True
-            endpoint.wake_capacity_until = time.monotonic() + self.waking_capacity_timeout_s
+            endpoint.wake_started_at = now
+            endpoint.wake_capacity_until = now + self.waking_capacity_timeout_s
             endpoint.last_error = None
             selected.append(endpoint.name)
         return selected
+
+    def _expire_stale_wakes_unlocked(self, now: float) -> int:
+        expired = 0
+        for endpoint in self._endpoints.values():
+            if (
+                not endpoint.waking
+                or endpoint.wake_capacity_until is None
+                or now < endpoint.wake_capacity_until
+            ):
+                continue
+            waking_for_s = (
+                max(now - endpoint.wake_started_at, 0.0)
+                if endpoint.wake_started_at is not None
+                else self.waking_capacity_timeout_s
+            )
+            endpoint.state_generation += 1
+            endpoint.waking = False
+            endpoint.wake_started_at = None
+            endpoint.wake_capacity_until = None
+            endpoint.last_error = (
+                f"wake attempt expired after {waking_for_s:.1f}s; endpoint is retryable"
+            )
+            self._last_error = endpoint.last_error
+            expired += 1
+            logger.error("Endpoint %s %s", endpoint.name, endpoint.last_error)
+        return expired
 
     def _mark_endpoints_to_park_unlocked(self) -> list[str]:
         now = time.monotonic()
@@ -1267,6 +1688,7 @@ class EndpointPoolRouter:
         for endpoint in eligible:
             if running_count - 1 < self.min_warm_endpoints:
                 return []
+            endpoint.state_generation += 1
             endpoint.parking = True
             self._next_park_allowed_at = now + self.park_cooldown_s
             return [endpoint.name]
@@ -1368,11 +1790,19 @@ class EndpointPoolRouter:
 
     def _spawn_wake_tasks(self, names: list[str]) -> None:
         for name in names:
-            asyncio.create_task(self._wake_endpoint(name))
+            generation = self._endpoints[name].state_generation
+            self._create_background_task(
+                self._wake_endpoint(name, generation),
+                label=f"wake-{name}-g{generation}",
+            )
 
     def _spawn_park_tasks(self, names: list[str]) -> None:
         for name in names:
-            asyncio.create_task(self._park_endpoint(name))
+            generation = self._endpoints[name].state_generation
+            self._create_background_task(
+                self._park_endpoint(name, generation),
+                label=f"park-{name}-g{generation}",
+            )
 
     @staticmethod
     def _fetch_pool_units(url: str) -> Optional[list[dict]]:
@@ -1419,7 +1849,7 @@ class EndpointPoolRouter:
             return_exceptions=True,
         )
 
-        to_restart: list[tuple[str, str]] = []  # (name, reason)
+        to_restart: list[tuple[str, str, int]] = []  # (name, reason, state generation)
 
         for (name, _), units in zip(to_poll, poll_results):
             if isinstance(units, BaseException) or not units:
@@ -1458,25 +1888,46 @@ class EndpointPoolRouter:
                 ep = self._endpoints.get(name)
                 if ep is None or ep.drain_restarting or ep.restarting or ep.parking or ep.waking or ep.draining:
                     continue
+                ep.state_generation += 1
                 ep.drain_restarting = True
+                generation = ep.state_generation
                 self._condition.notify_all()
 
-            to_restart.append((name, reason))
+            to_restart.append((name, reason, generation))
 
-        for name, reason in to_restart:
+        for name, reason, generation in to_restart:
             logger.error(
                 "Endpoint %s triggering force restart (pause → resume): %s",
                 name,
                 reason,
             )
-            asyncio.create_task(self._drain_restart_endpoint(name))
+            self._create_background_task(
+                self._drain_restart_endpoint(name, generation),
+                label=f"drain-restart-{name}-g{generation}",
+            )
 
-    async def _drain_restart_endpoint(self, name: str) -> None:
+    async def _drain_restart_endpoint(self, name: str, generation: int) -> None:
         try:
-            snapshot = await asyncio.to_thread(self.controller.force_restart, name)
+            snapshot = await self._run_control_operation(
+                "force_restart",
+                name,
+                self.controller.force_restart,
+                name,
+            )
         except Exception as exc:
             async with self._condition:
                 ep = self._endpoints[name]
+                if ep.state_generation != generation:
+                    logger.warning(
+                        "Ignoring failure from stale drain restart for %s "
+                        "(generation %d, current %d): %s",
+                        name,
+                        generation,
+                        ep.state_generation,
+                        exc,
+                    )
+                    return
+                ep.state_generation += 1
                 ep.drain_restarting = False
                 ep.last_error = str(exc)
                 self._last_error = ep.last_error
@@ -1486,6 +1937,14 @@ class EndpointPoolRouter:
 
         async with self._condition:
             ep = self._endpoints[name]
+            if ep.state_generation != generation:
+                logger.warning(
+                    "Ignoring late drain restart result for %s (generation %d, current %d)",
+                    name,
+                    generation,
+                    ep.state_generation,
+                )
+                return
             ep.status = snapshot.status
             ep.raw_status = snapshot.raw_status
             ep.url = snapshot.url
@@ -1503,8 +1962,9 @@ class EndpointPoolRouter:
         finally:
             async with self._condition:
                 ep = self._endpoints[name]
-                ep.drain_restarting = False
-                self._condition.notify_all()
+                if ep.state_generation == generation:
+                    ep.drain_restarting = False
+                    self._condition.notify_all()
         logger.info("Drain restart completed for endpoint %s (status: %s)", name, snapshot.raw_status)
 
     def _raise_if_closed(self) -> None:
