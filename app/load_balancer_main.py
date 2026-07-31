@@ -314,6 +314,7 @@ def _log_session_allocation_outcome(
     requester: RequesterIdentity | None = None,
     error: str | None = None,
     http_route: str = "POST /session",
+    no_connect_penalty_excluded: bool | None = None,
 ) -> None:
     allocation = allocation or {}
     session_id = allocation.get("session_id")
@@ -330,6 +331,7 @@ def _log_session_allocation_outcome(
         "waited_for_capacity": waited_for_capacity,
         "allocation_error": error,
         "http_route": http_route,
+        "no_connect_penalty_excluded": no_connect_penalty_excluded,
         "requester_id": requester.actor_id if requester is not None else None,
         "requester_kind": requester.kind if requester is not None else None,
         "requester_verification": requester.verification if requester is not None else None,
@@ -359,6 +361,9 @@ def _log_session_allocation_outcome(
     if error is not None:
         message += " error=%s"
         args.append(error)
+    if no_connect_penalty_excluded is not None:
+        message += " no_connect_penalty_excluded=%s"
+        args.append(no_connect_penalty_excluded)
 
     logger.log(level, message, *args, extra=extra)
 
@@ -665,10 +670,18 @@ async def _deliver_grant(
 
     if await request.is_disconnected():
         requester = await _refresh_requester_identity(requester)
+        # Queue grants are delayed by definition; waited_for_capacity also covers
+        # the queue-disabled path that blocked until a compute slot became free.
+        no_connect_penalty_excluded = bool(allocation.get("waited_for_capacity")) or (
+            http_route == "GET /queue/{queue_id}"
+        )
         if session_id and hasattr(session_manager, "cancel_pending_session"):
             await session_manager.cancel_pending_session(session_id)
         if session_id:
-            requester_rate_limiter.record_disconnected(session_id)
+            requester_rate_limiter.record_disconnected(
+                session_id,
+                penalize=not no_connect_penalty_excluded,
+            )
         _log_session_allocation_outcome(
             "client_disconnected",
             allocation=allocation,
@@ -677,6 +690,7 @@ async def _deliver_grant(
             level=logging.WARNING,
             requester=requester,
             http_route=http_route,
+            no_connect_penalty_excluded=no_connect_penalty_excluded,
         )
         await dashboard.record_session_request_abandoned(requester)
         raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
