@@ -56,6 +56,9 @@ COMPUTE_ENDPOINT_RECONCILE_STALE_AFTER_S = float(
 )
 COMPUTE_ENDPOINT_PARK_COOLDOWN_S = float(os.getenv("COMPUTE_ENDPOINT_PARK_COOLDOWN_S", "180"))
 COMPUTE_ENDPOINT_WAIT_TIMEOUT_S = int(os.getenv("COMPUTE_ENDPOINT_WAIT_TIMEOUT_S", "900"))
+COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S = float(
+    os.getenv("COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S", str(COMPUTE_ENDPOINT_WAIT_TIMEOUT_S))
+)
 COMPUTE_ENDPOINT_PARK_STRATEGY = os.getenv("COMPUTE_ENDPOINT_PARK_STRATEGY", "pause").strip().lower()
 COMPUTE_ENDPOINT_AUTO_RESTART = os.getenv("COMPUTE_ENDPOINT_AUTO_RESTART", "true").strip().lower() in {
     "true",
@@ -146,10 +149,7 @@ def build_endpoint_router() -> EndpointPoolRouter:
     controller = HuggingFaceEndpointController(
         namespace=HF_ENDPOINT_NAMESPACE,
         token=HF_CONTROL_TOKEN,
-        wait_timeout_s=min(
-            COMPUTE_ENDPOINT_WAIT_TIMEOUT_S,
-            max(int(COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S), 1),
-        ),
+        wait_timeout_s=COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S,
         active_min_replica=1,
         active_max_replica=1,
         park_strategy=COMPUTE_ENDPOINT_PARK_STRATEGY,

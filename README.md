@@ -295,6 +295,8 @@ load-balancer variable is ignored and can be removed from existing deployments.
   endpoint-control HTTP requests (defaults to 10 seconds)
 - `COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S`: total deadline for one endpoint
   status refresh (defaults to 30 seconds)
+- `COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S`: positive deadline for waiting
+  for a wake to become ready (defaults to `COMPUTE_ENDPOINT_WAIT_TIMEOUT_S`)
 - `COMPUTE_ENDPOINT_PARK_STRATEGY`: `pause` or `scale_to_zero`
 - `HF_CONTROL_TOKEN`: token used to call the Inference Endpoints API
 - `LB_ADMIN_AUTH_TOKEN`: dedicated bearer token required by the internal endpoint
