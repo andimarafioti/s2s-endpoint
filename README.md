@@ -36,17 +36,24 @@ Build the compute image:
 docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
-Today `Dockerfile.compute` defaults `S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and `S2S_REF=main`, because the realtime server path now lives on upstream `main`. If you need to override that repo/ref explicitly, use:
+`Dockerfile.compute` defaults to the reviewed revision from
+[`huggingface/speech-to-speech#192`](https://github.com/huggingface/speech-to-speech/pull/192),
+which adds Smart Turn v3.2 endpointing. Override the repository or revision explicitly with:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
   --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
-  --build-arg S2S_REF=main \
+  --build-arg S2S_REF=e9e080f278bf559772cec1ba97415327b565ab4a \
   -t your-registry/s2s-endpoint-compute:realtime .
 ```
 
-The compute image uses CUDA 12.8 and Qwen3-TTS defaults to the GGML backend in
-`speech-to-speech`. `Dockerfile.compute` downloads the CUDA 12.8
+The compute image uses CUDA 12.8, enables Smart Turn on CUDA by default, and
+preloads the pinned `smart-turn-v3.2-gpu.onnx` checkpoint so endpoint startup
+does not depend on a model download. It pins ONNX Runtime GPU 1.26 and verifies
+that the CUDA execution provider loads while building the image. The runtime
+launcher uses the fully built environment without resyncing it, preventing
+transitive CPU ONNX dependencies from replacing the GPU runtime. Qwen3-TTS defaults to the GGML backend in
+`speech-to-speech`. `Dockerfile.compute` also downloads the CUDA 12.8
 `qwentts-cpp-python` Hugging Face wheel into a local wheelhouse before running
 `uv sync`, because the PyPI wheel may require a newer manylinux tag than the
 base image exposes. For a different CUDA target and a compatible base image,
@@ -402,6 +409,18 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `NUM_PIPELINES`: concurrent realtime sessions the `speech-to-speech` process handles internally (default `1`)
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
+- `ENABLE_SMART_TURN`: enables Smart Turn end-of-turn validation. The compute
+  image defaults this to `1`; set it to `0` to restore Silero-only endpointing.
+- `SMART_TURN_DEVICE`: Smart Turn execution device (`cuda` by default in the
+  compute image).
+- `SMART_TURN_MODEL_PATH`: local ONNX checkpoint path. The compute image embeds
+  and selects `/opt/models/smart-turn-v3.2-gpu.onnx`.
+- `SMART_TURN_THRESHOLD`: completion probability threshold (default `0.5`).
+  Higher values keep ambiguous pauses open more often.
+- `SMART_TURN_MAX_WAIT_MS`: maximum time an incomplete turn can remain open
+  without new speech before it is finalized (default `3000`).
+- `SMART_TURN_CPU_COUNT`: optional ONNX Runtime thread count when using the CPU
+  execution provider.
 - `ENABLE_LLM_PROXY`: master switch for the LLM proxy feature — passes
   `--enable_llm_proxy` to the internal `speech-to-speech` server and opens the
   replica's `/v1/chat/completions` and `/v1/responses` proxy paths. Defaults
