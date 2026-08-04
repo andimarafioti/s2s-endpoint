@@ -43,7 +43,7 @@ which adds Smart Turn v3.2 endpointing. Override the repository or revision expl
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
   --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
-  --build-arg S2S_REF=e33861c36d5eafcc9a8df00d4f939dfe2156c174 \
+  --build-arg S2S_REF=8f961ca440aa409a757f589a2a5feca45e088df1 \
   -t your-registry/s2s-endpoint-compute:realtime .
 ```
 
@@ -409,10 +409,9 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `NUM_PIPELINES`: concurrent realtime sessions the `speech-to-speech` process handles internally (default `1`)
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
-- `ENABLE_SMART_TURN`: enables Smart Turn end-of-turn validation. The compute
-  image defaults this to `1`; set it to `0` to restore Silero-only endpointing.
-- `SMART_TURN_DEVICE`: Smart Turn execution device (`cpu` by default in the
-  compute image).
+- `ENABLE_SMART_TURN`: enables Smart Turn end-of-turn validation (default `1`).
+  Set it to `0` to restore Silero-only endpointing.
+- `SMART_TURN_DEVICE`: Smart Turn execution device (default `cpu`).
 - `SMART_TURN_MODEL_PATH`: local ONNX checkpoint path. The compute image embeds
   and selects `/opt/models/smart-turn-v3.2-cpu.onnx`.
 - `SMART_TURN_THRESHOLD`: completion probability threshold (default `0.5`).

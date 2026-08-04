@@ -39,8 +39,8 @@ TTS = os.getenv("TTS", "qwen3").strip()
 # General module flags
 ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().lower() in {"1", "true", "yes"}
 LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
-ENABLE_SMART_TURN = os.getenv("ENABLE_SMART_TURN", "0").strip().lower() in {"1", "true", "yes"}
-SMART_TURN_DEVICE = os.getenv("SMART_TURN_DEVICE", "cuda").strip()
+ENABLE_SMART_TURN = os.getenv("ENABLE_SMART_TURN", "1").strip().lower() in {"1", "true", "yes"}
+SMART_TURN_DEVICE = os.getenv("SMART_TURN_DEVICE", "cpu").strip()
 SMART_TURN_MODEL_PATH = os.getenv("SMART_TURN_MODEL_PATH", "").strip()
 SMART_TURN_THRESHOLD = os.getenv("SMART_TURN_THRESHOLD", "0.5").strip()
 SMART_TURN_MAX_WAIT_MS = os.getenv("SMART_TURN_MAX_WAIT_MS", "2000").strip()
@@ -133,13 +133,15 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     _add_bool_flag(cmd, ENABLE_LLM_PROXY, "--enable_llm_proxy")
     _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
-    _add_bool_flag(cmd, ENABLE_SMART_TURN, "--smart_turn")
     if ENABLE_SMART_TURN:
+        cmd.append("--smart_turn")
         _add_str_flag(cmd, SMART_TURN_DEVICE, "--smart_turn_device")
         _add_str_flag(cmd, SMART_TURN_MODEL_PATH, "--smart_turn_model_path")
         _add_str_flag(cmd, SMART_TURN_THRESHOLD, "--smart_turn_threshold")
         _add_str_flag(cmd, SMART_TURN_MAX_WAIT_MS, "--smart_turn_max_wait_ms")
         _add_str_flag(cmd, SMART_TURN_CPU_COUNT, "--smart_turn_cpu_count")
+    else:
+        cmd.append("--no_smart_turn")
     _add_str_flag(cmd, MODEL_NAME, "--model_name")
     _add_str_flag(cmd, INIT_CHAT_PROMPT, "--init_chat_prompt")
 

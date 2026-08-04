@@ -49,11 +49,12 @@ class BuildS2SCommandTests(unittest.TestCase):
 
         self.assertIn("--enable_llm_proxy", command)
 
-    def test_smart_turn_is_disabled_by_default(self):
+    def test_smart_turn_uses_cpu_by_default(self):
         command = self.build_command_with_env({})
 
-        self.assertNotIn("--smart_turn", command)
-        self.assertNotIn("--smart_turn_device", command)
+        self.assertIn("--smart_turn", command)
+        self.assertEqual(command[command.index("--smart_turn_device") + 1], "cpu")
+        self.assertNotIn("--no_smart_turn", command)
 
     def test_smart_turn_cuda_configuration_is_forwarded(self):
         command = self.build_command_with_env(
@@ -88,6 +89,7 @@ class BuildS2SCommandTests(unittest.TestCase):
         )
 
         self.assertNotIn("--smart_turn", command)
+        self.assertIn("--no_smart_turn", command)
         self.assertNotIn("--smart_turn_device", command)
         self.assertNotIn("--smart_turn_threshold", command)
 
