@@ -43,7 +43,7 @@ which adds Smart Turn v3.2 endpointing. Override the repository or revision expl
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
   --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
-  --build-arg S2S_REF=68cc722a54f67288a162d55e436b2dfff7127658 \
+  --build-arg S2S_REF=3442bd19c5548fcb9a80befc03ee2b9e7bc20c50 \
   -t your-registry/s2s-endpoint-compute:realtime .
 ```
 
@@ -418,7 +418,7 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `SMART_TURN_THRESHOLD`: completion probability threshold (default `0.5`).
   Higher values keep ambiguous pauses open more often.
 - `SMART_TURN_MAX_WAIT_MS`: maximum time an incomplete turn can remain open
-  without new speech before it is finalized (default `3000`).
+  without new speech before it is finalized (default `2000`).
 - `SMART_TURN_CPU_COUNT`: ONNX Runtime thread count when using the CPU execution
   provider (default `1` in the compute image).
 - `ENABLE_LLM_PROXY`: master switch for the LLM proxy feature — passes

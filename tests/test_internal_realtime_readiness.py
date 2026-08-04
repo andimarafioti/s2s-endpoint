@@ -99,7 +99,7 @@ class BuildS2SCommandTests(unittest.TestCase):
                 "SMART_TURN_DEVICE": "cuda",
                 "SMART_TURN_MODEL_PATH": "/opt/models/smart-turn-v3.2-gpu.onnx",
                 "SMART_TURN_THRESHOLD": "0.5",
-                "SMART_TURN_MAX_WAIT_MS": "3000",
+                "SMART_TURN_MAX_WAIT_MS": "2000",
             },
             clear=True,
         ):
@@ -114,7 +114,7 @@ class BuildS2SCommandTests(unittest.TestCase):
                 "device": "cuda",
                 "model_path": "/opt/models/smart-turn-v3.2-gpu.onnx",
                 "threshold": "0.5",
-                "max_wait_ms": "3000",
+                "max_wait_ms": "2000",
                 "cpu_count": None,
             },
         )
