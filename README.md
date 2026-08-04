@@ -43,7 +43,7 @@ which adds Smart Turn v3.2 endpointing. Override the repository or revision expl
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
   --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
-  --build-arg S2S_REF=f866e85f16022454cf3243edca20731c134fbead \
+  --build-arg S2S_REF=ba55e77e837bc930ce6fc6a63f6850ee8a1e4a0d \
   -t your-registry/s2s-endpoint-compute:realtime .
 ```
 
@@ -409,15 +409,17 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `NUM_PIPELINES`: concurrent realtime sessions the `speech-to-speech` process handles internally (default `1`)
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
-- `ENABLE_SMART_TURN`: enables Smart Turn end-of-turn validation (default `1`).
-  Set it to `0` to restore Silero-only endpointing.
+- `ENABLE_SMART_TURN`: enables Smart Turn speculative response gating after
+  Silero finalizes a segment (default `1`). Set it to `0` to use the ordinary
+  speculative reopen grace for every turn.
 - `SMART_TURN_DEVICE`: Smart Turn execution device (default `cpu`).
 - `SMART_TURN_MODEL_PATH`: local ONNX checkpoint path. The compute image embeds
   and selects `/opt/models/smart-turn-v3.2-cpu.onnx`.
 - `SMART_TURN_THRESHOLD`: completion probability threshold (default `0.5`).
-  Higher values keep ambiguous pauses open more often.
-- `SMART_TURN_MAX_WAIT_MS`: maximum time an incomplete turn can remain open
-  without new speech before it is finalized (default `2000`).
+  Higher values select the longer incomplete-turn grace more often.
+- `SMART_TURN_MAX_WAIT_MS`: speculative response grace after Smart Turn reports
+  an incomplete turn (default `2000`). Resumed speech creates a newer revision;
+  otherwise the pending response may commit after this delay.
 - `SMART_TURN_CPU_COUNT`: ONNX Runtime thread count when using the CPU execution
   provider (default `1` in the compute image).
 - `ENABLE_LLM_PROXY`: master switch for the LLM proxy feature — passes
