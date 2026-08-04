@@ -43,7 +43,7 @@ which adds Smart Turn v3.2 endpointing. Override the repository or revision expl
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
   --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
-  --build-arg S2S_REF=630fdfeddfa6f9e6b704766cee8714772883fffd \
+  --build-arg S2S_REF=e33861c36d5eafcc9a8df00d4f939dfe2156c174 \
   -t your-registry/s2s-endpoint-compute:realtime .
 ```
 
