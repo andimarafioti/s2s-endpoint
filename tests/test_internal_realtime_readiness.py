@@ -49,73 +49,41 @@ class BuildS2SCommandTests(unittest.TestCase):
 
         self.assertIn("--enable_llm_proxy", command)
 
-    def test_smart_turn_is_enabled_by_default(self):
+    def test_smart_turn_uses_upstream_defaults(self):
         command = self.build_command_with_env({})
 
-        self.assertIn("--smart_turn", command)
-        self.assertNotIn("--smart_turn_device", command)
+        self.assertIn("--no-sync", command)
+        self.assertNotIn("--smart_turn", command)
         self.assertNotIn("--no_smart_turn", command)
-        self.assertEqual(command[command.index("--smart_turn_max_wait_ms") + 1], "2000")
+        self.assertNotIn("--smart_turn_model_path", command)
+        self.assertNotIn("--smart_turn_threshold", command)
+        self.assertNotIn("--smart_turn_max_wait_ms", command)
+        self.assertNotIn("--smart_turn_cpu_count", command)
 
-    def test_smart_turn_cpu_configuration_is_forwarded(self):
+    def test_baked_smart_turn_model_path_is_forwarded(self):
         command = self.build_command_with_env(
             {
-                "ENABLE_SMART_TURN": "1",
                 "SMART_TURN_MODEL_PATH": "/opt/models/smart-turn-v3.2-cpu.onnx",
-                "SMART_TURN_THRESHOLD": "0.65",
-                "SMART_TURN_MAX_WAIT_MS": "2500",
-                "SMART_TURN_CPU_COUNT": "2",
             }
         )
 
-        self.assertIn("--no-sync", command)
-        self.assertIn("--smart_turn", command)
-        self.assertNotIn("--smart_turn_device", command)
+        self.assertNotIn("--smart_turn", command)
         self.assertEqual(
             command[command.index("--smart_turn_model_path") + 1],
             "/opt/models/smart-turn-v3.2-cpu.onnx",
         )
-        self.assertEqual(command[command.index("--smart_turn_threshold") + 1], "0.65")
-        self.assertEqual(command[command.index("--smart_turn_max_wait_ms") + 1], "2500")
-        self.assertEqual(command[command.index("--smart_turn_cpu_count") + 1], "2")
 
-    def test_disabled_smart_turn_does_not_forward_tuning(self):
+    def test_disabled_smart_turn_ignores_baked_model_path(self):
         command = self.build_command_with_env(
             {
                 "ENABLE_SMART_TURN": "0",
-                "SMART_TURN_THRESHOLD": "0.75",
+                "SMART_TURN_MODEL_PATH": "/opt/models/smart-turn-v3.2-cpu.onnx",
             }
         )
 
         self.assertNotIn("--smart_turn", command)
         self.assertIn("--no_smart_turn", command)
-        self.assertNotIn("--smart_turn_device", command)
-        self.assertNotIn("--smart_turn_threshold", command)
-
-    def test_smart_turn_config_reports_effective_settings(self):
-        with patch.dict(
-            os.environ,
-            {
-                "ENABLE_SMART_TURN": "1",
-                "SMART_TURN_MODEL_PATH": "/opt/models/smart-turn-v3.2-cpu.onnx",
-                "SMART_TURN_THRESHOLD": "0.5",
-            },
-            clear=True,
-        ):
-            module = importlib.reload(compute_main)
-            config = module._smart_turn_config()
-        importlib.reload(compute_main)
-
-        self.assertEqual(
-            config,
-            {
-                "enabled": True,
-                "model_path": "/opt/models/smart-turn-v3.2-cpu.onnx",
-                "threshold": "0.5",
-                "max_wait_ms": "2000",
-                "cpu_count": None,
-            },
-        )
+        self.assertNotIn("--smart_turn_model_path", command)
 
 
 class WaitForInternalRealtimeTests(unittest.IsolatedAsyncioTestCase):

@@ -41,9 +41,6 @@ ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().
 LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
 ENABLE_SMART_TURN = os.getenv("ENABLE_SMART_TURN", "1").strip().lower() in {"1", "true", "yes"}
 SMART_TURN_MODEL_PATH = os.getenv("SMART_TURN_MODEL_PATH", "").strip()
-SMART_TURN_THRESHOLD = os.getenv("SMART_TURN_THRESHOLD", "0.5").strip()
-SMART_TURN_MAX_WAIT_MS = os.getenv("SMART_TURN_MAX_WAIT_MS", "2000").strip()
-SMART_TURN_CPU_COUNT = os.getenv("SMART_TURN_CPU_COUNT", "").strip()
 # Master switch for the LLM proxy feature: passes --enable_llm_proxy to the
 # internal speech-to-speech server (which defaults the routes off) and opens
 # the replica's /v1/chat/completions and /v1/responses proxy paths. When off,
@@ -133,11 +130,7 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
     if ENABLE_SMART_TURN:
-        cmd.append("--smart_turn")
         _add_str_flag(cmd, SMART_TURN_MODEL_PATH, "--smart_turn_model_path")
-        _add_str_flag(cmd, SMART_TURN_THRESHOLD, "--smart_turn_threshold")
-        _add_str_flag(cmd, SMART_TURN_MAX_WAIT_MS, "--smart_turn_max_wait_ms")
-        _add_str_flag(cmd, SMART_TURN_CPU_COUNT, "--smart_turn_cpu_count")
     else:
         cmd.append("--no_smart_turn")
     _add_str_flag(cmd, MODEL_NAME, "--model_name")
@@ -156,16 +149,6 @@ def build_s2s_command(host: str, port: int) -> list[str]:
         cmd.extend(EXTRA_S2S_ARGS.split())
 
     return cmd
-
-
-def _smart_turn_config() -> dict[str, object]:
-    return {
-        "enabled": ENABLE_SMART_TURN,
-        "model_path": SMART_TURN_MODEL_PATH or None,
-        "threshold": SMART_TURN_THRESHOLD,
-        "max_wait_ms": SMART_TURN_MAX_WAIT_MS,
-        "cpu_count": SMART_TURN_CPU_COUNT or None,
-    }
 
 
 async def wait_for_internal_server(
@@ -224,7 +207,6 @@ async def root():
             "llm": LLM,
             "tts": TTS,
             "language": LANGUAGE,
-            "smart_turn": _smart_turn_config(),
         },
     }
 
@@ -245,7 +227,6 @@ async def health():
             "stt": STT,
             "llm": LLM,
             "tts": TTS,
-            "smart_turn": _smart_turn_config(),
             "router": snapshot,
         }
     )

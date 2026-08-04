@@ -414,13 +414,8 @@ load-balancer variable is ignored and can be removed from existing deployments.
   speculative reopen grace for every turn.
 - `SMART_TURN_MODEL_PATH`: local ONNX checkpoint path. The compute image embeds
   and selects `/opt/models/smart-turn-v3.2-cpu.onnx`.
-- `SMART_TURN_THRESHOLD`: completion probability threshold (default `0.5`).
-  Higher values select the longer incomplete-turn grace more often.
-- `SMART_TURN_MAX_WAIT_MS`: speculative response grace after Smart Turn reports
-  an incomplete turn (default `2000`). Resumed speech creates a newer revision;
-  otherwise the pending response may commit after this delay.
-- `SMART_TURN_CPU_COUNT`: ONNX Runtime thread count when using the CPU execution
-  provider (default `1` in the compute image).
+- `EXTRA_S2S_ARGS`: optional advanced CLI overrides passed through to
+  `speech-to-speech`, including experimental Smart Turn tuning.
 - `ENABLE_LLM_PROXY`: master switch for the LLM proxy feature — passes
   `--enable_llm_proxy` to the internal `speech-to-speech` server and opens the
   replica's `/v1/chat/completions` and `/v1/responses` proxy paths. Defaults
