@@ -55,7 +55,7 @@ class BuildS2SCommandTests(unittest.TestCase):
         self.assertIn("--smart_turn", command)
         self.assertNotIn("--smart_turn_device", command)
         self.assertNotIn("--no_smart_turn", command)
-        self.assertEqual(command[command.index("--smart_turn_max_wait_ms") + 1], "1800")
+        self.assertEqual(command[command.index("--smart_turn_max_wait_ms") + 1], "2000")
 
     def test_smart_turn_cpu_configuration_is_forwarded(self):
         command = self.build_command_with_env(
@@ -112,7 +112,7 @@ class BuildS2SCommandTests(unittest.TestCase):
                 "enabled": True,
                 "model_path": "/opt/models/smart-turn-v3.2-cpu.onnx",
                 "threshold": "0.5",
-                "max_wait_ms": "1800",
+                "max_wait_ms": "2000",
                 "cpu_count": None,
             },
         )

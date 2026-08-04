@@ -42,7 +42,7 @@ LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERV
 ENABLE_SMART_TURN = os.getenv("ENABLE_SMART_TURN", "1").strip().lower() in {"1", "true", "yes"}
 SMART_TURN_MODEL_PATH = os.getenv("SMART_TURN_MODEL_PATH", "").strip()
 SMART_TURN_THRESHOLD = os.getenv("SMART_TURN_THRESHOLD", "0.5").strip()
-SMART_TURN_MAX_WAIT_MS = os.getenv("SMART_TURN_MAX_WAIT_MS", "1800").strip()
+SMART_TURN_MAX_WAIT_MS = os.getenv("SMART_TURN_MAX_WAIT_MS", "2000").strip()
 SMART_TURN_CPU_COUNT = os.getenv("SMART_TURN_CPU_COUNT", "").strip()
 # Master switch for the LLM proxy feature: passes --enable_llm_proxy to the
 # internal speech-to-speech server (which defaults the routes off) and opens

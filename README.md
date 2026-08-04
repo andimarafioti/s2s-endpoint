@@ -43,7 +43,7 @@ which adds Smart Turn v3.2 endpointing. Override the repository or revision expl
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
   --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
-  --build-arg S2S_REF=ee2ca0bfd6e09aa4d80ecce5fe51fdd3f772c314 \
+  --build-arg S2S_REF=663585f3318b630d7dda7b1fb531902a7b2a8158 \
   -t your-registry/s2s-endpoint-compute:realtime .
 ```
 
@@ -417,14 +417,10 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `SMART_TURN_THRESHOLD`: completion probability threshold (default `0.5`).
   Higher values select the longer incomplete-turn grace more often.
 - `SMART_TURN_MAX_WAIT_MS`: speculative response grace after Smart Turn reports
-  an incomplete turn (default `1800`). Resumed speech creates a newer revision;
+  an incomplete turn (default `2000`). Resumed speech creates a newer revision;
   otherwise the pending response may commit after this delay.
 - `SMART_TURN_CPU_COUNT`: ONNX Runtime thread count when using the CPU execution
   provider (default `1` in the compute image).
-
-The pinned upstream VAD waits for 192 ms of configured Silero silence before a
-soft end and uses a 600 ms speculative grace for turns Smart Turn classifies as
-complete.
 - `ENABLE_LLM_PROXY`: master switch for the LLM proxy feature — passes
   `--enable_llm_proxy` to the internal `speech-to-speech` server and opens the
   replica's `/v1/chat/completions` and `/v1/responses` proxy paths. Defaults
