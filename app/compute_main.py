@@ -40,7 +40,6 @@ TTS = os.getenv("TTS", "qwen3").strip()
 ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().lower() in {"1", "true", "yes"}
 LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
 ENABLE_SMART_TURN = os.getenv("ENABLE_SMART_TURN", "1").strip().lower() in {"1", "true", "yes"}
-SMART_TURN_DEVICE = os.getenv("SMART_TURN_DEVICE", "cpu").strip()
 SMART_TURN_MODEL_PATH = os.getenv("SMART_TURN_MODEL_PATH", "").strip()
 SMART_TURN_THRESHOLD = os.getenv("SMART_TURN_THRESHOLD", "0.5").strip()
 SMART_TURN_MAX_WAIT_MS = os.getenv("SMART_TURN_MAX_WAIT_MS", "2000").strip()
@@ -135,7 +134,6 @@ def build_s2s_command(host: str, port: int) -> list[str]:
     _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
     if ENABLE_SMART_TURN:
         cmd.append("--smart_turn")
-        _add_str_flag(cmd, SMART_TURN_DEVICE, "--smart_turn_device")
         _add_str_flag(cmd, SMART_TURN_MODEL_PATH, "--smart_turn_model_path")
         _add_str_flag(cmd, SMART_TURN_THRESHOLD, "--smart_turn_threshold")
         _add_str_flag(cmd, SMART_TURN_MAX_WAIT_MS, "--smart_turn_max_wait_ms")
@@ -163,7 +161,6 @@ def build_s2s_command(host: str, port: int) -> list[str]:
 def _smart_turn_config() -> dict[str, object]:
     return {
         "enabled": ENABLE_SMART_TURN,
-        "device": SMART_TURN_DEVICE,
         "model_path": SMART_TURN_MODEL_PATH or None,
         "threshold": SMART_TURN_THRESHOLD,
         "max_wait_ms": SMART_TURN_MAX_WAIT_MS,

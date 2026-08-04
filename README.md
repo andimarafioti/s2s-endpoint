@@ -43,12 +43,12 @@ which adds Smart Turn v3.2 endpointing. Override the repository or revision expl
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
   --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
-  --build-arg S2S_REF=ba55e77e837bc930ce6fc6a63f6850ee8a1e4a0d \
+  --build-arg S2S_REF=e15254611240b39cd3c44be181c325e5c2a0d5d6 \
   -t your-registry/s2s-endpoint-compute:realtime .
 ```
 
 The compute image uses CUDA 12.8 for the speech pipeline models, but runs Smart
-Turn on the CPU by default so endpointing does not compete for the A10G. It
+Turn on the CPU so endpointing does not compete for the A10G. It
 preloads the pinned quantized `smart-turn-v3.2-cpu.onnx` checkpoint so endpoint
 startup does not depend on a model download, and verifies that ONNX Runtime's
 CPU execution provider loads while building the image. The runtime launcher
@@ -412,7 +412,6 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `ENABLE_SMART_TURN`: enables Smart Turn speculative response gating after
   Silero finalizes a segment (default `1`). Set it to `0` to use the ordinary
   speculative reopen grace for every turn.
-- `SMART_TURN_DEVICE`: Smart Turn execution device (default `cpu`).
 - `SMART_TURN_MODEL_PATH`: local ONNX checkpoint path. The compute image embeds
   and selects `/opt/models/smart-turn-v3.2-cpu.onnx`.
 - `SMART_TURN_THRESHOLD`: completion probability threshold (default `0.5`).
