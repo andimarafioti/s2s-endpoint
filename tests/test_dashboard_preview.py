@@ -829,6 +829,37 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_session_manager.allocation_calls, 1)
         self.assertEqual(fake_dashboard.calls, ["request", "success"])
 
+    async def test_default_verification_age_allows_the_full_default_allocation_wait(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        clock = FakeClock(0.0)
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        module.requester_identity_resolver._time_fn = clock
+        verified = RequesterIdentity(
+            **{
+                **_requester_identity(verification="verified", kind="authenticated").__dict__,
+                "verified_at_s": 0.0,
+            }
+        )
+        allocate = fake_session_manager.allocate
+
+        async def allocate_after_default_wait(*args, **kwargs):
+            result = await allocate(*args, **kwargs)
+            clock.now = 900.0
+            return result
+
+        fake_session_manager.allocate = allocate_after_default_wait
+
+        with patch.object(module.requester_identity_resolver, "identify", return_value=verified):
+            response = await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(module.SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S, 1800.0)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_session_manager.cancelled_session_ids, [])
+        self.assertEqual(fake_dashboard.calls, ["request", "success"])
+
     async def test_stale_cached_verification_is_refreshed_before_admission(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
@@ -873,6 +904,33 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(json.loads(queued.body)["state"], "queued")
         self.assertEqual(json.loads(granted.body)["state"], "granted")
+        self.assertEqual(fake_session_manager.poll_calls, 1)
+        self.assertEqual(fake_dashboard.calls, ["request", "success"])
+
+    async def test_default_verification_age_preserves_queue_ticket_past_60_seconds(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeQueuedGrantSessionManager()
+        clock = FakeClock(0.0)
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        module.requester_identity_resolver._time_fn = clock
+        verified = RequesterIdentity(
+            **{
+                **_requester_identity(verification="verified", kind="authenticated").__dict__,
+                "verified_at_s": 0.0,
+            }
+        )
+
+        with patch.object(module.requester_identity_resolver, "identify", return_value=verified):
+            queued = await module.create_session(FakeConnectedRequest())
+            clock.now = 61.0
+            granted = await module.queue_status("queue-123", FakeConnectedRequest())
+
+        self.assertEqual(module.SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S, 1800.0)
+        self.assertEqual(json.loads(queued.body)["state"], "queued")
+        self.assertEqual(json.loads(granted.body)["state"], "granted")
+        self.assertFalse(fake_session_manager.left)
         self.assertEqual(fake_session_manager.poll_calls, 1)
         self.assertEqual(fake_dashboard.calls, ["request", "success"])
 

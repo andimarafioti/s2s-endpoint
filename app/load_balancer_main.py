@@ -91,7 +91,7 @@ SESSION_REQUIRE_VERIFIED_HF_TOKEN = os.getenv(
 SESSION_HF_TOKEN_VERIFY_TIMEOUT_S = float(os.getenv("SESSION_HF_TOKEN_VERIFY_TIMEOUT_S", "5"))
 if SESSION_HF_TOKEN_VERIFY_TIMEOUT_S <= 0:
     raise ValueError("SESSION_HF_TOKEN_VERIFY_TIMEOUT_S must be > 0")
-SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S = float(os.getenv("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S", "60"))
+SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S = float(os.getenv("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S", "1800"))
 if SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S <= 0:
     raise ValueError("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S must be > 0")
 # How long session creation waits for a first-seen HF token's whoami validation

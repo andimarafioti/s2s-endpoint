@@ -339,8 +339,9 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `SESSION_HF_TOKEN_VERIFY_TIMEOUT_S`: maximum time to wait for first-seen token
   verification when session authentication is required (defaults to 5 seconds)
 - `SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S`: maximum age of a successful `whoami`
-  result when it is used as a session authentication proof (defaults to 60
-  seconds). Older cached identities are revalidated before admission.
+  result when it is used as a session authentication proof (defaults to 1,800
+  seconds / 30 minutes). Older cached identities are revalidated before
+  admission, so a revoked token can remain accepted until this proof expires.
 - `SESSION_HF_TOKEN_VERIFY_MAX_PENDING`: maximum remote token validations admitted
   concurrently for enforced session authentication (defaults to 64)
 - `SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK`: maximum pending enforced
@@ -658,7 +659,7 @@ uv run --with-requirements requirements.txt python scripts/update_load_balancer_
   --name reachy-s2s-lb \
   --env SESSION_REQUIRE_VERIFIED_HF_TOKEN=true \
   --env SESSION_HF_TOKEN_VERIFY_TIMEOUT_S=5 \
-  --env SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S=60 \
+  --env SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S=1800 \
   --env SESSION_HF_TOKEN_VERIFY_MAX_PENDING=64 \
   --env SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK=4 \
   --wait
