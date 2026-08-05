@@ -145,6 +145,40 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("rate limited: 1 request", leaderboard[0]["signals"])
         self.assertFalse(any(signal.startswith("mostly short sessions") for signal in leaderboard[0]["signals"]))
 
+    async def test_auth_rejections_raise_risk_from_watch_to_high_even_with_prior_connections(self):
+        service = self._service(FakeClock(2 * 3600))
+        requester = RequesterIdentity(
+            actor_id="anonymous:ip123",
+            label="Anonymous IP •ip123",
+            kind="anonymous",
+            verification="not_provided",
+            fingerprint="ip123",
+            network_id="net:ip123",
+            client_kind="browser",
+        )
+
+        await service.record("request", requester)
+        await service.record("auth_rejected", requester)
+
+        watched = (await service.data(window_minutes=60))["leaderboard"][0]
+        self.assertEqual(watched["auth_rejected"], 1)
+        self.assertEqual(watched["risk"], "watch")
+        self.assertIn("auth rejected: 1 request", watched["signals"])
+
+        for _ in range(6):
+            await service.record("request", requester)
+            await service.record("success", requester)
+            await service.record("connected", requester)
+        for _ in range(5):
+            await service.record("request", requester)
+            await service.record("auth_rejected", requester)
+
+        flagged = (await service.data(window_minutes=60))["leaderboard"][0]
+        self.assertEqual(flagged["connections"], 6)
+        self.assertEqual(flagged["auth_rejected"], 6)
+        self.assertEqual(flagged["risk"], "high")
+        self.assertIn("auth rejected: 6 requests", flagged["signals"])
+
     async def test_resolved_identity_updates_and_round_trips_existing_history(self):
         service = self._service(FakeClock(2 * 3600))
         pending = RequesterIdentity(

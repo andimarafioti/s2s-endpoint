@@ -50,7 +50,7 @@ REQUESTER_DASHBOARD_KPI_CARDS = """
         kpiCard(`Rate limited / ${windowLabel}`, prettyNumber(summary.session_rate_limited_window || 0), `POST /session requests rejected before compute allocation`),
         kpiCard(`Anonymous IPs / ${windowLabel}`, prettyNumber(summary.anonymous_ips_window || 0), `Distinct privacy-safe network fingerprints without tokens`),
         kpiCard(`Reported robots / ${windowLabel}`, prettyNumber(summary.reported_robots_window || 0), `Distinct privacy-safe robot fingerprints reported by clients; not verified hardware`),
-        kpiCard(`Flagged / ${windowLabel}`, prettyNumber(summary.unusual_requesters_window || 0), `Requesters with volume, burst, network, token, or automation signals`),
+        kpiCard(`Flagged / ${windowLabel}`, prettyNumber(summary.unusual_requesters_window || 0), `Requesters with rejection, volume, burst, network, token, or automation signals`),
 """
 
 

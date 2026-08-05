@@ -18,6 +18,7 @@ class RequesterUsageThresholds:
     high_volume_requests: int = 100
     burst_requests_per_minute: int = 20
     many_networks: int = 5
+    high_auth_rejections: int = 3
 
 
 class RequesterUsageService:
@@ -166,6 +167,7 @@ def aggregate_requester_usage(
             network_ids_overflow=bool(actor["network_ids_overflow"]),
             automated_requests=automated_requests,
             invalid_token_requests=int(actor["invalid_token_requests"]),
+            auth_rejected=auth_rejected,
             rate_limited=rate_limited,
             completed_sessions=completed_sessions,
             short_sessions=int(actor["short_sessions"]),
@@ -173,7 +175,7 @@ def aggregate_requester_usage(
             relative_threshold=relative_threshold,
             thresholds=thresholds,
         )
-        high_risk = any(
+        high_risk = auth_rejected >= thresholds.high_auth_rejections or any(
             signal.startswith(("high volume", "burst", "dominant traffic share", "rate limited")) for signal in signals
         )
         rows.append(
@@ -255,6 +257,7 @@ def aggregate_requester_usage(
             "high_volume_requests": thresholds.high_volume_requests,
             "burst_requests_per_minute": thresholds.burst_requests_per_minute,
             "many_networks": thresholds.many_networks,
+            "high_auth_rejections": thresholds.high_auth_rejections,
         },
         "leaderboard": rows[:20],
     }
@@ -459,6 +462,7 @@ def _usage_signals(
     network_ids_overflow: bool,
     automated_requests: int,
     invalid_token_requests: int,
+    auth_rejected: int,
     rate_limited: int,
     completed_sessions: int,
     short_sessions: int,
@@ -481,6 +485,9 @@ def _usage_signals(
         signals.append("mostly automation-like clients")
     if verification == "invalid" or invalid_token_requests > 0:
         signals.append("invalid HF token")
+    if auth_rejected > 0:
+        noun = "request" if auth_rejected == 1 else "requests"
+        signals.append(f"auth rejected: {auth_rejected:,} {noun}")
     if rate_limited > 0:
         noun = "request" if rate_limited == 1 else "requests"
         signals.append(f"rate limited: {rate_limited:,} {noun}")
