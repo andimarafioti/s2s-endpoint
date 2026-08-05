@@ -30,6 +30,15 @@ class SessionRequesterTrackerTests(unittest.TestCase):
         self.assertEqual(self.tracker.take("session-1"), self.requester)
         self.assertIsNone(self.tracker.take("session-1"))
 
+    def test_get_with_expiry_does_not_consume_valid_requester(self):
+        self.tracker.remember("session-1", self.requester)
+
+        requester, expired = self.tracker.get_with_expiry("session-1")
+
+        self.assertEqual(requester, self.requester)
+        self.assertFalse(expired)
+        self.assertEqual(self.tracker.take("session-1"), self.requester)
+
     def test_discards_disconnected_pending_session(self):
         self.tracker.remember("session-1", self.requester)
 
@@ -42,6 +51,16 @@ class SessionRequesterTrackerTests(unittest.TestCase):
         self.clock.now = 60
 
         self.assertEqual(self.tracker.count(), 0)
+        self.assertIsNone(self.tracker.take("session-1"))
+
+    def test_expired_identity_can_be_taken_for_cleanup_without_authorizing_it(self):
+        self.tracker.remember("session-1", self.requester)
+        self.clock.now = 60
+
+        requester, expired = self.tracker.take_with_expiry("session-1")
+
+        self.assertEqual(requester, self.requester)
+        self.assertTrue(expired)
         self.assertIsNone(self.tracker.take("session-1"))
 
 

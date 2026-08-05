@@ -139,6 +139,7 @@ def aggregate_requester_usage(
             reported_robot_requests += int(actor["reported_robot_requests"])
 
         successes = int(actor["successes"])
+        auth_rejected = int(actor["auth_rejected"])
         rate_limited = int(actor["rate_limited"])
         connections = int(actor["connections"])
         completed_sessions = int(actor["completed_sessions"])
@@ -188,6 +189,7 @@ def aggregate_requester_usage(
                 "requests": requests,
                 "successes": successes,
                 "failures": int(actor["failures"]),
+                "auth_rejected": auth_rejected,
                 "rate_limited": rate_limited,
                 "abandoned": int(actor["abandoned"]),
                 "connections": connections,
@@ -239,6 +241,7 @@ def aggregate_requester_usage(
         "authenticated_requests_window": authenticated_requests,
         "anonymous_requests_window": anonymous_requests,
         "invalid_token_requests_window": invalid_token_requests,
+        "auth_rejected_requests_window": sum(int(row["auth_rejected"]) for row in rows),
         "rate_limited_requests_window": sum(int(row["rate_limited"]) for row in rows),
         "unattributed_requests_window": unattributed_requests,
         "unusual_requesters_window": sum(1 for row in rows if row["risk"] != "normal"),
@@ -272,6 +275,10 @@ def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str
             actor["requests"] = int(actor["requests"]) + requests
             actor["successes"] = int(actor["successes"]) + max(int(record.get("successes", 0)), 0)
             actor["failures"] = int(actor["failures"]) + max(int(record.get("failures", 0)), 0)
+            actor["auth_rejected"] = int(actor["auth_rejected"]) + max(
+                int(record.get("auth_rejected", 0)),
+                0,
+            )
             actor["rate_limited"] = int(actor["rate_limited"]) + max(
                 int(record.get("rate_limited", 0)),
                 0,
@@ -413,6 +420,7 @@ def _new_actor(actor_id: str, record: dict[str, object], bucket_start_s: int) ->
         "requests": 0,
         "successes": 0,
         "failures": 0,
+        "auth_rejected": 0,
         "rate_limited": 0,
         "abandoned": 0,
         "connections": 0,

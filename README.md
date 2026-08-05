@@ -168,7 +168,8 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - running, warming, transitioning, and parked endpoint counts
 - connected and pending user sessions
 - free slots and effective free capacity
-- `POST /session` request counts, allocation successes/failures, and connect/disconnect events
+- `POST /session` request counts, authentication rejections, allocation
+  successes/failures, and connect/disconnect events
 - conversation starts/completions plus average and max completed conversation duration
 - distinct verified Hugging Face users, token fingerprints, anonymous network
   fingerprints, and client-reported robot fingerprints
@@ -179,10 +180,20 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 Clients can optionally send a Hugging Face user access token as
 `X-Reachy-Mini-Authorization: Bearer <token>` on `POST /session`. Standard
 `Authorization` is also accepted when the hosting gateway passes it through. The
-request is always allowed to continue: a missing, invalid, unrecognized, or
-temporarily unverifiable token does not deny allocation. Valid tokens are
-resolved to the Hugging Face account asynchronously through `whoami`, so identity
-lookup never sits on the allocation critical path.
+Reachy-specific header takes precedence when both are present. By default, the
+request is allowed to continue when the token is missing or cannot be verified,
+preserving compatibility with anonymous deployments. Valid tokens are resolved
+to the Hugging Face account asynchronously through `whoami`.
+
+Set `SESSION_REQUIRE_VERIFIED_HF_TOKEN=true` to require authentication for session
+admission. In this mode, the load balancer waits up to
+`SESSION_HF_TOKEN_VERIFY_TIMEOUT_S` for a first-seen token's `whoami` result before
+it allocates or queues. Missing, malformed, unrecognized, and invalid credentials
+return `401` with `WWW-Authenticate: Bearer`. A timed-out or unavailable Hugging
+Face validation returns retryable `503` without allocating, queueing, or waking
+compute. The verified privacy-safe requester identity is retained with a queue
+ticket, and queued grants are denied if that authorization context is lost. Raw
+bearer tokens are never logged or retained.
 
 Reachy clients can also include the daemon's optional 16-character hexadecimal
 `hardware_id` in the JSON body. The content type must be `application/json`:
@@ -310,6 +321,10 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S`: interval between repeated
   long-running drain warnings (defaults to 300 seconds)
 - `SESSION_SHARED_SECRET`: shared secret used to mint and validate direct session tokens
+- `SESSION_REQUIRE_VERIFIED_HF_TOKEN`: require a Hugging Face-verified bearer token
+  before allocating or queueing a session (defaults to `false`)
+- `SESSION_HF_TOKEN_VERIFY_TIMEOUT_S`: maximum time to wait for first-seen token
+  verification when session authentication is required (defaults to 5 seconds)
 - `LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S`: how long session creation waits for a
   first-seen HF token's `whoami` validation before minting the session's LLM
   proxy claim (defaults to 5 seconds). On timeout the session is created
@@ -611,6 +626,17 @@ uv run --with-requirements requirements.txt python scripts/update_load_balancer_
   --compute-endpoint-count 64 \
   --compute-endpoint-min-warm 3 \
   --compute-endpoint-wake-threshold-slots 3 \
+  --wait
+```
+
+To require verified Hugging Face users before granting session capacity:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_load_balancer_endpoint_env.py \
+  --namespace HuggingFaceM4 \
+  --name reachy-s2s-lb \
+  --env SESSION_REQUIRE_VERIFIED_HF_TOKEN=true \
+  --env SESSION_HF_TOKEN_VERIFY_TIMEOUT_S=5 \
   --wait
 ```
 

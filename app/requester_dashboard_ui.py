@@ -46,6 +46,7 @@ REQUESTER_DASHBOARD_MARKUP = """
 REQUESTER_DASHBOARD_KPI_CARDS = """
         kpiCard(`HF users / ${windowLabel}`, prettyNumber(summary.authenticated_users_window || 0), `Distinct verified Hugging Face accounts in the last ${windowLabel}`),
         kpiCard(`Connected requesters / ${windowLabel}`, prettyNumber(summary.connected_requesters_window || 0), `Distinct requesters whose allocated session reached the compute websocket`),
+        kpiCard(`Auth rejected / ${windowLabel}`, prettyNumber(summary.session_auth_rejections_window || 0), `POST /session and queued grants denied by verified-token enforcement`),
         kpiCard(`Rate limited / ${windowLabel}`, prettyNumber(summary.session_rate_limited_window || 0), `POST /session requests rejected before compute allocation`),
         kpiCard(`Anonymous IPs / ${windowLabel}`, prettyNumber(summary.anonymous_ips_window || 0), `Distinct privacy-safe network fingerprints without tokens`),
         kpiCard(`Reported robots / ${windowLabel}`, prettyNumber(summary.reported_robots_window || 0), `Distinct privacy-safe robot fingerprints reported by clients; not verified hardware`),
@@ -109,6 +110,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
         `<span class="status-pill good">${htmlEscape(prettyNumber(summary.authenticated_users_window || 0))} HF users</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.tokens_window || 0))} tokens</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.allocated_requesters_window || 0))} allocated · ${htmlEscape(prettyNumber(summary.connected_requesters_window || 0))} connected</span>`,
+        `<span class="status-pill ${summary.session_auth_rejections_window ? 'bad' : 'good'}">${htmlEscape(prettyNumber(summary.session_auth_rejections_window || 0))} auth rejected</span>`,
         `<span class="status-pill ${summary.session_rate_limited_window ? 'bad' : 'good'}">${htmlEscape(prettyNumber(summary.session_rate_limited_window || 0))} limited</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.anonymous_ips_window || 0))} anonymous IPs</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.reported_robots_window || 0))} reported robots</span>`,
@@ -135,7 +137,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td>${htmlEscape(prettyNumber(row.successes || 0))}<div class="muted">${htmlEscape(row.success_rate_pct || 0)}%</div></td>
             <td><strong>${htmlEscape(prettyNumber(row.connections || 0))}</strong><div class="muted">websocket joins</div></td>
             <td><strong>${htmlEscape(formatDuration(row.avg_connected_duration_s || 0))} avg</strong><div class="muted">${htmlEscape(prettyNumber(row.short_sessions || 0))} short · ${htmlEscape(formatDuration(row.max_connected_duration_s || 0))} max</div></td>
-            <td><strong>${htmlEscape(prettyNumber(row.rate_limited || 0))}</strong><div class="muted">before allocation</div></td>
+            <td><strong>${htmlEscape(prettyNumber(row.rate_limited || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.auth_rejected || 0))} auth rejected</div></td>
             <td>${htmlEscape(row.traffic_share_pct || 0)}%</td>
             <td>${htmlEscape(prettyNumber(row.peak_requests_per_minute || 0))}/min</td>
             <td>${htmlEscape(networks)}</td>

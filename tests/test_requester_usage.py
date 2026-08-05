@@ -79,6 +79,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         await service.record("success", token_requester)
         await service.record("connected", token_requester)
         await service.record("failure", token_requester)
+        await service.record("auth_rejected", token_requester)
         await service.record("rate_limited", token_requester)
         await service.record_session_outcome(
             token_requester,
@@ -113,6 +114,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["attributed_connections_window"], 1)
         self.assertEqual(summary["authenticated_requests_window"], 3)
         self.assertEqual(summary["anonymous_requests_window"], 1)
+        self.assertEqual(summary["auth_rejected_requests_window"], 1)
         self.assertEqual(summary["rate_limited_requests_window"], 1)
         self.assertEqual(summary["unattributed_requests_window"], 0)
         self.assertEqual(leaderboard[0]["actor_id"], "hf:reachy-user")
@@ -120,6 +122,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(leaderboard[0]["token_count"], 1)
         self.assertEqual(leaderboard[0]["token_fingerprints"], ["abc123"])
         self.assertEqual(leaderboard[0]["requests"], 3)
+        self.assertEqual(leaderboard[0]["auth_rejected"], 1)
         self.assertEqual(leaderboard[0]["network_count"], 2)
         self.assertEqual(leaderboard[0]["reported_robot_count"], 2)
         self.assertEqual(leaderboard[0]["reported_robot_requests"], 3)

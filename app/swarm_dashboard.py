@@ -70,6 +70,7 @@ class SwarmBucketAggregate:
     session_requests: int = 0
     session_allocation_successes: int = 0
     session_allocation_failures: int = 0
+    session_auth_rejections: int = 0
     session_rate_limited: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
@@ -100,6 +101,7 @@ class SwarmBucketAggregate:
             aggregate.session_requests += bucket.session_requests
             aggregate.session_allocation_successes += bucket.session_allocation_successes
             aggregate.session_allocation_failures += bucket.session_allocation_failures
+            aggregate.session_auth_rejections += bucket.session_auth_rejections
             aggregate.session_rate_limited += bucket.session_rate_limited
             aggregate.session_connected_events += bucket.session_connected_events
             aggregate.session_disconnected_events += bucket.session_disconnected_events
@@ -133,6 +135,7 @@ class SwarmBucketAggregate:
             "session_requests": self.session_requests,
             "session_allocation_successes": self.session_allocation_successes,
             "session_allocation_failures": self.session_allocation_failures,
+            "session_auth_rejections": self.session_auth_rejections,
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
@@ -163,6 +166,7 @@ class SwarmBucketAggregate:
             "session_requests": self.session_requests,
             "session_allocation_successes": self.session_allocation_successes,
             "session_allocation_failures": self.session_allocation_failures,
+            "session_auth_rejections": self.session_auth_rejections,
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
@@ -279,6 +283,9 @@ class SwarmDashboard:
     async def record_session_allocation_failure(self, requester: RequesterIdentity | None = None) -> None:
         await self.requesters.record("failure", requester)
 
+    async def record_session_auth_rejected(self, requester: RequesterIdentity | None = None) -> None:
+        await self.requesters.record("auth_rejected", requester)
+
     async def record_session_rate_limited(self, requester: RequesterIdentity | None = None) -> None:
         await self.requesters.record("rate_limited", requester)
 
@@ -363,6 +370,7 @@ class SwarmDashboard:
             "session_requests_window": selected["session_requests"],
             "session_failures_window": selected["session_allocation_failures"],
             "session_successes_window": selected["session_allocation_successes"],
+            "session_auth_rejections_window": selected["session_auth_rejections"],
             "session_rate_limited_window": selected["session_rate_limited"],
             "session_connects_window": selected["session_connected_events"],
             "session_disconnects_window": selected["session_disconnected_events"],
@@ -410,6 +418,7 @@ class SwarmDashboard:
                             "session_requests": 0,
                             "session_allocation_successes": 0,
                             "session_allocation_failures": 0,
+                            "session_auth_rejections": 0,
                             "session_rate_limited": 0,
                             "session_connected_events": 0,
                             "session_disconnected_events": 0,
@@ -1664,6 +1673,7 @@ __REQUESTER_DASHBOARD_SCRIPT__
         { key: 'session_requests', color: '#182125' },
         { key: 'session_allocation_successes', color: '#117a65' },
         { key: 'session_allocation_failures', color: '#bb2d3b' },
+        { key: 'session_auth_rejections', color: '#c0392b' },
         { key: 'session_rate_limited', color: '#8e44ad' },
         { key: 'session_connected_events', color: '#0b5cab' },
         { key: 'session_disconnected_events', color: '#d9822b' },

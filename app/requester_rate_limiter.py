@@ -183,6 +183,11 @@ class RequesterRateLimiter:
         if self._release_in_flight(requester):
             self._totals["allocation_failures"] += 1
 
+    def record_allocation_auth_rejection(self, requester: RequesterIdentity) -> None:
+        """Release admission accounting when a final auth guard denies a grant."""
+        if self._release_in_flight(requester):
+            self._totals["allocation_auth_rejections"] += 1
+
     def record_allocation_abandoned(self, requester: RequesterIdentity) -> None:
         """Release a queued admission that ended before compute was allocated."""
         if self._release_in_flight(requester):

@@ -160,6 +160,7 @@ class SwarmHistoryBucket:
     session_requests: int = 0
     session_allocation_successes: int = 0
     session_allocation_failures: int = 0
+    session_auth_rejections: int = 0
     session_rate_limited: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
@@ -212,6 +213,7 @@ class SwarmHistoryBucket:
             "session_requests": self.session_requests,
             "session_allocation_successes": self.session_allocation_successes,
             "session_allocation_failures": self.session_allocation_failures,
+            "session_auth_rejections": self.session_auth_rejections,
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
@@ -272,6 +274,7 @@ _HISTORY_BUCKET_INT_FIELDS = {
     "session_requests",
     "session_allocation_successes",
     "session_allocation_failures",
+    "session_auth_rejections",
     "session_rate_limited",
     "session_connected_events",
     "session_disconnected_events",
@@ -340,6 +343,7 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "requests": max(int(raw_record.get("requests", 0)), 0),
             "successes": max(int(raw_record.get("successes", 0)), 0),
             "failures": max(int(raw_record.get("failures", 0)), 0),
+            "auth_rejected": max(int(raw_record.get("auth_rejected", 0)), 0),
             "rate_limited": max(int(raw_record.get("rate_limited", 0)), 0),
             "abandoned": max(int(raw_record.get("abandoned", 0)), 0),
             "connections": max(int(raw_record.get("connections", 0)), 0),
@@ -388,6 +392,7 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
         "requests": 0,
         "successes": 0,
         "failures": 0,
+        "auth_rejected": 0,
         "rate_limited": 0,
         "abandoned": 0,
         "connections": 0,
@@ -752,6 +757,7 @@ class DashboardHistory:
             "request": ("session_requests", "requests"),
             "success": ("session_allocation_successes", "successes"),
             "failure": ("session_allocation_failures", "failures"),
+            "auth_rejected": ("session_auth_rejections", "auth_rejected"),
             "rate_limited": ("session_rate_limited", "rate_limited"),
             "abandoned": (None, "abandoned"),
             "connected": (None, "connections"),

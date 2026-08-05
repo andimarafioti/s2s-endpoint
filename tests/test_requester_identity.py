@@ -135,6 +135,27 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_reachy_authorization_header_takes_precedence_over_standard_header(self):
+        calls = []
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=lambda token: calls.append(token) or {"name": "reachy-user"},
+        )
+        request = FakeRequest(
+            headers={
+                "x-reachy-mini-authorization": "Bearer hf_reachy_token",
+                "authorization": "Bearer hf_standard_token",
+            }
+        )
+
+        pending = resolver.identify(request)
+        resolved = await resolver.wait_for_verification(pending, timeout_s=1)
+
+        self.assertEqual(calls, ["hf_reachy_token"])
+        self.assertEqual(resolved.verification, "verified")
+
+        await resolver.stop()
+
     async def test_reachy_conversation_app_user_agent_is_classified(self):
         resolver = RequesterIdentityResolver(hash_secret="stable-secret")
 

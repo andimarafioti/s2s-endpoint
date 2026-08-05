@@ -3,7 +3,7 @@ import json
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -14,6 +14,7 @@ from app.dashboard_preview import DashboardPreviewSessionManager
 from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointTransitionConflictError
 from app.requester_identity import RequesterIdentity
 from app.requester_rate_limiter import RequesterRateLimitConfig, RequesterRateLimiter
+from app.session_requester_tracker import SessionRequesterTracker
 from tests.helpers import monotonic_sequence
 
 
@@ -449,6 +450,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
                 "DASHBOARD_BUCKET_ID": "",
                 "DASHBOARD_PREVIEW_MODE": "",
                 "LB_ADMIN_AUTH_TOKEN": "",
+                "SESSION_REQUIRE_VERIFIED_HF_TOKEN": "false",
                 **env,
             },
             clear=False,
@@ -629,6 +631,228 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.outcome, "rate_limited")
         self.assertEqual(record.rate_limit_reason, "parallel_allocations")
         self.assertEqual(record.requester_client_kind, "missing-user-agent")
+
+    async def test_required_token_rejects_anonymous_request_before_rate_limit_or_allocation(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+
+        with (
+            self.assertLogs("s2s-endpoint", level="WARNING") as logs,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertEqual(raised.exception.headers["WWW-Authenticate"], "Bearer")
+        self.assertEqual(raised.exception.detail["reason"], "token_not_provided")
+        self.assertEqual(fake_session_manager.allocation_calls, 0)
+        self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
+        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 0)
+        self.assertEqual(logs.records[0].outcome, "auth_rejected")
+        self.assertEqual(logs.records[0].auth_stage, "admission")
+
+    async def test_required_token_rejects_malformed_and_unrecognized_credentials(self):
+        cases = (
+            ("malformed", "Basic not-a-bearer", "token_not_provided"),
+            ("unrecognized", f"Bearer {'x' * 4097}", "token_unrecognized"),
+        )
+        for label, authorization, reason in cases:
+            with self.subTest(label=label):
+                module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+                fake_dashboard = FakeDashboard()
+                fake_session_manager = FakeSessionManager()
+                module.dashboard = fake_dashboard
+                module.session_manager = fake_session_manager
+
+                with self.assertRaises(HTTPException) as raised:
+                    await module.create_session(FakeHeaderRequest({"authorization": authorization}))
+
+                self.assertEqual(raised.exception.status_code, 401)
+                self.assertEqual(raised.exception.headers["WWW-Authenticate"], "Bearer")
+                self.assertEqual(raised.exception.detail["reason"], reason)
+                self.assertEqual(fake_session_manager.allocation_calls, 0)
+                self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
+
+    async def test_required_token_returns_retryable_503_when_verification_is_unavailable(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        unavailable = _requester_identity(verification="unavailable")
+
+        with (
+            patch.object(module.requester_identity_resolver, "identify", return_value=unavailable),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.headers["Retry-After"], "1")
+        self.assertEqual(raised.exception.detail["reason"], "verification_unavailable")
+        self.assertEqual(fake_session_manager.allocation_calls, 0)
+        self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
+
+    async def test_required_token_returns_retryable_503_when_verification_times_out(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        pending = _requester_identity(verification="pending")
+
+        with (
+            patch.object(module.requester_identity_resolver, "identify", return_value=pending),
+            patch.object(
+                module.requester_identity_resolver,
+                "wait_for_verification",
+                new=AsyncMock(return_value=pending),
+            ) as wait_for_verification,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.headers["Retry-After"], "1")
+        self.assertEqual(raised.exception.detail["reason"], "verification_timeout")
+        self.assertEqual(fake_session_manager.allocation_calls, 0)
+        self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
+        wait_for_verification.assert_awaited_once_with(
+            pending,
+            timeout_s=module.SESSION_HF_TOKEN_VERIFY_TIMEOUT_S,
+        )
+
+    async def test_required_token_rejects_invalid_identity_without_allocation(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        invalid = _requester_identity(verification="invalid", kind="invalid_token")
+
+        with (
+            patch.object(module.requester_identity_resolver, "identify", return_value=invalid),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertEqual(raised.exception.detail["reason"], "token_invalid")
+        self.assertEqual(fake_session_manager.allocation_calls, 0)
+        self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
+
+    async def test_required_verified_token_can_receive_immediate_grant(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        verified = _requester_identity(verification="verified", kind="authenticated")
+
+        with patch.object(module.requester_identity_resolver, "identify", return_value=verified):
+            response = await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_session_manager.allocation_calls, 1)
+        self.assertEqual(fake_dashboard.calls, ["request", "success"])
+
+    async def test_required_verified_token_is_preserved_through_queue_grant(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeQueuedGrantSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        verified = _requester_identity(verification="verified", kind="authenticated")
+
+        with patch.object(module.requester_identity_resolver, "identify", return_value=verified):
+            queued = await module.create_session(FakeConnectedRequest())
+            granted = await module.queue_status("queue-123", FakeConnectedRequest())
+
+        self.assertEqual(json.loads(queued.body)["state"], "queued")
+        self.assertEqual(json.loads(granted.body)["state"], "granted")
+        self.assertEqual(fake_session_manager.poll_calls, 1)
+        self.assertEqual(fake_dashboard.calls, ["request", "success"])
+
+    async def test_expired_queue_identity_is_rejected_before_claiming_capacity(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeQueuedGrantSessionManager()
+        clock = FakeClock(0.0)
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        module.queue_requester_tracker = SessionRequesterTracker(retention_s=1, time_fn=clock)
+        verified = _requester_identity(verification="verified", kind="authenticated")
+
+        with patch.object(module.requester_identity_resolver, "identify", return_value=verified):
+            await module.create_session(FakeConnectedRequest())
+            clock.now = 2.0
+            with self.assertRaises(HTTPException) as raised:
+                await module.queue_status("queue-123", FakeConnectedRequest())
+
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertEqual(raised.exception.detail["reason"], "queue_identity_expired")
+        self.assertEqual(fake_session_manager.poll_calls, 0)
+        self.assertTrue(fake_session_manager.left)
+        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 0)
+        self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
+
+    async def test_queue_identity_must_still_be_verified_before_claiming_capacity(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeQueuedGrantSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        verified = _requester_identity(verification="verified", kind="authenticated")
+        invalid = _requester_identity(verification="invalid", kind="invalid_token")
+
+        with (
+            patch.object(module.requester_identity_resolver, "identify", return_value=verified),
+            patch.object(
+                module.requester_identity_resolver,
+                "latest_identity",
+                side_effect=[verified, invalid],
+            ),
+        ):
+            await module.create_session(FakeConnectedRequest())
+            with self.assertRaises(HTTPException) as raised:
+                await module.queue_status("queue-123", FakeConnectedRequest())
+
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertEqual(raised.exception.detail["reason"], "token_invalid")
+        self.assertEqual(fake_session_manager.poll_calls, 0)
+        self.assertTrue(fake_session_manager.left)
+        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 0)
+        self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
+
+    async def test_final_grant_guard_releases_session_if_identity_is_no_longer_verified(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        verified = _requester_identity(verification="verified", kind="authenticated")
+        invalid = _requester_identity(verification="invalid", kind="invalid_token")
+
+        with (
+            patch.object(module.requester_identity_resolver, "identify", return_value=verified),
+            patch.object(
+                module.requester_identity_resolver,
+                "latest_identity",
+                side_effect=[verified, invalid],
+            ),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await module.create_session(FakeConnectedRequest())
+
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertEqual(fake_session_manager.cancelled_session_ids, ["session-123"])
+        self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
+        status = module.requester_rate_limiter.status()
+        self.assertEqual(status["active_allocations"], 0)
+        self.assertEqual(status["totals"]["allocation_auth_rejections"], 1)
 
     async def test_leaving_queue_releases_parallel_allocation_permit(self):
         module = self._import_load_balancer()
@@ -846,7 +1070,7 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.allocation_total_ms, 250)
         self.assertTrue(record.waited_for_capacity)
 
-    def _import_load_balancer(self):
+    def _import_load_balancer(self, env=None):
         sys.modules.pop("app.load_balancer_main", None)
         with patch.dict(
             "os.environ",
@@ -855,6 +1079,8 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
                 "DASHBOARD_BUCKET_ID": "",
                 "DASHBOARD_PREVIEW_MODE": "",
                 "SESSION_SHARED_SECRET": "",
+                "SESSION_REQUIRE_VERIFIED_HF_TOKEN": "false",
+                **(env or {}),
             },
             clear=False,
         ):
@@ -879,6 +1105,9 @@ class FakeDashboard:
 
     async def record_session_allocation_success(self, requester=None):
         self.calls.append("success")
+
+    async def record_session_auth_rejected(self, requester=None):
+        self.calls.append("auth_rejected")
 
     async def record_session_request_abandoned(self, requester=None):
         self.calls.append("abandoned")
@@ -982,8 +1211,10 @@ class FakeQueuedGrantSessionManager(FakeQueuedSessionManager):
     def __init__(self):
         super().__init__()
         self.cancelled_session_ids = []
+        self.poll_calls = 0
 
     async def poll(self, queue_id, lb_base_url):
+        self.poll_calls += 1
         if queue_id != "queue-123":
             raise KeyError(queue_id)
         return {
@@ -1003,6 +1234,17 @@ class FakeQueuedGrantSessionManager(FakeQueuedSessionManager):
         self.cancelled_session_ids.append(session_id)
 
 
+def _requester_identity(*, verification, kind="unverified_token"):
+    return RequesterIdentity(
+        actor_id="token:abc123",
+        label="HF token •abc123",
+        kind=kind,
+        verification=verification,
+        fingerprint="abc123",
+        account_name="reachy-user" if verification == "verified" else None,
+    )
+
+
 class FakeDisconnectedRequest:
     headers = {
         "x-forwarded-proto": "https",
@@ -1017,6 +1259,11 @@ class FakeDisconnectedRequest:
 class FakeConnectedRequest(FakeDisconnectedRequest):
     async def is_disconnected(self):
         return False
+
+
+class FakeHeaderRequest(FakeConnectedRequest):
+    def __init__(self, headers):
+        self.headers = {**self.headers, **headers}
 
 
 class FakeJsonRequest(FakeConnectedRequest):
