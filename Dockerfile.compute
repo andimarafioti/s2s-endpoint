@@ -2,6 +2,9 @@
 FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
 ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
 ARG S2S_REF=main
+ARG SMART_TURN_MODEL_REPO=pipecat-ai/smart-turn-v3
+ARG SMART_TURN_MODEL_REV=f766f81d3cfdf7737ac64aad813d91bbfd56bf93
+ARG SMART_TURN_MODEL_FILENAME=smart-turn-v3.2-cpu.onnx
 ARG QWENTTS_WHEEL_URL=https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/resolve/main/whl/cu128/qwentts_cpp_python-0.3.1%2Bcu128-py3-none-manylinux_2_35_x86_64.whl
 ARG QWENTTS_WHEEL_FILENAME=qwentts_cpp_python-0.3.1+cu128-py3-none-manylinux_2_35_x86_64.whl
 
@@ -13,6 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     INTERNAL_WS_HOST=127.0.0.1 \
     INTERNAL_WS_PORT=9000 \
     S2S_REPO_DIR=/opt/speech-to-speech \
+    SMART_TURN_MODEL_PATH=/opt/models/smart-turn-v3.2-cpu.onnx \
     QWENTTS_WHEELHOUSE_DIR=/opt/qwentts-wheels \
     UV_FIND_LINKS=/opt/qwentts-wheels
 
@@ -32,14 +36,19 @@ RUN pip install --upgrade pip setuptools wheel && \
     pip install uv
 
 # Clone speech-to-speech and install its dependencies the way the repo expects
-RUN mkdir -p "${QWENTTS_WHEELHOUSE_DIR}" && \
+RUN mkdir -p "${QWENTTS_WHEELHOUSE_DIR}" /opt/models && \
     curl -L --fail "${QWENTTS_WHEEL_URL}" -o "${QWENTTS_WHEELHOUSE_DIR}/${QWENTTS_WHEEL_FILENAME}" && \
     git clone --filter=blob:none "${S2S_REPO_URL}" ${S2S_REPO_DIR} && \
     cd ${S2S_REPO_DIR} && \
     git checkout "${S2S_REF}" && \
     uv sync --no-dev && \
-    uv run --no-dev python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')" && \
-    uv run --no-dev python -c "import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)"
+    uv run --no-dev --no-sync python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='${SMART_TURN_MODEL_REPO}', filename='${SMART_TURN_MODEL_FILENAME}', revision='${SMART_TURN_MODEL_REV}', local_dir='/opt/models')" && \
+    uv run --no-dev --no-sync python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')" && \
+    uv run --no-dev --no-sync python -c "import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)"
+
+# Verify the CPU execution provider, then freeze the built environment.
+RUN cd ${S2S_REPO_DIR} && \
+    uv run --no-dev --no-sync python -c "import onnxruntime as ort; providers = ort.get_available_providers(); print(f'ONNX Runtime {ort.__version__} providers: {providers}'); assert 'CPUExecutionProvider' in providers"
 
 COPY app /app/app
 

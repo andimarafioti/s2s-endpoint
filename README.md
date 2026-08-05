@@ -36,7 +36,9 @@ Build the compute image:
 docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
-Today `Dockerfile.compute` defaults `S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and `S2S_REF=main`, because the realtime server path now lives on upstream `main`. If you need to override that repo/ref explicitly, use:
+`Dockerfile.compute` defaults
+`S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git` and
+`S2S_REF=main`. Override either value explicitly with:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
@@ -402,6 +404,12 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `NUM_PIPELINES`: concurrent realtime sessions the `speech-to-speech` process handles internally (default `1`)
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
+- `ENABLE_SMART_TURN`: enables Smart Turn endpointing (default `1`); set it to
+  `0` to disable it.
+- `SMART_TURN_MODEL_PATH`: optional Smart Turn ONNX checkpoint path. The
+  compute image defaults to `/opt/models/smart-turn-v3.2-cpu.onnx`.
+- `EXTRA_S2S_ARGS`: optional advanced CLI arguments passed to
+  `speech-to-speech`.
 - `ENABLE_LLM_PROXY`: master switch for the LLM proxy feature — passes
   `--enable_llm_proxy` to the internal `speech-to-speech` server and opens the
   replica's `/v1/chat/completions` and `/v1/responses` proxy paths. Defaults
