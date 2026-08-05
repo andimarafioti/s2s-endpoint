@@ -58,6 +58,7 @@ class BuildS2SCommandTests(unittest.TestCase):
         self.assertNotIn("--smart_turn_model_path", command)
         self.assertNotIn("--smart_turn_threshold", command)
         self.assertNotIn("--smart_turn_max_wait_ms", command)
+        self.assertNotIn("--smart_turn_incomplete_delay_ms", command)
         self.assertNotIn("--smart_turn_cpu_count", command)
 
     def test_baked_smart_turn_model_path_is_forwarded(self):

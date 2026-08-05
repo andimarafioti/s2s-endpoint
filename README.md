@@ -43,7 +43,7 @@ which adds Smart Turn v3.2 endpointing. Override the repository or revision expl
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
   --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
-  --build-arg S2S_REF=0feb0372d9aa8c1671a0eabbeef14fcfe18f557c \
+  --build-arg S2S_REF=baab217758115118cf96ba6f7ac7266ea0752e48 \
   -t your-registry/s2s-endpoint-compute:realtime .
 ```
 
@@ -411,7 +411,9 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
 - `ENABLE_SMART_TURN`: enables Smart Turn speculative response gating after
   Silero finalizes a segment (default `1`). Set it to `0` to use the ordinary
-  speculative reopen grace for every turn.
+  speculative reopen grace for every turn. Timing follows upstream defaults:
+  complete turns start processing immediately, while incomplete turns wait
+  600 ms before STT/LLM work begins within their 2-second response grace.
 - `SMART_TURN_MODEL_PATH`: local ONNX checkpoint path. The compute image embeds
   and selects `/opt/models/smart-turn-v3.2-cpu.onnx`.
 - `EXTRA_S2S_ARGS`: optional advanced CLI overrides passed through to
