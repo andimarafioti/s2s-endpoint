@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+import math
 import re
 import secrets
 import time
@@ -184,6 +185,23 @@ class RequesterIdentityResolver:
             return False
         age_s = max(self._time_fn() - identity.verified_at_s, 0.0)
         return age_s <= max_age_s
+
+    def verification_retry_after_s(self, identity: RequesterIdentity, *, default_s: int = 1) -> int:
+        """Return when a cached unavailable verdict can be attempted again."""
+        if default_s < 1:
+            raise ValueError("default_s must be >= 1")
+        if identity.verification != "unavailable":
+            return default_s
+
+        cached = self._cache.get(identity.actor_id)
+        if cached is None or cached.identity.verification != "unavailable":
+            return default_s
+
+        remaining_s = cached.expires_at_s - self._time_fn()
+        if remaining_s <= 0:
+            self._cache.pop(identity.actor_id, None)
+            return default_s
+        return max(math.ceil(remaining_s), default_s)
 
     def validation_task(self, identity: RequesterIdentity) -> asyncio.Task[None] | None:
         return self._validation_tasks.get(identity.actor_id)

@@ -195,9 +195,11 @@ admission, and queued grants fail closed if their proof ages out. Missing,
 malformed, unrecognized, and invalid credentials
 return `401` with `WWW-Authenticate: Bearer`. A timed-out or unavailable Hugging
 Face validation returns retryable `503` without allocating, queueing, or waking
-compute. The verified privacy-safe requester identity is retained with a queue
-ticket, and queued grants are denied if that authorization context is lost. Raw
-bearer tokens are never logged or retained.
+compute. When an upstream verification failure is cached, `Retry-After` reports
+the cache entry's remaining lifetime (up to 60 seconds) so clients do not retry
+before a new `whoami` attempt can occur. The verified privacy-safe requester
+identity is retained with a queue ticket, and queued grants are denied if that
+authorization context is lost. Raw bearer tokens are never logged or retained.
 
 New remote token validations are admitted through a separate pre-authentication
 guard before they enter the resolver queue. It limits both total pending checks

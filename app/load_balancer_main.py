@@ -549,14 +549,17 @@ async def _raise_session_auth_rejection(
     )
 
     if status_code == 503:
+        retry_after_s = (
+            requester_identity_resolver.verification_retry_after_s(requester) if requester is not None else 1
+        )
         raise HTTPException(
             status_code=503,
             detail={
                 "code": "hf_token_verification_unavailable",
                 "reason": reason,
-                "retry_after_s": 1,
+                "retry_after_s": retry_after_s,
             },
-            headers={"Retry-After": "1"},
+            headers={"Retry-After": str(retry_after_s)},
         )
     raise HTTPException(
         status_code=401,

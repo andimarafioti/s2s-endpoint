@@ -682,7 +682,7 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(fake_session_manager.allocation_calls, 0)
                 self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
 
-    async def test_required_token_returns_retryable_503_when_verification_is_unavailable(self):
+    async def test_required_token_uses_cached_failure_lifetime_for_retry_after(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
@@ -692,15 +692,22 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(module.requester_identity_resolver, "identify", return_value=unavailable),
+            patch.object(
+                module.requester_identity_resolver,
+                "verification_retry_after_s",
+                return_value=60,
+            ) as verification_retry_after_s,
             self.assertRaises(HTTPException) as raised,
         ):
             await module.create_session(FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(raised.exception.headers["Retry-After"], "1")
+        self.assertEqual(raised.exception.headers["Retry-After"], "60")
+        self.assertEqual(raised.exception.detail["retry_after_s"], 60)
         self.assertEqual(raised.exception.detail["reason"], "verification_unavailable")
         self.assertEqual(fake_session_manager.allocation_calls, 0)
         self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
+        verification_retry_after_s.assert_called_once_with(unavailable)
 
     async def test_required_token_returns_retryable_503_when_verification_times_out(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})

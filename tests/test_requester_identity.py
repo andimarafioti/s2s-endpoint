@@ -307,6 +307,29 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_remote_failure_retry_matches_remaining_unavailable_cache_lifetime(self):
+        clock = FakeClock()
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=lambda token: (_ for _ in ()).throw(FakeHubError(503)),
+            time_fn=clock,
+        )
+        request = FakeRequest(headers={"authorization": "Bearer hf_temporarily_unavailable"})
+
+        pending = resolver.identify(request)
+        unavailable = await resolver.wait_for_verification(pending, timeout_s=1)
+
+        self.assertEqual(unavailable.verification, "unavailable")
+        self.assertEqual(resolver.verification_retry_after_s(unavailable), 60)
+
+        clock.now = 17.2
+        self.assertEqual(resolver.verification_retry_after_s(unavailable), 43)
+
+        clock.now = 60
+        self.assertEqual(resolver.verification_retry_after_s(unavailable), 1)
+
+        await resolver.stop()
+
     async def test_stale_verified_identity_is_revalidated_before_authentication(self):
         clock = FakeClock()
         calls = []
