@@ -26,6 +26,7 @@ class RequesterIdentity:
     verification: str
     fingerprint: str
     account_name: Optional[str] = None
+    verified_at_s: Optional[float] = None
     network_id: Optional[str] = None
     reported_robot_id: Optional[str] = None
     client_kind: str = "unknown"
@@ -155,7 +156,8 @@ class RequesterIdentityResolver:
             verification="pending" if token_is_validatable else "unrecognized",
             fingerprint=fingerprint,
         )
-        if token_is_validatable and not self._schedule_validation(token, identity):
+        validation_task, _ = self._schedule_validation(token, identity) if token_is_validatable else (None, False)
+        if token_is_validatable and validation_task is None:
             identity = replace(identity, verification="unavailable")
         return identity.with_request_context(
             network_id=network_id,
@@ -172,6 +174,50 @@ class RequesterIdentityResolver:
             reported_robot_id=identity.reported_robot_id,
             client_kind=identity.client_kind,
         )
+
+    def verification_is_fresh(self, identity: RequesterIdentity, *, max_age_s: float) -> bool:
+        if max_age_s <= 0:
+            raise ValueError("max_age_s must be > 0")
+        if identity.verification != "verified" or identity.verified_at_s is None:
+            return False
+        age_s = max(self._time_fn() - identity.verified_at_s, 0.0)
+        return age_s <= max_age_s
+
+    def validation_task(self, identity: RequesterIdentity) -> asyncio.Task[None] | None:
+        return self._validation_tasks.get(identity.actor_id)
+
+    def start_verification(
+        self,
+        token: str,
+        identity: RequesterIdentity,
+        *,
+        force: bool = False,
+    ) -> tuple[RequesterIdentity, asyncio.Task[None] | None, bool]:
+        """Start token validation without retaining the raw token on the identity.
+
+        ``force`` discards a still-cached attribution verdict so authentication
+        can re-check a verified token whose short-lived proof has gone stale.
+        """
+        if not is_validatable_hf_token(token):
+            return replace(identity, verification="unrecognized", verified_at_s=None), None, False
+        expected_actor_id = f"token:{self._fingerprint('token', token)}"
+        if not hmac.compare_digest(expected_actor_id, identity.actor_id):
+            raise ValueError("token does not match requester identity")
+        if force:
+            self._cache.pop(identity.actor_id, None)
+
+        pending = replace(
+            identity,
+            label=f"HF token •{identity.fingerprint[:8]}",
+            kind="unverified_token",
+            verification="pending",
+            account_name=None,
+            verified_at_s=None,
+        )
+        task, started = self._schedule_validation(token, pending)
+        if task is None:
+            return replace(pending, verification="unavailable"), None, False
+        return pending, task, started
 
     async def wait_for_verification(self, identity: RequesterIdentity, *, timeout_s: float) -> RequesterIdentity:
         """Wait for the identity's in-flight token validation, then return the latest identity.
@@ -242,18 +288,23 @@ class RequesterIdentityResolver:
         self._cache.move_to_end(actor_id)
         return cached.identity
 
-    def _schedule_validation(self, token: str, identity: RequesterIdentity) -> bool:
-        if identity.actor_id in self._validation_tasks:
-            return True
+    def _schedule_validation(
+        self,
+        token: str,
+        identity: RequesterIdentity,
+    ) -> tuple[asyncio.Task[None] | None, bool]:
+        existing = self._validation_tasks.get(identity.actor_id)
+        if existing is not None:
+            return existing, False
         if len(self._validation_tasks) >= self._max_pending_validations:
-            return False
+            return None, False
 
         task = asyncio.create_task(self._validate_token(token, identity))
         self._validation_tasks[identity.actor_id] = task
         task.add_done_callback(
             lambda completed, actor_id=identity.actor_id: self._validation_finished(actor_id, completed)
         )
-        return True
+        return task, True
 
     def _validation_finished(self, actor_id: str, task: asyncio.Task[None]) -> None:
         if self._validation_tasks.get(actor_id) is task:
@@ -279,10 +330,11 @@ class RequesterIdentityResolver:
                     label=f"Invalid token •{identity.fingerprint[:8]}",
                     kind="invalid_token",
                     verification="invalid",
+                    verified_at_s=None,
                 )
                 ttl_s = 15 * 60
             else:
-                resolved = replace(identity, verification="unavailable")
+                resolved = replace(identity, verification="unavailable", verified_at_s=None)
                 ttl_s = 60
                 logger.warning(
                     "HF requester identity lookup unavailable actor_id=%s status_code=%s error_type=%s",
@@ -302,6 +354,7 @@ class RequesterIdentityResolver:
                 kind="authenticated",
                 verification="verified",
                 account_name=account_name,
+                verified_at_s=self._time_fn(),
             )
             ttl_s = 24 * 60 * 60
 

@@ -87,6 +87,9 @@ SESSION_REQUIRE_VERIFIED_HF_TOKEN = os.getenv(
 SESSION_HF_TOKEN_VERIFY_TIMEOUT_S = float(os.getenv("SESSION_HF_TOKEN_VERIFY_TIMEOUT_S", "5"))
 if SESSION_HF_TOKEN_VERIFY_TIMEOUT_S <= 0:
     raise ValueError("SESSION_HF_TOKEN_VERIFY_TIMEOUT_S must be > 0")
+SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S = float(os.getenv("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S", "60"))
+if SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S <= 0:
+    raise ValueError("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S must be > 0")
 # How long session creation waits for a first-seen HF token's whoami validation
 # before minting the LLM proxy claim. On timeout the claim fails closed: the
 # session is created normally but without LLM proxy access.
@@ -433,6 +436,7 @@ def _log_rate_limit_rejection(
 
 
 async def _require_verified_session_requester(
+    request: Request,
     requester: RequesterIdentity,
     *,
     http_route: str,
@@ -440,6 +444,14 @@ async def _require_verified_session_requester(
     wait_for_pending: bool,
 ) -> RequesterIdentity:
     pending_timed_out = False
+    if requester.verification == "verified" and not _session_verification_is_fresh(requester):
+        token = _request_hf_token(request)
+        if token is not None:
+            requester, _, _ = requester_identity_resolver.start_verification(
+                token,
+                requester,
+                force=True,
+            )
     if wait_for_pending and requester.verification == "pending":
         requester = await requester_identity_resolver.wait_for_verification(
             requester,
@@ -449,7 +461,7 @@ async def _require_verified_session_requester(
     else:
         requester = await _refresh_requester_identity(requester)
 
-    if requester.verification == "verified":
+    if _session_verification_is_fresh(requester):
         return requester
 
     await _raise_session_auth_rejection(
@@ -531,7 +543,16 @@ def _session_auth_rejection_reason(
         return "verification_unavailable"
     if requester.verification == "pending" and pending_timed_out:
         return "verification_timeout"
+    if requester.verification == "verified":
+        return "verification_stale"
     return "identity_not_verified"
+
+
+def _session_verification_is_fresh(requester: RequesterIdentity) -> bool:
+    return requester_identity_resolver.verification_is_fresh(
+        requester,
+        max_age_s=SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S,
+    )
 
 
 def _allocation_wait_ms(allocation: dict[str, object], *, fallback_ms: int) -> int:
@@ -585,9 +606,7 @@ async def _llm_proxy_fingerprint(request: Request, requester: RequesterIdentity)
     """
     if not SESSION_SHARED_SECRET:
         return None
-    token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
-    if token is None:
-        token = bearer_token(request.headers.get("authorization"))
+    token = _request_hf_token(request)
     if token is None or not is_validatable_hf_token(token):
         return None
     if requester.verification == "pending":
@@ -597,6 +616,13 @@ async def _llm_proxy_fingerprint(request: Request, requester: RequesterIdentity)
     if requester.verification != "verified":
         return None
     return llm_token_fingerprint(SESSION_SHARED_SECRET, token)
+
+
+def _request_hf_token(request: Request) -> str | None:
+    token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
+    if token is None:
+        token = bearer_token(request.headers.get("authorization"))
+    return token
 
 
 @app.get("/")
@@ -630,6 +656,7 @@ async def health():
     requester_tracking = requester_identity_resolver.status()
     requester_tracking["require_verified_hf_token"] = SESSION_REQUIRE_VERIFIED_HF_TOKEN
     requester_tracking["session_verification_timeout_s"] = SESSION_HF_TOKEN_VERIFY_TIMEOUT_S
+    requester_tracking["session_max_verified_age_s"] = SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S
     requester_tracking["pending_session_attributions"] = session_requester_tracker.count()
     requester_tracking["rate_limit"] = requester_rate_limiter.status()
     payload = {
@@ -656,6 +683,7 @@ async def create_session(request: Request):
     await dashboard.record_session_request(requester)
     if SESSION_REQUIRE_VERIFIED_HF_TOKEN:
         requester = await _require_verified_session_requester(
+            request,
             requester,
             http_route="POST /session",
             stage="admission",
@@ -758,7 +786,7 @@ async def queue_status(queue_id: str, request: Request):
                 status_code=401,
             )
         requester = await _refresh_requester_identity(requester)
-        if requester.verification != "verified":
+        if not _session_verification_is_fresh(requester):
             left = await session_manager.leave(queue_id)
             if not left:
                 raise HTTPException(status_code=404, detail="Unknown or expired ticket.")
@@ -835,7 +863,7 @@ async def _deliver_grant(
 
     if SESSION_REQUIRE_VERIFIED_HF_TOKEN:
         requester = await _refresh_requester_identity(requester)
-        if requester.verification != "verified":
+        if not _session_verification_is_fresh(requester):
             if session_id and hasattr(session_manager, "cancel_pending_session"):
                 await session_manager.cancel_pending_session(session_id)
             requester_rate_limiter.record_allocation_auth_rejection(requester)

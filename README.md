@@ -188,7 +188,11 @@ to the Hugging Face account asynchronously through `whoami`.
 Set `SESSION_REQUIRE_VERIFIED_HF_TOKEN=true` to require authentication for session
 admission. In this mode, the load balancer waits up to
 `SESSION_HF_TOKEN_VERIFY_TIMEOUT_S` for a first-seen token's `whoami` result before
-it allocates or queues. Missing, malformed, unrecognized, and invalid credentials
+it allocates or queues. A cached account identity is accepted for authentication
+only while its `verified_at` proof is no older than
+`SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S`; stale proofs are revalidated before a new
+admission, and queued grants fail closed if their proof ages out. Missing,
+malformed, unrecognized, and invalid credentials
 return `401` with `WWW-Authenticate: Bearer`. A timed-out or unavailable Hugging
 Face validation returns retryable `503` without allocating, queueing, or waking
 compute. The verified privacy-safe requester identity is retained with a queue
@@ -325,6 +329,9 @@ load-balancer variable is ignored and can be removed from existing deployments.
   before allocating or queueing a session (defaults to `false`)
 - `SESSION_HF_TOKEN_VERIFY_TIMEOUT_S`: maximum time to wait for first-seen token
   verification when session authentication is required (defaults to 5 seconds)
+- `SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S`: maximum age of a successful `whoami`
+  result when it is used as a session authentication proof (defaults to 60
+  seconds). Older cached identities are revalidated before admission.
 - `LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S`: how long session creation waits for a
   first-seen HF token's `whoami` validation before minting the session's LLM
   proxy claim (defaults to 5 seconds). On timeout the session is created
@@ -637,6 +644,7 @@ uv run --with-requirements requirements.txt python scripts/update_load_balancer_
   --name reachy-s2s-lb \
   --env SESSION_REQUIRE_VERIFIED_HF_TOKEN=true \
   --env SESSION_HF_TOKEN_VERIFY_TIMEOUT_S=5 \
+  --env SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S=60 \
   --wait
 ```
 

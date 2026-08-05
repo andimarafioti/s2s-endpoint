@@ -2,6 +2,7 @@ import importlib
 import json
 import sys
 import unittest
+from time import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -759,6 +760,36 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_session_manager.allocation_calls, 1)
         self.assertEqual(fake_dashboard.calls, ["request", "success"])
 
+    async def test_stale_cached_verification_is_refreshed_before_admission(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        fresh = _requester_identity(verification="verified", kind="authenticated")
+        stale = RequesterIdentity(**{**fresh.__dict__, "verified_at_s": 0.0})
+        pending = _requester_identity(verification="pending")
+        raw_token = "hf_fresh_authentication_proof"
+
+        with (
+            patch.object(module.requester_identity_resolver, "identify", return_value=stale),
+            patch.object(
+                module.requester_identity_resolver,
+                "start_verification",
+                return_value=(pending, None, True),
+            ) as start_verification,
+            patch.object(
+                module.requester_identity_resolver,
+                "wait_for_verification",
+                new=AsyncMock(return_value=fresh),
+            ),
+        ):
+            response = await module.create_session(FakeHeaderRequest({"authorization": f"Bearer {raw_token}"}))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fake_session_manager.allocation_calls, 1)
+        start_verification.assert_called_once_with(raw_token, stale, force=True)
+
     async def test_required_verified_token_is_preserved_through_queue_grant(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
@@ -1242,6 +1273,7 @@ def _requester_identity(*, verification, kind="unverified_token"):
         verification=verification,
         fingerprint="abc123",
         account_name="reachy-user" if verification == "verified" else None,
+        verified_at_s=time() if verification == "verified" else None,
     )
 
 

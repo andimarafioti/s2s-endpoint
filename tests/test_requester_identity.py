@@ -22,6 +22,14 @@ class FakeHubError(RuntimeError):
         self.response = SimpleNamespace(status_code=status_code)
 
 
+class FakeClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
 class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
     async def test_reported_hardware_id_is_normalized_and_fingerprinted(self):
         resolver = RequesterIdentityResolver(hash_secret="stable-secret", whoami_fn=lambda token: {})
@@ -276,6 +284,45 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resolved.verification, "verified")
         self.assertEqual(resolved.account_name, "reachy-user")
+        self.assertIsNotNone(resolved.verified_at_s)
+
+        await resolver.stop()
+
+    async def test_stale_verified_identity_is_revalidated_before_authentication(self):
+        clock = FakeClock()
+        calls = []
+
+        def whoami(token):
+            calls.append(token)
+            if len(calls) == 1:
+                return {"name": "reachy-user"}
+            raise FakeHubError(401)
+
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=whoami,
+            time_fn=clock,
+        )
+        raw_token = "hf_token_that_will_be_revoked"
+        request = FakeRequest(headers={"authorization": f"Bearer {raw_token}"})
+
+        pending = resolver.identify(request)
+        verified = await resolver.wait_for_verification(pending, timeout_s=1)
+        self.assertTrue(resolver.verification_is_fresh(verified, max_age_s=60))
+
+        clock.now = 61
+        cached = resolver.identify(request)
+        self.assertEqual(cached.verification, "verified")
+        self.assertFalse(resolver.verification_is_fresh(cached, max_age_s=60))
+
+        refreshing, task, started = resolver.start_verification(raw_token, cached, force=True)
+        self.assertTrue(started)
+        self.assertIsNotNone(task)
+        revoked = await resolver.wait_for_verification(refreshing, timeout_s=1)
+
+        self.assertEqual(calls, [raw_token, raw_token])
+        self.assertEqual(revoked.verification, "invalid")
+        self.assertIsNone(revoked.verified_at_s)
 
         await resolver.stop()
 
