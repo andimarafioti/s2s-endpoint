@@ -36,14 +36,14 @@ Build the compute image:
 docker build --platform linux/amd64 -f Dockerfile.compute -t your-registry/s2s-endpoint-compute:latest .
 ```
 
-`Dockerfile.compute` defaults to the reviewed revision from
-[`huggingface/speech-to-speech#192`](https://github.com/huggingface/speech-to-speech/pull/192),
-which adds Smart Turn v3.2 endpointing. Override the repository or revision explicitly with:
+`Dockerfile.compute` defaults to upstream `speech-to-speech` `main`, which
+includes Smart Turn v3.2 endpointing. Override the repository or revision
+explicitly with:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.compute \
   --build-arg S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git \
-  --build-arg S2S_REF=f5372a56aecbbf461ca4bc23d2277162a5eddb54 \
+  --build-arg S2S_REF=main \
   -t your-registry/s2s-endpoint-compute:realtime .
 ```
 
