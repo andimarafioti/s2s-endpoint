@@ -390,7 +390,7 @@ def _client_kind(user_agent: str | None) -> str:
     value = (user_agent or "").strip().lower()
     if not value:
         return "missing-user-agent"
-    if "reachy-mini-conversation-app" in value:
+    if "reachy-mini-conversation-app" in value or "reachy-mini-mobile-app" in value:
         return "reachy-mini"
 
     automation_markers = (
