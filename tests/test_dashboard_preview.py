@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import json
 import sys
@@ -16,6 +17,10 @@ from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointTrans
 from app.requester_identity import RequesterIdentity
 from app.requester_rate_limiter import RequesterRateLimitConfig, RequesterRateLimiter
 from app.session_requester_tracker import SessionRequesterTracker
+from app.verification_admission_limiter import (
+    VerificationAdmissionConfig,
+    VerificationAdmissionLimiter,
+)
 from tests.helpers import monotonic_sequence
 
 
@@ -725,6 +730,63 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
             pending,
             timeout_s=module.SESSION_HF_TOKEN_VERIFY_TIMEOUT_S,
         )
+
+    async def test_pre_verification_network_quota_blocks_distinct_tokens_before_resolver_queue(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dashboard = fake_dashboard
+        module.session_manager = fake_session_manager
+        module.session_verification_limiter = VerificationAdmissionLimiter(
+            config=VerificationAdmissionConfig(max_global_pending=2, max_network_pending=1)
+        )
+        first = RequesterIdentity(
+            **{
+                **_requester_identity(verification="pending").__dict__,
+                "actor_id": "token:first",
+                "fingerprint": "first",
+                "network_id": "net:same",
+            }
+        )
+        second = RequesterIdentity(
+            **{
+                **_requester_identity(verification="pending").__dict__,
+                "actor_id": "token:second",
+                "fingerprint": "second",
+                "network_id": "net:same",
+            }
+        )
+        release_validation = asyncio.Event()
+        validation_task = asyncio.create_task(release_validation.wait())
+
+        with (
+            patch.object(module.requester_identity_resolver, "identify", side_effect=[first, second]),
+            patch.object(
+                module.requester_identity_resolver,
+                "start_verification",
+                return_value=(first, validation_task, True),
+            ) as start_verification,
+            patch.object(
+                module.requester_identity_resolver,
+                "wait_for_verification",
+                new=AsyncMock(return_value=first),
+            ),
+        ):
+            with self.assertRaises(HTTPException):
+                await module.create_session(FakeHeaderRequest({"authorization": "Bearer hf_first_fabricated_token"}))
+            with self.assertRaises(HTTPException) as blocked:
+                await module.create_session(FakeHeaderRequest({"authorization": "Bearer hf_second_fabricated_token"}))
+
+        self.assertEqual(blocked.exception.status_code, 503)
+        self.assertEqual(blocked.exception.detail["reason"], "verification_network_quota")
+        self.assertEqual(start_verification.call_count, 1)
+        self.assertEqual(fake_session_manager.allocation_calls, 0)
+        self.assertEqual(module.session_verification_limiter.status()["pending"], 1)
+
+        release_validation.set()
+        await validation_task
+        await asyncio.sleep(0)
+        self.assertEqual(module.session_verification_limiter.status()["pending"], 0)
 
     async def test_required_token_rejects_invalid_identity_without_allocation(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})

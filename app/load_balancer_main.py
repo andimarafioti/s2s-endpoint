@@ -34,6 +34,10 @@ from app.session_request_metadata import reported_hardware_id
 from app.session_requester_tracker import SessionRequesterTracker
 from app.session_tokens import llm_token_fingerprint
 from app.swarm_dashboard import SwarmDashboard
+from app.verification_admission_limiter import (
+    VerificationAdmissionConfig,
+    VerificationAdmissionLimiter,
+)
 
 logger = setup_logging()
 APP_ROLE = "load_balancer"
@@ -121,6 +125,8 @@ REQUEST_USAGE_MAX_ACTORS_PER_MINUTE = int(os.getenv("REQUEST_USAGE_MAX_ACTORS_PE
 REQUEST_USAGE_MAX_RETAINED_RECORDS = int(os.getenv("REQUEST_USAGE_MAX_RETAINED_RECORDS", "50000"))
 REQUEST_USAGE_MAX_PENDING_VALIDATIONS = int(os.getenv("REQUEST_USAGE_MAX_PENDING_VALIDATIONS", "128"))
 REQUEST_USAGE_VALIDATION_CONCURRENCY = int(os.getenv("REQUEST_USAGE_VALIDATION_CONCURRENCY", "4"))
+SESSION_HF_TOKEN_VERIFY_MAX_PENDING = int(os.getenv("SESSION_HF_TOKEN_VERIFY_MAX_PENDING", "64"))
+SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK = int(os.getenv("SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK", "4"))
 REQUEST_USAGE_HIGH_REQUESTS = int(os.getenv("REQUEST_USAGE_HIGH_REQUESTS", "100"))
 REQUEST_USAGE_BURST_PER_MINUTE = int(os.getenv("REQUEST_USAGE_BURST_PER_MINUTE", "20"))
 REQUEST_USAGE_MANY_NETWORKS = int(os.getenv("REQUEST_USAGE_MANY_NETWORKS", "5"))
@@ -250,6 +256,12 @@ requester_identity_resolver = RequesterIdentityResolver(
     trust_proxy_headers=REQUEST_USAGE_TRUST_PROXY_HEADERS,
     max_pending_validations=REQUEST_USAGE_MAX_PENDING_VALIDATIONS,
     validation_concurrency=REQUEST_USAGE_VALIDATION_CONCURRENCY,
+)
+session_verification_limiter = VerificationAdmissionLimiter(
+    config=VerificationAdmissionConfig(
+        max_global_pending=SESSION_HF_TOKEN_VERIFY_MAX_PENDING,
+        max_network_pending=SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK,
+    )
 )
 requester_rate_limiter = RequesterRateLimiter(
     config=RequesterRateLimitConfig(
@@ -445,13 +457,9 @@ async def _require_verified_session_requester(
 ) -> RequesterIdentity:
     pending_timed_out = False
     if requester.verification == "verified" and not _session_verification_is_fresh(requester):
-        token = _request_hf_token(request)
-        if token is not None:
-            requester, _, _ = requester_identity_resolver.start_verification(
-                token,
-                requester,
-                force=True,
-            )
+        requester = await _start_session_verification(request, requester, force=True)
+    elif requester.verification == "pending" and requester_identity_resolver.validation_task(requester) is None:
+        requester = await _start_session_verification(request, requester, force=False)
     if wait_for_pending and requester.verification == "pending":
         requester = await requester_identity_resolver.wait_for_verification(
             requester,
@@ -472,6 +480,39 @@ async def _require_verified_session_requester(
         status_code=_session_auth_rejection_status(requester),
     )
     raise AssertionError("authentication rejection helper returned")
+
+
+async def _start_session_verification(
+    request: Request,
+    requester: RequesterIdentity,
+    *,
+    force: bool,
+) -> RequesterIdentity:
+    token = _request_hf_token(request)
+    if token is None:
+        return requester
+
+    decision, permit = session_verification_limiter.acquire(requester.network_id)
+    if not decision.allowed or permit is None:
+        await _raise_session_auth_rejection(
+            requester,
+            reason=f"verification_{decision.reason or 'quota'}",
+            http_route="POST /session",
+            stage="verification_admission",
+            status_code=503,
+        )
+        raise AssertionError("verification quota rejection helper returned")
+
+    requester, task, started = requester_identity_resolver.start_verification(
+        token,
+        requester,
+        force=force,
+    )
+    if task is not None and started:
+        permit.release_when_done(task)
+    else:
+        permit.release()
+    return requester
 
 
 async def _raise_session_auth_rejection(
@@ -657,6 +698,7 @@ async def health():
     requester_tracking["require_verified_hf_token"] = SESSION_REQUIRE_VERIFIED_HF_TOKEN
     requester_tracking["session_verification_timeout_s"] = SESSION_HF_TOKEN_VERIFY_TIMEOUT_S
     requester_tracking["session_max_verified_age_s"] = SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S
+    requester_tracking["session_verification_limit"] = session_verification_limiter.status()
     requester_tracking["pending_session_attributions"] = session_requester_tracker.count()
     requester_tracking["rate_limit"] = requester_rate_limiter.status()
     payload = {
@@ -679,7 +721,11 @@ async def create_session(request: Request):
     queue ticket the caller polls via GET /queue/{id}. 503 with {state:"at_capacity"}
     when the queue itself is full; 503 otherwise when the pool can't allocate."""
     hardware_id = await reported_hardware_id(request)
-    requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
+    requester = requester_identity_resolver.identify(
+        request,
+        hardware_id=hardware_id,
+        schedule_validation=not SESSION_REQUIRE_VERIFIED_HF_TOKEN,
+    )
     await dashboard.record_session_request(requester)
     if SESSION_REQUIRE_VERIFIED_HF_TOKEN:
         requester = await _require_verified_session_requester(

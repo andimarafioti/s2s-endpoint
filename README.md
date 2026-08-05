@@ -199,6 +199,13 @@ compute. The verified privacy-safe requester identity is retained with a queue
 ticket, and queued grants are denied if that authorization context is lost. Raw
 bearer tokens are never logged or retained.
 
+New remote token validations are admitted through a separate pre-authentication
+guard before they enter the resolver queue. It limits both total pending checks
+and pending checks from one privacy-safe network fingerprint, so fabricated token
+values cannot consume all resolver validation slots from a single source. This
+guard is independent of the requester rate limiter, which still runs only after
+authentication succeeds.
+
 Reachy clients can also include the daemon's optional 16-character hexadecimal
 `hardware_id` in the JSON body. The content type must be `application/json`:
 
@@ -332,6 +339,11 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S`: maximum age of a successful `whoami`
   result when it is used as a session authentication proof (defaults to 60
   seconds). Older cached identities are revalidated before admission.
+- `SESSION_HF_TOKEN_VERIFY_MAX_PENDING`: maximum remote token validations admitted
+  concurrently for enforced session authentication (defaults to 64)
+- `SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK`: maximum pending enforced
+  session validations attributed to one privacy-safe network fingerprint
+  (defaults to 4)
 - `LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S`: how long session creation waits for a
   first-seen HF token's `whoami` validation before minting the session's LLM
   proxy claim (defaults to 5 seconds). On timeout the session is created
@@ -645,6 +657,8 @@ uv run --with-requirements requirements.txt python scripts/update_load_balancer_
   --env SESSION_REQUIRE_VERIFIED_HF_TOKEN=true \
   --env SESSION_HF_TOKEN_VERIFY_TIMEOUT_S=5 \
   --env SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S=60 \
+  --env SESSION_HF_TOKEN_VERIFY_MAX_PENDING=64 \
+  --env SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK=4 \
   --wait
 ```
 

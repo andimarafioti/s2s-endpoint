@@ -272,6 +272,25 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_identify_can_defer_validation_until_an_admission_guard_allows_it(self):
+        calls = []
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=lambda token: calls.append(token) or {"name": "reachy-user"},
+        )
+
+        pending = resolver.identify(
+            FakeRequest(headers={"authorization": "Bearer hf_deferred_token"}),
+            schedule_validation=False,
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(pending.verification, "pending")
+        self.assertIsNone(resolver.validation_task(pending))
+        self.assertEqual(calls, [])
+
+        await resolver.stop()
+
     async def test_wait_for_verification_returns_the_resolved_identity(self):
         resolver = RequesterIdentityResolver(
             hash_secret="stable-secret",

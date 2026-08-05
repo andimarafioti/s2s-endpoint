@@ -113,6 +113,7 @@ class RequesterIdentityResolver:
         request: object,
         *,
         hardware_id: object = None,
+        schedule_validation: bool = True,
     ) -> RequesterIdentity:
         network_id = self._network_id(request)
         reported_robot_id = self._reported_robot_id(hardware_id)
@@ -156,9 +157,10 @@ class RequesterIdentityResolver:
             verification="pending" if token_is_validatable else "unrecognized",
             fingerprint=fingerprint,
         )
-        validation_task, _ = self._schedule_validation(token, identity) if token_is_validatable else (None, False)
-        if token_is_validatable and validation_task is None:
-            identity = replace(identity, verification="unavailable")
+        if token_is_validatable and schedule_validation:
+            validation_task, _ = self._schedule_validation(token, identity)
+            if validation_task is None:
+                identity = replace(identity, verification="unavailable")
         return identity.with_request_context(
             network_id=network_id,
             reported_robot_id=reported_robot_id,
