@@ -1,7 +1,7 @@
 # Compute image: runs local speech-to-speech pipelines on a GPU instance.
 FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
 ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
-ARG S2S_REF=baab217758115118cf96ba6f7ac7266ea0752e48
+ARG S2S_REF=f5372a56aecbbf461ca4bc23d2277162a5eddb54
 ARG SMART_TURN_MODEL_REPO=pipecat-ai/smart-turn-v3
 ARG SMART_TURN_MODEL_REV=f766f81d3cfdf7737ac64aad813d91bbfd56bf93
 ARG SMART_TURN_MODEL_FILENAME=smart-turn-v3.2-cpu.onnx
