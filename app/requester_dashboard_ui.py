@@ -26,7 +26,7 @@ REQUESTER_DASHBOARD_MARKUP = """
                 <th>Allocated</th>
                 <th>Connected</th>
                 <th>Duration</th>
-                <th>Limited</th>
+                <th>Rejected</th>
                 <th>Traffic</th>
                 <th>Peak</th>
                 <th>Networks</th>
@@ -103,6 +103,10 @@ REQUESTER_DASHBOARD_SCRIPT = """
       return `${tokenLabel} · ${fingerprints.join(', ')}${omittedCount ? `, +${prettyNumber(omittedCount)}` : ''}`;
     }
 
+    function requesterRejectedCount(row) {
+      return Number(row.auth_rejected || 0) + Number(row.rate_limited || 0);
+    }
+
     function renderRequesterUsage(requesters, summary) {
       const rows = requesters?.leaderboard || [];
       const windowLabel = summary.window_label || '6h';
@@ -137,7 +141,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td>${htmlEscape(prettyNumber(row.successes || 0))}<div class="muted">${htmlEscape(row.success_rate_pct || 0)}%</div></td>
             <td><strong>${htmlEscape(prettyNumber(row.connections || 0))}</strong><div class="muted">websocket joins</div></td>
             <td><strong>${htmlEscape(formatDuration(row.avg_connected_duration_s || 0))} avg</strong><div class="muted">${htmlEscape(prettyNumber(row.short_sessions || 0))} short · ${htmlEscape(formatDuration(row.max_connected_duration_s || 0))} max</div></td>
-            <td><strong>${htmlEscape(prettyNumber(row.rate_limited || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.auth_rejected || 0))} auth rejected</div></td>
+            <td><strong>${htmlEscape(prettyNumber(requesterRejectedCount(row)))}</strong><div class="muted">${htmlEscape(prettyNumber(row.auth_rejected || 0))} auth rejected · ${htmlEscape(prettyNumber(row.rate_limited || 0))} limited</div></td>
             <td>${htmlEscape(row.traffic_share_pct || 0)}%</td>
             <td>${htmlEscape(prettyNumber(row.peak_requests_per_minute || 0))}/min</td>
             <td>${htmlEscape(networks)}</td>
