@@ -35,7 +35,7 @@ RUN pip install --upgrade pip setuptools wheel && \
     pip install -r requirements.txt && \
     pip install uv
 
-# Clone speech-to-speech, install its default CPU Smart Turn runtime, and cache its models.
+# Clone speech-to-speech and install its dependencies the way the repo expects
 RUN mkdir -p "${QWENTTS_WHEELHOUSE_DIR}" /opt/models && \
     curl -L --fail "${QWENTTS_WHEEL_URL}" -o "${QWENTTS_WHEELHOUSE_DIR}/${QWENTTS_WHEEL_FILENAME}" && \
     git clone --filter=blob:none "${S2S_REPO_URL}" ${S2S_REPO_DIR} && \
