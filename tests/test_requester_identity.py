@@ -144,6 +144,15 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_reachy_mobile_app_user_agent_is_classified(self):
+        resolver = RequesterIdentityResolver(hash_secret="stable-secret")
+
+        identity = resolver.identify(FakeRequest(headers={"user-agent": "reachy-mini-mobile-app"}))
+
+        self.assertEqual(identity.client_kind, "reachy-mini-mobile-app")
+
+        await resolver.stop()
+
     async def test_invalid_token_is_classified_but_request_remains_identifiable(self):
         updated = asyncio.Event()
         updates = []
