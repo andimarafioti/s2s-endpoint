@@ -140,7 +140,7 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         identity = resolver.identify(FakeRequest(headers={"user-agent": "reachy-mini-conversation-app"}))
 
-        self.assertEqual(identity.client_kind, "reachy-mini")
+        self.assertEqual(identity.client_kind, "reachy-mini-conversation-app")
 
         await resolver.stop()
 
@@ -149,7 +149,7 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         identity = resolver.identify(FakeRequest(headers={"user-agent": "reachy-mini-mobile-app"}))
 
-        self.assertEqual(identity.client_kind, "reachy-mini")
+        self.assertEqual(identity.client_kind, "reachy-mini-mobile-app")
 
         await resolver.stop()
 
