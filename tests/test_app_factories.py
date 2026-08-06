@@ -292,6 +292,7 @@ class LoadBalancerApplicationFactoryTests(unittest.TestCase):
 
     def test_openapi_identities_remain_compatible(self):
         app = load_balancer_app.create_app(load_balancer_app.LoadBalancerSettings(dashboard_preview_mode=True))
+        schema = app.openapi()
 
         self.assertEqual(
             _openapi_identities(app),
@@ -324,6 +325,30 @@ class LoadBalancerApplicationFactoryTests(unittest.TestCase):
                 ("GET", "/dashboard/data"): (
                     "dashboard_data_dashboard_data_get",
                     "Dashboard Data",
+                ),
+            },
+        )
+        self.assertEqual(
+            {
+                (method.upper(), path): operation["description"]
+                for path, methods in schema["paths"].items()
+                for method, operation in methods.items()
+                if operation.get("description")
+            },
+            {
+                ("POST", "/session"): (
+                    "Grant a session if a slot is free and the line is empty, otherwise return a\n"
+                    'queue ticket the caller polls via GET /queue/{id}. 503 with {state:"at_capacity"}\n'
+                    "when the queue itself is full; 503 otherwise when the pool can't allocate."
+                ),
+                ("GET", "/queue/{queue_id}"): (
+                    "Advance a waiting ticket: report position, or — for the head of the line —\n"
+                    "hand back a session grant once a slot frees. 404 for an unknown/expired ticket.\n"
+                    "404 for everything when the queue is disabled — indistinguishable from main,\n"
+                    "where these routes don't exist."
+                ),
+                ("DELETE", "/queue/{queue_id}"): (
+                    "Leave the queue early (explicit button / teardown beacon). Idempotent."
                 ),
             },
         )

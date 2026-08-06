@@ -1,6 +1,7 @@
 import logging
 import secrets
 from dataclasses import dataclass
+from inspect import cleandoc
 from time import monotonic
 from typing import Any, Mapping
 
@@ -1445,18 +1446,21 @@ def create_app(
         create_session_route,
         methods=["POST"],
         name="create_session",
+        description=cleandoc(create_session.__doc__ or ""),
     )
     application.add_api_route(
         "/queue/{queue_id}",
         queue_status_route,
         methods=["GET"],
         name="queue_status",
+        description=cleandoc(queue_status.__doc__ or ""),
     )
     application.add_api_route(
         "/queue/{queue_id}",
         queue_leave_route,
         methods=["DELETE"],
         name="queue_leave",
+        description=cleandoc(queue_leave.__doc__ or ""),
     )
     application.add_api_route(
         "/internal/sessions/{session_id}/event",
