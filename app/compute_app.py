@@ -814,10 +814,24 @@ def create_app(
     async def websocket_route(client_ws: WebSocket):
         await websocket_proxy(client_ws, settings, resolved_dependencies)
 
-    application.add_api_route("/", root_route, methods=["GET"])
-    application.add_api_route("/health", health_route, methods=["GET"])
-    application.add_api_route("/v1/pool", pool_route, methods=["GET"])
-    application.add_api_route("/v1/chat/completions", chat_completions_route, methods=["POST"])
-    application.add_api_route("/v1/responses", responses_route, methods=["POST"])
-    application.add_api_websocket_route("/v1/realtime", websocket_route)
+    application.add_api_route("/", root_route, methods=["GET"], name="root")
+    application.add_api_route("/health", health_route, methods=["GET"], name="health")
+    application.add_api_route("/v1/pool", pool_route, methods=["GET"], name="pool")
+    application.add_api_route(
+        "/v1/chat/completions",
+        chat_completions_route,
+        methods=["POST"],
+        name="llm_proxy_chat_completions",
+    )
+    application.add_api_route(
+        "/v1/responses",
+        responses_route,
+        methods=["POST"],
+        name="llm_proxy_responses",
+    )
+    application.add_api_websocket_route(
+        "/v1/realtime",
+        websocket_route,
+        name="websocket_proxy",
+    )
     return application

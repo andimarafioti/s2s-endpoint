@@ -110,6 +110,14 @@ def _load_balancer_dependencies():
     )
 
 
+def _openapi_identities(app):
+    return {
+        (method.upper(), path): (operation["operationId"], operation["summary"])
+        for path, methods in app.openapi()["paths"].items()
+        for method, operation in methods.items()
+    }
+
+
 class ComputeSettingsTests(unittest.TestCase):
     def test_from_env_preserves_boolean_and_api_key_precedence(self):
         settings = compute_app.ComputeSettings.from_env(
@@ -168,6 +176,26 @@ class ComputeApplicationFactoryTests(unittest.TestCase):
 
         self.assertEqual(first_dependencies.session_router.stops, 1)
         self.assertEqual(second_dependencies.session_router.stops, 1)
+
+    def test_openapi_identities_remain_compatible(self):
+        app = compute_app.create_app(compute_app.ComputeSettings(), _compute_dependencies("router"))
+
+        self.assertEqual(
+            _openapi_identities(app),
+            {
+                ("GET", "/"): ("root__get", "Root"),
+                ("GET", "/health"): ("health_health_get", "Health"),
+                ("GET", "/v1/pool"): ("pool_v1_pool_get", "Pool"),
+                ("POST", "/v1/chat/completions"): (
+                    "llm_proxy_chat_completions_v1_chat_completions_post",
+                    "Llm Proxy Chat Completions",
+                ),
+                ("POST", "/v1/responses"): (
+                    "llm_proxy_responses_v1_responses_post",
+                    "Llm Proxy Responses",
+                ),
+            },
+        )
 
 
 class LoadBalancerSettingsTests(unittest.TestCase):
@@ -261,6 +289,44 @@ class LoadBalancerApplicationFactoryTests(unittest.TestCase):
         self.assertEqual(second_dependencies.session_manager.stops, 1)
         self.assertEqual(first_dependencies.requester_identity_resolver.stops, 1)
         self.assertEqual(second_dependencies.requester_identity_resolver.stops, 1)
+
+    def test_openapi_identities_remain_compatible(self):
+        app = load_balancer_app.create_app(load_balancer_app.LoadBalancerSettings(dashboard_preview_mode=True))
+
+        self.assertEqual(
+            _openapi_identities(app),
+            {
+                ("GET", "/"): ("root__get", "Root"),
+                ("GET", "/ready"): ("ready_ready_get", "Ready"),
+                ("GET", "/health"): ("health_health_get", "Health"),
+                ("POST", "/session"): ("create_session_session_post", "Create Session"),
+                ("GET", "/queue/{queue_id}"): (
+                    "queue_status_queue__queue_id__get",
+                    "Queue Status",
+                ),
+                ("DELETE", "/queue/{queue_id}"): (
+                    "queue_leave_queue__queue_id__delete",
+                    "Queue Leave",
+                ),
+                ("POST", "/internal/sessions/{session_id}/event"): (
+                    "session_event_internal_sessions__session_id__event_post",
+                    "Session Event",
+                ),
+                ("GET", "/internal/endpoints/{endpoint_name}"): (
+                    "endpoint_status_internal_endpoints__endpoint_name__get",
+                    "Endpoint Status",
+                ),
+                ("POST", "/internal/endpoints/{endpoint_name}/drain"): (
+                    "endpoint_drain_internal_endpoints__endpoint_name__drain_post",
+                    "Endpoint Drain",
+                ),
+                ("GET", "/dashboard"): ("dashboard_page_dashboard_get", "Dashboard Page"),
+                ("GET", "/dashboard/data"): (
+                    "dashboard_data_dashboard_data_get",
+                    "Dashboard Data",
+                ),
+            },
+        )
 
     def test_factory_module_import_does_not_require_deployment_environment(self):
         completed = subprocess.run(

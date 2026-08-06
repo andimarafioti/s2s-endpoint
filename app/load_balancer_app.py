@@ -1437,28 +1437,60 @@ def create_app(
     async def dashboard_data_route(window: str = "6h", resolution: str = ""):
         return await dashboard_data(runtime, window, resolution)
 
-    application.add_api_route("/", root_route, methods=["GET"])
-    application.add_api_route("/ready", ready, methods=["GET"])
-    application.add_api_route("/health", health_route, methods=["GET"])
-    application.add_api_route("/session", create_session_route, methods=["POST"])
-    application.add_api_route("/queue/{queue_id}", queue_status_route, methods=["GET"])
-    application.add_api_route("/queue/{queue_id}", queue_leave_route, methods=["DELETE"])
+    application.add_api_route("/", root_route, methods=["GET"], name="root")
+    application.add_api_route("/ready", ready, methods=["GET"], name="ready")
+    application.add_api_route("/health", health_route, methods=["GET"], name="health")
+    application.add_api_route(
+        "/session",
+        create_session_route,
+        methods=["POST"],
+        name="create_session",
+    )
+    application.add_api_route(
+        "/queue/{queue_id}",
+        queue_status_route,
+        methods=["GET"],
+        name="queue_status",
+    )
+    application.add_api_route(
+        "/queue/{queue_id}",
+        queue_leave_route,
+        methods=["DELETE"],
+        name="queue_leave",
+    )
     application.add_api_route(
         "/internal/sessions/{session_id}/event",
         session_event_route,
         methods=["POST"],
+        name="session_event",
     )
     application.add_api_route(
         "/internal/endpoints/{endpoint_name}",
         endpoint_status_route,
         methods=["GET"],
+        name="endpoint_status",
     )
     application.add_api_route(
         "/internal/endpoints/{endpoint_name}/drain",
         endpoint_drain_route,
         methods=["POST"],
+        name="endpoint_drain",
     )
-    application.add_api_websocket_route("/ws", deprecated_websocket_route)
-    application.add_api_route("/dashboard", dashboard_page_route, methods=["GET"])
-    application.add_api_route("/dashboard/data", dashboard_data_route, methods=["GET"])
+    application.add_api_websocket_route(
+        "/ws",
+        deprecated_websocket_route,
+        name="deprecated_websocket_route",
+    )
+    application.add_api_route(
+        "/dashboard",
+        dashboard_page_route,
+        methods=["GET"],
+        name="dashboard_page",
+    )
+    application.add_api_route(
+        "/dashboard/data",
+        dashboard_data_route,
+        methods=["GET"],
+        name="dashboard_data",
+    )
     return application
