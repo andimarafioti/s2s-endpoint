@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from websockets.exceptions import ConnectionClosed
 
-from app import compute_main
+from app import compute_app as compute_main
 from app.ws_proxy import proxy_websocket
 
 
@@ -51,6 +51,17 @@ class _FakeConnectCtx:
 
 def _lease(slot_id=0, ws_url="ws://127.0.0.1:9999"):
     return SimpleNamespace(slot_id=slot_id, ws_url=ws_url)
+
+
+def _dependencies(router, notify):
+    return compute_main.ComputeDependencies(
+        session_router=router,
+        connected_llm_fingerprints=compute_main._ConnectedFingerprintRegistry(),
+        llm_rate_limiter=compute_main._FingerprintRateLimiter(100),
+        http_get_json=lambda url: {},
+        notify_lb_session_event=notify,
+        proxy_websocket=proxy_websocket,
+    )
 
 
 class ProxyWebsocketLeaseHookTests(unittest.IsolatedAsyncioTestCase):
@@ -184,6 +195,9 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
             "session_token": "token-abc",
         }
 
+    def _settings(self):
+        return compute_main.ComputeSettings(session_shared_secret="test-secret")
+
     async def test_rejected_session_posts_only_disconnected(self):
         client = FakeClientWS()
         notify = AsyncMock()
@@ -191,12 +205,9 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
         async def failing_acquire():
             raise RuntimeError("all 3 pipeline session(s) are in use")
 
-        with (
-            patch.object(compute_main, "_get_session_payload", return_value=self._payload()),
-            patch.object(compute_main, "_notify_lb_session_event", notify),
-            patch.object(compute_main.session_router, "acquire", failing_acquire),
-        ):
-            await compute_main.websocket_proxy(client)
+        router = SimpleNamespace(acquire=failing_acquire, release=AsyncMock())
+        with patch.object(compute_main, "_get_session_payload", return_value=self._payload()):
+            await compute_main.websocket_proxy(client, self._settings(), _dependencies(router, notify))
 
         events = [call.args[2] for call in notify.await_args_list]
         self.assertEqual(events, ["disconnected"])
@@ -212,14 +223,12 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
         async def release(slot_id):
             pass
 
+        router = SimpleNamespace(acquire=acquire, release=release)
         with (
             patch.object(compute_main, "_get_session_payload", return_value=self._payload()),
-            patch.object(compute_main, "_notify_lb_session_event", notify),
-            patch.object(compute_main.session_router, "acquire", acquire),
-            patch.object(compute_main.session_router, "release", release),
             patch("app.ws_proxy.websockets.connect", _FakeConnectCtx),
         ):
-            await compute_main.websocket_proxy(client)
+            await compute_main.websocket_proxy(client, self._settings(), _dependencies(router, notify))
 
         events = [call.args[2] for call in notify.await_args_list]
         self.assertEqual(events, ["connected", "disconnected"])
@@ -242,13 +251,9 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
         async def release(slot_id):
             pass
 
-        with (
-            patch.object(compute_main, "_get_session_payload", return_value=self._payload()),
-            patch.object(compute_main, "_notify_lb_session_event", notify),
-            patch.object(compute_main.session_router, "acquire", acquire),
-            patch.object(compute_main.session_router, "release", release),
-        ):
-            await compute_main.websocket_proxy(client)
+        router = SimpleNamespace(acquire=acquire, release=release)
+        with patch.object(compute_main, "_get_session_payload", return_value=self._payload()):
+            await compute_main.websocket_proxy(client, self._settings(), _dependencies(router, notify))
 
         self.assertEqual(calls, ["connected", "disconnected"])
         # The session must not proxy after a failed connected notification.
@@ -272,13 +277,9 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
         async def release(slot_id):
             released.append(slot_id)
 
-        with (
-            patch.object(compute_main, "_get_session_payload", return_value=self._payload()),
-            patch.object(compute_main, "_notify_lb_session_event", notify),
-            patch.object(compute_main.session_router, "acquire", acquire),
-            patch.object(compute_main.session_router, "release", release),
-        ):
-            await compute_main.websocket_proxy(client)
+        router = SimpleNamespace(acquire=acquire, release=release)
+        with patch.object(compute_main, "_get_session_payload", return_value=self._payload()):
+            await compute_main.websocket_proxy(client, self._settings(), _dependencies(router, notify))
 
         events = [call.args[2] for call in notify.await_args_list]
         self.assertEqual(events, ["connected", "disconnected"])
@@ -294,14 +295,15 @@ class NotifyLbRetryTests(unittest.IsolatedAsyncioTestCase):
             if len(calls) < 3:
                 raise RuntimeError("LB callback failed with HTTP 503")
 
-        with patch.object(compute_main, "_post_json", post):
-            await compute_main._notify_lb_session_event(
-                "https://lb.example/internal/sessions/abc/event",
-                "token-abc",
-                "disconnected",
-                attempts=3,
-                backoff_s=0,
-            )
+        await compute_main._notify_lb_session_event(
+            "https://lb.example/internal/sessions/abc/event",
+            "token-abc",
+            "disconnected",
+            post_json=post,
+            default_backoff_s=1.0,
+            attempts=3,
+            backoff_s=0,
+        )
 
         self.assertEqual(calls, ["disconnected"] * 3)
 
@@ -312,15 +314,16 @@ class NotifyLbRetryTests(unittest.IsolatedAsyncioTestCase):
             calls.append(payload["event"])
             raise RuntimeError("LB callback failed: read timeout")
 
-        with patch.object(compute_main, "_post_json", post):
-            with self.assertRaisesRegex(RuntimeError, "read timeout"):
-                await compute_main._notify_lb_session_event(
-                    "https://lb.example/internal/sessions/abc/event",
-                    "token-abc",
-                    "disconnected",
-                    attempts=3,
-                    backoff_s=0,
-                )
+        with self.assertRaisesRegex(RuntimeError, "read timeout"):
+            await compute_main._notify_lb_session_event(
+                "https://lb.example/internal/sessions/abc/event",
+                "token-abc",
+                "disconnected",
+                post_json=post,
+                default_backoff_s=1.0,
+                attempts=3,
+                backoff_s=0,
+            )
 
         self.assertEqual(len(calls), 3)
 
@@ -345,15 +348,29 @@ class NotifyLbRetryTests(unittest.IsolatedAsyncioTestCase):
             "callback_url": "https://lb.example/internal/sessions/abc/event",
             "session_token": "token-abc",
         }
+
+        async def notify(callback_url, token, event, *, attempts=1, backoff_s=None):
+            await compute_main._notify_lb_session_event(
+                callback_url,
+                token,
+                event,
+                post_json=post,
+                default_backoff_s=0.0,
+                attempts=attempts,
+                backoff_s=backoff_s,
+            )
+
+        router = SimpleNamespace(acquire=acquire, release=release)
+        settings = compute_main.ComputeSettings(
+            session_shared_secret="test-secret",
+            lb_callback_retry_attempts=5,
+            lb_callback_retry_backoff_s=0.0,
+        )
         with (
             patch.object(compute_main, "_get_session_payload", return_value=payload),
-            patch.object(compute_main, "_post_json", post),
-            patch.object(compute_main, "LB_CALLBACK_RETRY_BACKOFF_S", 0.0),
-            patch.object(compute_main.session_router, "acquire", acquire),
-            patch.object(compute_main.session_router, "release", release),
             patch("app.ws_proxy.websockets.connect", _FakeConnectCtx),
         ):
-            await compute_main.websocket_proxy(client)
+            await compute_main.websocket_proxy(client, settings, _dependencies(router, notify))
 
         self.assertEqual(posted, ["connected", "disconnected", "disconnected"])
 

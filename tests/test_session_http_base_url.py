@@ -2,14 +2,12 @@
 the compute replica that owns the session — so LLM proxy clients can address
 the right replica without deriving it from the websocket URL."""
 
-import importlib
-import sys
 import unittest
-from unittest.mock import patch
 
 from app.app_utils import http_base_url_from_ws_url
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointLease
+from app.load_balancer_app import _public_session_allocation
 
 
 class HttpBaseUrlFromWsUrlTests(unittest.TestCase):
@@ -44,13 +42,8 @@ class GrantCarriesHttpBaseUrlTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PublicSessionAllocationTests(unittest.TestCase):
-    def tearDown(self):
-        sys.modules.pop("app.load_balancer_main", None)
-
     def test_http_base_url_survives_the_public_projection(self):
-        module = self._import_load_balancer()
-
-        public = module._public_session_allocation(
+        public = _public_session_allocation(
             {
                 "state": "granted",
                 "session_id": "sid",
@@ -65,20 +58,6 @@ class PublicSessionAllocationTests(unittest.TestCase):
 
         self.assertEqual(public["http_base_url"], "https://compute-01.example")
         self.assertNotIn("endpoint_name", public)
-
-    def _import_load_balancer(self):
-        sys.modules.pop("app.load_balancer_main", None)
-        with patch.dict(
-            "os.environ",
-            {
-                "COMPUTE_ENDPOINT_NAMES": "TEST",
-                "DASHBOARD_BUCKET_ID": "",
-                "DASHBOARD_PREVIEW_MODE": "",
-                "SESSION_SHARED_SECRET": "",
-            },
-            clear=False,
-        ):
-            return importlib.import_module("app.load_balancer_main")
 
 
 class _SingleLeaseRouter:
