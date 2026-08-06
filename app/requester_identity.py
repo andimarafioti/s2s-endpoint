@@ -391,7 +391,7 @@ def _client_kind(user_agent: str | None) -> str:
     if not value:
         return "missing-user-agent"
     if "reachy-mini-conversation-app" in value:
-        return "reachy-mini-conversation-app"
+        return "reachy-mini"
     if "reachy-mini-mobile-app" in value:
         return "reachy-mini-mobile-app"
 
