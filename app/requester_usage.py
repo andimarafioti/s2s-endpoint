@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from app.dashboard_history import (
@@ -19,6 +20,228 @@ class RequesterUsageThresholds:
     burst_requests_per_minute: int = 20
     many_networks: int = 5
     high_auth_rejections: int = 3
+
+
+@dataclass
+class _ActorUsageAccumulator:
+    actor_id: str
+    label: str
+    kind: str
+    verification: str
+    fingerprint: str
+    account_name: str | None
+    first_seen_s: int
+    last_seen_s: int
+    requests: int = 0
+    successes: int = 0
+    failures: int = 0
+    auth_rejected: int = 0
+    rate_limited: int = 0
+    abandoned: int = 0
+    connections: int = 0
+    completed_sessions: int = 0
+    short_sessions: int = 0
+    connected_duration_total_s: float = 0.0
+    connected_duration_max_s: float = 0.0
+    authenticated_requests: int = 0
+    anonymous_requests: int = 0
+    invalid_token_requests: int = 0
+    token_actor_ids: set[str] = field(default_factory=set)
+    requesting_token_actor_ids: set[str] = field(default_factory=set)
+    token_fingerprints: set[str] = field(default_factory=set)
+    token_requests: int = 0
+    authenticated_account_names: set[str] = field(default_factory=set)
+    connected_authenticated_account_names: set[str] = field(default_factory=set)
+    peak_requests_per_minute: int = 0
+    network_ids: set[str] = field(default_factory=set)
+    network_ids_overflow: bool = False
+    reported_robot_requests: int = 0
+    reported_robot_ids: set[str] = field(default_factory=set)
+    reported_robot_ids_overflow: bool = False
+    client_kinds: Counter[str] = field(default_factory=Counter)
+    _requests_by_bucket: dict[int, int] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_identity(
+        cls,
+        actor_id: str,
+        identity: dict[str, object],
+        bucket_start_s: int,
+    ) -> _ActorUsageAccumulator:
+        account_name = identity.get("account_name")
+        return cls(
+            actor_id=actor_id,
+            label=str(identity.get("label") or "Unknown requester"),
+            kind=str(identity.get("kind") or "unknown"),
+            verification=str(identity.get("verification") or "unknown"),
+            fingerprint=str(identity.get("fingerprint") or ""),
+            account_name=str(account_name) if account_name is not None else None,
+            first_seen_s=bucket_start_s,
+            last_seen_s=bucket_start_s,
+        )
+
+    def merge_identity(self, identity: dict[str, object]) -> None:
+        merged: dict[str, object] = {
+            "label": self.label,
+            "kind": self.kind,
+            "verification": self.verification,
+            "fingerprint": self.fingerprint,
+            "account_name": self.account_name,
+        }
+        _merge_requester_identity(merged, identity)
+        self.label = str(merged["label"])
+        self.kind = str(merged["kind"])
+        self.verification = str(merged["verification"])
+        self.fingerprint = str(merged["fingerprint"])
+        account_name = merged.get("account_name")
+        self.account_name = str(account_name) if account_name is not None else None
+
+    def absorb(
+        self,
+        record: dict[str, object],
+        bucket_start_s: int,
+        *,
+        source_actor_id: str,
+        source_identity: dict[str, object],
+    ) -> None:
+        requests = max(int(record.get("requests", 0)), 0)
+        self.requests += requests
+        self.successes += max(int(record.get("successes", 0)), 0)
+        self.failures += max(int(record.get("failures", 0)), 0)
+        self.auth_rejected += max(int(record.get("auth_rejected", 0)), 0)
+        self.rate_limited += max(int(record.get("rate_limited", 0)), 0)
+        self.abandoned += max(int(record.get("abandoned", 0)), 0)
+        connections = max(int(record.get("connections", 0)), 0)
+        self.connections += connections
+        self.completed_sessions += max(int(record.get("completed_sessions", 0)), 0)
+        self.short_sessions += max(int(record.get("short_sessions", 0)), 0)
+        self.connected_duration_total_s += max(float(record.get("connected_duration_total_s", 0.0)), 0.0)
+        self.connected_duration_max_s = max(
+            self.connected_duration_max_s,
+            max(float(record.get("connected_duration_max_s", 0.0)), 0.0),
+        )
+        bucket_requests = self._requests_by_bucket.get(bucket_start_s, 0) + requests
+        self._requests_by_bucket[bucket_start_s] = bucket_requests
+        self.peak_requests_per_minute = max(self.peak_requests_per_minute, bucket_requests)
+        self.first_seen_s = min(self.first_seen_s, bucket_start_s)
+        self.last_seen_s = max(self.last_seen_s, bucket_start_s)
+
+        if source_actor_id.startswith("token:"):
+            self.token_actor_ids.add(source_actor_id)
+            if requests > 0:
+                self.requesting_token_actor_ids.add(source_actor_id)
+            fingerprint = str(
+                record.get("fingerprint")
+                or source_identity.get("fingerprint")
+                or source_actor_id.removeprefix("token:")
+            )
+            if fingerprint:
+                self.token_fingerprints.add(fingerprint)
+            self.token_requests += requests
+
+        kind = str(record.get("kind") or "unknown")
+        if kind == "authenticated":
+            self.authenticated_requests += requests
+            if requests > 0:
+                self.authenticated_account_names.add(
+                    _normalized_account_name(record.get("account_name")) or self.actor_id
+                )
+            if connections > 0:
+                self.connected_authenticated_account_names.add(
+                    _normalized_account_name(record.get("account_name")) or self.actor_id
+                )
+        elif kind == "anonymous":
+            self.anonymous_requests += requests
+        elif kind == "invalid_token":
+            self.invalid_token_requests += requests
+
+        self.network_ids.update(str(item) for item in list(record.get("network_ids") or []))
+        self.network_ids_overflow = self.network_ids_overflow or bool(record.get("network_ids_overflow", False))
+        self.reported_robot_requests += max(int(record.get("reported_robot_requests", 0)), 0)
+        self.reported_robot_ids.update(str(item) for item in list(record.get("reported_robot_ids") or []))
+        self.reported_robot_ids_overflow = self.reported_robot_ids_overflow or bool(
+            record.get("reported_robot_ids_overflow", False)
+        )
+        for client_kind, count in dict(record.get("client_kinds") or {}).items():
+            self.client_kinds[str(client_kind)] += max(int(count), 0)
+
+    def to_row(
+        self,
+        *,
+        total_session_requests: int,
+        window_hours: float,
+        peer_count: int,
+        relative_threshold: int,
+        thresholds: RequesterUsageThresholds,
+    ) -> dict[str, object]:
+        token_fingerprints = sorted(self.token_fingerprints)
+        client_kinds = dict(sorted(self.client_kinds.items(), key=lambda item: (-item[1], item[0])))
+        automated_requests = sum(
+            count for client_kind, count in client_kinds.items() if client_kind.startswith("automation:")
+        )
+        traffic_share_pct = (
+            round((self.requests / total_session_requests) * 100.0, 1) if total_session_requests else 0.0
+        )
+        signals = _usage_signals(
+            requests=self.requests,
+            verification=self.verification,
+            traffic_share_pct=traffic_share_pct,
+            peak_requests_per_minute=self.peak_requests_per_minute,
+            network_count=len(self.network_ids),
+            network_ids_overflow=self.network_ids_overflow,
+            automated_requests=automated_requests,
+            invalid_token_requests=self.invalid_token_requests,
+            auth_rejected=self.auth_rejected,
+            rate_limited=self.rate_limited,
+            completed_sessions=self.completed_sessions,
+            short_sessions=self.short_sessions,
+            peer_count=peer_count,
+            relative_threshold=relative_threshold,
+            thresholds=thresholds,
+        )
+        high_risk = self.auth_rejected >= thresholds.high_auth_rejections or any(
+            signal.startswith(("high volume", "burst", "dominant traffic share", "rate limited")) for signal in signals
+        )
+        return {
+            "actor_id": self.actor_id,
+            "label": self.label,
+            "kind": self.kind,
+            "verification": self.verification,
+            "fingerprint": token_fingerprints[0] if token_fingerprints else self.fingerprint,
+            "token_count": len(self.token_actor_ids),
+            "token_fingerprints": token_fingerprints,
+            "account_name": self.account_name,
+            "requests": self.requests,
+            "successes": self.successes,
+            "failures": self.failures,
+            "auth_rejected": self.auth_rejected,
+            "rate_limited": self.rate_limited,
+            "abandoned": self.abandoned,
+            "connections": self.connections,
+            "completed_sessions": self.completed_sessions,
+            "short_sessions": self.short_sessions,
+            "avg_connected_duration_s": (
+                round(self.connected_duration_total_s / self.completed_sessions, 2) if self.completed_sessions else 0.0
+            ),
+            "max_connected_duration_s": round(self.connected_duration_max_s, 2),
+            "success_rate_pct": round((self.successes / self.requests) * 100.0, 1) if self.requests else 0.0,
+            "traffic_share_pct": traffic_share_pct,
+            "requests_per_hour": round(self.requests / window_hours, 2),
+            "peak_requests_per_minute": self.peak_requests_per_minute,
+            "network_count": len(self.network_ids),
+            "network_count_overflow": self.network_ids_overflow,
+            "reported_robot_count": len(self.reported_robot_ids),
+            "reported_robot_count_overflow": self.reported_robot_ids_overflow,
+            "reported_robot_ids": sorted(self.reported_robot_ids),
+            "reported_robot_requests": self.reported_robot_requests,
+            "client_kinds": client_kinds,
+            "automated_requests": automated_requests,
+            "invalid_token_requests": self.invalid_token_requests,
+            "first_seen": _isoformat(self.first_seen_s),
+            "last_seen": _isoformat(self.last_seen_s),
+            "risk": "high" if high_risk else ("watch" if signals else "normal"),
+            "signals": signals,
+        }
 
 
 class RequesterUsageService:
@@ -81,11 +304,9 @@ def aggregate_requester_usage(
     thresholds: RequesterUsageThresholds,
 ) -> dict[str, object]:
     actors = _collect_actors(buckets)
-    tracked_requests = sum(int(actor["requests"]) for actor in actors.values())
+    tracked_requests = sum(actor.requests for actor in actors.values())
     peer_request_counts = [
-        int(actor["requests"])
-        for actor_id, actor in actors.items()
-        if actor_id != "overflow" and int(actor["requests"]) > 0
+        actor.requests for actor_id, actor in actors.items() if actor_id != "overflow" and actor.requests > 0
     ]
     median_peer_requests = _median([float(value) for value in peer_request_counts])
     relative_threshold = max(20, int(median_peer_requests * 5))
@@ -106,122 +327,37 @@ def aggregate_requester_usage(
     attributed_connections = 0
 
     for actor_id, actor in actors.items():
-        requests = int(actor["requests"])
-        kind = str(actor["kind"])
-        verification = str(actor["verification"])
-        account_name = actor.get("account_name")
-        token_actor_ids = actor["token_actor_ids"] if isinstance(actor["token_actor_ids"], set) else set()
-        requesting_token_actor_ids = (
-            actor["requesting_token_actor_ids"] if isinstance(actor["requesting_token_actor_ids"], set) else set()
-        )
-        token_fingerprints = sorted(
-            str(value)
-            for value in (actor["token_fingerprints"] if isinstance(actor["token_fingerprints"], set) else set())
-        )
-        network_ids = actor["network_ids"] if isinstance(actor["network_ids"], set) else set()
-        reported_robot_ids = actor["reported_robot_ids"] if isinstance(actor["reported_robot_ids"], set) else set()
-        client_kinds = dict(actor["client_kinds"]) if isinstance(actor["client_kinds"], dict) else {}
-        automated_requests = sum(
-            count for client_kind, count in client_kinds.items() if client_kind.startswith("automation:")
-        )
-        traffic_share_pct = round((requests / total_session_requests) * 100.0, 1) if total_session_requests else 0.0
-
-        if requests > 0 and actor_id != "overflow":
-            token_actors.update(str(value) for value in requesting_token_actor_ids)
-            authenticated_accounts.update(str(value) for value in actor["authenticated_account_names"])
-            if kind == "authenticated" and verification == "verified":
-                authenticated_accounts.add(_normalized_account_name(account_name) or actor_id)
-            authenticated_requests += int(actor["authenticated_requests"])
-            anonymous_requests += int(actor["anonymous_requests"])
-            invalid_token_requests += int(actor["invalid_token_requests"])
-            if int(actor["anonymous_requests"]) > 0 and actor_id != "anonymous:unknown":
+        if actor.requests > 0 and actor_id != "overflow":
+            token_actors.update(actor.requesting_token_actor_ids)
+            authenticated_accounts.update(actor.authenticated_account_names)
+            if actor.kind == "authenticated" and actor.verification == "verified":
+                authenticated_accounts.add(_normalized_account_name(actor.account_name) or actor_id)
+            authenticated_requests += actor.authenticated_requests
+            anonymous_requests += actor.anonymous_requests
+            invalid_token_requests += actor.invalid_token_requests
+            if actor.anonymous_requests > 0 and actor_id != "anonymous:unknown":
                 anonymous_actors.add(actor_id)
-            reported_robots.update(str(value) for value in reported_robot_ids)
-            reported_robot_requests += int(actor["reported_robot_requests"])
+            reported_robots.update(actor.reported_robot_ids)
+            reported_robot_requests += actor.reported_robot_requests
 
-        successes = int(actor["successes"])
-        auth_rejected = int(actor["auth_rejected"])
-        rate_limited = int(actor["rate_limited"])
-        connections = int(actor["connections"])
-        completed_sessions = int(actor["completed_sessions"])
-        duration_total_s = float(actor["connected_duration_total_s"])
         if actor_id != "overflow":
-            if successes > 0:
+            if actor.successes > 0:
                 allocated_requesters.add(actor_id)
-            if connections > 0:
+            if actor.connections > 0:
                 connected_requesters.add(actor_id)
-                attributed_connections += connections
-                connected_authenticated_accounts.update(
-                    str(value) for value in actor["connected_authenticated_account_names"]
-                )
-                if kind == "authenticated" and verification == "verified":
-                    connected_authenticated_accounts.add(_normalized_account_name(account_name) or actor_id)
+                attributed_connections += actor.connections
+                connected_authenticated_accounts.update(actor.connected_authenticated_account_names)
+                if actor.kind == "authenticated" and actor.verification == "verified":
+                    connected_authenticated_accounts.add(_normalized_account_name(actor.account_name) or actor_id)
 
-        peak_requests_per_minute = int(actor["peak_requests_per_minute"])
-        signals = _usage_signals(
-            requests=requests,
-            verification=verification,
-            traffic_share_pct=traffic_share_pct,
-            peak_requests_per_minute=peak_requests_per_minute,
-            network_count=len(network_ids),
-            network_ids_overflow=bool(actor["network_ids_overflow"]),
-            automated_requests=automated_requests,
-            invalid_token_requests=int(actor["invalid_token_requests"]),
-            auth_rejected=auth_rejected,
-            rate_limited=rate_limited,
-            completed_sessions=completed_sessions,
-            short_sessions=int(actor["short_sessions"]),
-            peer_count=len(peer_request_counts),
-            relative_threshold=relative_threshold,
-            thresholds=thresholds,
-        )
-        high_risk = auth_rejected >= thresholds.high_auth_rejections or any(
-            signal.startswith(("high volume", "burst", "dominant traffic share", "rate limited")) for signal in signals
-        )
         rows.append(
-            {
-                "actor_id": actor_id,
-                "label": actor["label"],
-                "kind": kind,
-                "verification": verification,
-                "fingerprint": token_fingerprints[0] if token_fingerprints else actor["fingerprint"],
-                "token_count": len(token_actor_ids),
-                "token_fingerprints": token_fingerprints,
-                "account_name": account_name,
-                "requests": requests,
-                "successes": successes,
-                "failures": int(actor["failures"]),
-                "auth_rejected": auth_rejected,
-                "rate_limited": rate_limited,
-                "abandoned": int(actor["abandoned"]),
-                "connections": connections,
-                "completed_sessions": completed_sessions,
-                "short_sessions": int(actor["short_sessions"]),
-                "avg_connected_duration_s": (
-                    round(duration_total_s / completed_sessions, 2) if completed_sessions else 0.0
-                ),
-                "max_connected_duration_s": round(
-                    float(actor["connected_duration_max_s"]),
-                    2,
-                ),
-                "success_rate_pct": round((successes / requests) * 100.0, 1) if requests else 0.0,
-                "traffic_share_pct": traffic_share_pct,
-                "requests_per_hour": round(requests / window_hours, 2),
-                "peak_requests_per_minute": peak_requests_per_minute,
-                "network_count": len(network_ids),
-                "network_count_overflow": bool(actor["network_ids_overflow"]),
-                "reported_robot_count": len(reported_robot_ids),
-                "reported_robot_count_overflow": bool(actor["reported_robot_ids_overflow"]),
-                "reported_robot_ids": sorted(str(value) for value in reported_robot_ids),
-                "reported_robot_requests": int(actor["reported_robot_requests"]),
-                "client_kinds": dict(sorted(client_kinds.items(), key=lambda item: (-item[1], item[0]))),
-                "automated_requests": automated_requests,
-                "invalid_token_requests": int(actor["invalid_token_requests"]),
-                "first_seen": _isoformat(int(actor["first_seen_s"])),
-                "last_seen": _isoformat(int(actor["last_seen_s"])),
-                "risk": "high" if high_risk else ("watch" if signals else "normal"),
-                "signals": signals,
-            }
+            actor.to_row(
+                total_session_requests=total_session_requests,
+                window_hours=window_hours,
+                peer_count=len(peer_request_counts),
+                relative_threshold=relative_threshold,
+                thresholds=thresholds,
+            )
         )
 
     rows.sort(key=lambda row: (-int(row["requests"]), str(row["label"])))
@@ -239,12 +375,12 @@ def aggregate_requester_usage(
         "connected_requesters_window": len(connected_requesters),
         "authenticated_users_connected_window": len(connected_authenticated_accounts),
         "attributed_connections_window": attributed_connections,
-        "token_requests_window": sum(int(actor["token_requests"]) for actor in actors.values()),
+        "token_requests_window": sum(actor.token_requests for actor in actors.values()),
         "authenticated_requests_window": authenticated_requests,
         "anonymous_requests_window": anonymous_requests,
         "invalid_token_requests_window": invalid_token_requests,
-        "auth_rejected_requests_window": sum(int(row["auth_rejected"]) for row in rows),
-        "rate_limited_requests_window": sum(int(row["rate_limited"]) for row in rows),
+        "auth_rejected_requests_window": sum(actor.auth_rejected for actor in actors.values()),
+        "rate_limited_requests_window": sum(actor.rate_limited for actor in actors.values()),
         "unattributed_requests_window": unattributed_requests,
         "unusual_requesters_window": sum(1 for row in rows if row["risk"] != "normal"),
     }
@@ -263,106 +399,24 @@ def aggregate_requester_usage(
     }
 
 
-def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, dict[str, object]]:
+def _collect_actors(buckets: Iterable[SwarmHistoryBucket]) -> dict[str, _ActorUsageAccumulator]:
     ordered_buckets = sorted(buckets, key=lambda item: item.bucket_start_s)
     identities = _collect_actor_identities(ordered_buckets)
-    actors: dict[str, dict[str, object]] = {}
+    actors: dict[str, _ActorUsageAccumulator] = {}
     for bucket in ordered_buckets:
-        bucket_requests: dict[str, int] = {}
         for source_actor_id, record in bucket.requester_usage.items():
             actor_id, identity = _aggregation_identity(source_actor_id, identities[source_actor_id])
-            actor = actors.setdefault(actor_id, _new_actor(actor_id, identity, bucket.bucket_start_s))
-            _merge_requester_identity(actor, identity)
-
-            requests = max(int(record.get("requests", 0)), 0)
-            actor["requests"] = int(actor["requests"]) + requests
-            actor["successes"] = int(actor["successes"]) + max(int(record.get("successes", 0)), 0)
-            actor["failures"] = int(actor["failures"]) + max(int(record.get("failures", 0)), 0)
-            actor["auth_rejected"] = int(actor["auth_rejected"]) + max(
-                int(record.get("auth_rejected", 0)),
-                0,
+            actor = actors.get(actor_id)
+            if actor is None:
+                actor = _ActorUsageAccumulator.from_identity(actor_id, identity, bucket.bucket_start_s)
+                actors[actor_id] = actor
+            actor.merge_identity(identity)
+            actor.absorb(
+                record,
+                bucket.bucket_start_s,
+                source_actor_id=source_actor_id,
+                source_identity=identities[source_actor_id],
             )
-            actor["rate_limited"] = int(actor["rate_limited"]) + max(
-                int(record.get("rate_limited", 0)),
-                0,
-            )
-            actor["abandoned"] = int(actor["abandoned"]) + max(int(record.get("abandoned", 0)), 0)
-            connections = max(int(record.get("connections", 0)), 0)
-            actor["connections"] = int(actor["connections"]) + connections
-            actor["completed_sessions"] = int(actor["completed_sessions"]) + max(
-                int(record.get("completed_sessions", 0)),
-                0,
-            )
-            actor["short_sessions"] = int(actor["short_sessions"]) + max(
-                int(record.get("short_sessions", 0)),
-                0,
-            )
-            actor["connected_duration_total_s"] = float(actor["connected_duration_total_s"]) + max(
-                float(record.get("connected_duration_total_s", 0.0)), 0.0
-            )
-            actor["connected_duration_max_s"] = max(
-                float(actor["connected_duration_max_s"]),
-                max(float(record.get("connected_duration_max_s", 0.0)), 0.0),
-            )
-            bucket_requests[actor_id] = bucket_requests.get(actor_id, 0) + requests
-            actor["first_seen_s"] = min(int(actor["first_seen_s"]), bucket.bucket_start_s)
-            actor["last_seen_s"] = max(int(actor["last_seen_s"]), bucket.bucket_start_s)
-
-            if source_actor_id.startswith("token:"):
-                token_actor_ids = actor["token_actor_ids"]
-                if isinstance(token_actor_ids, set):
-                    token_actor_ids.add(source_actor_id)
-                requesting_token_actor_ids = actor["requesting_token_actor_ids"]
-                if requests > 0 and isinstance(requesting_token_actor_ids, set):
-                    requesting_token_actor_ids.add(source_actor_id)
-                token_fingerprints = actor["token_fingerprints"]
-                if isinstance(token_fingerprints, set):
-                    fingerprint = str(
-                        record.get("fingerprint")
-                        or identities[source_actor_id].get("fingerprint")
-                        or source_actor_id.removeprefix("token:")
-                    )
-                    if fingerprint:
-                        token_fingerprints.add(fingerprint)
-                actor["token_requests"] = int(actor["token_requests"]) + requests
-
-            kind = str(record.get("kind") or "unknown")
-            if kind == "authenticated":
-                actor["authenticated_requests"] = int(actor["authenticated_requests"]) + requests
-                account_names = actor["authenticated_account_names"]
-                if isinstance(account_names, set) and requests > 0:
-                    account_names.add(_normalized_account_name(record.get("account_name")) or actor_id)
-                connected_account_names = actor["connected_authenticated_account_names"]
-                if isinstance(connected_account_names, set) and connections > 0:
-                    connected_account_names.add(_normalized_account_name(record.get("account_name")) or actor_id)
-            elif kind == "anonymous":
-                actor["anonymous_requests"] = int(actor["anonymous_requests"]) + requests
-            elif kind == "invalid_token":
-                actor["invalid_token_requests"] = int(actor["invalid_token_requests"]) + requests
-
-            network_ids = actor["network_ids"]
-            if isinstance(network_ids, set):
-                network_ids.update(str(item) for item in list(record.get("network_ids") or []))
-            actor["network_ids_overflow"] = bool(
-                actor["network_ids_overflow"] or record.get("network_ids_overflow", False)
-            )
-            actor["reported_robot_requests"] = int(actor["reported_robot_requests"]) + max(
-                int(record.get("reported_robot_requests", 0)),
-                0,
-            )
-            reported_robot_ids = actor["reported_robot_ids"]
-            if isinstance(reported_robot_ids, set):
-                reported_robot_ids.update(str(item) for item in list(record.get("reported_robot_ids") or []))
-            actor["reported_robot_ids_overflow"] = bool(
-                actor["reported_robot_ids_overflow"] or record.get("reported_robot_ids_overflow", False)
-            )
-            client_kinds = actor["client_kinds"]
-            if isinstance(client_kinds, dict):
-                for kind, count in dict(record.get("client_kinds") or {}).items():
-                    client_kinds[str(kind)] = int(client_kinds.get(str(kind), 0)) + max(int(count), 0)
-        for actor_id, requests in bucket_requests.items():
-            actor = actors[actor_id]
-            actor["peak_requests_per_minute"] = max(int(actor["peak_requests_per_minute"]), requests)
     return actors
 
 
@@ -410,46 +464,6 @@ def _aggregation_identity(
 def _normalized_account_name(value: object) -> str | None:
     account_name = str(value).strip().casefold() if value is not None else ""
     return account_name or None
-
-
-def _new_actor(actor_id: str, record: dict[str, object], bucket_start_s: int) -> dict[str, object]:
-    return {
-        "actor_id": actor_id,
-        "label": str(record.get("label") or "Unknown requester"),
-        "kind": str(record.get("kind") or "unknown"),
-        "verification": str(record.get("verification") or "unknown"),
-        "fingerprint": str(record.get("fingerprint") or ""),
-        "account_name": record.get("account_name"),
-        "requests": 0,
-        "successes": 0,
-        "failures": 0,
-        "auth_rejected": 0,
-        "rate_limited": 0,
-        "abandoned": 0,
-        "connections": 0,
-        "completed_sessions": 0,
-        "short_sessions": 0,
-        "connected_duration_total_s": 0.0,
-        "connected_duration_max_s": 0.0,
-        "authenticated_requests": 0,
-        "anonymous_requests": 0,
-        "invalid_token_requests": 0,
-        "token_actor_ids": set(),
-        "requesting_token_actor_ids": set(),
-        "token_fingerprints": set(),
-        "token_requests": 0,
-        "authenticated_account_names": set(),
-        "connected_authenticated_account_names": set(),
-        "peak_requests_per_minute": 0,
-        "network_ids": set(),
-        "network_ids_overflow": False,
-        "reported_robot_requests": 0,
-        "reported_robot_ids": set(),
-        "reported_robot_ids_overflow": False,
-        "client_kinds": {},
-        "first_seen_s": bucket_start_s,
-        "last_seen_s": bucket_start_s,
-    }
 
 
 def _usage_signals(
