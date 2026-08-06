@@ -9,8 +9,6 @@ never stored anywhere.
 """
 
 import asyncio
-import importlib
-import sys
 import time
 import unittest
 from types import SimpleNamespace
@@ -18,12 +16,14 @@ from unittest.mock import patch
 
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointLease
+from app.load_balancer_app import _llm_proxy_fingerprint
 from app.requester_identity import RequesterIdentity, RequesterIdentityResolver
 from app.session_tokens import (
     create_session_token,
     llm_token_fingerprint,
     verify_session_token,
 )
+from tests.helpers import load_balancer_fixture
 
 SECRET = "shared-secret"
 HF_TOKEN = "hf_faketesttoken1234"
@@ -167,22 +167,8 @@ class _FakeHubError(RuntimeError):
 
 
 class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
-    def tearDown(self):
-        sys.modules.pop("app.load_balancer_main", None)
-
-    def _import_load_balancer(self, secret: str = SECRET):
-        sys.modules.pop("app.load_balancer_main", None)
-        with patch.dict(
-            "os.environ",
-            {
-                "COMPUTE_ENDPOINT_NAMES": "TEST",
-                "DASHBOARD_BUCKET_ID": "",
-                "DASHBOARD_PREVIEW_MODE": "",
-                "SESSION_SHARED_SECRET": secret,
-            },
-            clear=False,
-        ):
-            return importlib.import_module("app.load_balancer_main")
+    def _import_load_balancer(self, secret: str = SECRET, **environ):
+        return load_balancer_fixture({"SESSION_SHARED_SECRET": secret, **environ})
 
     def _request(self, headers: dict[str, str]) -> SimpleNamespace:
         return SimpleNamespace(headers=headers)
@@ -198,7 +184,8 @@ class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_verified_hf_bearer_yields_the_shared_fingerprint(self):
         module = self._import_load_balancer()
-        result = await module._llm_proxy_fingerprint(
+        result = await _llm_proxy_fingerprint(
+            module.runtime,
             self._request({"authorization": f"Bearer {HF_TOKEN}"}),
             self._requester("verified"),
         )
@@ -206,7 +193,8 @@ class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reachy_authorization_header_wins_over_authorization(self):
         module = self._import_load_balancer()
-        result = await module._llm_proxy_fingerprint(
+        result = await _llm_proxy_fingerprint(
+            module.runtime,
             self._request(
                 {
                     "x-reachy-mini-authorization": f"Bearer {HF_TOKEN}",
@@ -219,12 +207,13 @@ class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_bearer_yields_no_claim(self):
         module = self._import_load_balancer()
-        self.assertIsNone(await module._llm_proxy_fingerprint(self._request({}), self._requester("verified")))
+        self.assertIsNone(await _llm_proxy_fingerprint(module.runtime, self._request({}), self._requester("verified")))
 
     async def test_unvalidatable_token_yields_no_claim(self):
         module = self._import_load_balancer()
         self.assertIsNone(
-            await module._llm_proxy_fingerprint(
+            await _llm_proxy_fingerprint(
+                module.runtime,
                 self._request({"authorization": "Bearer bad token with spaces"}),
                 self._requester("verified"),
             )
@@ -233,7 +222,8 @@ class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_shared_secret_yields_no_claim(self):
         module = self._import_load_balancer(secret="")
         self.assertIsNone(
-            await module._llm_proxy_fingerprint(
+            await _llm_proxy_fingerprint(
+                module.runtime,
                 self._request({"authorization": f"Bearer {HF_TOKEN}"}),
                 self._requester("verified"),
             )
@@ -247,7 +237,8 @@ class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
         for verification in ("pending", "invalid", "unavailable", "unrecognized"):
             with self.subTest(verification=verification):
                 self.assertIsNone(
-                    await module._llm_proxy_fingerprint(
+                    await _llm_proxy_fingerprint(
+                        module.runtime,
                         self._request({"authorization": f"Bearer {HF_TOKEN}"}),
                         self._requester(verification),
                     )
@@ -260,10 +251,10 @@ class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
         resolver = RequesterIdentityResolver(hash_secret=SECRET, whoami_fn=lambda token: {"name": "reachy-user"})
         request = self._request({"authorization": f"Bearer {HF_TOKEN}"})
         try:
-            with patch.object(module, "requester_identity_resolver", resolver):
+            with patch.object(module.dependencies, "requester_identity_resolver", resolver):
                 pending = resolver.identify(request)
                 self.assertEqual(pending.verification, "pending")
-                result = await module._llm_proxy_fingerprint(request, pending)
+                result = await _llm_proxy_fingerprint(module.runtime, request, pending)
             self.assertEqual(result, llm_token_fingerprint(SECRET, HF_TOKEN))
         finally:
             await resolver.stop()
@@ -276,9 +267,9 @@ class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
         resolver = RequesterIdentityResolver(hash_secret=SECRET, whoami_fn=whoami)
         request = self._request({"authorization": f"Bearer {HF_TOKEN}"})
         try:
-            with patch.object(module, "requester_identity_resolver", resolver):
+            with patch.object(module.dependencies, "requester_identity_resolver", resolver):
                 pending = resolver.identify(request)
-                self.assertIsNone(await module._llm_proxy_fingerprint(request, pending))
+                self.assertIsNone(await _llm_proxy_fingerprint(module.runtime, request, pending))
         finally:
             await resolver.stop()
 
@@ -287,17 +278,16 @@ class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
             time.sleep(0.5)
             return {"name": "reachy-user"}
 
-        module = self._import_load_balancer()
+        module = self._import_load_balancer(
+            LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S="0.05",
+        )
         resolver = RequesterIdentityResolver(hash_secret=SECRET, whoami_fn=whoami)
         request = self._request({"authorization": f"Bearer {HF_TOKEN}"})
         try:
-            with (
-                patch.object(module, "requester_identity_resolver", resolver),
-                patch.object(module, "LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S", 0.05),
-            ):
+            with patch.object(module.dependencies, "requester_identity_resolver", resolver):
                 pending = resolver.identify(request)
                 started = asyncio.get_running_loop().time()
-                result = await module._llm_proxy_fingerprint(request, pending)
+                result = await _llm_proxy_fingerprint(module.runtime, request, pending)
                 waited_s = asyncio.get_running_loop().time() - started
             self.assertIsNone(result)
             self.assertLess(waited_s, 0.4)
