@@ -2062,6 +2062,130 @@ class EndpointSelectionTests(unittest.TestCase):
 
 
 class ManagedEndpointPropertyTests(unittest.TestCase):
+    def test_applies_controller_snapshot_as_one_state_update(self):
+        ep = ManagedEndpoint(name="ep", slots=2)
+
+        ep.apply_snapshot(
+            EndpointSnapshot(
+                name="ep",
+                status="running",
+                raw_status="RUNNING",
+                url="https://ep.example.endpoints.huggingface.cloud",
+            )
+        )
+
+        self.assertEqual(ep.status, "running")
+        self.assertEqual(ep.raw_status, "RUNNING")
+        self.assertEqual(ep.url, "https://ep.example.endpoints.huggingface.cloud")
+
+    def test_usage_sync_state_is_invalidated_and_restored_atomically(self):
+        ep = ManagedEndpoint(name="ep", slots=2)
+        ep.observed_active_sessions = 1
+        ep.unobserved_connected_sessions = 2
+        ep.usage_synced = True
+        ep.last_usage_sync_at = 10
+        ep.usage_sync_drain_generation = 3
+        ep.last_sync_failure_log_at = 11
+        ep.last_error = "old failure"
+
+        ep.invalidate_usage_sync(forget_last_success=False)
+
+        self.assertFalse(ep.usage_synced)
+        self.assertEqual(ep.last_usage_sync_at, 10)
+        self.assertIsNone(ep.usage_sync_drain_generation)
+
+        ep.apply_usage_sync(
+            ComputeUsage(active_sessions=2, max_sessions=4),
+            synced_at=20,
+            drain_generation=4,
+        )
+
+        self.assertEqual(ep.slots, 4)
+        self.assertEqual(ep.observed_active_sessions, 2)
+        self.assertEqual(ep.unobserved_connected_sessions, 1)
+        self.assertTrue(ep.usage_synced)
+        self.assertEqual(ep.last_usage_sync_at, 20)
+        self.assertEqual(ep.usage_sync_drain_generation, 4)
+        self.assertIsNone(ep.last_sync_failure_log_at)
+        self.assertIsNone(ep.last_error)
+        self.assertEqual(ep.last_used_at, 20)
+
+    def test_fresh_process_reset_revokes_stale_usage_trust(self):
+        ep = ManagedEndpoint(name="ep", slots=2)
+        ep.observed_active_sessions = 1
+        ep.usage_synced = True
+        ep.last_usage_sync_at = 10
+        ep.usage_sync_drain_generation = 3
+
+        ep.reset_usage_after_fresh_process()
+
+        self.assertEqual(ep.observed_active_sessions, 0)
+        self.assertFalse(ep.usage_synced)
+        self.assertIsNone(ep.last_usage_sync_at)
+        self.assertIsNone(ep.usage_sync_drain_generation)
+
+    def test_stopped_process_reset_can_preserve_or_clear_local_sessions(self):
+        ep = ManagedEndpoint(name="ep", slots=2)
+        ep.active_sessions = 1
+        ep.connected_sessions = 1
+        ep.observed_active_sessions = 1
+        ep.unobserved_connected_sessions = 1
+        ep.usage_synced = True
+
+        ep.reset_usage_after_process_stop(clear_local_sessions=False)
+
+        self.assertEqual(ep.active_sessions, 1)
+        self.assertEqual(ep.connected_sessions, 1)
+        self.assertEqual(ep.observed_active_sessions, 0)
+        self.assertEqual(ep.unobserved_connected_sessions, 0)
+        self.assertFalse(ep.usage_synced)
+
+        ep.reset_usage_after_process_stop(clear_local_sessions=True)
+
+        self.assertEqual(ep.active_sessions, 0)
+        self.assertEqual(ep.connected_sessions, 0)
+
+    def test_drain_mutations_keep_lease_fields_consistent(self):
+        ep = ManagedEndpoint(name="ep", slots=2)
+
+        ep.acquire_drain(lease_id="rollout-a", now=10, lease_ttl_s=30)
+        ep.acquire_drain(lease_id="rollout-a", now=20, lease_ttl_s=30)
+
+        self.assertTrue(ep.draining)
+        self.assertEqual(ep.drain_generation, 1)
+        self.assertEqual(ep.draining_since, 10)
+        self.assertEqual(ep.drain_expires_at, 50)
+        self.assertEqual(ep.drain_lease_id, "rollout-a")
+
+        ep.clear_drain()
+
+        self.assertFalse(ep.draining)
+        self.assertIsNone(ep.draining_since)
+        self.assertIsNone(ep.drain_expires_at)
+        self.assertIsNone(ep.drain_lease_id)
+        self.assertIsNone(ep.last_drain_warning_at)
+
+    def test_failure_and_transition_completion_mutations_are_scoped(self):
+        ep = ManagedEndpoint(name="ep", slots=2)
+        ep.waking = True
+        ep.parking = True
+        ep.restarting = True
+        ep.drain_restarting = True
+        ep.wake_capacity_until = 10
+
+        ep.record_failure(RuntimeError("transition failed"))
+        ep.finish_wake()
+        ep.finish_park()
+        ep.finish_restart()
+        ep.finish_drain_restart()
+
+        self.assertEqual(ep.last_error, "transition failed")
+        self.assertFalse(ep.waking)
+        self.assertFalse(ep.parking)
+        self.assertFalse(ep.restarting)
+        self.assertFalse(ep.drain_restarting)
+        self.assertIsNone(ep.wake_capacity_until)
+
     def test_drain_restarting_zeroes_free_slots(self):
         ep = ManagedEndpoint(name="ep", slots=2)
         ep.status = "running"

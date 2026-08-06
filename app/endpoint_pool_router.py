@@ -413,6 +413,88 @@ class ManagedEndpoint:
     last_drain_warning_at: Optional[float] = None
     last_sync_failure_log_at: Optional[float] = None
 
+    def apply_snapshot(self, snapshot: EndpointSnapshot) -> None:
+        self.status = snapshot.status
+        self.raw_status = snapshot.raw_status
+        self.url = snapshot.url
+
+    def invalidate_usage_sync(self, *, forget_last_success: bool) -> None:
+        self.usage_synced = False
+        self.usage_sync_drain_generation = None
+        if forget_last_success:
+            self.last_usage_sync_at = None
+
+    def reset_usage_after_fresh_process(self) -> None:
+        self.observed_active_sessions = 0
+        self.invalidate_usage_sync(forget_last_success=True)
+
+    def reset_usage_after_process_stop(self, *, clear_local_sessions: bool) -> None:
+        if clear_local_sessions:
+            self.active_sessions = 0
+            self.connected_sessions = 0
+        self.observed_active_sessions = 0
+        self.unobserved_connected_sessions = 0
+        self.invalidate_usage_sync(forget_last_success=True)
+
+    def apply_usage_sync(
+        self,
+        usage: ComputeUsage,
+        *,
+        synced_at: float,
+        drain_generation: int,
+    ) -> None:
+        observed_increase = max(usage.active_sessions - self.observed_active_sessions, 0)
+        self.slots = usage.max_sessions
+        self.observed_active_sessions = usage.active_sessions
+        self.usage_synced = True
+        self.last_usage_sync_at = synced_at
+        self.usage_sync_drain_generation = drain_generation
+        self.last_sync_failure_log_at = None
+        self.last_error = None
+        if observed_increase:
+            self.unobserved_connected_sessions = max(
+                self.unobserved_connected_sessions - observed_increase,
+                0,
+            )
+        if usage.active_sessions:
+            self.last_used_at = synced_at
+
+    def record_failure(self, error: object) -> None:
+        self.last_error = str(error)
+
+    def clear_failure(self) -> None:
+        self.last_error = None
+
+    def finish_wake(self) -> None:
+        self.waking = False
+        self.wake_capacity_until = None
+
+    def finish_park(self) -> None:
+        self.parking = False
+        self.wake_capacity_until = None
+
+    def finish_restart(self) -> None:
+        self.restarting = False
+
+    def finish_drain_restart(self) -> None:
+        self.drain_restarting = False
+
+    def acquire_drain(self, *, lease_id: str, now: float, lease_ttl_s: float) -> None:
+        if not self.draining:
+            self.drain_generation += 1
+            self.draining_since = now
+            self.last_drain_warning_at = None
+            self.drain_lease_id = lease_id
+        self.draining = True
+        self.drain_expires_at = now + lease_ttl_s
+
+    def clear_drain(self) -> None:
+        self.draining = False
+        self.draining_since = None
+        self.drain_expires_at = None
+        self.drain_lease_id = None
+        self.last_drain_warning_at = None
+
     @property
     def running(self) -> bool:
         return _is_running_status(self.status) and self.url is not None
@@ -757,19 +839,13 @@ class EndpointPoolRouter:
 
             now = time.monotonic()
             if draining:
-                if not endpoint.draining:
-                    endpoint.drain_generation += 1
-                    endpoint.draining_since = now
-                    endpoint.last_drain_warning_at = None
-                    endpoint.drain_lease_id = lease_id
-                endpoint.draining = True
-                endpoint.drain_expires_at = now + (lease_ttl_s if lease_ttl_s is not None else self.drain_lease_ttl_s)
+                endpoint.acquire_drain(
+                    lease_id=lease_id,
+                    now=now,
+                    lease_ttl_s=lease_ttl_s if lease_ttl_s is not None else self.drain_lease_ttl_s,
+                )
             else:
-                endpoint.draining = False
-                endpoint.draining_since = None
-                endpoint.drain_expires_at = None
-                endpoint.drain_lease_id = None
-                endpoint.last_drain_warning_at = None
+                endpoint.clear_drain()
             if draining:
                 deficit = self.min_warm_endpoints - self._running_or_waking_count_unlocked()
                 if deficit > 0:
@@ -946,7 +1022,7 @@ class EndpointPoolRouter:
                 if endpoint.state_generation != generation:
                     continue
                 if isinstance(result, Exception):
-                    endpoint.last_error = str(result)
+                    endpoint.record_failure(result)
                     self._last_error = endpoint.last_error
                     log = logger.error if isinstance(result, TimeoutError) else logger.warning
                     log("Failed to fetch endpoint %s: %s", name, result)
@@ -955,9 +1031,7 @@ class EndpointPoolRouter:
                 successful_fetches += 1
                 was_running = endpoint.running
 
-                endpoint.status = result.status
-                endpoint.raw_status = result.raw_status
-                endpoint.url = result.url
+                endpoint.apply_snapshot(result)
                 if endpoint.running:
                     # A controller-driven wake keeps this transition marked
                     # until its first capacity sync finishes. Clearing it here
@@ -967,7 +1041,7 @@ class EndpointPoolRouter:
                         endpoint.wake_capacity_until = None
                     if not was_running:
                         endpoint.running_since = now
-                        endpoint.drain_restarting = False
+                        endpoint.finish_drain_restart()
                     if (
                         endpoint.restart_attempts > 0
                         and endpoint.running_since is not None
@@ -983,30 +1057,22 @@ class EndpointPoolRouter:
 
                 local_active_sessions = endpoint.active_sessions
                 if was_running and not endpoint.running:
-                    endpoint.active_sessions = 0
-                    endpoint.connected_sessions = 0
-                    endpoint.observed_active_sessions = 0
-                    endpoint.unobserved_connected_sessions = 0
-                    endpoint.usage_synced = False
-                    endpoint.last_usage_sync_at = None
-                    endpoint.usage_sync_drain_generation = None
+                    endpoint.reset_usage_after_process_stop(clear_local_sessions=True)
                     if local_active_sessions > 0:
                         downed_endpoints.append(endpoint.name)
                 elif not endpoint.running:
-                    endpoint.observed_active_sessions = 0
-                    endpoint.unobserved_connected_sessions = 0
-                    endpoint.usage_synced = False
-                    endpoint.last_usage_sync_at = None
-                    endpoint.usage_sync_drain_generation = None
+                    endpoint.reset_usage_after_process_stop(clear_local_sessions=False)
 
                 if (
                     _is_failed_status(endpoint.status)
                     and self.auto_restart
                     and endpoint.restart_attempts >= self.max_restart_attempts
                 ):
-                    endpoint.last_error = f"endpoint failed, {endpoint.restart_attempts} restart attempt(s) exhausted"
+                    endpoint.record_failure(
+                        f"endpoint failed, {endpoint.restart_attempts} restart attempt(s) exhausted"
+                    )
                 else:
-                    endpoint.last_error = None
+                    endpoint.clear_failure()
                 self._last_error = None
 
         if self._on_endpoint_down is not None:
@@ -1073,10 +1139,8 @@ class EndpointPoolRouter:
                             name,
                             result,
                         )
-                        endpoint.usage_synced = False
-                        endpoint.last_usage_sync_at = None
-                        endpoint.usage_sync_drain_generation = None
-                        endpoint.last_error = str(result)
+                        endpoint.invalidate_usage_sync(forget_last_success=True)
+                        endpoint.record_failure(result)
                     elif isinstance(result, ComputeUsageSchemaError):
                         # Every future poll will fail the same way; stale
                         # observations must not keep granting capacity. Log
@@ -1089,9 +1153,7 @@ class EndpointPoolRouter:
                             name,
                             result,
                         )
-                        endpoint.usage_synced = False
-                        endpoint.last_usage_sync_at = None
-                        endpoint.usage_sync_drain_generation = None
+                        endpoint.invalidate_usage_sync(forget_last_success=True)
                     else:
                         stale_for = None if endpoint.last_usage_sync_at is None else now - endpoint.last_usage_sync_at
                         if stale_for is None or stale_for > self.usage_sync_stale_ttl_s:
@@ -1111,8 +1173,7 @@ class EndpointPoolRouter:
                                     result,
                                 )
                                 endpoint.last_sync_failure_log_at = now
-                            endpoint.usage_synced = False
-                            endpoint.usage_sync_drain_generation = None
+                            endpoint.invalidate_usage_sync(forget_last_success=False)
                         else:
                             logger.warning(
                                 "Failed to sync compute usage for %s (last success %.1fs ago, TTL %.1fs): %s",
@@ -1130,46 +1191,30 @@ class EndpointPoolRouter:
                         name,
                         type(result).__name__,
                     )
-                    endpoint.usage_synced = False
-                    endpoint.last_usage_sync_at = None
-                    endpoint.usage_sync_drain_generation = None
+                    endpoint.invalidate_usage_sync(forget_last_success=True)
                     continue
 
                 previous_slots = endpoint.slots
                 previous_observed_active_sessions = endpoint.observed_active_sessions
-                endpoint.slots = result.max_sessions
-                observed_active_sessions = result.active_sessions
-                observed_increase = max(
-                    observed_active_sessions - previous_observed_active_sessions,
-                    0,
-                )
-                if endpoint.slots != previous_slots:
+                if result.max_sessions != previous_slots:
                     logger.info(
                         "Synced compute capacity for %s: max sessions %s -> %s",
                         name,
                         previous_slots or "unknown",
-                        endpoint.slots,
+                        result.max_sessions,
                     )
-                if observed_active_sessions != endpoint.observed_active_sessions:
+                if result.active_sessions != previous_observed_active_sessions:
                     logger.info(
                         "Synced compute usage for %s: observed active sessions %s -> %s",
                         name,
-                        endpoint.observed_active_sessions,
-                        observed_active_sessions,
+                        previous_observed_active_sessions,
+                        result.active_sessions,
                     )
-                endpoint.observed_active_sessions = observed_active_sessions
-                endpoint.usage_synced = True
-                endpoint.last_usage_sync_at = now
-                endpoint.usage_sync_drain_generation = drain_generation
-                endpoint.last_sync_failure_log_at = None
-                endpoint.last_error = None
-                if observed_increase:
-                    endpoint.unobserved_connected_sessions = max(
-                        endpoint.unobserved_connected_sessions - observed_increase,
-                        0,
-                    )
-                if observed_active_sessions:
-                    endpoint.last_used_at = now
+                endpoint.apply_usage_sync(
+                    result,
+                    synced_at=now,
+                    drain_generation=drain_generation,
+                )
 
             if notify:
                 self._condition.notify_all()
@@ -1181,9 +1226,8 @@ class EndpointPoolRouter:
             async with self._condition:
                 endpoint = self._endpoints[name]
                 endpoint.state_generation += 1
-                endpoint.waking = False
-                endpoint.wake_capacity_until = None
-                endpoint.last_error = str(exc)
+                endpoint.finish_wake()
+                endpoint.record_failure(exc)
                 self._last_error = endpoint.last_error
                 self._condition.notify_all()
             logger.error("Failed to wake endpoint %s: %s", name, exc)
@@ -1192,17 +1236,13 @@ class EndpointPoolRouter:
         async with self._condition:
             endpoint = self._endpoints[name]
             endpoint.state_generation += 1
-            endpoint.status = snapshot.status
-            endpoint.raw_status = snapshot.raw_status
-            endpoint.url = snapshot.url
+            endpoint.apply_snapshot(snapshot)
             endpoint.parking = False
-            endpoint.last_error = None
-            endpoint.observed_active_sessions = 0
+            endpoint.clear_failure()
             # The process is fresh, but its capacity may have changed while it
             # was parked. Keep it unroutable until /health reports both current
             # usage and max_sessions.
-            endpoint.usage_synced = False
-            endpoint.last_usage_sync_at = None
+            endpoint.reset_usage_after_fresh_process()
             self._last_error = None
 
         try:
@@ -1210,8 +1250,7 @@ class EndpointPoolRouter:
         finally:
             async with self._condition:
                 endpoint = self._endpoints[name]
-                endpoint.waking = False
-                endpoint.wake_capacity_until = None
+                endpoint.finish_wake()
                 self._condition.notify_all()
         logger.info("Endpoint %s is ready at %s", name, snapshot.url)
 
@@ -1222,9 +1261,8 @@ class EndpointPoolRouter:
             async with self._condition:
                 endpoint = self._endpoints[name]
                 endpoint.state_generation += 1
-                endpoint.parking = False
-                endpoint.wake_capacity_until = None
-                endpoint.last_error = str(exc)
+                endpoint.finish_park()
+                endpoint.record_failure(exc)
                 self._last_error = endpoint.last_error
                 self._condition.notify_all()
             logger.error("Failed to park endpoint %s: %s", name, exc)
@@ -1233,12 +1271,9 @@ class EndpointPoolRouter:
         async with self._condition:
             endpoint = self._endpoints[name]
             endpoint.state_generation += 1
-            endpoint.status = snapshot.status
-            endpoint.raw_status = snapshot.raw_status
-            endpoint.url = snapshot.url
-            endpoint.parking = False
-            endpoint.wake_capacity_until = None
-            endpoint.last_error = None
+            endpoint.apply_snapshot(snapshot)
+            endpoint.finish_park()
+            endpoint.clear_failure()
             self._last_error = None
             self._condition.notify_all()
 
@@ -1273,11 +1308,7 @@ class EndpointPoolRouter:
                     max(endpoint.drain_expires_at - now, 0.0) if endpoint.drain_expires_at is not None else 0.0
                 )
                 if endpoint.drain_expires_at is None or now >= endpoint.drain_expires_at:
-                    endpoint.draining = False
-                    endpoint.draining_since = None
-                    endpoint.drain_expires_at = None
-                    endpoint.drain_lease_id = None
-                    endpoint.last_drain_warning_at = None
+                    endpoint.clear_drain()
                     expired.append((endpoint.name, draining_for_s))
                     continue
 
@@ -1353,8 +1384,8 @@ class EndpointPoolRouter:
             async with self._condition:
                 endpoint = self._endpoints[name]
                 endpoint.state_generation += 1
-                endpoint.restarting = False
-                endpoint.last_error = str(exc)
+                endpoint.finish_restart()
+                endpoint.record_failure(exc)
                 self._last_error = endpoint.last_error
                 self._condition.notify_all()
             logger.error("Failed to restart endpoint %s: %s", name, exc)
@@ -1363,23 +1394,19 @@ class EndpointPoolRouter:
         async with self._condition:
             endpoint = self._endpoints[name]
             endpoint.state_generation += 1
-            endpoint.status = snapshot.status
-            endpoint.raw_status = snapshot.raw_status
-            endpoint.url = snapshot.url
-            endpoint.last_error = None
+            endpoint.apply_snapshot(snapshot)
+            endpoint.clear_failure()
             self._last_error = None
             if endpoint.running:
                 endpoint.running_since = time.monotonic()
-                endpoint.observed_active_sessions = 0
-                endpoint.usage_synced = False
-                endpoint.last_usage_sync_at = None
+                endpoint.reset_usage_after_fresh_process()
 
         try:
             await self._sync_compute_usage(notify=False)
         finally:
             async with self._condition:
                 endpoint = self._endpoints[name]
-                endpoint.restarting = False
+                endpoint.finish_restart()
                 self._condition.notify_all()
         logger.info(
             "Restart action completed for endpoint %s (status: %s)",
@@ -1439,7 +1466,7 @@ class EndpointPoolRouter:
             endpoint.waking = True
             endpoint.state_generation += 1
             endpoint.wake_capacity_until = time.monotonic() + self.waking_capacity_timeout_s
-            endpoint.last_error = None
+            endpoint.clear_failure()
             selected.append(endpoint.name)
         return selected
 
@@ -1668,8 +1695,8 @@ class EndpointPoolRouter:
             async with self._condition:
                 ep = self._endpoints[name]
                 ep.state_generation += 1
-                ep.drain_restarting = False
-                ep.last_error = str(exc)
+                ep.finish_drain_restart()
+                ep.record_failure(exc)
                 self._last_error = ep.last_error
                 self._condition.notify_all()
             logger.error("Drain restart failed for endpoint %s: %s", name, exc)
@@ -1678,15 +1705,10 @@ class EndpointPoolRouter:
         async with self._condition:
             ep = self._endpoints[name]
             ep.state_generation += 1
-            ep.status = snapshot.status
-            ep.raw_status = snapshot.raw_status
-            ep.url = snapshot.url
-            ep.last_error = None
+            ep.apply_snapshot(snapshot)
+            ep.clear_failure()
             self._last_error = None
-            ep.observed_active_sessions = 0
-            ep.usage_synced = False
-            ep.last_usage_sync_at = None
-            ep.usage_sync_drain_generation = None
+            ep.reset_usage_after_fresh_process()
             if ep.running:
                 ep.running_since = time.monotonic()
 
@@ -1695,7 +1717,7 @@ class EndpointPoolRouter:
         finally:
             async with self._condition:
                 ep = self._endpoints[name]
-                ep.drain_restarting = False
+                ep.finish_drain_restart()
                 self._condition.notify_all()
         logger.info("Drain restart completed for endpoint %s (status: %s)", name, snapshot.raw_status)
 
