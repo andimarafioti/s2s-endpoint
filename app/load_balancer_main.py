@@ -34,6 +34,10 @@ from app.session_request_metadata import reported_hardware_id
 from app.session_requester_tracker import SessionRequesterTracker
 from app.session_tokens import llm_token_fingerprint
 from app.swarm_dashboard import SwarmDashboard
+from app.verification_admission_limiter import (
+    VerificationAdmissionConfig,
+    VerificationAdmissionLimiter,
+)
 
 logger = setup_logging()
 APP_ROLE = "load_balancer"
@@ -77,6 +81,19 @@ HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TO
 LB_ADMIN_AUTH_TOKEN = os.getenv("LB_ADMIN_AUTH_TOKEN", "").strip() or None
 
 SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
+# Require Hugging Face to accept the caller's bearer token before any session
+# admission work is allowed. Off by default for deployments that intentionally
+# allow anonymous callers.
+SESSION_REQUIRE_VERIFIED_HF_TOKEN = os.getenv(
+    "SESSION_REQUIRE_VERIFIED_HF_TOKEN",
+    "false",
+).strip().lower() in {"true", "1", "yes"}
+SESSION_HF_TOKEN_VERIFY_TIMEOUT_S = float(os.getenv("SESSION_HF_TOKEN_VERIFY_TIMEOUT_S", "5"))
+if SESSION_HF_TOKEN_VERIFY_TIMEOUT_S <= 0:
+    raise ValueError("SESSION_HF_TOKEN_VERIFY_TIMEOUT_S must be > 0")
+SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S = float(os.getenv("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S", "1800"))
+if SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S <= 0:
+    raise ValueError("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S must be > 0")
 # How long session creation waits for a first-seen HF token's whoami validation
 # before minting the LLM proxy claim. On timeout the claim fails closed: the
 # session is created normally but without LLM proxy access.
@@ -108,6 +125,8 @@ REQUEST_USAGE_MAX_ACTORS_PER_MINUTE = int(os.getenv("REQUEST_USAGE_MAX_ACTORS_PE
 REQUEST_USAGE_MAX_RETAINED_RECORDS = int(os.getenv("REQUEST_USAGE_MAX_RETAINED_RECORDS", "50000"))
 REQUEST_USAGE_MAX_PENDING_VALIDATIONS = int(os.getenv("REQUEST_USAGE_MAX_PENDING_VALIDATIONS", "128"))
 REQUEST_USAGE_VALIDATION_CONCURRENCY = int(os.getenv("REQUEST_USAGE_VALIDATION_CONCURRENCY", "4"))
+SESSION_HF_TOKEN_VERIFY_MAX_PENDING = int(os.getenv("SESSION_HF_TOKEN_VERIFY_MAX_PENDING", "64"))
+SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK = int(os.getenv("SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK", "4"))
 REQUEST_USAGE_HIGH_REQUESTS = int(os.getenv("REQUEST_USAGE_HIGH_REQUESTS", "100"))
 REQUEST_USAGE_BURST_PER_MINUTE = int(os.getenv("REQUEST_USAGE_BURST_PER_MINUTE", "20"))
 REQUEST_USAGE_MANY_NETWORKS = int(os.getenv("REQUEST_USAGE_MANY_NETWORKS", "5"))
@@ -238,6 +257,12 @@ requester_identity_resolver = RequesterIdentityResolver(
     max_pending_validations=REQUEST_USAGE_MAX_PENDING_VALIDATIONS,
     validation_concurrency=REQUEST_USAGE_VALIDATION_CONCURRENCY,
 )
+session_verification_limiter = VerificationAdmissionLimiter(
+    config=VerificationAdmissionConfig(
+        max_global_pending=SESSION_HF_TOKEN_VERIFY_MAX_PENDING,
+        max_network_pending=SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK,
+    )
+)
 requester_rate_limiter = RequesterRateLimiter(
     config=RequesterRateLimitConfig(
         enabled=REQUEST_RATE_LIMIT_ENABLED,
@@ -289,7 +314,7 @@ async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
 async def record_expired_queue_ticket(ticket_id: str) -> None:
     """Terminal outcome for a queued request whose ticket the reaper dropped:
     the waiter stopped polling, which is the queue's version of abandoning."""
-    requester = queue_requester_tracker.take(ticket_id)
+    requester, _ = queue_requester_tracker.take_with_expiry(ticket_id)
     if requester is not None:
         requester_rate_limiter.record_allocation_abandoned(requester)
     await dashboard.record_session_request_abandoned(requester)
@@ -422,6 +447,158 @@ def _log_rate_limit_rejection(
     )
 
 
+async def _require_verified_session_requester(
+    request: Request,
+    requester: RequesterIdentity,
+    *,
+    http_route: str,
+    stage: str,
+    wait_for_pending: bool,
+) -> RequesterIdentity:
+    pending_timed_out = False
+    if requester.verification == "verified" and not _session_verification_is_fresh(requester):
+        requester = await _start_session_verification(request, requester, force=True)
+    elif requester.verification == "pending" and requester_identity_resolver.validation_task(requester) is None:
+        requester = await _start_session_verification(request, requester, force=False)
+    if wait_for_pending and requester.verification == "pending":
+        requester = await requester_identity_resolver.wait_for_verification(
+            requester,
+            timeout_s=SESSION_HF_TOKEN_VERIFY_TIMEOUT_S,
+        )
+        pending_timed_out = requester.verification == "pending"
+    else:
+        requester = await _refresh_requester_identity(requester)
+
+    if _session_verification_is_fresh(requester):
+        return requester
+
+    await _raise_session_auth_rejection(
+        requester,
+        reason=_session_auth_rejection_reason(requester, pending_timed_out=pending_timed_out),
+        http_route=http_route,
+        stage=stage,
+        status_code=_session_auth_rejection_status(requester),
+    )
+    raise AssertionError("authentication rejection helper returned")
+
+
+async def _start_session_verification(
+    request: Request,
+    requester: RequesterIdentity,
+    *,
+    force: bool,
+) -> RequesterIdentity:
+    token = _request_hf_token(request)
+    if token is None:
+        return requester
+
+    decision, permit = session_verification_limiter.acquire(requester.network_id)
+    if not decision.allowed or permit is None:
+        await _raise_session_auth_rejection(
+            requester,
+            reason=f"verification_{decision.reason or 'quota'}",
+            http_route="POST /session",
+            stage="verification_admission",
+            status_code=503,
+        )
+        raise AssertionError("verification quota rejection helper returned")
+
+    requester, task, started = requester_identity_resolver.start_verification(
+        token,
+        requester,
+        force=force,
+    )
+    if task is not None and started:
+        permit.release_when_done(task)
+    else:
+        permit.release()
+    return requester
+
+
+async def _raise_session_auth_rejection(
+    requester: RequesterIdentity | None,
+    *,
+    reason: str,
+    http_route: str,
+    stage: str,
+    status_code: int,
+) -> None:
+    await dashboard.record_session_auth_rejected(requester)
+    extra = {
+        "outcome": "auth_rejected",
+        "auth_rejection_reason": reason,
+        "auth_stage": stage,
+        "http_route": http_route,
+        "requester_id": requester.actor_id if requester is not None else None,
+        "requester_kind": requester.kind if requester is not None else None,
+        "requester_verification": requester.verification if requester is not None else None,
+        "requester_network_id": requester.network_id if requester is not None else None,
+        "requester_reported_robot_id": requester.reported_robot_id if requester is not None else None,
+        "requester_client_kind": requester.client_kind if requester is not None else None,
+    }
+    logger.warning(
+        "Session authentication rejected route=%s stage=%s reason=%s "
+        "requester_id=%s requester_kind=%s requester_verification=%s",
+        http_route,
+        stage,
+        reason,
+        requester.actor_id if requester is not None else None,
+        requester.kind if requester is not None else None,
+        requester.verification if requester is not None else None,
+        extra=extra,
+    )
+
+    if status_code == 503:
+        retry_after_s = (
+            requester_identity_resolver.verification_retry_after_s(requester) if requester is not None else 1
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "hf_token_verification_unavailable",
+                "reason": reason,
+                "retry_after_s": retry_after_s,
+            },
+            headers={"Retry-After": str(retry_after_s)},
+        )
+    raise HTTPException(
+        status_code=401,
+        detail={"code": "verified_hf_token_required", "reason": reason},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _session_auth_rejection_status(requester: RequesterIdentity) -> int:
+    return 503 if requester.verification in {"pending", "unavailable"} else 401
+
+
+def _session_auth_rejection_reason(
+    requester: RequesterIdentity,
+    *,
+    pending_timed_out: bool,
+) -> str:
+    if requester.verification == "not_provided":
+        return "token_not_provided"
+    if requester.verification == "unrecognized":
+        return "token_unrecognized"
+    if requester.verification == "invalid":
+        return "token_invalid"
+    if requester.verification == "unavailable":
+        return "verification_unavailable"
+    if requester.verification == "pending" and pending_timed_out:
+        return "verification_timeout"
+    if requester.verification == "verified":
+        return "verification_stale"
+    return "identity_not_verified"
+
+
+def _session_verification_is_fresh(requester: RequesterIdentity) -> bool:
+    return requester_identity_resolver.verification_is_fresh(
+        requester,
+        max_age_s=SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S,
+    )
+
+
 def _allocation_wait_ms(allocation: dict[str, object], *, fallback_ms: int) -> int:
     value = allocation.get("allocation_wait_ms")
     if value is None:
@@ -473,9 +650,7 @@ async def _llm_proxy_fingerprint(request: Request, requester: RequesterIdentity)
     """
     if not SESSION_SHARED_SECRET:
         return None
-    token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
-    if token is None:
-        token = bearer_token(request.headers.get("authorization"))
+    token = _request_hf_token(request)
     if token is None or not is_validatable_hf_token(token):
         return None
     if requester.verification == "pending":
@@ -485,6 +660,13 @@ async def _llm_proxy_fingerprint(request: Request, requester: RequesterIdentity)
     if requester.verification != "verified":
         return None
     return llm_token_fingerprint(SESSION_SHARED_SECRET, token)
+
+
+def _request_hf_token(request: Request) -> str | None:
+    token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
+    if token is None:
+        token = bearer_token(request.headers.get("authorization"))
+    return token
 
 
 @app.get("/")
@@ -516,6 +698,10 @@ async def ready():
 async def health():
     healthy, detail, snapshot = await session_manager.healthcheck()
     requester_tracking = requester_identity_resolver.status()
+    requester_tracking["require_verified_hf_token"] = SESSION_REQUIRE_VERIFIED_HF_TOKEN
+    requester_tracking["session_verification_timeout_s"] = SESSION_HF_TOKEN_VERIFY_TIMEOUT_S
+    requester_tracking["session_max_verified_age_s"] = SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S
+    requester_tracking["session_verification_limit"] = session_verification_limiter.status()
     requester_tracking["pending_session_attributions"] = session_requester_tracker.count()
     requester_tracking["rate_limit"] = requester_rate_limiter.status()
     payload = {
@@ -538,9 +724,22 @@ async def create_session(request: Request):
     queue ticket the caller polls via GET /queue/{id}. 503 with {state:"at_capacity"}
     when the queue itself is full; 503 otherwise when the pool can't allocate."""
     hardware_id = await reported_hardware_id(request)
-    requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
+    requester = requester_identity_resolver.identify(
+        request,
+        hardware_id=hardware_id,
+        schedule_validation=not SESSION_REQUIRE_VERIFIED_HF_TOKEN,
+    )
     await dashboard.record_session_request(requester)
-    requester = await _refresh_requester_identity(requester)
+    if SESSION_REQUIRE_VERIFIED_HF_TOKEN:
+        requester = await _require_verified_session_requester(
+            request,
+            requester,
+            http_route="POST /session",
+            stage="admission",
+            wait_for_pending=True,
+        )
+    else:
+        requester = await _refresh_requester_identity(requester)
     rate_limit_decision = requester_rate_limiter.acquire(requester)
     if not rate_limit_decision.allowed:
         _log_rate_limit_rejection(rate_limit_decision, requester=requester)
@@ -615,6 +814,41 @@ async def queue_status(queue_id: str, request: Request):
     if not session_manager.queue_enabled:
         raise HTTPException(status_code=404, detail="Not found.")
 
+    requester: RequesterIdentity | None = None
+    if SESSION_REQUIRE_VERIFIED_HF_TOKEN:
+        requester, requester_expired = queue_requester_tracker.get_with_expiry(queue_id)
+        if requester is None or requester_expired:
+            # Do not let the manager claim a free slot when the authorization
+            # context associated with this ticket has disappeared. Removing the
+            # ticket also prevents repeated attempts from reaching allocation.
+            left = await session_manager.leave(queue_id)
+            if not left:
+                raise HTTPException(status_code=404, detail="Unknown or expired ticket.")
+            queue_requester_tracker.discard(queue_id)
+            if requester is not None:
+                requester_rate_limiter.record_allocation_auth_rejection(requester)
+            await _raise_session_auth_rejection(
+                requester,
+                reason="queue_identity_expired" if requester_expired else "queue_identity_missing",
+                http_route="GET /queue/{queue_id}",
+                stage="queue_claim",
+                status_code=401,
+            )
+        requester = await _refresh_requester_identity(requester)
+        if not _session_verification_is_fresh(requester):
+            left = await session_manager.leave(queue_id)
+            if not left:
+                raise HTTPException(status_code=404, detail="Unknown or expired ticket.")
+            queue_requester_tracker.discard(queue_id)
+            requester_rate_limiter.record_allocation_auth_rejection(requester)
+            await _raise_session_auth_rejection(
+                requester,
+                reason=_session_auth_rejection_reason(requester, pending_timed_out=True),
+                http_route="GET /queue/{queue_id}",
+                stage="queue_claim",
+                status_code=_session_auth_rejection_status(requester),
+            )
+
     poll_started_at = monotonic()
     try:
         result = await session_manager.poll(queue_id, public_base_url(request))
@@ -624,9 +858,13 @@ async def queue_status(queue_id: str, request: Request):
         # Same contract as POST /session: allocation-time failures are 503s, not
         # 500s. The manager re-queues the ticket at the head on a failed claim,
         # so the caller keeps its place and simply polls again.
+        if requester is not None:
+            queue_requester_tracker.remember(queue_id, requester)
         raise HTTPException(status_code=503, detail=f"Failed to claim session: {exc}") from exc
 
-    requester = queue_requester_tracker.take(queue_id)
+    tracked_requester = queue_requester_tracker.take(queue_id)
+    if tracked_requester is not None:
+        requester = tracked_requester
     if result.get("state") == "queued":
         if requester is not None:
             queue_requester_tracker.remember(queue_id, requester)  # refresh retention
@@ -647,7 +885,7 @@ async def queue_leave(queue_id: str):
     if not session_manager.queue_enabled:
         raise HTTPException(status_code=404, detail="Not found.")
     left = await session_manager.leave(queue_id)
-    requester = queue_requester_tracker.take(queue_id)
+    requester, _ = queue_requester_tracker.take_with_expiry(queue_id)
     if left:
         # Terminal outcome for the queued request: leaving the line is the queue's
         # version of abandoning before delivery.
@@ -671,6 +909,21 @@ async def _deliver_grant(
     allocation_wait_ms = _allocation_wait_ms(allocation, fallback_ms=allocation_total_ms)
     allocation.setdefault("allocation_wait_ms", allocation_wait_ms)
     session_id = str(allocation.get("session_id") or "")
+
+    if SESSION_REQUIRE_VERIFIED_HF_TOKEN:
+        requester = await _refresh_requester_identity(requester)
+        if not _session_verification_is_fresh(requester):
+            if session_id and hasattr(session_manager, "cancel_pending_session"):
+                await session_manager.cancel_pending_session(session_id)
+            requester_rate_limiter.record_allocation_auth_rejection(requester)
+            await _raise_session_auth_rejection(
+                requester,
+                reason=_session_auth_rejection_reason(requester, pending_timed_out=True),
+                http_route=http_route,
+                stage="grant_delivery",
+                status_code=_session_auth_rejection_status(requester),
+            )
+
     if session_id:
         requester_rate_limiter.record_allocation(
             session_id,

@@ -79,6 +79,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         await service.record("success", token_requester)
         await service.record("connected", token_requester)
         await service.record("failure", token_requester)
+        await service.record("auth_rejected", token_requester)
         await service.record("rate_limited", token_requester)
         await service.record_session_outcome(
             token_requester,
@@ -113,6 +114,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["attributed_connections_window"], 1)
         self.assertEqual(summary["authenticated_requests_window"], 3)
         self.assertEqual(summary["anonymous_requests_window"], 1)
+        self.assertEqual(summary["auth_rejected_requests_window"], 1)
         self.assertEqual(summary["rate_limited_requests_window"], 1)
         self.assertEqual(summary["unattributed_requests_window"], 0)
         self.assertEqual(leaderboard[0]["actor_id"], "hf:reachy-user")
@@ -120,6 +122,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(leaderboard[0]["token_count"], 1)
         self.assertEqual(leaderboard[0]["token_fingerprints"], ["abc123"])
         self.assertEqual(leaderboard[0]["requests"], 3)
+        self.assertEqual(leaderboard[0]["auth_rejected"], 1)
         self.assertEqual(leaderboard[0]["network_count"], 2)
         self.assertEqual(leaderboard[0]["reported_robot_count"], 2)
         self.assertEqual(leaderboard[0]["reported_robot_requests"], 3)
@@ -141,6 +144,40 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("many networks: 2", leaderboard[0]["signals"])
         self.assertIn("rate limited: 1 request", leaderboard[0]["signals"])
         self.assertFalse(any(signal.startswith("mostly short sessions") for signal in leaderboard[0]["signals"]))
+
+    async def test_auth_rejections_raise_risk_from_watch_to_high_even_with_prior_connections(self):
+        service = self._service(FakeClock(2 * 3600))
+        requester = RequesterIdentity(
+            actor_id="anonymous:ip123",
+            label="Anonymous IP •ip123",
+            kind="anonymous",
+            verification="not_provided",
+            fingerprint="ip123",
+            network_id="net:ip123",
+            client_kind="browser",
+        )
+
+        await service.record("request", requester)
+        await service.record("auth_rejected", requester)
+
+        watched = (await service.data(window_minutes=60))["leaderboard"][0]
+        self.assertEqual(watched["auth_rejected"], 1)
+        self.assertEqual(watched["risk"], "watch")
+        self.assertIn("auth rejected: 1 request", watched["signals"])
+
+        for _ in range(6):
+            await service.record("request", requester)
+            await service.record("success", requester)
+            await service.record("connected", requester)
+        for _ in range(5):
+            await service.record("request", requester)
+            await service.record("auth_rejected", requester)
+
+        flagged = (await service.data(window_minutes=60))["leaderboard"][0]
+        self.assertEqual(flagged["connections"], 6)
+        self.assertEqual(flagged["auth_rejected"], 6)
+        self.assertEqual(flagged["risk"], "high")
+        self.assertIn("auth rejected: 6 requests", flagged["signals"])
 
     async def test_resolved_identity_updates_and_round_trips_existing_history(self):
         service = self._service(FakeClock(2 * 3600))
@@ -503,4 +540,9 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertIn("not hardware attestation", html)
         self.assertIn("function requesterCredentialSummary(row)", html)
         self.assertIn("row.token_fingerprints", html)
+        self.assertIn("<th>Rejected</th>", html)
+        self.assertNotIn("<th>Limited</th>", html)
+        self.assertIn("function requesterRejectedCount(row)", html)
+        self.assertIn("Number(row.auth_rejected || 0) + Number(row.rate_limited || 0)", html)
+        self.assertIn("auth rejected · ${htmlEscape(prettyNumber(row.rate_limited || 0))} limited", html)
         self.assertIn("function renderRequesterUsage(requesters, summary)", html)

@@ -37,9 +37,32 @@ class SessionRequesterTracker:
         )
 
     def take(self, session_id: str) -> RequesterIdentity | None:
-        self._prune(self._time_fn())
+        requester, expired = self.take_with_expiry(session_id)
+        return None if expired else requester
+
+    def get_with_expiry(self, session_id: str) -> tuple[RequesterIdentity | None, bool]:
+        """Inspect an entry without consuming a still-valid authorization context."""
+        now = self._time_fn()
+        entry = self._entries.get(session_id)
+        self._prune(now)
+        if entry is None:
+            return None, False
+        return entry.requester, entry.expires_at_s <= now
+
+    def take_with_expiry(self, session_id: str) -> tuple[RequesterIdentity | None, bool]:
+        """Remove an entry while still exposing whether it had expired.
+
+        Security-sensitive callers must not use an expired identity to authorize
+        work, but may still need it to release accounting state associated with
+        the original request. Pop the requested entry before pruning the rest so
+        that cleanup remains possible without extending its authorization life.
+        """
+        now = self._time_fn()
         entry = self._entries.pop(session_id, None)
-        return entry.requester if entry is not None else None
+        self._prune(now)
+        if entry is None:
+            return None, False
+        return entry.requester, entry.expires_at_s <= now
 
     def discard(self, session_id: str) -> None:
         self._entries.pop(session_id, None)

@@ -22,6 +22,14 @@ class FakeHubError(RuntimeError):
         self.response = SimpleNamespace(status_code=status_code)
 
 
+class FakeClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
 class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
     async def test_reported_hardware_id_is_normalized_and_fingerprinted(self):
         resolver = RequesterIdentityResolver(hash_secret="stable-secret", whoami_fn=lambda token: {})
@@ -132,6 +140,27 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [raw_token])
         self.assertEqual(resolved.kind, "authenticated")
         self.assertEqual(resolved.account_name, "reachy-user")
+
+        await resolver.stop()
+
+    async def test_reachy_authorization_header_takes_precedence_over_standard_header(self):
+        calls = []
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=lambda token: calls.append(token) or {"name": "reachy-user"},
+        )
+        request = FakeRequest(
+            headers={
+                "x-reachy-mini-authorization": "Bearer hf_reachy_token",
+                "authorization": "Bearer hf_standard_token",
+            }
+        )
+
+        pending = resolver.identify(request)
+        resolved = await resolver.wait_for_verification(pending, timeout_s=1)
+
+        self.assertEqual(calls, ["hf_reachy_token"])
+        self.assertEqual(resolved.verification, "verified")
 
         await resolver.stop()
 
@@ -252,6 +281,25 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_identify_can_defer_validation_until_an_admission_guard_allows_it(self):
+        calls = []
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=lambda token: calls.append(token) or {"name": "reachy-user"},
+        )
+
+        pending = resolver.identify(
+            FakeRequest(headers={"authorization": "Bearer hf_deferred_token"}),
+            schedule_validation=False,
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(pending.verification, "pending")
+        self.assertIsNone(resolver.validation_task(pending))
+        self.assertEqual(calls, [])
+
+        await resolver.stop()
+
     async def test_wait_for_verification_returns_the_resolved_identity(self):
         resolver = RequesterIdentityResolver(
             hash_secret="stable-secret",
@@ -264,6 +312,68 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resolved.verification, "verified")
         self.assertEqual(resolved.account_name, "reachy-user")
+        self.assertIsNotNone(resolved.verified_at_s)
+
+        await resolver.stop()
+
+    async def test_remote_failure_retry_matches_remaining_unavailable_cache_lifetime(self):
+        clock = FakeClock()
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=lambda token: (_ for _ in ()).throw(FakeHubError(503)),
+            time_fn=clock,
+        )
+        request = FakeRequest(headers={"authorization": "Bearer hf_temporarily_unavailable"})
+
+        pending = resolver.identify(request)
+        unavailable = await resolver.wait_for_verification(pending, timeout_s=1)
+
+        self.assertEqual(unavailable.verification, "unavailable")
+        self.assertEqual(resolver.verification_retry_after_s(unavailable), 60)
+
+        clock.now = 17.2
+        self.assertEqual(resolver.verification_retry_after_s(unavailable), 43)
+
+        clock.now = 60
+        self.assertEqual(resolver.verification_retry_after_s(unavailable), 1)
+
+        await resolver.stop()
+
+    async def test_stale_verified_identity_is_revalidated_before_authentication(self):
+        clock = FakeClock()
+        calls = []
+
+        def whoami(token):
+            calls.append(token)
+            if len(calls) == 1:
+                return {"name": "reachy-user"}
+            raise FakeHubError(401)
+
+        resolver = RequesterIdentityResolver(
+            hash_secret="stable-secret",
+            whoami_fn=whoami,
+            time_fn=clock,
+        )
+        raw_token = "hf_token_that_will_be_revoked"
+        request = FakeRequest(headers={"authorization": f"Bearer {raw_token}"})
+
+        pending = resolver.identify(request)
+        verified = await resolver.wait_for_verification(pending, timeout_s=1)
+        self.assertTrue(resolver.verification_is_fresh(verified, max_age_s=60))
+
+        clock.now = 61
+        cached = resolver.identify(request)
+        self.assertEqual(cached.verification, "verified")
+        self.assertFalse(resolver.verification_is_fresh(cached, max_age_s=60))
+
+        refreshing, task, started = resolver.start_verification(raw_token, cached, force=True)
+        self.assertTrue(started)
+        self.assertIsNotNone(task)
+        revoked = await resolver.wait_for_verification(refreshing, timeout_s=1)
+
+        self.assertEqual(calls, [raw_token, raw_token])
+        self.assertEqual(revoked.verification, "invalid")
+        self.assertIsNone(revoked.verified_at_s)
 
         await resolver.stop()
 
