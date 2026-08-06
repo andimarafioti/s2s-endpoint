@@ -7,7 +7,6 @@ import secrets
 import sys
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -15,18 +14,20 @@ from urllib.request import Request, urlopen
 
 from _endpoint_helpers import (
     DEFAULT_LOAD_BALANCER_HEALTH_ROUTE,
+    PARKED_STATUSES,
     build_names,
     current_custom_image,
     current_model_env,
+    expected_target_status,
+    run_ordered_batch,
+    wait_for_endpoint_update,
 )
 from huggingface_hub import HfApi, get_token
-from huggingface_hub.errors import HfHubHTTPError, InferenceEndpointError, InferenceEndpointTimeoutError
+from huggingface_hub.errors import HfHubHTTPError
 
 DEFAULT_LOAD_BALANCER_NAME = "reachy-s2s-lb"
 DEFAULT_COMPUTE_INDEX_START = 1
 DEFAULT_COMPUTE_INDEX_WIDTH = 2
-FAILED_UPDATE_STATUSES = {"failed", "updateFailed"}
-PARKED_STATUSES = {"paused", "scaledToZero"}
 TRANSIENT_LOAD_BALANCER_HTTP_STATUSES = {502, 503, 504}
 PERMANENT_LOAD_BALANCER_503_DETAILS = {
     "LB admin auth token is not configured",
@@ -368,10 +369,6 @@ def is_not_found_error(exc: HfHubHTTPError) -> bool:
     return "404" in message or "not found" in message
 
 
-def expected_target_status(status_before: str) -> str:
-    return "parked" if status_before in PARKED_STATUSES else "running"
-
-
 def update_many(
     *,
     api: HfApi,
@@ -384,16 +381,11 @@ def update_many(
     dry_run: bool,
     parallelism: int,
 ) -> list[dict[str, object]]:
-    total = len(names)
-    if total == 0:
-        return []
-
-    max_workers = total if parallelism <= 0 else min(total, parallelism)
-    if max_workers == 1:
-        return update_many_sequential(
+    def worker(name: str) -> dict[str, object]:
+        return update_one(
             api=api,
             namespace=namespace,
-            names=names,
+            name=name,
             image_url=image_url,
             wait=wait,
             wait_timeout_s=wait_timeout_s,
@@ -401,38 +393,16 @@ def update_many(
             dry_run=dry_run,
         )
 
-    log_progress(f"Updating {total} compute endpoints in parallel with {max_workers} workers")
-    results: list[dict[str, object] | None] = [None] * total
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures: dict[Future[dict[str, object]], tuple[int, str]] = {}
-        for index, name in enumerate(names, start=1):
-            log_progress(f"[{index}/{total}] Submitting compute endpoint update for {name}")
-            future = executor.submit(
-                update_one,
-                api=api,
-                namespace=namespace,
-                name=name,
-                image_url=image_url,
-                wait=wait,
-                wait_timeout_s=wait_timeout_s,
-                wait_refresh_every_s=wait_refresh_every_s,
-                dry_run=dry_run,
-            )
-            futures[future] = (index, name)
-
-        try:
-            for future in as_completed(futures):
-                index, name = futures[future]
-                result = future.result()
-                log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
-                results[index - 1] = result
-        except BaseException:
-            for pending_future in futures:
-                if pending_future is not future:
-                    pending_future.cancel()
-            raise
-
-    return [result for result in results if result is not None]
+    return run_ordered_batch(
+        names=names,
+        worker=worker,
+        parallelism=parallelism,
+        progress=log_progress,
+        parallel_start_message="Updating {total} compute endpoints in parallel with {max_workers} workers",
+        sequential_start_message="[{index}/{total}] Updating compute endpoint {name}",
+        parallel_submit_message="[{index}/{total}] Submitting compute endpoint update for {name}",
+        completed_message=lambda result: f"{result['status_before']} -> {result['status_after']}",
+    )
 
 
 def update_many_draining(
@@ -465,115 +435,8 @@ def update_many_draining(
             parallelism=parallelism,
         )
 
-    total = len(names)
-    if total == 0:
-        return []
-
-    max_workers = total if parallelism <= 0 else min(total, parallelism)
-    if max_workers == 1:
-        return update_many_draining_sequential(
-            api=api,
-            namespace=namespace,
-            names=names,
-            image_url=image_url,
-            load_balancer_url=load_balancer_url,
-            token=token,
-            wait=wait,
-            wait_timeout_s=wait_timeout_s,
-            wait_refresh_every_s=wait_refresh_every_s,
-            drain_timeout_s=drain_timeout_s,
-            drain_refresh_every_s=drain_refresh_every_s,
-            request_timeout_s=request_timeout_s,
-        )
-
-    log_progress(f"Draining and updating {total} compute endpoints in parallel with {max_workers} workers")
-    results: list[dict[str, object] | None] = [None] * total
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures: dict[Future[dict[str, object]], tuple[int, str]] = {}
-        for index, name in enumerate(names, start=1):
-            log_progress(f"[{index}/{total}] Submitting drained compute endpoint update for {name}")
-            future = executor.submit(
-                update_one_draining,
-                api=api,
-                namespace=namespace,
-                name=name,
-                image_url=image_url,
-                load_balancer_url=load_balancer_url,
-                token=token,
-                wait=wait,
-                wait_timeout_s=wait_timeout_s,
-                wait_refresh_every_s=wait_refresh_every_s,
-                drain_timeout_s=drain_timeout_s,
-                drain_refresh_every_s=drain_refresh_every_s,
-                request_timeout_s=request_timeout_s,
-            )
-            futures[future] = (index, name)
-
-        try:
-            for future in as_completed(futures):
-                index, name = futures[future]
-                result = future.result()
-                log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
-                results[index - 1] = result
-        except BaseException:
-            for pending_future in futures:
-                if pending_future is not future:
-                    pending_future.cancel()
-            raise
-
-    return [result for result in results if result is not None]
-
-
-def update_many_sequential(
-    *,
-    api: HfApi,
-    namespace: str | None,
-    names: list[str],
-    image_url: str,
-    wait: bool,
-    wait_timeout_s: int,
-    wait_refresh_every_s: int,
-    dry_run: bool,
-) -> list[dict[str, object]]:
-    results: list[dict[str, object]] = []
-    total = len(names)
-    for index, name in enumerate(names, start=1):
-        log_progress(f"[{index}/{total}] Updating compute endpoint {name}")
-        result = update_one(
-            api=api,
-            namespace=namespace,
-            name=name,
-            image_url=image_url,
-            wait=wait,
-            wait_timeout_s=wait_timeout_s,
-            wait_refresh_every_s=wait_refresh_every_s,
-            dry_run=dry_run,
-        )
-        log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
-        results.append(result)
-    return results
-
-
-def update_many_draining_sequential(
-    *,
-    api: HfApi,
-    namespace: str | None,
-    names: list[str],
-    image_url: str,
-    load_balancer_url: str,
-    token: str | None,
-    wait: bool,
-    wait_timeout_s: int,
-    wait_refresh_every_s: int,
-    drain_timeout_s: int,
-    drain_refresh_every_s: int,
-    request_timeout_s: float,
-) -> list[dict[str, object]]:
-    results: list[dict[str, object]] = []
-    total = len(names)
-    for index, name in enumerate(names, start=1):
-        log_progress(f"[{index}/{total}] Draining compute endpoint {name}")
-        result = update_one_draining(
+    def worker(name: str) -> dict[str, object]:
+        return update_one_draining(
             api=api,
             namespace=namespace,
             name=name,
@@ -587,9 +450,17 @@ def update_many_draining_sequential(
             drain_refresh_every_s=drain_refresh_every_s,
             request_timeout_s=request_timeout_s,
         )
-        log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
-        results.append(result)
-    return results
+
+    return run_ordered_batch(
+        names=names,
+        worker=worker,
+        parallelism=parallelism,
+        progress=log_progress,
+        parallel_start_message="Draining and updating {total} compute endpoints in parallel with {max_workers} workers",
+        sequential_start_message="[{index}/{total}] Draining compute endpoint {name}",
+        parallel_submit_message="[{index}/{total}] Submitting drained compute endpoint update for {name}",
+        completed_message=lambda result: f"{result['status_before']} -> {result['status_after']}",
+    )
 
 
 def update_one(
@@ -836,39 +707,6 @@ def is_definitive_hf_update_rejection(exc: Exception) -> bool:
 
 def endpoint_image_update_is_noop(endpoint, *, image_url: str) -> bool:
     return current_custom_image(endpoint.raw)["url"] == image_url
-
-
-def wait_for_endpoint_update(
-    endpoint,
-    *,
-    target_status: str,
-    timeout: int,
-    refresh_every: int,
-):
-    if target_status == "running":
-        endpoint.wait(timeout=timeout, refresh_every=refresh_every)
-        endpoint.fetch()
-        return endpoint
-
-    start = time.time()
-    while True:
-        current_status = str(endpoint.status)
-        if current_status in FAILED_UPDATE_STATUSES:
-            raise InferenceEndpointError(
-                f"Inference Endpoint {endpoint.name} failed to update. Please check the logs for more information."
-            )
-        if target_status == "parked" and current_status in PARKED_STATUSES:
-            endpoint.fetch()
-            return endpoint
-        if current_status == target_status:
-            endpoint.fetch()
-            return endpoint
-        if timeout is not None and time.time() - start > timeout:
-            raise InferenceEndpointTimeoutError(
-                f"Timeout while waiting for Inference Endpoint {endpoint.name} to return to {target_status}."
-            )
-        time.sleep(refresh_every)
-        endpoint.fetch()
 
 
 def wait_for_compute_endpoint_free(

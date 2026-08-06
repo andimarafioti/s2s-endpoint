@@ -2,62 +2,22 @@
 import argparse
 import json
 import sys
-import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 
 from _endpoint_helpers import (
     build_names,
     current_model_env,
+    expected_target_status,
     load_json_file,
     merge_env_updates,
     parse_key_value_pairs,
+    run_ordered_batch,
+    wait_for_endpoint_update,
 )
 from huggingface_hub import HfApi
-from huggingface_hub.errors import InferenceEndpointError, InferenceEndpointTimeoutError
-
-FAILED_UPDATE_STATUSES = {"failed", "updateFailed"}
-PARKED_STATUSES = {"paused", "scaledToZero"}
 
 
 def log_progress(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
-
-
-def expected_target_status(status_before: str) -> str:
-    return "parked" if status_before in PARKED_STATUSES else "running"
-
-
-def wait_for_endpoint_update(
-    endpoint,
-    *,
-    target_status: str,
-    timeout: int,
-    refresh_every: int,
-):
-    if target_status == "running":
-        endpoint.wait(timeout=timeout, refresh_every=refresh_every)
-        endpoint.fetch()
-        return endpoint
-
-    start = time.time()
-    while True:
-        current_status = str(endpoint.status)
-        if current_status in FAILED_UPDATE_STATUSES:
-            raise InferenceEndpointError(
-                f"Inference Endpoint {endpoint.name} failed to update. Please check the logs for more information."
-            )
-        if target_status == "parked" and current_status in PARKED_STATUSES:
-            endpoint.fetch()
-            return endpoint
-        if current_status == target_status:
-            endpoint.fetch()
-            return endpoint
-        if timeout is not None and time.time() - start > timeout:
-            raise InferenceEndpointTimeoutError(
-                f"Timeout while waiting for Inference Endpoint {endpoint.name} to return to {target_status}."
-            )
-        time.sleep(refresh_every)
-        endpoint.fetch()
 
 
 def main() -> None:
@@ -152,82 +112,8 @@ def update_many(
     parallelism: int,
     replace_env: bool = False,
 ) -> list[dict[str, object]]:
-    total = len(names)
-    if total == 0:
-        return []
-
-    max_workers = total if parallelism <= 0 else min(total, parallelism)
-    if max_workers == 1:
-        return update_many_sequential(
-            api=api,
-            namespace=namespace,
-            names=names,
-            env_updates=env_updates,
-            unset_env=unset_env,
-            secret_updates=secret_updates,
-            wait=wait,
-            wait_timeout_s=wait_timeout_s,
-            wait_refresh_every_s=wait_refresh_every_s,
-            dry_run=dry_run,
-            replace_env=replace_env,
-        )
-
-    log_progress(f"Updating {total} compute endpoint envs in parallel with {max_workers} workers")
-    results: list[dict[str, object] | None] = [None] * total
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures: dict[Future[dict[str, object]], tuple[int, str]] = {}
-        for index, name in enumerate(names, start=1):
-            log_progress(f"[{index}/{total}] Submitting compute env update for {name}")
-            future = executor.submit(
-                update_one,
-                api=api,
-                namespace=namespace,
-                name=name,
-                env_updates=env_updates,
-                unset_env=unset_env,
-                secret_updates=secret_updates,
-                wait=wait,
-                wait_timeout_s=wait_timeout_s,
-                wait_refresh_every_s=wait_refresh_every_s,
-                dry_run=dry_run,
-                replace_env=replace_env,
-            )
-            futures[future] = (index, name)
-
-        try:
-            for future in as_completed(futures):
-                index, name = futures[future]
-                result = future.result()
-                log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
-                results[index - 1] = result
-        except BaseException:
-            for pending_future in futures:
-                if pending_future is not future:
-                    pending_future.cancel()
-            raise
-
-    return [result for result in results if result is not None]
-
-
-def update_many_sequential(
-    *,
-    api: HfApi,
-    namespace: str | None,
-    names: list[str],
-    env_updates: dict[str, str],
-    unset_env: list[str],
-    secret_updates: dict[str, str],
-    wait: bool,
-    wait_timeout_s: int,
-    wait_refresh_every_s: int,
-    dry_run: bool,
-    replace_env: bool = False,
-) -> list[dict[str, object]]:
-    results: list[dict[str, object]] = []
-    total = len(names)
-    for index, name in enumerate(names, start=1):
-        log_progress(f"[{index}/{total}] Updating env on compute endpoint {name}")
-        result = update_one(
+    def worker(name: str) -> dict[str, object]:
+        return update_one(
             api=api,
             namespace=namespace,
             name=name,
@@ -240,9 +126,17 @@ def update_many_sequential(
             dry_run=dry_run,
             replace_env=replace_env,
         )
-        log_progress(f"[{index}/{total}] {name}: {result['status_before']} -> {result['status_after']}")
-        results.append(result)
-    return results
+
+    return run_ordered_batch(
+        names=names,
+        worker=worker,
+        parallelism=parallelism,
+        progress=log_progress,
+        parallel_start_message="Updating {total} compute endpoint envs in parallel with {max_workers} workers",
+        sequential_start_message="[{index}/{total}] Updating env on compute endpoint {name}",
+        parallel_submit_message="[{index}/{total}] Submitting compute env update for {name}",
+        completed_message=lambda result: f"{result['status_before']} -> {result['status_after']}",
+    )
 
 
 def update_one(

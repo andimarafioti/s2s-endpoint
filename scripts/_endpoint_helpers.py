@@ -1,6 +1,11 @@
 import json
+import time
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
+
+from huggingface_hub.errors import InferenceEndpointError, InferenceEndpointTimeoutError
 
 DEFAULT_REPOSITORY = "andito/s2s"
 DEFAULT_FRAMEWORK = "custom"
@@ -8,6 +13,9 @@ DEFAULT_ENDPOINT_TYPE = "protected"
 DEFAULT_HEALTH_ROUTE = "/health"
 DEFAULT_LOAD_BALANCER_HEALTH_ROUTE = "/ready"
 DEFAULT_IMAGE_PORT = 7860
+FAILED_UPDATE_STATUSES = {"failed", "updateFailed"}
+PARKED_STATUSES = {"paused", "scaledToZero"}
+BatchResult = TypeVar("BatchResult")
 
 
 def load_json_file(path: str | None) -> dict[str, Any] | None:
@@ -97,3 +105,89 @@ def merge_env_updates(
     for key in unset_keys:
         merged.pop(key, None)
     return merged
+
+
+def expected_target_status(status_before: str) -> str:
+    return "parked" if status_before in PARKED_STATUSES else "running"
+
+
+def wait_for_endpoint_update(
+    endpoint,
+    *,
+    target_status: str,
+    timeout: float | None,
+    refresh_every: float,
+):
+    if target_status == "running":
+        endpoint.wait(timeout=timeout, refresh_every=refresh_every)
+        endpoint.fetch()
+        return endpoint
+
+    start = time.time()
+    while True:
+        current_status = str(endpoint.status)
+        if current_status in FAILED_UPDATE_STATUSES:
+            raise InferenceEndpointError(
+                f"Inference Endpoint {endpoint.name} failed to update. Please check the logs for more information."
+            )
+        if target_status == "parked" and current_status in PARKED_STATUSES:
+            endpoint.fetch()
+            return endpoint
+        if current_status == target_status:
+            endpoint.fetch()
+            return endpoint
+        if timeout is not None and time.time() - start > timeout:
+            raise InferenceEndpointTimeoutError(
+                f"Timeout while waiting for Inference Endpoint {endpoint.name} to return to {target_status}."
+            )
+        time.sleep(refresh_every)
+        endpoint.fetch()
+
+
+def run_ordered_batch(
+    *,
+    names: list[str],
+    worker: Callable[[str], BatchResult],
+    parallelism: int,
+    progress: Callable[[str], None],
+    parallel_start_message: str,
+    sequential_start_message: str,
+    parallel_submit_message: str,
+    completed_message: Callable[[BatchResult], str],
+) -> list[BatchResult]:
+    total = len(names)
+    if total == 0:
+        return []
+
+    max_workers = total if parallelism <= 0 else min(total, parallelism)
+    if max_workers == 1:
+        results: list[BatchResult] = []
+        for index, name in enumerate(names, start=1):
+            progress(sequential_start_message.format(index=index, total=total, name=name))
+            result = worker(name)
+            progress(f"[{index}/{total}] {name}: {completed_message(result)}")
+            results.append(result)
+        return results
+
+    progress(parallel_start_message.format(total=total, max_workers=max_workers))
+    results: dict[int, BatchResult] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[Future[BatchResult], tuple[int, str]] = {}
+        for index, name in enumerate(names, start=1):
+            progress(parallel_submit_message.format(index=index, total=total, name=name))
+            future = executor.submit(worker, name)
+            futures[future] = (index, name)
+
+        try:
+            for future in as_completed(futures):
+                index, name = futures[future]
+                result = future.result()
+                progress(f"[{index}/{total}] {name}: {completed_message(result)}")
+                results[index - 1] = result
+        except BaseException:
+            for pending_future in futures:
+                if pending_future is not future:
+                    pending_future.cancel()
+            raise
+
+    return [results[index] for index in range(total)]
