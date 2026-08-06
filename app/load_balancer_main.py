@@ -1,13 +1,22 @@
 import logging
-import os
 import secrets
+from contextvars import ContextVar
+from dataclasses import dataclass
 from time import monotonic
-from typing import Any
+from typing import Any, Mapping
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.app_utils import build_lifespan, elapsed_ms, public_base_url, setup_logging
+from app.app_utils import (
+    build_lifespan,
+    elapsed_ms,
+    env_bool,
+    env_optional,
+    env_text,
+    public_base_url,
+    setup_logging,
+)
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
 from app.direct_session_manager import DirectSessionManager, QueueAtCapacityError
@@ -41,270 +50,475 @@ from app.verification_admission_limiter import (
 
 logger = setup_logging()
 APP_ROLE = "load_balancer"
-
-HF_ENDPOINT_NAMESPACE = os.getenv("HF_ENDPOINT_NAMESPACE", "").strip() or None
-COMPUTE_ENDPOINT_NAMES_ENV = os.getenv("COMPUTE_ENDPOINT_NAMES", "").strip()
-COMPUTE_ENDPOINT_NAMES = [name.strip() for name in COMPUTE_ENDPOINT_NAMES_ENV.split(",") if name.strip()]
-COMPUTE_ENDPOINT_MIN_WARM = int(os.getenv("COMPUTE_ENDPOINT_MIN_WARM", "1"))
-COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS = int(os.getenv("COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS", "1"))
-COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "600"))
-COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S", "10"))
-COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S", "300"))
-COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S", "30"))
-COMPUTE_ENDPOINT_HTTP_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_HTTP_TIMEOUT_S", "10"))
-COMPUTE_ENDPOINT_RECONCILE_STALE_AFTER_S = float(
-    os.getenv(
-        "COMPUTE_ENDPOINT_RECONCILE_STALE_AFTER_S",
-        str(max(COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S * 3, COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S * 2)),
-    )
-)
-COMPUTE_ENDPOINT_PARK_COOLDOWN_S = float(os.getenv("COMPUTE_ENDPOINT_PARK_COOLDOWN_S", "180"))
-COMPUTE_ENDPOINT_WAIT_TIMEOUT_S = int(os.getenv("COMPUTE_ENDPOINT_WAIT_TIMEOUT_S", "900"))
-COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S = float(
-    os.getenv("COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S", str(COMPUTE_ENDPOINT_WAIT_TIMEOUT_S))
-)
-COMPUTE_ENDPOINT_PARK_STRATEGY = os.getenv("COMPUTE_ENDPOINT_PARK_STRATEGY", "pause").strip().lower()
-COMPUTE_ENDPOINT_AUTO_RESTART = os.getenv("COMPUTE_ENDPOINT_AUTO_RESTART", "true").strip().lower() in {
-    "true",
-    "1",
-    "yes",
-}
-COMPUTE_ENDPOINT_MAX_RESTART_ATTEMPTS = int(os.getenv("COMPUTE_ENDPOINT_MAX_RESTART_ATTEMPTS", "3"))
-COMPUTE_ENDPOINT_RESTART_BACKOFF_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_BACKOFF_S", "30"))
-COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S", "300"))
-COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S = float(os.getenv("COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S", "120"))
-COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S", "600"))
-COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S", "3600"))
-COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S", "600"))
-COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S = float(os.getenv("COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S", "300"))
-HF_CONTROL_TOKEN = os.getenv("HF_CONTROL_TOKEN", "").strip() or os.getenv("HF_TOKEN", "").strip() or None
-LB_ADMIN_AUTH_TOKEN = os.getenv("LB_ADMIN_AUTH_TOKEN", "").strip() or None
-
-SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
-# Require Hugging Face to accept the caller's bearer token before any session
-# admission work is allowed. Off by default for deployments that intentionally
-# allow anonymous callers.
-SESSION_REQUIRE_VERIFIED_HF_TOKEN = os.getenv(
-    "SESSION_REQUIRE_VERIFIED_HF_TOKEN",
-    "false",
-).strip().lower() in {"true", "1", "yes"}
-SESSION_HF_TOKEN_VERIFY_TIMEOUT_S = float(os.getenv("SESSION_HF_TOKEN_VERIFY_TIMEOUT_S", "5"))
-if SESSION_HF_TOKEN_VERIFY_TIMEOUT_S <= 0:
-    raise ValueError("SESSION_HF_TOKEN_VERIFY_TIMEOUT_S must be > 0")
-SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S = float(os.getenv("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S", "1800"))
-if SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S <= 0:
-    raise ValueError("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S must be > 0")
-# How long session creation waits for a first-seen HF token's whoami validation
-# before minting the LLM proxy claim. On timeout the claim fails closed: the
-# session is created normally but without LLM proxy access.
-LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S = float(os.getenv("LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S", "5"))
-SESSION_PENDING_TIMEOUT_S = float(os.getenv("SESSION_PENDING_TIMEOUT_S", "60"))
-SESSION_TOKEN_TTL_S = float(os.getenv("SESSION_TOKEN_TTL_S", "86400"))
-SESSION_REAP_INTERVAL_S = float(os.getenv("SESSION_REAP_INTERVAL_S", "5"))
-# Waiting queue: when every slot is busy a caller gets a ticket and polls
-# GET /queue/{id} until the head of the line claims a freed slot. Waiting never
-# reserves compute or usage time; an un-polled ticket is reaped after its TTL.
-#
-# The queue ships dark: with SESSION_QUEUE_ENABLED unset, /session behaves
-# exactly as before the queue existed — the request blocks until a slot frees
-# (up to COMPUTE_ENDPOINT_WAIT_TIMEOUT_S) and /queue/* returns 404. Set
-# SESSION_QUEUE_ENABLED=true on an instance only once its clients understand
-# {"state": "queued"} responses and poll GET /queue/{id}; a pre-queue client
-# on a queueing instance would receive a 200 without a connect_url and fail.
-SESSION_QUEUE_ENABLED = os.getenv("SESSION_QUEUE_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
-QUEUE_MAX_DEPTH = int(os.getenv("QUEUE_MAX_DEPTH", "100"))
-QUEUE_TICKET_TTL_S = float(os.getenv("QUEUE_TICKET_TTL_S", "8"))
-QUEUE_POLL_INTERVAL_S = float(os.getenv("QUEUE_POLL_INTERVAL_S", "2"))
-QUEUE_REAP_INTERVAL_S = float(os.getenv("QUEUE_REAP_INTERVAL_S", "2"))
-REQUEST_USAGE_HASH_SECRET = os.getenv("REQUEST_USAGE_HASH_SECRET", "").strip() or SESSION_SHARED_SECRET or None
-REQUEST_USAGE_TRUST_PROXY_HEADERS = os.getenv(
-    "REQUEST_USAGE_TRUST_PROXY_HEADERS",
-    "true",
-).strip().lower() in {"true", "1", "yes"}
-REQUEST_USAGE_MAX_ACTORS_PER_MINUTE = int(os.getenv("REQUEST_USAGE_MAX_ACTORS_PER_MINUTE", "1000"))
-REQUEST_USAGE_MAX_RETAINED_RECORDS = int(os.getenv("REQUEST_USAGE_MAX_RETAINED_RECORDS", "50000"))
-REQUEST_USAGE_MAX_PENDING_VALIDATIONS = int(os.getenv("REQUEST_USAGE_MAX_PENDING_VALIDATIONS", "128"))
-REQUEST_USAGE_VALIDATION_CONCURRENCY = int(os.getenv("REQUEST_USAGE_VALIDATION_CONCURRENCY", "4"))
-SESSION_HF_TOKEN_VERIFY_MAX_PENDING = int(os.getenv("SESSION_HF_TOKEN_VERIFY_MAX_PENDING", "64"))
-SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK = int(os.getenv("SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK", "4"))
-REQUEST_USAGE_HIGH_REQUESTS = int(os.getenv("REQUEST_USAGE_HIGH_REQUESTS", "100"))
-REQUEST_USAGE_BURST_PER_MINUTE = int(os.getenv("REQUEST_USAGE_BURST_PER_MINUTE", "20"))
-REQUEST_USAGE_MANY_NETWORKS = int(os.getenv("REQUEST_USAGE_MANY_NETWORKS", "5"))
-REQUEST_RATE_LIMIT_ENABLED = os.getenv(
-    "REQUEST_RATE_LIMIT_ENABLED",
-    "true",
-).strip().lower() in {"true", "1", "yes"}
-REQUEST_RATE_LIMIT_WINDOW_S = float(os.getenv("REQUEST_RATE_LIMIT_WINDOW_S", "60"))
-REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW = int(os.getenv("REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW", "20"))
-REQUEST_RATE_LIMIT_MAX_PARALLEL = int(os.getenv("REQUEST_RATE_LIMIT_MAX_PARALLEL", "10"))
-REQUEST_RATE_LIMIT_NO_CONNECTS = int(os.getenv("REQUEST_RATE_LIMIT_NO_CONNECTS", "5"))
-REQUEST_RATE_LIMIT_SHORT_SESSION_S = float(os.getenv("REQUEST_RATE_LIMIT_SHORT_SESSION_S", "10"))
-REQUEST_RATE_LIMIT_SHORT_SESSIONS = int(os.getenv("REQUEST_RATE_LIMIT_SHORT_SESSIONS", "8"))
-REQUEST_RATE_LIMIT_COOLDOWN_S = float(os.getenv("REQUEST_RATE_LIMIT_COOLDOWN_S", "900"))
-REQUEST_RATE_LIMIT_ACTOR_RETENTION_S = float(os.getenv("REQUEST_RATE_LIMIT_ACTOR_RETENTION_S", "3600"))
-REQUEST_RATE_LIMIT_MAX_ACTORS = int(os.getenv("REQUEST_RATE_LIMIT_MAX_ACTORS", "10000"))
-DASHBOARD_SAMPLE_INTERVAL_S = float(os.getenv("DASHBOARD_SAMPLE_INTERVAL_S", "15"))
-DASHBOARD_RETENTION_MINUTES = int(os.getenv("DASHBOARD_RETENTION_MINUTES", str(28 * 24 * 60)))
-DASHBOARD_FLUSH_BATCH_SIZE = int(os.getenv("DASHBOARD_FLUSH_BATCH_SIZE", "100"))
-DASHBOARD_FLUSH_TIMEOUT_S = float(os.getenv("DASHBOARD_FLUSH_TIMEOUT_S", "60"))
-DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S = float(os.getenv("DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S", "300"))
-DASHBOARD_STARTUP_MERGE_DELAY_S = float(os.getenv("DASHBOARD_STARTUP_MERGE_DELAY_S", "60"))
-DASHBOARD_BUCKET_ID = os.getenv("DASHBOARD_BUCKET_ID", "").strip() or None
-DASHBOARD_BUCKET_PREFIX = os.getenv("DASHBOARD_BUCKET_PREFIX", "s2s-endpoint/swarm-dashboard").strip()
-DASHBOARD_BUCKET_TOKEN = os.getenv("DASHBOARD_BUCKET_TOKEN", "").strip() or HF_CONTROL_TOKEN
-DASHBOARD_PREVIEW_MODE = os.getenv("DASHBOARD_PREVIEW_MODE", "").strip().lower() in {"true", "1", "yes"}
 DASHBOARD_PREVIEW_SENTINELS = {"test", "preview", "dashboard_preview"}
-if len(COMPUTE_ENDPOINT_NAMES) == 1 and COMPUTE_ENDPOINT_NAMES[0].strip().lower() in DASHBOARD_PREVIEW_SENTINELS:
-    DASHBOARD_PREVIEW_MODE = True
-    COMPUTE_ENDPOINT_NAMES = []
-if DASHBOARD_PREVIEW_MODE and not COMPUTE_ENDPOINT_NAMES:
-    COMPUTE_ENDPOINT_NAMES = ["preview-compute-01", "preview-compute-02", "preview-compute-03", "preview-compute-04"]
 
 
-def build_endpoint_router() -> EndpointPoolRouter:
-    if not COMPUTE_ENDPOINT_NAMES:
+@dataclass(frozen=True)
+class LoadBalancerSettings:
+    hf_endpoint_namespace: str | None = None
+    compute_endpoint_names: tuple[str, ...] = ()
+    compute_endpoint_min_warm: int = 1
+    compute_endpoint_wake_threshold_slots: int = 1
+    compute_endpoint_idle_park_timeout_s: float = 600.0
+    compute_endpoint_reconcile_interval_s: float = 10.0
+    compute_endpoint_waking_capacity_timeout_s: float = 300.0
+    compute_endpoint_control_fetch_timeout_s: float = 30.0
+    compute_endpoint_http_timeout_s: float = 10.0
+    compute_endpoint_reconcile_stale_after_s: float = 60.0
+    compute_endpoint_park_cooldown_s: float = 180.0
+    compute_endpoint_wait_timeout_s: int = 900
+    compute_endpoint_control_operation_timeout_s: float = 900.0
+    compute_endpoint_park_strategy: str = "pause"
+    compute_endpoint_auto_restart: bool = True
+    compute_endpoint_max_restart_attempts: int = 3
+    compute_endpoint_restart_backoff_s: float = 30.0
+    compute_endpoint_restart_backoff_max_s: float = 300.0
+    compute_endpoint_restart_stable_running_s: float = 120.0
+    compute_endpoint_drain_restart_timeout_s: float = 600.0
+    compute_endpoint_drain_lease_ttl_s: float = 3600.0
+    compute_endpoint_drain_warning_after_s: float = 600.0
+    compute_endpoint_drain_warning_interval_s: float = 300.0
+    compute_usage_stale_ttl_s: float = 60.0
+    hf_control_token: str | None = None
+    lb_admin_auth_token: str | None = None
+    session_shared_secret: str = ""
+    session_require_verified_hf_token: bool = False
+    session_hf_token_verify_timeout_s: float = 5.0
+    session_hf_token_max_verified_age_s: float = 1800.0
+    llm_proxy_claim_verify_timeout_s: float = 5.0
+    session_pending_timeout_s: float = 60.0
+    session_token_ttl_s: float = 86400.0
+    session_reap_interval_s: float = 5.0
+    session_queue_enabled: bool = False
+    queue_max_depth: int = 100
+    queue_ticket_ttl_s: float = 8.0
+    queue_poll_interval_s: float = 2.0
+    queue_reap_interval_s: float = 2.0
+    request_usage_hash_secret: str | None = None
+    request_usage_trust_proxy_headers: bool = True
+    request_usage_max_actors_per_minute: int = 1000
+    request_usage_max_retained_records: int = 50000
+    request_usage_max_pending_validations: int = 128
+    request_usage_validation_concurrency: int = 4
+    session_hf_token_verify_max_pending: int = 64
+    session_hf_token_verify_max_pending_per_network: int = 4
+    request_usage_high_requests: int = 100
+    request_usage_burst_per_minute: int = 20
+    request_usage_many_networks: int = 5
+    request_rate_limit_enabled: bool = True
+    request_rate_limit_window_s: float = 60.0
+    request_rate_limit_requests_per_window: int = 20
+    request_rate_limit_max_parallel: int = 10
+    request_rate_limit_no_connects: int = 5
+    request_rate_limit_short_session_s: float = 10.0
+    request_rate_limit_short_sessions: int = 8
+    request_rate_limit_cooldown_s: float = 900.0
+    request_rate_limit_actor_retention_s: float = 3600.0
+    request_rate_limit_max_actors: int = 10000
+    dashboard_sample_interval_s: float = 15.0
+    dashboard_retention_minutes: int = 28 * 24 * 60
+    dashboard_flush_batch_size: int = 100
+    dashboard_flush_timeout_s: float = 60.0
+    dashboard_dirty_bucket_warning_age_s: float = 300.0
+    dashboard_startup_merge_delay_s: float = 60.0
+    dashboard_bucket_id: str | None = None
+    dashboard_bucket_prefix: str = "s2s-endpoint/swarm-dashboard"
+    dashboard_bucket_token: str | None = None
+    dashboard_preview_mode: bool = False
+
+    def __post_init__(self) -> None:
+        if self.session_hf_token_verify_timeout_s <= 0:
+            raise ValueError("SESSION_HF_TOKEN_VERIFY_TIMEOUT_S must be > 0")
+        if self.session_hf_token_max_verified_age_s <= 0:
+            raise ValueError("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S must be > 0")
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "LoadBalancerSettings":
+        names = tuple(
+            name.strip() for name in env_text("COMPUTE_ENDPOINT_NAMES", environ=environ).split(",") if name.strip()
+        )
+        preview_mode = env_bool("DASHBOARD_PREVIEW_MODE", False, environ=environ)
+        if len(names) == 1 and names[0].lower() in DASHBOARD_PREVIEW_SENTINELS:
+            preview_mode = True
+            names = ()
+        if preview_mode and not names:
+            names = tuple(f"preview-compute-{index:02d}" for index in range(1, 5))
+
+        reconcile_interval_s = float(env_text("COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S", "10", environ=environ))
+        control_fetch_timeout_s = float(env_text("COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S", "30", environ=environ))
+        wait_timeout_s = int(env_text("COMPUTE_ENDPOINT_WAIT_TIMEOUT_S", "900", environ=environ))
+        hf_control_token = env_optional("HF_CONTROL_TOKEN", environ=environ)
+        if hf_control_token is None:
+            hf_control_token = env_optional("HF_TOKEN", environ=environ)
+        session_shared_secret = env_text("SESSION_SHARED_SECRET", environ=environ)
+        request_hash_secret = env_optional("REQUEST_USAGE_HASH_SECRET", environ=environ)
+        if request_hash_secret is None:
+            request_hash_secret = session_shared_secret or None
+        dashboard_bucket_token = env_optional("DASHBOARD_BUCKET_TOKEN", environ=environ)
+        if dashboard_bucket_token is None:
+            dashboard_bucket_token = hf_control_token
+
+        return cls(
+            hf_endpoint_namespace=env_optional("HF_ENDPOINT_NAMESPACE", environ=environ),
+            compute_endpoint_names=names,
+            compute_endpoint_min_warm=int(env_text("COMPUTE_ENDPOINT_MIN_WARM", "1", environ=environ)),
+            compute_endpoint_wake_threshold_slots=int(
+                env_text("COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS", "1", environ=environ)
+            ),
+            compute_endpoint_idle_park_timeout_s=float(
+                env_text("COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S", "600", environ=environ)
+            ),
+            compute_endpoint_reconcile_interval_s=reconcile_interval_s,
+            compute_endpoint_waking_capacity_timeout_s=float(
+                env_text("COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S", "300", environ=environ)
+            ),
+            compute_endpoint_control_fetch_timeout_s=control_fetch_timeout_s,
+            compute_endpoint_http_timeout_s=float(env_text("COMPUTE_ENDPOINT_HTTP_TIMEOUT_S", "10", environ=environ)),
+            compute_endpoint_reconcile_stale_after_s=float(
+                env_text(
+                    "COMPUTE_ENDPOINT_RECONCILE_STALE_AFTER_S",
+                    str(max(reconcile_interval_s * 3, control_fetch_timeout_s * 2)),
+                    environ=environ,
+                )
+            ),
+            compute_endpoint_park_cooldown_s=float(
+                env_text("COMPUTE_ENDPOINT_PARK_COOLDOWN_S", "180", environ=environ)
+            ),
+            compute_endpoint_wait_timeout_s=wait_timeout_s,
+            compute_endpoint_control_operation_timeout_s=float(
+                env_text(
+                    "COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S",
+                    str(wait_timeout_s),
+                    environ=environ,
+                )
+            ),
+            compute_endpoint_park_strategy=env_text("COMPUTE_ENDPOINT_PARK_STRATEGY", "pause", environ=environ).lower(),
+            compute_endpoint_auto_restart=env_bool("COMPUTE_ENDPOINT_AUTO_RESTART", True, environ=environ),
+            compute_endpoint_max_restart_attempts=int(
+                env_text("COMPUTE_ENDPOINT_MAX_RESTART_ATTEMPTS", "3", environ=environ)
+            ),
+            compute_endpoint_restart_backoff_s=float(
+                env_text("COMPUTE_ENDPOINT_RESTART_BACKOFF_S", "30", environ=environ)
+            ),
+            compute_endpoint_restart_backoff_max_s=float(
+                env_text("COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S", "300", environ=environ)
+            ),
+            compute_endpoint_restart_stable_running_s=float(
+                env_text("COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S", "120", environ=environ)
+            ),
+            compute_endpoint_drain_restart_timeout_s=float(
+                env_text("COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S", "600", environ=environ)
+            ),
+            compute_endpoint_drain_lease_ttl_s=float(
+                env_text("COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S", "3600", environ=environ)
+            ),
+            compute_endpoint_drain_warning_after_s=float(
+                env_text("COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S", "600", environ=environ)
+            ),
+            compute_endpoint_drain_warning_interval_s=float(
+                env_text("COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S", "300", environ=environ)
+            ),
+            compute_usage_stale_ttl_s=float(env_text("COMPUTE_USAGE_STALE_TTL_S", "60", environ=environ)),
+            hf_control_token=hf_control_token,
+            lb_admin_auth_token=env_optional("LB_ADMIN_AUTH_TOKEN", environ=environ),
+            session_shared_secret=session_shared_secret,
+            session_require_verified_hf_token=env_bool("SESSION_REQUIRE_VERIFIED_HF_TOKEN", False, environ=environ),
+            session_hf_token_verify_timeout_s=float(
+                env_text("SESSION_HF_TOKEN_VERIFY_TIMEOUT_S", "5", environ=environ)
+            ),
+            session_hf_token_max_verified_age_s=float(
+                env_text("SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S", "1800", environ=environ)
+            ),
+            llm_proxy_claim_verify_timeout_s=float(env_text("LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S", "5", environ=environ)),
+            session_pending_timeout_s=float(env_text("SESSION_PENDING_TIMEOUT_S", "60", environ=environ)),
+            session_token_ttl_s=float(env_text("SESSION_TOKEN_TTL_S", "86400", environ=environ)),
+            session_reap_interval_s=float(env_text("SESSION_REAP_INTERVAL_S", "5", environ=environ)),
+            session_queue_enabled=env_bool("SESSION_QUEUE_ENABLED", False, environ=environ),
+            queue_max_depth=int(env_text("QUEUE_MAX_DEPTH", "100", environ=environ)),
+            queue_ticket_ttl_s=float(env_text("QUEUE_TICKET_TTL_S", "8", environ=environ)),
+            queue_poll_interval_s=float(env_text("QUEUE_POLL_INTERVAL_S", "2", environ=environ)),
+            queue_reap_interval_s=float(env_text("QUEUE_REAP_INTERVAL_S", "2", environ=environ)),
+            request_usage_hash_secret=request_hash_secret,
+            request_usage_trust_proxy_headers=env_bool("REQUEST_USAGE_TRUST_PROXY_HEADERS", True, environ=environ),
+            request_usage_max_actors_per_minute=int(
+                env_text("REQUEST_USAGE_MAX_ACTORS_PER_MINUTE", "1000", environ=environ)
+            ),
+            request_usage_max_retained_records=int(
+                env_text("REQUEST_USAGE_MAX_RETAINED_RECORDS", "50000", environ=environ)
+            ),
+            request_usage_max_pending_validations=int(
+                env_text("REQUEST_USAGE_MAX_PENDING_VALIDATIONS", "128", environ=environ)
+            ),
+            request_usage_validation_concurrency=int(
+                env_text("REQUEST_USAGE_VALIDATION_CONCURRENCY", "4", environ=environ)
+            ),
+            session_hf_token_verify_max_pending=int(
+                env_text("SESSION_HF_TOKEN_VERIFY_MAX_PENDING", "64", environ=environ)
+            ),
+            session_hf_token_verify_max_pending_per_network=int(
+                env_text("SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK", "4", environ=environ)
+            ),
+            request_usage_high_requests=int(env_text("REQUEST_USAGE_HIGH_REQUESTS", "100", environ=environ)),
+            request_usage_burst_per_minute=int(env_text("REQUEST_USAGE_BURST_PER_MINUTE", "20", environ=environ)),
+            request_usage_many_networks=int(env_text("REQUEST_USAGE_MANY_NETWORKS", "5", environ=environ)),
+            request_rate_limit_enabled=env_bool("REQUEST_RATE_LIMIT_ENABLED", True, environ=environ),
+            request_rate_limit_window_s=float(env_text("REQUEST_RATE_LIMIT_WINDOW_S", "60", environ=environ)),
+            request_rate_limit_requests_per_window=int(
+                env_text("REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW", "20", environ=environ)
+            ),
+            request_rate_limit_max_parallel=int(env_text("REQUEST_RATE_LIMIT_MAX_PARALLEL", "10", environ=environ)),
+            request_rate_limit_no_connects=int(env_text("REQUEST_RATE_LIMIT_NO_CONNECTS", "5", environ=environ)),
+            request_rate_limit_short_session_s=float(
+                env_text("REQUEST_RATE_LIMIT_SHORT_SESSION_S", "10", environ=environ)
+            ),
+            request_rate_limit_short_sessions=int(env_text("REQUEST_RATE_LIMIT_SHORT_SESSIONS", "8", environ=environ)),
+            request_rate_limit_cooldown_s=float(env_text("REQUEST_RATE_LIMIT_COOLDOWN_S", "900", environ=environ)),
+            request_rate_limit_actor_retention_s=float(
+                env_text("REQUEST_RATE_LIMIT_ACTOR_RETENTION_S", "3600", environ=environ)
+            ),
+            request_rate_limit_max_actors=int(env_text("REQUEST_RATE_LIMIT_MAX_ACTORS", "10000", environ=environ)),
+            dashboard_sample_interval_s=float(env_text("DASHBOARD_SAMPLE_INTERVAL_S", "15", environ=environ)),
+            dashboard_retention_minutes=int(
+                env_text("DASHBOARD_RETENTION_MINUTES", str(28 * 24 * 60), environ=environ)
+            ),
+            dashboard_flush_batch_size=int(env_text("DASHBOARD_FLUSH_BATCH_SIZE", "100", environ=environ)),
+            dashboard_flush_timeout_s=float(env_text("DASHBOARD_FLUSH_TIMEOUT_S", "60", environ=environ)),
+            dashboard_dirty_bucket_warning_age_s=float(
+                env_text("DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S", "300", environ=environ)
+            ),
+            dashboard_startup_merge_delay_s=float(env_text("DASHBOARD_STARTUP_MERGE_DELAY_S", "60", environ=environ)),
+            dashboard_bucket_id=env_optional("DASHBOARD_BUCKET_ID", environ=environ),
+            dashboard_bucket_prefix=env_text(
+                "DASHBOARD_BUCKET_PREFIX", "s2s-endpoint/swarm-dashboard", environ=environ
+            ),
+            dashboard_bucket_token=dashboard_bucket_token,
+            dashboard_preview_mode=preview_mode,
+        )
+
+
+_module_settings = LoadBalancerSettings.from_env()
+for _field_name in LoadBalancerSettings.__dataclass_fields__:
+    globals()[_field_name.upper()] = getattr(_module_settings, _field_name)
+COMPUTE_ENDPOINT_NAMES_ENV = env_text("COMPUTE_ENDPOINT_NAMES")
+COMPUTE_ENDPOINT_NAMES = list(_module_settings.compute_endpoint_names)
+
+
+def build_endpoint_router(settings: LoadBalancerSettings | None = None) -> EndpointPoolRouter:
+    settings = settings or _current_settings()
+    if not settings.compute_endpoint_names:
         raise RuntimeError("COMPUTE_ENDPOINT_NAMES must be set for the load-balancer app")
 
     controller = HuggingFaceEndpointController(
-        namespace=HF_ENDPOINT_NAMESPACE,
-        token=HF_CONTROL_TOKEN,
-        wait_timeout_s=COMPUTE_ENDPOINT_CONTROL_OPERATION_TIMEOUT_S,
+        namespace=settings.hf_endpoint_namespace,
+        token=settings.hf_control_token,
+        wait_timeout_s=settings.compute_endpoint_control_operation_timeout_s,
         active_min_replica=1,
         active_max_replica=1,
-        park_strategy=COMPUTE_ENDPOINT_PARK_STRATEGY,
-        http_timeout_s=COMPUTE_ENDPOINT_HTTP_TIMEOUT_S,
+        park_strategy=settings.compute_endpoint_park_strategy,
+        http_timeout_s=settings.compute_endpoint_http_timeout_s,
     )
 
     return EndpointPoolRouter(
-        endpoint_names=COMPUTE_ENDPOINT_NAMES,
-        min_warm_endpoints=COMPUTE_ENDPOINT_MIN_WARM,
-        wake_threshold_slots=COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS,
-        idle_park_timeout_s=COMPUTE_ENDPOINT_IDLE_PARK_TIMEOUT_S,
-        reconcile_interval_s=COMPUTE_ENDPOINT_RECONCILE_INTERVAL_S,
-        waking_capacity_timeout_s=COMPUTE_ENDPOINT_WAKING_CAPACITY_TIMEOUT_S,
-        park_cooldown_s=COMPUTE_ENDPOINT_PARK_COOLDOWN_S,
+        endpoint_names=settings.compute_endpoint_names,
+        min_warm_endpoints=settings.compute_endpoint_min_warm,
+        wake_threshold_slots=settings.compute_endpoint_wake_threshold_slots,
+        idle_park_timeout_s=settings.compute_endpoint_idle_park_timeout_s,
+        reconcile_interval_s=settings.compute_endpoint_reconcile_interval_s,
+        waking_capacity_timeout_s=settings.compute_endpoint_waking_capacity_timeout_s,
+        park_cooldown_s=settings.compute_endpoint_park_cooldown_s,
         controller=controller,
-        auto_restart=COMPUTE_ENDPOINT_AUTO_RESTART,
-        max_restart_attempts=COMPUTE_ENDPOINT_MAX_RESTART_ATTEMPTS,
-        restart_backoff_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_S,
-        restart_backoff_max_s=COMPUTE_ENDPOINT_RESTART_BACKOFF_MAX_S,
-        restart_stable_running_s=COMPUTE_ENDPOINT_RESTART_STABLE_RUNNING_S,
-        drain_restart_timeout_s=COMPUTE_ENDPOINT_DRAIN_RESTART_TIMEOUT_S,
-        drain_lease_ttl_s=COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S,
-        drain_warning_after_s=COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S,
-        drain_warning_interval_s=COMPUTE_ENDPOINT_DRAIN_WARNING_INTERVAL_S,
+        auto_restart=settings.compute_endpoint_auto_restart,
+        max_restart_attempts=settings.compute_endpoint_max_restart_attempts,
+        restart_backoff_s=settings.compute_endpoint_restart_backoff_s,
+        restart_backoff_max_s=settings.compute_endpoint_restart_backoff_max_s,
+        restart_stable_running_s=settings.compute_endpoint_restart_stable_running_s,
+        drain_restart_timeout_s=settings.compute_endpoint_drain_restart_timeout_s,
+        drain_lease_ttl_s=settings.compute_endpoint_drain_lease_ttl_s,
+        drain_warning_after_s=settings.compute_endpoint_drain_warning_after_s,
+        drain_warning_interval_s=settings.compute_endpoint_drain_warning_interval_s,
         compute_usage_fetcher=fetch_compute_usage,
         # How long a previously observed usage count stays trusted when
         # health polls fail transiently. Must be comfortably above the
         # reconcile interval (10s): the default 60s means roughly six
         # consecutive failed polls before a synced node loses capacity.
         # Setting it below the reconcile interval revokes on a single blip.
-        usage_sync_stale_ttl_s=float(os.getenv("COMPUTE_USAGE_STALE_TTL_S", "60")),
-        control_fetch_timeout_s=COMPUTE_ENDPOINT_CONTROL_FETCH_TIMEOUT_S,
-        reconcile_stale_after_s=COMPUTE_ENDPOINT_RECONCILE_STALE_AFTER_S,
+        usage_sync_stale_ttl_s=settings.compute_usage_stale_ttl_s,
+        control_fetch_timeout_s=settings.compute_endpoint_control_fetch_timeout_s,
+        reconcile_stale_after_s=settings.compute_endpoint_reconcile_stale_after_s,
     )
 
 
-if DASHBOARD_PREVIEW_MODE:
-    session_manager = DashboardPreviewSessionManager()
-    if SESSION_QUEUE_ENABLED:
-        logger.warning("SESSION_QUEUE_ENABLED is ignored in dashboard preview mode")
-else:
-    session_manager = DirectSessionManager(
-        endpoint_router=build_endpoint_router(),
-        session_shared_secret=SESSION_SHARED_SECRET,
-        pending_timeout_s=SESSION_PENDING_TIMEOUT_S,
-        session_token_ttl_s=SESSION_TOKEN_TTL_S,
-        reap_interval_s=SESSION_REAP_INTERVAL_S,
-        queue_enabled=SESSION_QUEUE_ENABLED,
-        queue_max_depth=QUEUE_MAX_DEPTH,
-        queue_ticket_ttl_s=QUEUE_TICKET_TTL_S,
-        queue_poll_interval_s=QUEUE_POLL_INTERVAL_S,
-        queue_reap_interval_s=QUEUE_REAP_INTERVAL_S,
-    )
+@dataclass(frozen=True)
+class LoadBalancerDependencies:
+    session_manager: Any
+    dashboard_history_store: Any | None
+    dashboard: SwarmDashboard
+    requester_identity_resolver: RequesterIdentityResolver
+    session_verification_limiter: VerificationAdmissionLimiter
+    requester_rate_limiter: RequesterRateLimiter
+    session_requester_tracker: SessionRequesterTracker
+    queue_requester_tracker: SessionRequesterTracker
 
-dashboard_history_store = None
-if DASHBOARD_BUCKET_ID:
-    dashboard_history_store = HuggingFaceBucketHistoryStore(
-        bucket_id=DASHBOARD_BUCKET_ID,
-        prefix=DASHBOARD_BUCKET_PREFIX,
-        token=DASHBOARD_BUCKET_TOKEN,
-        request_timeout_s=DASHBOARD_FLUSH_TIMEOUT_S,
-    )
-    if DASHBOARD_PREVIEW_MODE:
-        dashboard_history_store = ReadOnlyDashboardHistoryStore(dashboard_history_store)
 
-dashboard = SwarmDashboard(
-    snapshot_provider=session_manager.healthcheck,
-    sample_interval_s=DASHBOARD_SAMPLE_INTERVAL_S,
-    retention_minutes=DASHBOARD_RETENTION_MINUTES,
-    history_store=dashboard_history_store,
-    restore_history_in_background=True,
-    flush_batch_size=DASHBOARD_FLUSH_BATCH_SIZE,
-    flush_timeout_s=DASHBOARD_FLUSH_TIMEOUT_S,
-    dirty_bucket_warning_age_s=DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S,
-    startup_merge_delay_s=DASHBOARD_STARTUP_MERGE_DELAY_S,
-    max_requesters_per_bucket=REQUEST_USAGE_MAX_ACTORS_PER_MINUTE,
-    max_requester_records=REQUEST_USAGE_MAX_RETAINED_RECORDS,
-    requester_high_volume_threshold=REQUEST_USAGE_HIGH_REQUESTS,
-    requester_burst_threshold_per_minute=REQUEST_USAGE_BURST_PER_MINUTE,
-    requester_many_networks_threshold=REQUEST_USAGE_MANY_NETWORKS,
+@dataclass(frozen=True)
+class _LoadBalancerApplicationContext:
+    settings: LoadBalancerSettings
+    dependencies: LoadBalancerDependencies
+
+
+class _ModuleSettingsProxy:
+    def __getattr__(self, name: str):
+        return globals()[name.upper()]
+
+
+class _ModuleDependenciesProxy:
+    def __getattr__(self, name: str):
+        return globals()[name]
+
+
+_load_balancer_application_context: ContextVar[_LoadBalancerApplicationContext | None] = ContextVar(
+    "load_balancer_application_context",
+    default=None,
 )
-requester_identity_resolver = RequesterIdentityResolver(
-    hash_secret=REQUEST_USAGE_HASH_SECRET,
-    on_identity_update=dashboard.update_requester_identity,
-    trust_proxy_headers=REQUEST_USAGE_TRUST_PROXY_HEADERS,
-    max_pending_validations=REQUEST_USAGE_MAX_PENDING_VALIDATIONS,
-    validation_concurrency=REQUEST_USAGE_VALIDATION_CONCURRENCY,
-)
-session_verification_limiter = VerificationAdmissionLimiter(
-    config=VerificationAdmissionConfig(
-        max_global_pending=SESSION_HF_TOKEN_VERIFY_MAX_PENDING,
-        max_network_pending=SESSION_HF_TOKEN_VERIFY_MAX_PENDING_PER_NETWORK,
+_module_settings_proxy = _ModuleSettingsProxy()
+_module_dependencies_proxy = _ModuleDependenciesProxy()
+
+
+def _current_settings() -> LoadBalancerSettings:
+    context = _load_balancer_application_context.get()
+    if context is None:
+        return _module_settings_proxy  # type: ignore[return-value]
+    return context.settings
+
+
+def _current_dependencies() -> LoadBalancerDependencies:
+    context = _load_balancer_application_context.get()
+    if context is None:
+        return _module_dependencies_proxy  # type: ignore[return-value]
+    return context.dependencies
+
+
+class _LoadBalancerContextMiddleware:
+    def __init__(self, application, *, context: _LoadBalancerApplicationContext):
+        self.application = application
+        self.context = context
+
+    async def __call__(self, scope, receive, send):
+        token = _load_balancer_application_context.set(self.context)
+        try:
+            await self.application(scope, receive, send)
+        finally:
+            _load_balancer_application_context.reset(token)
+
+
+def build_load_balancer_dependencies(settings: LoadBalancerSettings) -> LoadBalancerDependencies:
+    if settings.dashboard_preview_mode:
+        session_manager = DashboardPreviewSessionManager()
+        if settings.session_queue_enabled:
+            logger.warning("SESSION_QUEUE_ENABLED is ignored in dashboard preview mode")
+    else:
+        session_manager = DirectSessionManager(
+            endpoint_router=build_endpoint_router(settings),
+            session_shared_secret=settings.session_shared_secret,
+            pending_timeout_s=settings.session_pending_timeout_s,
+            session_token_ttl_s=settings.session_token_ttl_s,
+            reap_interval_s=settings.session_reap_interval_s,
+            queue_enabled=settings.session_queue_enabled,
+            queue_max_depth=settings.queue_max_depth,
+            queue_ticket_ttl_s=settings.queue_ticket_ttl_s,
+            queue_poll_interval_s=settings.queue_poll_interval_s,
+            queue_reap_interval_s=settings.queue_reap_interval_s,
+        )
+
+    dashboard_history_store = None
+    if settings.dashboard_bucket_id:
+        dashboard_history_store = HuggingFaceBucketHistoryStore(
+            bucket_id=settings.dashboard_bucket_id,
+            prefix=settings.dashboard_bucket_prefix,
+            token=settings.dashboard_bucket_token,
+            request_timeout_s=settings.dashboard_flush_timeout_s,
+        )
+        if settings.dashboard_preview_mode:
+            dashboard_history_store = ReadOnlyDashboardHistoryStore(dashboard_history_store)
+
+    dashboard = SwarmDashboard(
+        snapshot_provider=session_manager.healthcheck,
+        sample_interval_s=settings.dashboard_sample_interval_s,
+        retention_minutes=settings.dashboard_retention_minutes,
+        history_store=dashboard_history_store,
+        restore_history_in_background=True,
+        flush_batch_size=settings.dashboard_flush_batch_size,
+        flush_timeout_s=settings.dashboard_flush_timeout_s,
+        dirty_bucket_warning_age_s=settings.dashboard_dirty_bucket_warning_age_s,
+        startup_merge_delay_s=settings.dashboard_startup_merge_delay_s,
+        max_requesters_per_bucket=settings.request_usage_max_actors_per_minute,
+        max_requester_records=settings.request_usage_max_retained_records,
+        requester_high_volume_threshold=settings.request_usage_high_requests,
+        requester_burst_threshold_per_minute=settings.request_usage_burst_per_minute,
+        requester_many_networks_threshold=settings.request_usage_many_networks,
     )
-)
-requester_rate_limiter = RequesterRateLimiter(
-    config=RequesterRateLimitConfig(
-        enabled=REQUEST_RATE_LIMIT_ENABLED,
-        request_window_s=REQUEST_RATE_LIMIT_WINDOW_S,
-        max_requests_per_window=REQUEST_RATE_LIMIT_REQUESTS_PER_WINDOW,
-        max_parallel_allocations=REQUEST_RATE_LIMIT_MAX_PARALLEL,
-        max_consecutive_no_connects=REQUEST_RATE_LIMIT_NO_CONNECTS,
-        short_session_threshold_s=REQUEST_RATE_LIMIT_SHORT_SESSION_S,
-        max_consecutive_short_sessions=REQUEST_RATE_LIMIT_SHORT_SESSIONS,
-        cooldown_s=REQUEST_RATE_LIMIT_COOLDOWN_S,
-        actor_retention_s=REQUEST_RATE_LIMIT_ACTOR_RETENTION_S,
-        max_actor_states=REQUEST_RATE_LIMIT_MAX_ACTORS,
+    requester_identity_resolver = RequesterIdentityResolver(
+        hash_secret=settings.request_usage_hash_secret,
+        on_identity_update=dashboard.update_requester_identity,
+        trust_proxy_headers=settings.request_usage_trust_proxy_headers,
+        max_pending_validations=settings.request_usage_max_pending_validations,
+        validation_concurrency=settings.request_usage_validation_concurrency,
     )
-)
-session_requester_tracker = SessionRequesterTracker(
-    retention_s=SESSION_PENDING_TIMEOUT_S + max(2 * SESSION_REAP_INTERVAL_S, 30.0),
-)
-# Queue polls are bodyless GETs, so the hardware-id identity resolved from the
-# original POST /session can't be re-derived at claim time — carry it across the
-# wait keyed by ticket. Refreshed on every poll; retention only has to outlive
-# the ticket itself (un-polled tickets die at QUEUE_TICKET_TTL_S).
-queue_requester_tracker = SessionRequesterTracker(
-    retention_s=QUEUE_TICKET_TTL_S + max(2 * QUEUE_REAP_INTERVAL_S, 10.0),
-)
+    session_verification_limiter = VerificationAdmissionLimiter(
+        config=VerificationAdmissionConfig(
+            max_global_pending=settings.session_hf_token_verify_max_pending,
+            max_network_pending=settings.session_hf_token_verify_max_pending_per_network,
+        )
+    )
+    requester_rate_limiter = RequesterRateLimiter(
+        config=RequesterRateLimitConfig(
+            enabled=settings.request_rate_limit_enabled,
+            request_window_s=settings.request_rate_limit_window_s,
+            max_requests_per_window=settings.request_rate_limit_requests_per_window,
+            max_parallel_allocations=settings.request_rate_limit_max_parallel,
+            max_consecutive_no_connects=settings.request_rate_limit_no_connects,
+            short_session_threshold_s=settings.request_rate_limit_short_session_s,
+            max_consecutive_short_sessions=settings.request_rate_limit_short_sessions,
+            cooldown_s=settings.request_rate_limit_cooldown_s,
+            actor_retention_s=settings.request_rate_limit_actor_retention_s,
+            max_actor_states=settings.request_rate_limit_max_actors,
+        )
+    )
+    session_requester_tracker = SessionRequesterTracker(
+        retention_s=settings.session_pending_timeout_s + max(2 * settings.session_reap_interval_s, 30.0),
+    )
+    queue_requester_tracker = SessionRequesterTracker(
+        retention_s=settings.queue_ticket_ttl_s + max(2 * settings.queue_reap_interval_s, 10.0),
+    )
+    return LoadBalancerDependencies(
+        session_manager=session_manager,
+        dashboard_history_store=dashboard_history_store,
+        dashboard=dashboard,
+        requester_identity_resolver=requester_identity_resolver,
+        session_verification_limiter=session_verification_limiter,
+        requester_rate_limiter=requester_rate_limiter,
+        session_requester_tracker=session_requester_tracker,
+        queue_requester_tracker=queue_requester_tracker,
+    )
 
 
 async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
+    dependencies = _current_dependencies()
     session_id = str(result.get("session_id") or "")
     if session_id:
-        outcome = requester_rate_limiter.record_disconnected(
+        outcome = dependencies.requester_rate_limiter.record_disconnected(
             session_id,
             duration_s=_optional_float(result.get("conversation_duration_s")),
             penalize=False,
         )
         if outcome is not None and outcome.connected and outcome.duration_s is not None:
             requester = await _refresh_requester_identity(outcome.requester)
-            await dashboard.record_requester_session_disconnected(
+            await dependencies.dashboard.record_requester_session_disconnected(
                 requester,
                 duration_s=outcome.duration_s,
                 short_session=False,
             )
-    await dashboard.record_session_event(
+    await dependencies.dashboard.record_session_event(
         "disconnected",
         conversation_duration_s=result.get("conversation_duration_s"),
         conversation_counted=bool(result.get("conversation_counted")),
@@ -314,33 +528,35 @@ async def record_abnormal_session_disconnect(result: dict[str, object]) -> None:
 async def record_expired_queue_ticket(ticket_id: str) -> None:
     """Terminal outcome for a queued request whose ticket the reaper dropped:
     the waiter stopped polling, which is the queue's version of abandoning."""
-    requester, _ = queue_requester_tracker.take_with_expiry(ticket_id)
+    dependencies = _current_dependencies()
+    requester, _ = dependencies.queue_requester_tracker.take_with_expiry(ticket_id)
     if requester is not None:
-        requester_rate_limiter.record_allocation_abandoned(requester)
-    await dashboard.record_session_request_abandoned(requester)
+        dependencies.requester_rate_limiter.record_allocation_abandoned(requester)
+    await dependencies.dashboard.record_session_request_abandoned(requester)
 
 
 class LoadBalancerRuntime:
+    def __init__(self, dependencies: LoadBalancerDependencies):
+        self.dependencies = dependencies
+
     async def start(self) -> None:
+        dependencies = self.dependencies
         # Dashboard preview mode uses a synthetic manager with no real sessions.
-        if hasattr(session_manager, "set_abnormal_disconnect_handler"):
-            session_manager.set_abnormal_disconnect_handler(record_abnormal_session_disconnect)
-        if hasattr(session_manager, "set_ticket_expired_handler"):
-            session_manager.set_ticket_expired_handler(record_expired_queue_ticket)
+        if hasattr(dependencies.session_manager, "set_abnormal_disconnect_handler"):
+            dependencies.session_manager.set_abnormal_disconnect_handler(record_abnormal_session_disconnect)
+        if hasattr(dependencies.session_manager, "set_ticket_expired_handler"):
+            dependencies.session_manager.set_ticket_expired_handler(record_expired_queue_ticket)
         logger.info(
             "Session queue %s",
-            "enabled" if session_manager.queue_enabled else "disabled",
+            "enabled" if dependencies.session_manager.queue_enabled else "disabled",
         )
-        await session_manager.start()
-        await dashboard.start()
+        await dependencies.session_manager.start()
+        await dependencies.dashboard.start()
 
     async def stop(self) -> None:
-        await requester_identity_resolver.stop()
-        await dashboard.stop()
-        await session_manager.stop()
-
-
-app = FastAPI(lifespan=build_lifespan(LoadBalancerRuntime()))
+        await self.dependencies.requester_identity_resolver.stop()
+        await self.dependencies.dashboard.stop()
+        await self.dependencies.session_manager.stop()
 
 
 def _log_session_allocation_outcome(
@@ -455,15 +671,20 @@ async def _require_verified_session_requester(
     stage: str,
     wait_for_pending: bool,
 ) -> RequesterIdentity:
+    settings = _current_settings()
+    dependencies = _current_dependencies()
     pending_timed_out = False
     if requester.verification == "verified" and not _session_verification_is_fresh(requester):
         requester = await _start_session_verification(request, requester, force=True)
-    elif requester.verification == "pending" and requester_identity_resolver.validation_task(requester) is None:
+    elif (
+        requester.verification == "pending"
+        and dependencies.requester_identity_resolver.validation_task(requester) is None
+    ):
         requester = await _start_session_verification(request, requester, force=False)
     if wait_for_pending and requester.verification == "pending":
-        requester = await requester_identity_resolver.wait_for_verification(
+        requester = await dependencies.requester_identity_resolver.wait_for_verification(
             requester,
-            timeout_s=SESSION_HF_TOKEN_VERIFY_TIMEOUT_S,
+            timeout_s=settings.session_hf_token_verify_timeout_s,
         )
         pending_timed_out = requester.verification == "pending"
     else:
@@ -488,11 +709,12 @@ async def _start_session_verification(
     *,
     force: bool,
 ) -> RequesterIdentity:
+    dependencies = _current_dependencies()
     token = _request_hf_token(request)
     if token is None:
         return requester
 
-    decision, permit = session_verification_limiter.acquire(requester.network_id)
+    decision, permit = dependencies.session_verification_limiter.acquire(requester.network_id)
     if not decision.allowed or permit is None:
         await _raise_session_auth_rejection(
             requester,
@@ -503,7 +725,7 @@ async def _start_session_verification(
         )
         raise AssertionError("verification quota rejection helper returned")
 
-    requester, task, started = requester_identity_resolver.start_verification(
+    requester, task, started = dependencies.requester_identity_resolver.start_verification(
         token,
         requester,
         force=force,
@@ -523,7 +745,8 @@ async def _raise_session_auth_rejection(
     stage: str,
     status_code: int,
 ) -> None:
-    await dashboard.record_session_auth_rejected(requester)
+    dependencies = _current_dependencies()
+    await dependencies.dashboard.record_session_auth_rejected(requester)
     extra = {
         "outcome": "auth_rejected",
         "auth_rejection_reason": reason,
@@ -550,7 +773,9 @@ async def _raise_session_auth_rejection(
 
     if status_code == 503:
         retry_after_s = (
-            requester_identity_resolver.verification_retry_after_s(requester) if requester is not None else 1
+            dependencies.requester_identity_resolver.verification_retry_after_s(requester)
+            if requester is not None
+            else 1
         )
         raise HTTPException(
             status_code=503,
@@ -593,9 +818,9 @@ def _session_auth_rejection_reason(
 
 
 def _session_verification_is_fresh(requester: RequesterIdentity) -> bool:
-    return requester_identity_resolver.verification_is_fresh(
+    return _current_dependencies().requester_identity_resolver.verification_is_fresh(
         requester,
-        max_age_s=SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S,
+        max_age_s=_current_settings().session_hf_token_max_verified_age_s,
     )
 
 
@@ -629,9 +854,10 @@ def _public_session_allocation(allocation: dict[str, object]) -> dict[str, objec
 
 
 async def _refresh_requester_identity(requester: RequesterIdentity) -> RequesterIdentity:
-    latest = requester_identity_resolver.latest_identity(requester)
+    dependencies = _current_dependencies()
+    latest = dependencies.requester_identity_resolver.latest_identity(requester)
     if latest != requester:
-        await dashboard.update_requester_identity(latest)
+        await dependencies.dashboard.update_requester_identity(latest)
     return latest
 
 
@@ -648,18 +874,20 @@ async def _llm_proxy_fingerprint(request: Request, requester: RequesterIdentity)
     in time get no claim, so their holders get 401 from the LLM paths for
     the session's lifetime. The raw token is never stored or forwarded.
     """
-    if not SESSION_SHARED_SECRET:
+    settings = _current_settings()
+    if not settings.session_shared_secret:
         return None
     token = _request_hf_token(request)
     if token is None or not is_validatable_hf_token(token):
         return None
     if requester.verification == "pending":
-        requester = await requester_identity_resolver.wait_for_verification(
-            requester, timeout_s=LLM_PROXY_CLAIM_VERIFY_TIMEOUT_S
+        requester = await _current_dependencies().requester_identity_resolver.wait_for_verification(
+            requester,
+            timeout_s=settings.llm_proxy_claim_verify_timeout_s,
         )
     if requester.verification != "verified":
         return None
-    return llm_token_fingerprint(SESSION_SHARED_SECRET, token)
+    return llm_token_fingerprint(settings.session_shared_secret, token)
 
 
 def _request_hf_token(request: Request) -> str | None:
@@ -669,8 +897,8 @@ def _request_hf_token(request: Request) -> str | None:
     return token
 
 
-@app.get("/")
 async def root():
+    settings = _current_settings()
     return {
         "message": "s2s load balancer endpoint is up",
         "role": APP_ROLE,
@@ -679,12 +907,11 @@ async def root():
         "session": "/session",
         "dashboard": "/dashboard",
         "dashboard_data": "/dashboard/data",
-        "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
-        "dashboard_preview_mode": DASHBOARD_PREVIEW_MODE,
+        "compute_endpoints": list(settings.compute_endpoint_names),
+        "dashboard_preview_mode": settings.dashboard_preview_mode,
     }
 
 
-@app.get("/ready")
 async def ready():
     return JSONResponse(
         {
@@ -694,22 +921,23 @@ async def ready():
     )
 
 
-@app.get("/health")
 async def health():
-    healthy, detail, snapshot = await session_manager.healthcheck()
-    requester_tracking = requester_identity_resolver.status()
-    requester_tracking["require_verified_hf_token"] = SESSION_REQUIRE_VERIFIED_HF_TOKEN
-    requester_tracking["session_verification_timeout_s"] = SESSION_HF_TOKEN_VERIFY_TIMEOUT_S
-    requester_tracking["session_max_verified_age_s"] = SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S
-    requester_tracking["session_verification_limit"] = session_verification_limiter.status()
-    requester_tracking["pending_session_attributions"] = session_requester_tracker.count()
-    requester_tracking["rate_limit"] = requester_rate_limiter.status()
+    settings = _current_settings()
+    dependencies = _current_dependencies()
+    healthy, detail, snapshot = await dependencies.session_manager.healthcheck()
+    requester_tracking = dependencies.requester_identity_resolver.status()
+    requester_tracking["require_verified_hf_token"] = settings.session_require_verified_hf_token
+    requester_tracking["session_verification_timeout_s"] = settings.session_hf_token_verify_timeout_s
+    requester_tracking["session_max_verified_age_s"] = settings.session_hf_token_max_verified_age_s
+    requester_tracking["session_verification_limit"] = dependencies.session_verification_limiter.status()
+    requester_tracking["pending_session_attributions"] = dependencies.session_requester_tracker.count()
+    requester_tracking["rate_limit"] = dependencies.requester_rate_limiter.status()
     payload = {
         "status": "ok" if healthy else "unhealthy",
         "role": APP_ROLE,
-        "compute_endpoints": COMPUTE_ENDPOINT_NAMES,
-        "dashboard_preview_mode": DASHBOARD_PREVIEW_MODE,
-        "dashboard_history": dashboard.persistence_status(),
+        "compute_endpoints": list(settings.compute_endpoint_names),
+        "dashboard_preview_mode": settings.dashboard_preview_mode,
+        "dashboard_history": dependencies.dashboard.persistence_status(),
         "requester_tracking": requester_tracking,
         "sessions": snapshot,
     }
@@ -718,19 +946,20 @@ async def health():
     return JSONResponse(payload, status_code=200 if healthy else 503)
 
 
-@app.post("/session")
 async def create_session(request: Request):
     """Grant a session if a slot is free and the line is empty, otherwise return a
     queue ticket the caller polls via GET /queue/{id}. 503 with {state:"at_capacity"}
     when the queue itself is full; 503 otherwise when the pool can't allocate."""
+    settings = _current_settings()
+    dependencies = _current_dependencies()
     hardware_id = await reported_hardware_id(request)
-    requester = requester_identity_resolver.identify(
+    requester = dependencies.requester_identity_resolver.identify(
         request,
         hardware_id=hardware_id,
-        schedule_validation=not SESSION_REQUIRE_VERIFIED_HF_TOKEN,
+        schedule_validation=not settings.session_require_verified_hf_token,
     )
-    await dashboard.record_session_request(requester)
-    if SESSION_REQUIRE_VERIFIED_HF_TOKEN:
+    await dependencies.dashboard.record_session_request(requester)
+    if settings.session_require_verified_hf_token:
         requester = await _require_verified_session_requester(
             request,
             requester,
@@ -740,10 +969,10 @@ async def create_session(request: Request):
         )
     else:
         requester = await _refresh_requester_identity(requester)
-    rate_limit_decision = requester_rate_limiter.acquire(requester)
+    rate_limit_decision = dependencies.requester_rate_limiter.acquire(requester)
     if not rate_limit_decision.allowed:
         _log_rate_limit_rejection(rate_limit_decision, requester=requester)
-        await dashboard.record_session_rate_limited(requester)
+        await dependencies.dashboard.record_session_rate_limited(requester)
         retry_after_s = rate_limit_decision.retry_after_s or 1
         raise HTTPException(
             status_code=429,
@@ -756,12 +985,12 @@ async def create_session(request: Request):
         )
     allocation_started_at = monotonic()
     try:
-        allocation = await session_manager.allocate(
+        allocation = await dependencies.session_manager.allocate(
             public_base_url(request),
             llm_fingerprint=await _llm_proxy_fingerprint(request, requester),
         )
     except QueueAtCapacityError as exc:
-        requester_rate_limiter.record_allocation_failure(requester)
+        dependencies.requester_rate_limiter.record_allocation_failure(requester)
         requester = await _refresh_requester_identity(requester)
         allocation_total_ms = elapsed_ms(allocation_started_at, monotonic())
         _log_session_allocation_outcome(
@@ -773,10 +1002,10 @@ async def create_session(request: Request):
             requester=requester,
             error=str(exc),
         )
-        await dashboard.record_session_allocation_failure(requester)
+        await dependencies.dashboard.record_session_allocation_failure(requester)
         return JSONResponse({"state": "at_capacity", "detail": str(exc)}, status_code=503)
     except BaseException as exc:
-        requester_rate_limiter.record_allocation_failure(requester)
+        dependencies.requester_rate_limiter.record_allocation_failure(requester)
         if not isinstance(exc, Exception):
             raise
         requester = await _refresh_requester_identity(requester)
@@ -792,41 +1021,42 @@ async def create_session(request: Request):
             requester=requester,
             error=str(exc),
         )
-        await dashboard.record_session_allocation_failure(requester)
+        await dependencies.dashboard.record_session_allocation_failure(requester)
         raise HTTPException(status_code=503, detail=f"Failed to allocate compute endpoint: {exc}") from exc
 
     # No slot free (and/or others waiting): the caller joined the queue. Keep the
     # requester identity for the claim — queue polls are bodyless GETs that can't
     # re-derive it.
     if allocation.get("state") == "queued":
-        queue_requester_tracker.remember(str(allocation["queue_id"]), requester)
+        dependencies.queue_requester_tracker.remember(str(allocation["queue_id"]), requester)
         return JSONResponse(allocation)
 
     return await _deliver_grant(request, allocation, allocation_started_at, requester)
 
 
-@app.get("/queue/{queue_id}")
 async def queue_status(queue_id: str, request: Request):
     """Advance a waiting ticket: report position, or — for the head of the line —
     hand back a session grant once a slot frees. 404 for an unknown/expired ticket.
     404 for everything when the queue is disabled — indistinguishable from main,
     where these routes don't exist."""
-    if not session_manager.queue_enabled:
+    settings = _current_settings()
+    dependencies = _current_dependencies()
+    if not dependencies.session_manager.queue_enabled:
         raise HTTPException(status_code=404, detail="Not found.")
 
     requester: RequesterIdentity | None = None
-    if SESSION_REQUIRE_VERIFIED_HF_TOKEN:
-        requester, requester_expired = queue_requester_tracker.get_with_expiry(queue_id)
+    if settings.session_require_verified_hf_token:
+        requester, requester_expired = dependencies.queue_requester_tracker.get_with_expiry(queue_id)
         if requester is None or requester_expired:
             # Do not let the manager claim a free slot when the authorization
             # context associated with this ticket has disappeared. Removing the
             # ticket also prevents repeated attempts from reaching allocation.
-            left = await session_manager.leave(queue_id)
+            left = await dependencies.session_manager.leave(queue_id)
             if not left:
                 raise HTTPException(status_code=404, detail="Unknown or expired ticket.")
-            queue_requester_tracker.discard(queue_id)
+            dependencies.queue_requester_tracker.discard(queue_id)
             if requester is not None:
-                requester_rate_limiter.record_allocation_auth_rejection(requester)
+                dependencies.requester_rate_limiter.record_allocation_auth_rejection(requester)
             await _raise_session_auth_rejection(
                 requester,
                 reason="queue_identity_expired" if requester_expired else "queue_identity_missing",
@@ -836,11 +1066,11 @@ async def queue_status(queue_id: str, request: Request):
             )
         requester = await _refresh_requester_identity(requester)
         if not _session_verification_is_fresh(requester):
-            left = await session_manager.leave(queue_id)
+            left = await dependencies.session_manager.leave(queue_id)
             if not left:
                 raise HTTPException(status_code=404, detail="Unknown or expired ticket.")
-            queue_requester_tracker.discard(queue_id)
-            requester_rate_limiter.record_allocation_auth_rejection(requester)
+            dependencies.queue_requester_tracker.discard(queue_id)
+            dependencies.requester_rate_limiter.record_allocation_auth_rejection(requester)
             await _raise_session_auth_rejection(
                 requester,
                 reason=_session_auth_rejection_reason(requester, pending_timed_out=True),
@@ -851,7 +1081,7 @@ async def queue_status(queue_id: str, request: Request):
 
     poll_started_at = monotonic()
     try:
-        result = await session_manager.poll(queue_id, public_base_url(request))
+        result = await dependencies.session_manager.poll(queue_id, public_base_url(request))
     except KeyError:
         raise HTTPException(status_code=404, detail="Unknown or expired ticket.") from None
     except Exception as exc:
@@ -859,15 +1089,15 @@ async def queue_status(queue_id: str, request: Request):
         # 500s. The manager re-queues the ticket at the head on a failed claim,
         # so the caller keeps its place and simply polls again.
         if requester is not None:
-            queue_requester_tracker.remember(queue_id, requester)
+            dependencies.queue_requester_tracker.remember(queue_id, requester)
         raise HTTPException(status_code=503, detail=f"Failed to claim session: {exc}") from exc
 
-    tracked_requester = queue_requester_tracker.take(queue_id)
+    tracked_requester = dependencies.queue_requester_tracker.take(queue_id)
     if tracked_requester is not None:
         requester = tracked_requester
     if result.get("state") == "queued":
         if requester is not None:
-            queue_requester_tracker.remember(queue_id, requester)  # refresh retention
+            dependencies.queue_requester_tracker.remember(queue_id, requester)  # refresh retention
         return JSONResponse(result)
 
     # Head of line claimed a slot — same delivery path as a fast-path grant. The
@@ -875,23 +1105,23 @@ async def queue_status(queue_id: str, request: Request):
     # (bodyless, so IP-only) only happens if the tracker entry expired.
     if requester is None:
         hardware_id = await reported_hardware_id(request)
-        requester = requester_identity_resolver.identify(request, hardware_id=hardware_id)
+        requester = dependencies.requester_identity_resolver.identify(request, hardware_id=hardware_id)
     return await _deliver_grant(request, result, poll_started_at, requester, http_route="GET /queue/{queue_id}")
 
 
-@app.delete("/queue/{queue_id}")
 async def queue_leave(queue_id: str):
     """Leave the queue early (explicit button / teardown beacon). Idempotent."""
-    if not session_manager.queue_enabled:
+    dependencies = _current_dependencies()
+    if not dependencies.session_manager.queue_enabled:
         raise HTTPException(status_code=404, detail="Not found.")
-    left = await session_manager.leave(queue_id)
-    requester, _ = queue_requester_tracker.take_with_expiry(queue_id)
+    left = await dependencies.session_manager.leave(queue_id)
+    requester, _ = dependencies.queue_requester_tracker.take_with_expiry(queue_id)
     if left:
         # Terminal outcome for the queued request: leaving the line is the queue's
         # version of abandoning before delivery.
         if requester is not None:
-            requester_rate_limiter.record_allocation_abandoned(requester)
-        await dashboard.record_session_request_abandoned(requester)
+            dependencies.requester_rate_limiter.record_allocation_abandoned(requester)
+        await dependencies.dashboard.record_session_request_abandoned(requester)
     return JSONResponse({"status": "ok", "state": "left", "removed": left})
 
 
@@ -905,17 +1135,19 @@ async def _deliver_grant(
 ) -> JSONResponse:
     """Shared tail for a granted session (fast path or queue claim): guard against a
     client that vanished, record the success, and return the public grant fields."""
+    settings = _current_settings()
+    dependencies = _current_dependencies()
     allocation_total_ms = elapsed_ms(started_at, monotonic())
     allocation_wait_ms = _allocation_wait_ms(allocation, fallback_ms=allocation_total_ms)
     allocation.setdefault("allocation_wait_ms", allocation_wait_ms)
     session_id = str(allocation.get("session_id") or "")
 
-    if SESSION_REQUIRE_VERIFIED_HF_TOKEN:
+    if settings.session_require_verified_hf_token:
         requester = await _refresh_requester_identity(requester)
         if not _session_verification_is_fresh(requester):
-            if session_id and hasattr(session_manager, "cancel_pending_session"):
-                await session_manager.cancel_pending_session(session_id)
-            requester_rate_limiter.record_allocation_auth_rejection(requester)
+            if session_id and hasattr(dependencies.session_manager, "cancel_pending_session"):
+                await dependencies.session_manager.cancel_pending_session(session_id)
+            dependencies.requester_rate_limiter.record_allocation_auth_rejection(requester)
             await _raise_session_auth_rejection(
                 requester,
                 reason=_session_auth_rejection_reason(requester, pending_timed_out=True),
@@ -925,13 +1157,13 @@ async def _deliver_grant(
             )
 
     if session_id:
-        requester_rate_limiter.record_allocation(
+        dependencies.requester_rate_limiter.record_allocation(
             session_id,
             requester,
-            pending_timeout_s=float(allocation.get("pending_timeout_s") or SESSION_PENDING_TIMEOUT_S),
+            pending_timeout_s=float(allocation.get("pending_timeout_s") or settings.session_pending_timeout_s),
         )
     else:
-        requester_rate_limiter.record_allocation_failure(requester)
+        dependencies.requester_rate_limiter.record_allocation_failure(requester)
 
     if await request.is_disconnected():
         requester = await _refresh_requester_identity(requester)
@@ -940,10 +1172,10 @@ async def _deliver_grant(
         no_connect_penalty_excluded = bool(allocation.get("waited_for_capacity")) or (
             http_route == "GET /queue/{queue_id}"
         )
-        if session_id and hasattr(session_manager, "cancel_pending_session"):
-            await session_manager.cancel_pending_session(session_id)
+        if session_id and hasattr(dependencies.session_manager, "cancel_pending_session"):
+            await dependencies.session_manager.cancel_pending_session(session_id)
         if session_id:
-            requester_rate_limiter.record_disconnected(
+            dependencies.requester_rate_limiter.record_disconnected(
                 session_id,
                 penalize=not no_connect_penalty_excluded,
             )
@@ -957,13 +1189,13 @@ async def _deliver_grant(
             http_route=http_route,
             no_connect_penalty_excluded=no_connect_penalty_excluded,
         )
-        await dashboard.record_session_request_abandoned(requester)
+        await dependencies.dashboard.record_session_request_abandoned(requester)
         raise HTTPException(status_code=503, detail="Client disconnected before session could be delivered")
 
     requester = await _refresh_requester_identity(requester)
     if session_id:
-        session_requester_tracker.remember(session_id, requester)
-    await dashboard.record_session_allocation_success(requester)
+        dependencies.session_requester_tracker.remember(session_id, requester)
+    await dependencies.dashboard.record_session_allocation_success(requester)
     _log_session_allocation_outcome(
         "success",
         allocation=allocation,
@@ -978,8 +1210,8 @@ async def _deliver_grant(
     return JSONResponse(_public_session_allocation(allocation))
 
 
-@app.post("/internal/sessions/{session_id}/event")
 async def session_event(session_id: str, payload: dict[str, Any]):
+    dependencies = _current_dependencies()
     session_token = str(payload.get("session_token", "")).strip()
     event = str(payload.get("event", "")).strip()
     if not session_token:
@@ -988,29 +1220,29 @@ async def session_event(session_id: str, payload: dict[str, Any]):
         raise HTTPException(status_code=400, detail="event is required")
 
     try:
-        result = await session_manager.handle_event(session_id, session_token, event)
+        result = await dependencies.session_manager.handle_event(session_id, session_token, event)
     except KeyError:
         if event == "disconnected":
-            requester_rate_limiter.record_disconnected(session_id)
-            session_requester_tracker.discard(session_id)
+            dependencies.requester_rate_limiter.record_disconnected(session_id)
+            dependencies.session_requester_tracker.discard(session_id)
             return JSONResponse({"status": "ok", "session_id": session_id, "state": "already_released"})
         raise HTTPException(status_code=404, detail="Unknown session id") from None
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    await dashboard.record_session_event(
+    await dependencies.dashboard.record_session_event(
         event,
         conversation_duration_s=result.get("conversation_duration_s"),
         conversation_counted=bool(result.get("conversation_counted")),
     )
     if event == "connected":
-        requester_rate_limiter.record_connected(session_id)
-        requester = session_requester_tracker.take(session_id)
+        dependencies.requester_rate_limiter.record_connected(session_id)
+        requester = dependencies.session_requester_tracker.take(session_id)
         if requester is not None:
             requester = await _refresh_requester_identity(requester)
-            await dashboard.record_requester_session_connected(requester)
+            await dependencies.dashboard.record_requester_session_connected(requester)
     elif event == "disconnected":
-        outcome = requester_rate_limiter.record_disconnected(
+        outcome = dependencies.requester_rate_limiter.record_disconnected(
             session_id,
             duration_s=_optional_float(result.get("conversation_duration_s")),
             penalize=(
@@ -1019,16 +1251,15 @@ async def session_event(session_id: str, payload: dict[str, Any]):
         )
         if outcome is not None and outcome.connected and outcome.duration_s is not None:
             requester = await _refresh_requester_identity(outcome.requester)
-            await dashboard.record_requester_session_disconnected(
+            await dependencies.dashboard.record_requester_session_disconnected(
                 requester,
                 duration_s=outcome.duration_s,
                 short_session=outcome.short_session,
             )
-        session_requester_tracker.discard(session_id)
+        dependencies.session_requester_tracker.discard(session_id)
     return JSONResponse(result)
 
 
-@app.get("/internal/endpoints/{endpoint_name}")
 async def endpoint_status(endpoint_name: str, request: Request):
     require_admin_auth(request)
 
@@ -1042,11 +1273,10 @@ async def endpoint_status(endpoint_name: str, request: Request):
     )
 
 
-@app.post("/internal/endpoints/{endpoint_name}/drain")
 async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str, Any]):
     require_admin_auth(request)
 
-    endpoint_router = getattr(session_manager, "endpoint_router", None)
+    endpoint_router = getattr(_current_dependencies().session_manager, "endpoint_router", None)
     if endpoint_router is None:
         raise HTTPException(status_code=503, detail="Endpoint draining is not available")
 
@@ -1095,6 +1325,7 @@ async def endpoint_drain(endpoint_name: str, request: Request, payload: dict[str
 
 
 async def get_endpoint_snapshot(endpoint_name: str) -> dict[str, object]:
+    session_manager = _current_dependencies().session_manager
     endpoint_router = getattr(session_manager, "endpoint_router", None)
     if endpoint_router is None:
         raise HTTPException(status_code=503, detail="Endpoint status is not available")
@@ -1112,7 +1343,8 @@ async def get_endpoint_snapshot(endpoint_name: str) -> dict[str, object]:
 
 
 def require_admin_auth(request: Request) -> None:
-    if not LB_ADMIN_AUTH_TOKEN:
+    admin_auth_token = _current_settings().lb_admin_auth_token
+    if not admin_auth_token:
         raise HTTPException(status_code=503, detail="LB admin auth token is not configured")
 
     token = _bearer_token(request.headers.get("authorization"))
@@ -1122,7 +1354,7 @@ def require_admin_auth(request: Request) -> None:
             detail="Missing admin bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if not secrets.compare_digest(token, LB_ADMIN_AUTH_TOKEN):
+    if not secrets.compare_digest(token, admin_auth_token):
         raise HTTPException(status_code=403, detail="Invalid admin authorization")
 
 
@@ -1130,23 +1362,86 @@ def _bearer_token(authorization: str | None) -> str | None:
     return bearer_token(authorization)
 
 
-@app.websocket("/ws")
 async def deprecated_websocket_route(client_ws: WebSocket):
     await client_ws.close(
         code=1008, reason="Use POST /session and connect directly to the returned compute websocket URL"
     )
 
 
-@app.get("/dashboard")
 async def dashboard_page():
-    return HTMLResponse(dashboard.html())
+    return HTMLResponse(_current_dependencies().dashboard.html())
 
 
-@app.get("/dashboard/data")
 async def dashboard_data(window: str = "6h", resolution: str = ""):
     try:
-        payload = await dashboard.data(window=window, resolution=resolution or None)
+        payload = await _current_dependencies().dashboard.data(
+            window=window,
+            resolution=resolution or None,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return JSONResponse(payload)
+
+
+def _build_load_balancer_app(
+    settings: LoadBalancerSettings,
+    dependencies: LoadBalancerDependencies,
+    *,
+    isolated: bool,
+) -> FastAPI:
+    application = FastAPI(lifespan=build_lifespan(LoadBalancerRuntime(dependencies)))
+    application.state.settings = settings
+    application.state.dependencies = dependencies
+    if isolated:
+        application.add_middleware(
+            _LoadBalancerContextMiddleware,
+            context=_LoadBalancerApplicationContext(settings, dependencies),
+        )
+
+    application.add_api_route("/", root, methods=["GET"])
+    application.add_api_route("/ready", ready, methods=["GET"])
+    application.add_api_route("/health", health, methods=["GET"])
+    application.add_api_route("/session", create_session, methods=["POST"])
+    application.add_api_route("/queue/{queue_id}", queue_status, methods=["GET"])
+    application.add_api_route("/queue/{queue_id}", queue_leave, methods=["DELETE"])
+    application.add_api_route(
+        "/internal/sessions/{session_id}/event",
+        session_event,
+        methods=["POST"],
+    )
+    application.add_api_route(
+        "/internal/endpoints/{endpoint_name}",
+        endpoint_status,
+        methods=["GET"],
+    )
+    application.add_api_route(
+        "/internal/endpoints/{endpoint_name}/drain",
+        endpoint_drain,
+        methods=["POST"],
+    )
+    application.add_api_websocket_route("/ws", deprecated_websocket_route)
+    application.add_api_route("/dashboard", dashboard_page, methods=["GET"])
+    application.add_api_route("/dashboard/data", dashboard_data, methods=["GET"])
+    return application
+
+
+def create_app(
+    settings: LoadBalancerSettings,
+    dependencies: LoadBalancerDependencies | None = None,
+) -> FastAPI:
+    """Create an isolated load-balancer application from explicit configuration."""
+    resolved_dependencies = dependencies or build_load_balancer_dependencies(settings)
+    return _build_load_balancer_app(settings, resolved_dependencies, isolated=True)
+
+
+_module_dependencies = build_load_balancer_dependencies(_module_settings)
+session_manager = _module_dependencies.session_manager
+dashboard_history_store = _module_dependencies.dashboard_history_store
+dashboard = _module_dependencies.dashboard
+requester_identity_resolver = _module_dependencies.requester_identity_resolver
+session_verification_limiter = _module_dependencies.session_verification_limiter
+requester_rate_limiter = _module_dependencies.requester_rate_limiter
+session_requester_tracker = _module_dependencies.session_requester_tracker
+queue_requester_tracker = _module_dependencies.queue_requester_tracker
+app = _build_load_balancer_app(_module_settings, _module_dependencies, isolated=False)

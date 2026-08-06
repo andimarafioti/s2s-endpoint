@@ -1,7 +1,7 @@
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Protocol
+from typing import Mapping, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -14,6 +14,41 @@ class LifecycleManager(Protocol):
     async def start(self) -> None: ...
 
     async def stop(self) -> None: ...
+
+
+TRUE_ENV_VALUES = frozenset({"1", "true", "yes"})
+
+
+def env_text(
+    name: str,
+    default: str = "",
+    *,
+    environ: Mapping[str, str] | None = None,
+    strip: bool = True,
+) -> str:
+    """Read a text setting from an explicit environment mapping."""
+    source = os.environ if environ is None else environ
+    value = source.get(name, default)
+    return value.strip() if strip else value
+
+
+def env_optional(name: str, *, environ: Mapping[str, str] | None = None) -> str | None:
+    """Return a stripped environment value, treating blank as unset."""
+    return env_text(name, environ=environ) or None
+
+
+def env_bool(
+    name: str,
+    default: bool = False,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Parse the boolean spellings accepted by all application settings."""
+    source = os.environ if environ is None else environ
+    value = source.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in TRUE_ENV_VALUES
 
 
 def setup_logging() -> logging.Logger:

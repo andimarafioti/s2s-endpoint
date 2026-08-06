@@ -1,19 +1,20 @@
 import asyncio
 import json
-import os
 import subprocess
 import time
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
-from typing import Optional
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Mapping, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from app.app_utils import build_lifespan, setup_logging
+from app.app_utils import build_lifespan, env_bool, env_text, setup_logging
 from app.requester_identity import bearer_token
 from app.session_router import SessionRouter
 from app.session_tokens import llm_token_fingerprint, verify_session_token, websocket_host_matches
@@ -22,65 +23,130 @@ from app.ws_proxy import proxy_websocket
 logger = setup_logging()
 APP_ROLE = "compute"
 
-INTERNAL_WS_HOST = os.getenv("INTERNAL_WS_HOST", "127.0.0.1")
-INTERNAL_WS_BASE_PORT = int(os.getenv("INTERNAL_WS_PORT", "9000"))
-
-S2S_REPO_DIR = os.getenv("S2S_REPO_DIR", "/opt/speech-to-speech")
-NUM_PIPELINES = os.getenv("NUM_PIPELINES", "1").strip()
-
-# Core pipeline selection
-LANGUAGE = os.getenv("LANGUAGE", "en").strip()
-CHAT_SIZE = os.getenv("CHAT_SIZE", "30").strip()
-
-STT = os.getenv("STT", "parakeet-tdt").strip()
-LLM = os.getenv("LLM", "chat-completions").strip()
-TTS = os.getenv("TTS", "qwen3").strip()
-
-# General module flags
-ENABLE_LIVE_TRANSCRIPTION = os.getenv("ENABLE_LIVE_TRANSCRIPTION", "1").strip().lower() in {"1", "true", "yes"}
-LIVE_TRANSCRIPTION_UPDATE_INTERVAL = os.getenv("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", "").strip()
-ENABLE_SMART_TURN = os.getenv("ENABLE_SMART_TURN", "1").strip().lower() in {"1", "true", "yes"}
-SMART_TURN_MODEL_PATH = os.getenv("SMART_TURN_MODEL_PATH", "").strip()
-# Master switch for the LLM proxy feature: passes --enable_llm_proxy to the
-# internal speech-to-speech server (which defaults the routes off) and opens
-# the replica's /v1/chat/completions and /v1/responses proxy paths. When off,
-# those paths answer 404, indistinguishable from a build without the feature.
-ENABLE_LLM_PROXY = os.getenv("ENABLE_LLM_PROXY", "0").strip().lower() in {"1", "true", "yes"}
-
-# Responses API / HF router
-MODEL_NAME = os.getenv("MODEL_NAME", "").strip()
-INIT_CHAT_PROMPT = os.getenv("INIT_CHAT_PROMPT", "gpt-5.4").strip()
-RESPONSES_API_BASE_URL = os.getenv("RESPONSES_API_BASE_URL", "").strip()
-RESPONSES_API_API_KEY = os.getenv("RESPONSES_API_API_KEY", "").strip() or os.getenv("HF_TOKEN", "").strip()
-RESPONSES_API_REASONING_EFFORT = os.getenv("RESPONSES_API_REASONING_EFFORT", "").strip()
-RESPONSES_API_STREAM = os.getenv("RESPONSES_API_STREAM", "1").strip().lower() in {"1", "true", "yes"}
-
-# Optional generic extras for power users
-EXTRA_S2S_ARGS = os.getenv("EXTRA_S2S_ARGS", "").strip()
-
-SESSION_SHARED_SECRET = os.getenv("SESSION_SHARED_SECRET", "").strip()
-LB_CALLBACK_AUTH_TOKEN = os.getenv("LB_CALLBACK_AUTH_TOKEN", "").strip()
-# Disconnect notifications are retried so a transient LB timeout or 503 does
-# not leave a session counted as connected forever (connected sessions are
-# never reaped by the pending-session reaper). Defaults give backoff waits of
-# 1s/3s/9s/27s, roughly 40s of coverage: enough to ride out an LB redeploy or
-# brief network partition, which is precisely the case sync gating cannot
-# cover (the LB stayed up, so its in-memory session survives).
-LB_CALLBACK_RETRY_ATTEMPTS = max(int(os.getenv("LB_CALLBACK_RETRY_ATTEMPTS", "5")), 1)
-LB_CALLBACK_RETRY_BACKOFF_S = max(float(os.getenv("LB_CALLBACK_RETRY_BACKOFF_S", "1.0")), 0.0)
-
 INTERNAL_SLOT_WS_PATH = "/v1/realtime"
 PUBLIC_WS_PATH = "/v1/realtime"
-INTERNAL_WS_URL = f"ws://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_SLOT_WS_PATH}"
 INTERNAL_USAGE_PATH = "/v1/usage"
-INTERNAL_USAGE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_USAGE_PATH}"
 INTERNAL_POOL_PATH = "/v1/pool"
-INTERNAL_POOL_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}{INTERNAL_POOL_PATH}"
-INTERNAL_HTTP_BASE_URL = f"http://{INTERNAL_WS_HOST}:{INTERNAL_WS_BASE_PORT}"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
-# Sliding-window ceiling per HF token fingerprint. Zero or negative closes
-# the LLM proxy paths entirely (every request answers 429).
-LLM_PROXY_REQUESTS_PER_MINUTE = int(os.getenv("LLM_PROXY_REQUESTS_PER_MINUTE", "20"))
+
+
+@dataclass(frozen=True)
+class ComputeSettings:
+    internal_ws_host: str = "127.0.0.1"
+    internal_ws_base_port: int = 9000
+    s2s_repo_dir: str = "/opt/speech-to-speech"
+    num_pipelines: str = "1"
+    language: str = "en"
+    chat_size: str = "30"
+    stt: str = "parakeet-tdt"
+    llm: str = "chat-completions"
+    tts: str = "qwen3"
+    enable_live_transcription: bool = True
+    live_transcription_update_interval: str = ""
+    enable_smart_turn: bool = True
+    smart_turn_model_path: str = ""
+    enable_llm_proxy: bool = False
+    model_name: str = ""
+    init_chat_prompt: str = "gpt-5.4"
+    responses_api_base_url: str = ""
+    responses_api_api_key: str = ""
+    responses_api_reasoning_effort: str = ""
+    responses_api_stream: bool = True
+    extra_s2s_args: str = ""
+    session_shared_secret: str = ""
+    lb_callback_auth_token: str = ""
+    lb_callback_retry_attempts: int = 5
+    lb_callback_retry_backoff_s: float = 1.0
+    llm_proxy_requests_per_minute: int = 20
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "ComputeSettings":
+        responses_api_api_key = env_text("RESPONSES_API_API_KEY", environ=environ)
+        if not responses_api_api_key:
+            responses_api_api_key = env_text("HF_TOKEN", environ=environ)
+        return cls(
+            internal_ws_host=env_text("INTERNAL_WS_HOST", "127.0.0.1", environ=environ, strip=False),
+            internal_ws_base_port=int(env_text("INTERNAL_WS_PORT", "9000", environ=environ, strip=False)),
+            s2s_repo_dir=env_text("S2S_REPO_DIR", "/opt/speech-to-speech", environ=environ, strip=False),
+            num_pipelines=env_text("NUM_PIPELINES", "1", environ=environ),
+            language=env_text("LANGUAGE", "en", environ=environ),
+            chat_size=env_text("CHAT_SIZE", "30", environ=environ),
+            stt=env_text("STT", "parakeet-tdt", environ=environ),
+            llm=env_text("LLM", "chat-completions", environ=environ),
+            tts=env_text("TTS", "qwen3", environ=environ),
+            enable_live_transcription=env_bool("ENABLE_LIVE_TRANSCRIPTION", True, environ=environ),
+            live_transcription_update_interval=env_text("LIVE_TRANSCRIPTION_UPDATE_INTERVAL", environ=environ),
+            enable_smart_turn=env_bool("ENABLE_SMART_TURN", True, environ=environ),
+            smart_turn_model_path=env_text("SMART_TURN_MODEL_PATH", environ=environ),
+            enable_llm_proxy=env_bool("ENABLE_LLM_PROXY", False, environ=environ),
+            model_name=env_text("MODEL_NAME", environ=environ),
+            init_chat_prompt=env_text("INIT_CHAT_PROMPT", "gpt-5.4", environ=environ),
+            responses_api_base_url=env_text("RESPONSES_API_BASE_URL", environ=environ),
+            responses_api_api_key=responses_api_api_key,
+            responses_api_reasoning_effort=env_text("RESPONSES_API_REASONING_EFFORT", environ=environ),
+            responses_api_stream=env_bool("RESPONSES_API_STREAM", True, environ=environ),
+            extra_s2s_args=env_text("EXTRA_S2S_ARGS", environ=environ),
+            session_shared_secret=env_text("SESSION_SHARED_SECRET", environ=environ),
+            lb_callback_auth_token=env_text("LB_CALLBACK_AUTH_TOKEN", environ=environ),
+            lb_callback_retry_attempts=max(
+                int(env_text("LB_CALLBACK_RETRY_ATTEMPTS", "5", environ=environ)),
+                1,
+            ),
+            lb_callback_retry_backoff_s=max(
+                float(env_text("LB_CALLBACK_RETRY_BACKOFF_S", "1.0", environ=environ)),
+                0.0,
+            ),
+            llm_proxy_requests_per_minute=int(env_text("LLM_PROXY_REQUESTS_PER_MINUTE", "20", environ=environ)),
+        )
+
+    @property
+    def internal_ws_url(self) -> str:
+        return f"ws://{self.internal_ws_host}:{self.internal_ws_base_port}{INTERNAL_SLOT_WS_PATH}"
+
+    @property
+    def internal_usage_url(self) -> str:
+        return f"http://{self.internal_ws_host}:{self.internal_ws_base_port}{INTERNAL_USAGE_PATH}"
+
+    @property
+    def internal_pool_url(self) -> str:
+        return f"http://{self.internal_ws_host}:{self.internal_ws_base_port}{INTERNAL_POOL_PATH}"
+
+    @property
+    def internal_http_base_url(self) -> str:
+        return f"http://{self.internal_ws_host}:{self.internal_ws_base_port}"
+
+
+_module_settings = ComputeSettings.from_env()
+INTERNAL_WS_HOST = _module_settings.internal_ws_host
+INTERNAL_WS_BASE_PORT = _module_settings.internal_ws_base_port
+S2S_REPO_DIR = _module_settings.s2s_repo_dir
+NUM_PIPELINES = _module_settings.num_pipelines
+LANGUAGE = _module_settings.language
+CHAT_SIZE = _module_settings.chat_size
+STT = _module_settings.stt
+LLM = _module_settings.llm
+TTS = _module_settings.tts
+ENABLE_LIVE_TRANSCRIPTION = _module_settings.enable_live_transcription
+LIVE_TRANSCRIPTION_UPDATE_INTERVAL = _module_settings.live_transcription_update_interval
+ENABLE_SMART_TURN = _module_settings.enable_smart_turn
+SMART_TURN_MODEL_PATH = _module_settings.smart_turn_model_path
+ENABLE_LLM_PROXY = _module_settings.enable_llm_proxy
+MODEL_NAME = _module_settings.model_name
+INIT_CHAT_PROMPT = _module_settings.init_chat_prompt
+RESPONSES_API_BASE_URL = _module_settings.responses_api_base_url
+RESPONSES_API_API_KEY = _module_settings.responses_api_api_key
+RESPONSES_API_REASONING_EFFORT = _module_settings.responses_api_reasoning_effort
+RESPONSES_API_STREAM = _module_settings.responses_api_stream
+EXTRA_S2S_ARGS = _module_settings.extra_s2s_args
+SESSION_SHARED_SECRET = _module_settings.session_shared_secret
+LB_CALLBACK_AUTH_TOKEN = _module_settings.lb_callback_auth_token
+LB_CALLBACK_RETRY_ATTEMPTS = _module_settings.lb_callback_retry_attempts
+LB_CALLBACK_RETRY_BACKOFF_S = _module_settings.lb_callback_retry_backoff_s
+INTERNAL_WS_URL = _module_settings.internal_ws_url
+INTERNAL_USAGE_URL = _module_settings.internal_usage_url
+INTERNAL_POOL_URL = _module_settings.internal_pool_url
+INTERNAL_HTTP_BASE_URL = _module_settings.internal_http_base_url
+LLM_PROXY_REQUESTS_PER_MINUTE = _module_settings.llm_proxy_requests_per_minute
 
 if not SESSION_SHARED_SECRET:
     logger.warning("SESSION_SHARED_SECRET is unset; the LLM proxy paths fail closed and answer 401 for every request")
@@ -96,14 +162,19 @@ def _add_str_flag(cmd: list[str], value: str, flag: str) -> None:
         cmd.extend([flag, value])
 
 
-def build_s2s_command(host: str, port: int) -> list[str]:
+def build_s2s_command(
+    host: str,
+    port: int,
+    settings: ComputeSettings | None = None,
+) -> list[str]:
+    settings = settings or _current_settings()
     cmd = [
         "uv",
         "run",
         "--no-dev",
         "--no-sync",
         "--directory",
-        S2S_REPO_DIR,
+        settings.s2s_repo_dir,
         "speech-to-speech",
         "--mode",
         "realtime",
@@ -114,39 +185,39 @@ def build_s2s_command(host: str, port: int) -> list[str]:
         "--device",
         "cuda",
         "--language",
-        LANGUAGE,
+        settings.language,
         "--chat_size",
-        CHAT_SIZE,
+        settings.chat_size,
         "--stt",
-        STT,
+        settings.stt,
         "--llm_backend",
-        LLM,
+        settings.llm,
         "--tts",
-        TTS,
+        settings.tts,
     ]
 
-    _add_str_flag(cmd, NUM_PIPELINES, "--num_pipelines")
-    _add_bool_flag(cmd, ENABLE_LLM_PROXY, "--enable_llm_proxy")
-    _add_bool_flag(cmd, ENABLE_LIVE_TRANSCRIPTION, "--enable_live_transcription")
-    _add_str_flag(cmd, LIVE_TRANSCRIPTION_UPDATE_INTERVAL, "--live_transcription_update_interval")
-    if ENABLE_SMART_TURN:
-        _add_str_flag(cmd, SMART_TURN_MODEL_PATH, "--smart_turn_model_path")
+    _add_str_flag(cmd, settings.num_pipelines, "--num_pipelines")
+    _add_bool_flag(cmd, settings.enable_llm_proxy, "--enable_llm_proxy")
+    _add_bool_flag(cmd, settings.enable_live_transcription, "--enable_live_transcription")
+    _add_str_flag(cmd, settings.live_transcription_update_interval, "--live_transcription_update_interval")
+    if settings.enable_smart_turn:
+        _add_str_flag(cmd, settings.smart_turn_model_path, "--smart_turn_model_path")
     else:
         cmd.append("--no_smart_turn")
-    _add_str_flag(cmd, MODEL_NAME, "--model_name")
-    _add_str_flag(cmd, INIT_CHAT_PROMPT, "--init_chat_prompt")
+    _add_str_flag(cmd, settings.model_name, "--model_name")
+    _add_str_flag(cmd, settings.init_chat_prompt, "--init_chat_prompt")
 
-    if LLM in {"responses-api", "chat-completions"}:
-        if RESPONSES_API_BASE_URL:
-            _add_str_flag(cmd, RESPONSES_API_BASE_URL, "--responses_api_base_url")
-        if RESPONSES_API_API_KEY:
-            _add_str_flag(cmd, RESPONSES_API_API_KEY, "--responses_api_api_key")
-        if RESPONSES_API_REASONING_EFFORT:
-            _add_str_flag(cmd, RESPONSES_API_REASONING_EFFORT, "--responses_api_reasoning_effort")
-        _add_bool_flag(cmd, RESPONSES_API_STREAM, "--responses_api_stream")
+    if settings.llm in {"responses-api", "chat-completions"}:
+        if settings.responses_api_base_url:
+            _add_str_flag(cmd, settings.responses_api_base_url, "--responses_api_base_url")
+        if settings.responses_api_api_key:
+            _add_str_flag(cmd, settings.responses_api_api_key, "--responses_api_api_key")
+        if settings.responses_api_reasoning_effort:
+            _add_str_flag(cmd, settings.responses_api_reasoning_effort, "--responses_api_reasoning_effort")
+        _add_bool_flag(cmd, settings.responses_api_stream, "--responses_api_stream")
 
-    if EXTRA_S2S_ARGS:
-        cmd.extend(EXTRA_S2S_ARGS.split())
+    if settings.extra_s2s_args:
+        cmd.extend(settings.extra_s2s_args.split())
 
     return cmd
 
@@ -180,40 +251,27 @@ async def wait_for_internal_server(
         await asyncio.sleep(2.0)
 
 
-session_router = SessionRouter(
-    host=INTERNAL_WS_HOST,
-    base_port=INTERNAL_WS_BASE_PORT,
-    ws_path=INTERNAL_SLOT_WS_PATH,
-    repo_dir=S2S_REPO_DIR,
-    build_command=build_s2s_command,
-    wait_for_ready=wait_for_internal_server,
-    max_sessions=int(NUM_PIPELINES),
-)
-
-app = FastAPI(lifespan=build_lifespan(session_router))
-
-
-@app.get("/")
 async def root():
+    settings = _current_settings()
     return {
         "message": "s2s compute endpoint is up",
         "role": APP_ROLE,
         "health": "/health",
         "websocket": PUBLIC_WS_PATH,
-        "internal_ws": INTERNAL_WS_URL,
-        "internal_usage": INTERNAL_USAGE_URL,
+        "internal_ws": settings.internal_ws_url,
+        "internal_usage": settings.internal_usage_url,
         "config": {
-            "stt": STT,
-            "llm": LLM,
-            "tts": TTS,
-            "language": LANGUAGE,
+            "stt": settings.stt,
+            "llm": settings.llm,
+            "tts": settings.tts,
+            "language": settings.language,
         },
     }
 
 
-@app.get("/health")
 async def health():
-    healthy, detail, snapshot = await session_router.healthcheck()
+    settings = _current_settings()
+    healthy, detail, snapshot = await _current_dependencies().session_router.healthcheck()
     if not healthy:
         raise HTTPException(status_code=503, detail=detail or "compute router is not ready")
 
@@ -221,21 +279,24 @@ async def health():
         {
             "status": "ok",
             "role": APP_ROLE,
-            "internal_ws_base": INTERNAL_WS_URL,
-            "internal_usage_url": INTERNAL_USAGE_URL,
+            "internal_ws_base": settings.internal_ws_url,
+            "internal_usage_url": settings.internal_usage_url,
             "public_websocket": PUBLIC_WS_PATH,
-            "stt": STT,
-            "llm": LLM,
-            "tts": TTS,
+            "stt": settings.stt,
+            "llm": settings.llm,
+            "tts": settings.tts,
             "router": snapshot,
         }
     )
 
 
-@app.get("/v1/pool")
 async def pool():
+    settings = _current_settings()
     try:
-        data = await asyncio.to_thread(_http_get_json, INTERNAL_POOL_URL)
+        data = await asyncio.to_thread(
+            _current_dependencies().http_get_json,
+            settings.internal_pool_url,
+        )
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return JSONResponse(_redact_pool_payload(data))
@@ -320,10 +381,6 @@ class _FingerprintRateLimiter:
         return True
 
 
-_connected_llm_fingerprints = _ConnectedFingerprintRegistry()
-_llm_rate_limiter = _FingerprintRateLimiter(LLM_PROXY_REQUESTS_PER_MINUTE)
-
-
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": error_type}}, status_code=status_code)
 
@@ -344,18 +401,20 @@ def _llm_proxy_denial(request: Request) -> Optional[JSONResponse]:
     SDK clients on that infrastructure carry the token in the custom header
     (``default_headers``) alongside their normal ``api_key``.
     """
-    if SESSION_SHARED_SECRET:
+    settings = _current_settings()
+    dependencies = _current_dependencies()
+    if settings.session_shared_secret:
         token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
         if token is None:
             token = bearer_token(request.headers.get("authorization"))
         if token is not None:
-            fingerprint = llm_token_fingerprint(SESSION_SHARED_SECRET, token)
-            if fingerprint in _connected_llm_fingerprints:
-                if _llm_rate_limiter.allow(fingerprint):
+            fingerprint = llm_token_fingerprint(settings.session_shared_secret, token)
+            if fingerprint in dependencies.connected_llm_fingerprints:
+                if dependencies.llm_rate_limiter.allow(fingerprint):
                     return None
                 return _llm_proxy_error(
                     429,
-                    f"Rate limit exceeded: {_llm_rate_limiter.limit_rpm} requests per minute "
+                    f"Rate limit exceeded: {dependencies.llm_rate_limiter.limit_rpm} requests per minute "
                     "per user. Back off and retry.",
                     "rate_limit_exceeded",
                 )
@@ -367,12 +426,10 @@ def _llm_proxy_denial(request: Request) -> Optional[JSONResponse]:
     )
 
 
-@app.post("/v1/chat/completions")
 async def llm_proxy_chat_completions(request: Request) -> Response:
     return await _proxy_llm_request(request, "/v1/chat/completions")
 
 
-@app.post("/v1/responses")
 async def llm_proxy_responses(request: Request) -> Response:
     return await _proxy_llm_request(request, "/v1/responses")
 
@@ -389,7 +446,8 @@ async def _proxy_llm_request(request: Request, path: str) -> Response:
     (feature disabled), 401 and 429 (denials), and 502 (internal pipeline
     unreachable).
     """
-    if not ENABLE_LLM_PROXY:
+    settings = _current_settings()
+    if not settings.enable_llm_proxy:
         # Checked before auth: a disabled replica reveals nothing, answering
         # exactly like an app where these routes were never registered.
         raise HTTPException(status_code=404)
@@ -410,7 +468,7 @@ async def _proxy_llm_request(request: Request, path: str) -> Response:
     try:
         upstream_request = client.build_request(
             "POST",
-            INTERNAL_HTTP_BASE_URL + path,
+            settings.internal_http_base_url + path,
             content=await request.body(),
             headers=headers,
         )
@@ -463,11 +521,12 @@ async def _proxy_llm_request(request: Request, path: str) -> Response:
     )
 
 
-@app.websocket("/v1/realtime")
 async def websocket_proxy(client_ws: WebSocket):
+    settings = _current_settings()
+    dependencies = _current_dependencies()
     session_payload = _get_session_payload(client_ws)
 
-    if SESSION_SHARED_SECRET and session_payload is None:
+    if settings.session_shared_secret and session_payload is None:
         await client_ws.close(code=1008, reason="Missing or invalid session token")
         return
 
@@ -485,7 +544,7 @@ async def websocket_proxy(client_ws: WebSocket):
         # counted as a completed conversation while live users stayed at zero.
         if session_payload is None:
             return
-        await _notify_lb_session_event(
+        await dependencies.notify_lb_session_event(
             session_payload["callback_url"],
             session_payload["session_token"],
             "connected",
@@ -494,14 +553,14 @@ async def websocket_proxy(client_ws: WebSocket):
         # the finally below, alongside the disconnected notification.
         nonlocal llm_fingerprint_registered
         if llm_fingerprint is not None:
-            _connected_llm_fingerprints.add(llm_fingerprint)
+            dependencies.connected_llm_fingerprints.add(llm_fingerprint)
             llm_fingerprint_registered = True
 
     try:
-        await proxy_websocket(
+        await dependencies.proxy_websocket(
             client_ws,
-            acquire_lease=lambda _: session_router.acquire(),
-            release_lease=session_router.release,
+            acquire_lease=lambda _: dependencies.session_router.acquire(),
+            release_lease=dependencies.session_router.release,
             describe_lease=lambda slot: f"slot {slot.slot_id} at {slot.ws_url}",
             no_capacity_reason="No pipeline capacity available",
             no_capacity_log="Failed to allocate speech-to-speech slot",
@@ -515,7 +574,7 @@ async def websocket_proxy(client_ws: WebSocket):
             pass
     finally:
         if llm_fingerprint_registered and llm_fingerprint is not None:
-            _connected_llm_fingerprints.remove(llm_fingerprint)
+            dependencies.connected_llm_fingerprints.remove(llm_fingerprint)
         if session_payload is not None:
             # Always tell the LB the session is over. For a normal session this
             # completes the conversation; for a capacity rejection it releases
@@ -523,18 +582,19 @@ async def websocket_proxy(client_ws: WebSocket):
             # the pending reaper fires. The LB treats a disconnect for an
             # unknown or never-connected session as a no-op release.
             try:
-                await _notify_lb_session_event(
+                await dependencies.notify_lb_session_event(
                     session_payload["callback_url"],
                     session_payload["session_token"],
                     "disconnected",
-                    attempts=LB_CALLBACK_RETRY_ATTEMPTS,
+                    attempts=settings.lb_callback_retry_attempts,
                 )
             except Exception:
                 logger.exception("Failed to notify LB that session ended")
 
 
 def _get_session_payload(client_ws: WebSocket) -> Optional[dict[str, str]]:
-    if not SESSION_SHARED_SECRET:
+    settings = _current_settings()
+    if not settings.session_shared_secret:
         return None
 
     session_token = _extract_session_token(client_ws)
@@ -542,7 +602,7 @@ def _get_session_payload(client_ws: WebSocket) -> Optional[dict[str, str]]:
         return None
 
     try:
-        payload = verify_session_token(session_token, SESSION_SHARED_SECRET)
+        payload = verify_session_token(session_token, settings.session_shared_secret)
     except ValueError:
         logger.warning("Rejected websocket with invalid session token")
         return None
@@ -588,12 +648,12 @@ async def _notify_lb_session_event(
         "event": event,
     }
     if backoff_s is None:
-        backoff_s = LB_CALLBACK_RETRY_BACKOFF_S
+        backoff_s = _current_settings().lb_callback_retry_backoff_s
     attempts = max(attempts, 1)
     delay = backoff_s
     for attempt in range(1, attempts + 1):
         try:
-            await asyncio.to_thread(_post_json, callback_url, payload)
+            await asyncio.to_thread(_current_dependencies().post_json, callback_url, payload)
             return
         except Exception as exc:
             if attempt >= attempts:
@@ -632,8 +692,9 @@ def _http_get_json(url: str) -> dict[str, object]:
 def _post_json(url: str, payload: dict[str, str]) -> None:
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    if LB_CALLBACK_AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {LB_CALLBACK_AUTH_TOKEN}"
+    callback_auth_token = _current_settings().lb_callback_auth_token
+    if callback_auth_token:
+        headers["Authorization"] = f"Bearer {callback_auth_token}"
 
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
@@ -645,3 +706,144 @@ def _post_json(url: str, payload: dict[str, str]) -> None:
         raise RuntimeError(f"LB callback failed with HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"LB callback failed: {exc.reason}") from exc
+
+
+@dataclass(frozen=True)
+class ComputeDependencies:
+    session_router: SessionRouter
+    connected_llm_fingerprints: _ConnectedFingerprintRegistry
+    llm_rate_limiter: _FingerprintRateLimiter
+    http_get_json: Callable[[str], dict[str, object]]
+    post_json: Callable[[str, dict[str, str]], None]
+    notify_lb_session_event: Callable[..., Awaitable[None]]
+    proxy_websocket: Callable[..., Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class _ComputeApplicationContext:
+    settings: ComputeSettings
+    dependencies: ComputeDependencies
+
+
+class _ModuleSettingsProxy:
+    def __getattr__(self, name: str):
+        return globals()[name.upper()]
+
+
+class _ModuleDependenciesProxy:
+    _NAMES = {
+        "session_router": "session_router",
+        "connected_llm_fingerprints": "_connected_llm_fingerprints",
+        "llm_rate_limiter": "_llm_rate_limiter",
+        "http_get_json": "_http_get_json",
+        "post_json": "_post_json",
+        "notify_lb_session_event": "_notify_lb_session_event",
+        "proxy_websocket": "proxy_websocket",
+    }
+
+    def __getattr__(self, name: str):
+        return globals()[self._NAMES[name]]
+
+
+_compute_application_context: ContextVar[_ComputeApplicationContext | None] = ContextVar(
+    "compute_application_context",
+    default=None,
+)
+_module_settings_proxy = _ModuleSettingsProxy()
+_module_dependencies_proxy = _ModuleDependenciesProxy()
+
+
+def _current_settings() -> ComputeSettings:
+    context = _compute_application_context.get()
+    if context is None:
+        return _module_settings_proxy  # type: ignore[return-value]
+    return context.settings
+
+
+def _current_dependencies() -> ComputeDependencies:
+    context = _compute_application_context.get()
+    if context is None:
+        return _module_dependencies_proxy  # type: ignore[return-value]
+    return context.dependencies
+
+
+class _ComputeContextMiddleware:
+    def __init__(self, application, *, context: _ComputeApplicationContext):
+        self.application = application
+        self.context = context
+
+    async def __call__(self, scope, receive, send):
+        token = _compute_application_context.set(self.context)
+        try:
+            await self.application(scope, receive, send)
+        finally:
+            _compute_application_context.reset(token)
+
+
+def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies:
+    router = SessionRouter(
+        host=settings.internal_ws_host,
+        base_port=settings.internal_ws_base_port,
+        ws_path=INTERNAL_SLOT_WS_PATH,
+        repo_dir=settings.s2s_repo_dir,
+        build_command=lambda host, port: build_s2s_command(host, port, settings),
+        wait_for_ready=wait_for_internal_server,
+        max_sessions=int(settings.num_pipelines),
+    )
+    return ComputeDependencies(
+        session_router=router,
+        connected_llm_fingerprints=_ConnectedFingerprintRegistry(),
+        llm_rate_limiter=_FingerprintRateLimiter(settings.llm_proxy_requests_per_minute),
+        http_get_json=_http_get_json,
+        post_json=_post_json,
+        notify_lb_session_event=_notify_lb_session_event,
+        proxy_websocket=proxy_websocket,
+    )
+
+
+def _build_compute_app(
+    settings: ComputeSettings,
+    dependencies: ComputeDependencies,
+    *,
+    isolated: bool,
+) -> FastAPI:
+    application = FastAPI(lifespan=build_lifespan(dependencies.session_router))
+    application.state.settings = settings
+    application.state.dependencies = dependencies
+    if isolated:
+        application.add_middleware(
+            _ComputeContextMiddleware,
+            context=_ComputeApplicationContext(settings, dependencies),
+        )
+
+    application.add_api_route("/", root, methods=["GET"])
+    application.add_api_route("/health", health, methods=["GET"])
+    application.add_api_route("/v1/pool", pool, methods=["GET"])
+    application.add_api_route(
+        "/v1/chat/completions",
+        llm_proxy_chat_completions,
+        methods=["POST"],
+    )
+    application.add_api_route("/v1/responses", llm_proxy_responses, methods=["POST"])
+    application.add_api_websocket_route("/v1/realtime", websocket_proxy)
+    return application
+
+
+def create_app(
+    settings: ComputeSettings,
+    dependencies: ComputeDependencies | None = None,
+) -> FastAPI:
+    """Create an isolated compute application from explicit configuration."""
+    resolved_dependencies = dependencies or build_compute_dependencies(settings)
+    if not settings.session_shared_secret:
+        logger.warning(
+            "SESSION_SHARED_SECRET is unset; the LLM proxy paths fail closed and answer 401 for every request"
+        )
+    return _build_compute_app(settings, resolved_dependencies, isolated=True)
+
+
+_module_dependencies = build_compute_dependencies(_module_settings)
+session_router = _module_dependencies.session_router
+_connected_llm_fingerprints = _module_dependencies.connected_llm_fingerprints
+_llm_rate_limiter = _module_dependencies.llm_rate_limiter
+app = _build_compute_app(_module_settings, _module_dependencies, isolated=False)
