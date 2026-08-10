@@ -11,6 +11,30 @@ class BuildS2SCommandTests(unittest.TestCase):
             settings = compute_main.ComputeSettings.from_env()
         return compute_main.build_s2s_command("127.0.0.1", 9000, settings)
 
+    def test_uses_serve_subcommand_and_server_address_flags(self):
+        command = self.build_command_with_env({})
+
+        self.assertEqual(
+            command[:12],
+            [
+                "uv",
+                "run",
+                "--no-dev",
+                "--no-sync",
+                "--directory",
+                "/opt/speech-to-speech",
+                "speech-to-speech",
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "9000",
+            ],
+        )
+        self.assertNotIn("--mode", command)
+        self.assertNotIn("--ws_host", command)
+        self.assertNotIn("--ws_port", command)
+
     def test_chat_completions_forwards_explicit_openai_compatible_connection_flags(self):
         command = self.build_command_with_env(
             {
