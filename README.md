@@ -15,7 +15,7 @@ Speech-to-speech endpoint project.
 This repo now builds two different images with two different app entrypoints:
 
 - compute image: `Dockerfile.compute`
-  Starts `app.compute_main:app` on a GPU instance, runs local `speech-to-speech` subprocesses in upstream `--mode realtime`, and serves `/v1/realtime` directly.
+  Starts `app.compute_main:app` on a GPU instance, runs local `speech-to-speech serve` subprocesses, and serves `/v1/realtime` directly.
 - load-balancer image: `Dockerfile.load_balancer`
   Starts `app.load_balancer_main:app` on a CPU instance, tracks a configured set of pre-created compute endpoints, keeps a warm pool, wakes parked endpoints when free session capacity gets tight, and allocates direct compute sessions for clients.
 
