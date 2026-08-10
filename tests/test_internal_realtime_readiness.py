@@ -1,18 +1,15 @@
-import importlib
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from app import compute_main
+from app import compute_app as compute_main
 
 
 class BuildS2SCommandTests(unittest.TestCase):
     def build_command_with_env(self, env: dict[str, str]) -> list[str]:
         with patch.dict(os.environ, env, clear=True):
-            module = importlib.reload(compute_main)
-            command = module.build_s2s_command("127.0.0.1", 9000)
-        importlib.reload(compute_main)
-        return command
+            settings = compute_main.ComputeSettings.from_env()
+        return compute_main.build_s2s_command("127.0.0.1", 9000, settings)
 
     def test_uses_serve_subcommand_and_server_address_flags(self):
         command = self.build_command_with_env({})
@@ -126,8 +123,8 @@ class WaitForInternalRealtimeTests(unittest.IsolatedAsyncioTestCase):
             patch.object(compute_main.asyncio, "open_connection", connect),
         ):
             await compute_main.wait_for_internal_server(
-                compute_main.INTERNAL_WS_HOST,
-                compute_main.INTERNAL_WS_BASE_PORT,
+                "127.0.0.1",
+                9000,
                 None,
                 timeout_s=0.01,
             )
@@ -135,7 +132,7 @@ class WaitForInternalRealtimeTests(unittest.IsolatedAsyncioTestCase):
         connect.assert_not_called()
         self.assertEqual(
             observed["url"],
-            f"http://{compute_main.INTERNAL_WS_HOST}:{compute_main.INTERNAL_WS_BASE_PORT}/v1/usage",
+            "http://127.0.0.1:9000/v1/usage",
         )
 
 

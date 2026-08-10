@@ -1,7 +1,5 @@
 import asyncio
-import importlib
 import json
-import sys
 import unittest
 from time import time
 from types import SimpleNamespace
@@ -14,6 +12,13 @@ from app.dashboard_history import SwarmHistoryBucket
 from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
 from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointTransitionConflictError
+from app.load_balancer_app import (
+    create_session,
+    queue_leave,
+    queue_status,
+    record_expired_queue_ticket,
+    session_event,
+)
 from app.requester_identity import RequesterIdentity
 from app.requester_rate_limiter import RequesterRateLimitConfig, RequesterRateLimiter
 from app.session_requester_tracker import SessionRequesterTracker
@@ -21,7 +26,7 @@ from app.verification_admission_limiter import (
     VerificationAdmissionConfig,
     VerificationAdmissionLimiter,
 )
-from tests.helpers import monotonic_sequence
+from tests.helpers import load_balancer_fixture, monotonic_sequence
 
 
 class FakeClock:
@@ -104,9 +109,6 @@ class DashboardPreviewSessionManagerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LoadBalancerPreviewModeTests(unittest.TestCase):
-    def tearDown(self):
-        sys.modules.pop("app.load_balancer_main", None)
-
     def test_compute_endpoint_names_test_enables_preview_without_session_secret(self):
         module = self._import_load_balancer(
             {
@@ -115,9 +117,9 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
             }
         )
 
-        self.assertTrue(module.DASHBOARD_PREVIEW_MODE)
-        self.assertIsInstance(module.session_manager, DashboardPreviewSessionManager)
-        self.assertEqual(module.COMPUTE_ENDPOINT_NAMES[0], "preview-compute-01")
+        self.assertTrue(module.settings.dashboard_preview_mode)
+        self.assertIsInstance(module.dependencies.session_manager, DashboardPreviewSessionManager)
+        self.assertEqual(module.settings.compute_endpoint_names[0], "preview-compute-01")
 
     def test_health_exposes_dashboard_persistence_status(self):
         module = self._import_load_balancer(
@@ -143,9 +145,9 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
             }
         )
 
-        self.assertTrue(module.DASHBOARD_PREVIEW_MODE)
-        self.assertIsInstance(module.dashboard_history_store, ReadOnlyDashboardHistoryStore)
-        self.assertIs(module.dashboard.history_store, module.dashboard_history_store)
+        self.assertTrue(module.settings.dashboard_preview_mode)
+        self.assertIsInstance(module.dependencies.dashboard_history_store, ReadOnlyDashboardHistoryStore)
+        self.assertIs(module.dependencies.dashboard.history_store, module.dependencies.dashboard_history_store)
         init_store.assert_called_once()
 
     def test_drain_route_requires_admin_authorization(self):
@@ -222,7 +224,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
                 return True, None, {"router": {"endpoints": []}}
 
         session_manager = MissingEndpointSessionManager()
-        module.session_manager = session_manager
+        module.dependencies.session_manager = session_manager
         client = TestClient(module.app)
 
         response = client.post(
@@ -280,7 +282,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
                     },
                 )
 
-        module.session_manager = ConflictingSessionManager()
+        module.dependencies.session_manager = ConflictingSessionManager()
         client = TestClient(module.app)
 
         response = client.post(
@@ -345,7 +347,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
                 )
 
         session_manager = RecordingSessionManager()
-        module.session_manager = session_manager
+        module.dependencies.session_manager = session_manager
         client = TestClient(module.app)
 
         response = client.post(
@@ -407,7 +409,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
                     },
                 )
 
-        module.session_manager = UnhealthySessionManager()
+        module.dependencies.session_manager = UnhealthySessionManager()
         client = TestClient(module.app)
 
         health = client.get("/health")
@@ -449,45 +451,30 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertEqual(response.json()["detail"], "LB admin auth token is not configured")
 
     def _import_load_balancer(self, env):
-        sys.modules.pop("app.load_balancer_main", None)
-        with patch.dict(
-            "os.environ",
-            {
-                "DASHBOARD_BUCKET_ID": "",
-                "DASHBOARD_PREVIEW_MODE": "",
-                "LB_ADMIN_AUTH_TOKEN": "",
-                "SESSION_REQUIRE_VERIFIED_HF_TOKEN": "false",
-                **env,
-            },
-            clear=False,
-        ):
-            return importlib.import_module("app.load_balancer_main")
+        return load_balancer_fixture({"LB_ADMIN_AUTH_TOKEN": "", **env})
 
 
 class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
-    def tearDown(self):
-        sys.modules.pop("app.load_balancer_main", None)
-
     async def test_delayed_disconnected_session_allocation_skips_no_connect_penalty(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
 
         request = FakeDisconnectedRequest()
 
         with (
-            patch.object(module, "monotonic", new=monotonic_sequence(20.0, 21.5)),
+            patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 21.5)),
             self.assertLogs("s2s-endpoint", level="WARNING") as logs,
             self.assertRaises(HTTPException) as raised,
         ):
-            await module.create_session(request)
+            await create_session(module.runtime, request)
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(fake_session_manager.cancelled_session_ids, ["session-123"])
         self.assertEqual(fake_dashboard.calls, ["request", "abandoned"])
-        status = module.requester_rate_limiter.status()
+        status = module.dependencies.requester_rate_limiter.status()
         self.assertEqual(status["active_allocations"], 0)
         self.assertNotIn("no_connects", status["totals"])
         record = logs.records[0]
@@ -509,28 +496,28 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeQueuedGrantSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
 
-        response = await module.create_session(FakeConnectedRequest())
+        response = await create_session(module.runtime, FakeConnectedRequest())
         self.assertEqual(json.loads(response.body)["state"], "queued")
-        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 1)
+        self.assertEqual(module.dependencies.requester_rate_limiter.status()["active_allocations"], 1)
 
         with (
-            patch.object(module, "monotonic", new=monotonic_sequence(30.0, 30.2)),
+            patch("app.load_balancer_app.monotonic", new=monotonic_sequence(30.0, 30.2)),
             self.assertLogs("s2s-endpoint", level="WARNING") as logs,
             self.assertRaises(HTTPException) as raised,
         ):
-            await module.queue_status("queue-123", FakeDisconnectedRequest())
+            await queue_status(module.runtime, "queue-123", FakeDisconnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(fake_session_manager.cancelled_session_ids, ["session-123"])
         self.assertEqual(fake_dashboard.calls, ["request", "abandoned"])
-        status = module.requester_rate_limiter.status()
+        status = module.dependencies.requester_rate_limiter.status()
         self.assertEqual(status["active_allocations"], 0)
         self.assertEqual(status["totals"]["allocations"], 1)
         self.assertNotIn("no_connects", status["totals"])
-        decision = module.requester_rate_limiter.acquire(fake_dashboard.requesters[0])
+        decision = module.dependencies.requester_rate_limiter.acquire(fake_dashboard.requesters[0])
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.consecutive_no_connects, 0)
         record = logs.records[0]
@@ -542,42 +529,42 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
         clock = FakeClock(0.0)
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeSessionManager(
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeSessionManager(
             allocation_wait_ms=40,
             waited_for_capacity=False,
         )
-        module.requester_rate_limiter = RequesterRateLimiter(
+        module.dependencies.requester_rate_limiter = RequesterRateLimiter(
             config=RequesterRateLimitConfig(max_consecutive_no_connects=1),
             time_fn=clock,
         )
 
-        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
-            response = await module.create_session(FakeConnectedRequest())
+        with patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.05)):
+            response = await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 1)
+        self.assertEqual(module.dependencies.requester_rate_limiter.status()["active_allocations"], 1)
         clock.now = 60.0
-        decision = module.requester_rate_limiter.acquire(fake_dashboard.requesters[0])
+        decision = module.dependencies.requester_rate_limiter.acquire(fake_dashboard.requesters[0])
 
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason, "behavior_cooldown")
         self.assertEqual(decision.consecutive_no_connects, 1)
-        status = module.requester_rate_limiter.status()
+        status = module.dependencies.requester_rate_limiter.status()
         self.assertEqual(status["active_allocations"], 0)
         self.assertEqual(status["totals"]["no_connects"], 1)
 
     async def test_successful_session_allocation_logs_outcome(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeSessionManager(allocation_wait_ms=40)
 
         with (
-            patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)),
+            patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.05)),
             self.assertLogs("s2s-endpoint", level="INFO") as logs,
         ):
-            response = await module.create_session(FakeConnectedRequest())
+            response = await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_dashboard.calls, ["request", "success"])
@@ -609,20 +596,20 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager(allocation_wait_ms=40)
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
-        module.requester_rate_limiter = RequesterRateLimiter(
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
+        module.dependencies.requester_rate_limiter = RequesterRateLimiter(
             config=RequesterRateLimitConfig(max_parallel_allocations=1)
         )
 
-        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
-            await module.create_session(FakeConnectedRequest())
+        with patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.05)):
+            await create_session(module.runtime, FakeConnectedRequest())
 
         with (
             self.assertLogs("s2s-endpoint", level="WARNING") as logs,
             self.assertRaises(HTTPException) as raised,
         ):
-            await module.create_session(FakeConnectedRequest())
+            await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 429)
         self.assertEqual(raised.exception.headers["Retry-After"], "60")
@@ -642,21 +629,21 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
 
         with (
             self.assertLogs("s2s-endpoint", level="WARNING") as logs,
             self.assertRaises(HTTPException) as raised,
         ):
-            await module.create_session(FakeConnectedRequest())
+            await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 401)
         self.assertEqual(raised.exception.headers["WWW-Authenticate"], "Bearer")
         self.assertEqual(raised.exception.detail["reason"], "token_not_provided")
         self.assertEqual(fake_session_manager.allocation_calls, 0)
         self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
-        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 0)
+        self.assertEqual(module.dependencies.requester_rate_limiter.status()["active_allocations"], 0)
         self.assertEqual(logs.records[0].outcome, "auth_rejected")
         self.assertEqual(logs.records[0].auth_stage, "admission")
 
@@ -670,11 +657,11 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
                 module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
                 fake_dashboard = FakeDashboard()
                 fake_session_manager = FakeSessionManager()
-                module.dashboard = fake_dashboard
-                module.session_manager = fake_session_manager
+                module.dependencies.dashboard = fake_dashboard
+                module.dependencies.session_manager = fake_session_manager
 
                 with self.assertRaises(HTTPException) as raised:
-                    await module.create_session(FakeHeaderRequest({"authorization": authorization}))
+                    await create_session(module.runtime, FakeHeaderRequest({"authorization": authorization}))
 
                 self.assertEqual(raised.exception.status_code, 401)
                 self.assertEqual(raised.exception.headers["WWW-Authenticate"], "Bearer")
@@ -686,20 +673,20 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
         unavailable = _requester_identity(verification="unavailable")
 
         with (
-            patch.object(module.requester_identity_resolver, "identify", return_value=unavailable),
+            patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=unavailable),
             patch.object(
-                module.requester_identity_resolver,
+                module.dependencies.requester_identity_resolver,
                 "verification_retry_after_s",
                 return_value=60,
             ) as verification_retry_after_s,
             self.assertRaises(HTTPException) as raised,
         ):
-            await module.create_session(FakeConnectedRequest())
+            await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.headers["Retry-After"], "60")
@@ -713,20 +700,20 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
         pending = _requester_identity(verification="pending")
 
         with (
-            patch.object(module.requester_identity_resolver, "identify", return_value=pending),
+            patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=pending),
             patch.object(
-                module.requester_identity_resolver,
+                module.dependencies.requester_identity_resolver,
                 "wait_for_verification",
                 new=AsyncMock(return_value=pending),
             ) as wait_for_verification,
             self.assertRaises(HTTPException) as raised,
         ):
-            await module.create_session(FakeConnectedRequest())
+            await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.headers["Retry-After"], "1")
@@ -735,16 +722,16 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
         wait_for_verification.assert_awaited_once_with(
             pending,
-            timeout_s=module.SESSION_HF_TOKEN_VERIFY_TIMEOUT_S,
+            timeout_s=module.settings.session_hf_token_verify_timeout_s,
         )
 
     async def test_pre_verification_network_quota_blocks_distinct_tokens_before_resolver_queue(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
-        module.session_verification_limiter = VerificationAdmissionLimiter(
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
+        module.dependencies.session_verification_limiter = VerificationAdmissionLimiter(
             config=VerificationAdmissionConfig(max_global_pending=2, max_network_pending=1)
         )
         first = RequesterIdentity(
@@ -767,47 +754,51 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         validation_task = asyncio.create_task(release_validation.wait())
 
         with (
-            patch.object(module.requester_identity_resolver, "identify", side_effect=[first, second]),
+            patch.object(module.dependencies.requester_identity_resolver, "identify", side_effect=[first, second]),
             patch.object(
-                module.requester_identity_resolver,
+                module.dependencies.requester_identity_resolver,
                 "start_verification",
                 return_value=(first, validation_task, True),
             ) as start_verification,
             patch.object(
-                module.requester_identity_resolver,
+                module.dependencies.requester_identity_resolver,
                 "wait_for_verification",
                 new=AsyncMock(return_value=first),
             ),
         ):
             with self.assertRaises(HTTPException):
-                await module.create_session(FakeHeaderRequest({"authorization": "Bearer hf_first_fabricated_token"}))
+                await create_session(
+                    module.runtime, FakeHeaderRequest({"authorization": "Bearer hf_first_fabricated_token"})
+                )
             with self.assertRaises(HTTPException) as blocked:
-                await module.create_session(FakeHeaderRequest({"authorization": "Bearer hf_second_fabricated_token"}))
+                await create_session(
+                    module.runtime, FakeHeaderRequest({"authorization": "Bearer hf_second_fabricated_token"})
+                )
 
         self.assertEqual(blocked.exception.status_code, 503)
         self.assertEqual(blocked.exception.detail["reason"], "verification_network_quota")
         self.assertEqual(start_verification.call_count, 1)
         self.assertEqual(fake_session_manager.allocation_calls, 0)
-        self.assertEqual(module.session_verification_limiter.status()["pending"], 1)
+        self.assertEqual(module.dependencies.session_verification_limiter.status()["pending"], 1)
 
         release_validation.set()
         await validation_task
         await asyncio.sleep(0)
-        self.assertEqual(module.session_verification_limiter.status()["pending"], 0)
+        self.assertEqual(module.dependencies.session_verification_limiter.status()["pending"], 0)
 
     async def test_required_token_rejects_invalid_identity_without_allocation(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
         invalid = _requester_identity(verification="invalid", kind="invalid_token")
 
         with (
-            patch.object(module.requester_identity_resolver, "identify", return_value=invalid),
+            patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=invalid),
             self.assertRaises(HTTPException) as raised,
         ):
-            await module.create_session(FakeConnectedRequest())
+            await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 401)
         self.assertEqual(raised.exception.detail["reason"], "token_invalid")
@@ -818,12 +809,12 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
         verified = _requester_identity(verification="verified", kind="authenticated")
 
-        with patch.object(module.requester_identity_resolver, "identify", return_value=verified):
-            response = await module.create_session(FakeConnectedRequest())
+        with patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified):
+            response = await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_session_manager.allocation_calls, 1)
@@ -834,9 +825,9 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
         clock = FakeClock(0.0)
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
-        module.requester_identity_resolver._time_fn = clock
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
+        module.dependencies.requester_identity_resolver._time_fn = clock
         verified = RequesterIdentity(
             **{
                 **_requester_identity(verification="verified", kind="authenticated").__dict__,
@@ -852,10 +843,10 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         fake_session_manager.allocate = allocate_after_default_wait
 
-        with patch.object(module.requester_identity_resolver, "identify", return_value=verified):
-            response = await module.create_session(FakeConnectedRequest())
+        with patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified):
+            response = await create_session(module.runtime, FakeConnectedRequest())
 
-        self.assertEqual(module.SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S, 1800.0)
+        self.assertEqual(module.settings.session_hf_token_max_verified_age_s, 1800.0)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_session_manager.cancelled_session_ids, [])
         self.assertEqual(fake_dashboard.calls, ["request", "success"])
@@ -864,27 +855,27 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
         fresh = _requester_identity(verification="verified", kind="authenticated")
         stale = RequesterIdentity(**{**fresh.__dict__, "verified_at_s": 0.0})
         pending = _requester_identity(verification="pending")
         raw_token = "hf_fresh_authentication_proof"
 
         with (
-            patch.object(module.requester_identity_resolver, "identify", return_value=stale),
+            patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=stale),
             patch.object(
-                module.requester_identity_resolver,
+                module.dependencies.requester_identity_resolver,
                 "start_verification",
                 return_value=(pending, None, True),
             ) as start_verification,
             patch.object(
-                module.requester_identity_resolver,
+                module.dependencies.requester_identity_resolver,
                 "wait_for_verification",
                 new=AsyncMock(return_value=fresh),
             ),
         ):
-            response = await module.create_session(FakeHeaderRequest({"authorization": f"Bearer {raw_token}"}))
+            response = await create_session(module.runtime, FakeHeaderRequest({"authorization": f"Bearer {raw_token}"}))
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_session_manager.allocation_calls, 1)
@@ -894,13 +885,13 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeQueuedGrantSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
         verified = _requester_identity(verification="verified", kind="authenticated")
 
-        with patch.object(module.requester_identity_resolver, "identify", return_value=verified):
-            queued = await module.create_session(FakeConnectedRequest())
-            granted = await module.queue_status("queue-123", FakeConnectedRequest())
+        with patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified):
+            queued = await create_session(module.runtime, FakeConnectedRequest())
+            granted = await queue_status(module.runtime, "queue-123", FakeConnectedRequest())
 
         self.assertEqual(json.loads(queued.body)["state"], "queued")
         self.assertEqual(json.loads(granted.body)["state"], "granted")
@@ -912,9 +903,9 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeQueuedGrantSessionManager()
         clock = FakeClock(0.0)
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
-        module.requester_identity_resolver._time_fn = clock
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
+        module.dependencies.requester_identity_resolver._time_fn = clock
         verified = RequesterIdentity(
             **{
                 **_requester_identity(verification="verified", kind="authenticated").__dict__,
@@ -922,12 +913,12 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with patch.object(module.requester_identity_resolver, "identify", return_value=verified):
-            queued = await module.create_session(FakeConnectedRequest())
+        with patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified):
+            queued = await create_session(module.runtime, FakeConnectedRequest())
             clock.now = 61.0
-            granted = await module.queue_status("queue-123", FakeConnectedRequest())
+            granted = await queue_status(module.runtime, "queue-123", FakeConnectedRequest())
 
-        self.assertEqual(module.SESSION_HF_TOKEN_MAX_VERIFIED_AGE_S, 1800.0)
+        self.assertEqual(module.settings.session_hf_token_max_verified_age_s, 1800.0)
         self.assertEqual(json.loads(queued.body)["state"], "queued")
         self.assertEqual(json.loads(granted.body)["state"], "granted")
         self.assertFalse(fake_session_manager.left)
@@ -939,93 +930,93 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeQueuedGrantSessionManager()
         clock = FakeClock(0.0)
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
-        module.queue_requester_tracker = SessionRequesterTracker(retention_s=1, time_fn=clock)
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
+        module.dependencies.queue_requester_tracker = SessionRequesterTracker(retention_s=1, time_fn=clock)
         verified = _requester_identity(verification="verified", kind="authenticated")
 
-        with patch.object(module.requester_identity_resolver, "identify", return_value=verified):
-            await module.create_session(FakeConnectedRequest())
+        with patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified):
+            await create_session(module.runtime, FakeConnectedRequest())
             clock.now = 2.0
             with self.assertRaises(HTTPException) as raised:
-                await module.queue_status("queue-123", FakeConnectedRequest())
+                await queue_status(module.runtime, "queue-123", FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 401)
         self.assertEqual(raised.exception.detail["reason"], "queue_identity_expired")
         self.assertEqual(fake_session_manager.poll_calls, 0)
         self.assertTrue(fake_session_manager.left)
-        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 0)
+        self.assertEqual(module.dependencies.requester_rate_limiter.status()["active_allocations"], 0)
         self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
 
     async def test_queue_identity_must_still_be_verified_before_claiming_capacity(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeQueuedGrantSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
         verified = _requester_identity(verification="verified", kind="authenticated")
         invalid = _requester_identity(verification="invalid", kind="invalid_token")
 
         with (
-            patch.object(module.requester_identity_resolver, "identify", return_value=verified),
+            patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified),
             patch.object(
-                module.requester_identity_resolver,
+                module.dependencies.requester_identity_resolver,
                 "latest_identity",
                 side_effect=[verified, invalid],
             ),
         ):
-            await module.create_session(FakeConnectedRequest())
+            await create_session(module.runtime, FakeConnectedRequest())
             with self.assertRaises(HTTPException) as raised:
-                await module.queue_status("queue-123", FakeConnectedRequest())
+                await queue_status(module.runtime, "queue-123", FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 401)
         self.assertEqual(raised.exception.detail["reason"], "token_invalid")
         self.assertEqual(fake_session_manager.poll_calls, 0)
         self.assertTrue(fake_session_manager.left)
-        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 0)
+        self.assertEqual(module.dependencies.requester_rate_limiter.status()["active_allocations"], 0)
         self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
 
     async def test_final_grant_guard_releases_session_if_identity_is_no_longer_verified(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
-        module.dashboard = fake_dashboard
-        module.session_manager = fake_session_manager
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
         verified = _requester_identity(verification="verified", kind="authenticated")
         invalid = _requester_identity(verification="invalid", kind="invalid_token")
 
         with (
-            patch.object(module.requester_identity_resolver, "identify", return_value=verified),
+            patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified),
             patch.object(
-                module.requester_identity_resolver,
+                module.dependencies.requester_identity_resolver,
                 "latest_identity",
                 side_effect=[verified, invalid],
             ),
             self.assertRaises(HTTPException) as raised,
         ):
-            await module.create_session(FakeConnectedRequest())
+            await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 401)
         self.assertEqual(fake_session_manager.cancelled_session_ids, ["session-123"])
         self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
-        status = module.requester_rate_limiter.status()
+        status = module.dependencies.requester_rate_limiter.status()
         self.assertEqual(status["active_allocations"], 0)
         self.assertEqual(status["totals"]["allocation_auth_rejections"], 1)
 
     async def test_leaving_queue_releases_parallel_allocation_permit(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeQueuedSessionManager()
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeQueuedSessionManager()
 
-        response = await module.create_session(FakeConnectedRequest())
+        response = await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(json.loads(response.body)["state"], "queued")
-        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 1)
+        self.assertEqual(module.dependencies.requester_rate_limiter.status()["active_allocations"], 1)
 
-        await module.queue_leave("queue-123")
+        await queue_leave(module.runtime, "queue-123")
 
-        status = module.requester_rate_limiter.status()
+        status = module.dependencies.requester_rate_limiter.status()
         self.assertEqual(status["active_allocations"], 0)
         self.assertEqual(status["totals"]["allocation_abandonments"], 1)
         self.assertEqual(fake_dashboard.calls, ["request", "abandoned"])
@@ -1033,13 +1024,13 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_expired_queue_ticket_releases_parallel_allocation_permit(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeQueuedSessionManager()
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeQueuedSessionManager()
 
-        await module.create_session(FakeConnectedRequest())
-        await module.record_expired_queue_ticket("queue-123")
+        await create_session(module.runtime, FakeConnectedRequest())
+        await record_expired_queue_ticket(module.runtime, "queue-123")
 
-        status = module.requester_rate_limiter.status()
+        status = module.dependencies.requester_rate_limiter.status()
         self.assertEqual(status["active_allocations"], 0)
         self.assertEqual(status["totals"]["allocation_abandonments"], 1)
         self.assertEqual(fake_dashboard.calls, ["request", "abandoned"])
@@ -1047,12 +1038,12 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_allocation_tracks_reported_hardware_id_as_fingerprint(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeSessionManager(allocation_wait_ms=40)
         raw_hardware_id = "ABCDEF0123456789"
 
-        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
-            response = await module.create_session(FakeJsonRequest({"hardware_id": raw_hardware_id}))
+        with patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.05)):
+            response = await create_session(module.runtime, FakeJsonRequest({"hardware_id": raw_hardware_id}))
 
         self.assertEqual(response.status_code, 200)
         requester = fake_dashboard.requesters[0]
@@ -1062,11 +1053,11 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_allocation_ignores_invalid_reported_hardware_id(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeSessionManager(allocation_wait_ms=40)
 
-        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
-            response = await module.create_session(FakeJsonRequest({"hardware_id": "invalid"}))
+        with patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.05)):
+            response = await create_session(module.runtime, FakeJsonRequest({"hardware_id": "invalid"}))
 
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(fake_dashboard.requesters[0].reported_robot_id)
@@ -1074,37 +1065,39 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_connected_callback_is_attributed_to_requester_once(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeSessionManager(allocation_wait_ms=40)
 
-        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
-            await module.create_session(FakeConnectedRequest())
+        with patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.05)):
+            await create_session(module.runtime, FakeConnectedRequest())
 
-        self.assertEqual(module.session_requester_tracker.count(), 1)
+        self.assertEqual(module.dependencies.session_requester_tracker.count(), 1)
         payload = {"session_token": "session-token", "event": "connected"}
-        first = await module.session_event("session-123", payload)
-        second = await module.session_event("session-123", payload)
+        first = await session_event(module.runtime, "session-123", payload)
+        second = await session_event(module.runtime, "session-123", payload)
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
-        self.assertEqual(module.session_requester_tracker.count(), 0)
+        self.assertEqual(module.dependencies.session_requester_tracker.count(), 0)
         self.assertEqual(fake_dashboard.session_events, ["connected", "connected"])
         self.assertEqual(fake_dashboard.connected_requesters, [fake_dashboard.requesters[0]])
 
     async def test_disconnected_callback_records_requester_duration_after_connect(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeSessionManager(allocation_wait_ms=40)
 
-        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
-            await module.create_session(FakeConnectedRequest())
+        with patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.05)):
+            await create_session(module.runtime, FakeConnectedRequest())
 
-        await module.session_event(
+        await session_event(
+            module.runtime,
             "session-123",
             {"session_token": "session-token", "event": "connected"},
         )
-        await module.session_event(
+        await session_event(
+            module.runtime,
             "session-123",
             {"session_token": "session-token", "event": "disconnected"},
         )
@@ -1117,8 +1110,8 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_disconnected_callback_refreshes_stale_allocation_identity(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeSessionManager(allocation_wait_ms=40)
         pending = RequesterIdentity(
             actor_id="token:abc123",
             label="HF token •abc123",
@@ -1136,20 +1129,22 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch.object(module.requester_identity_resolver, "identify", return_value=pending),
+            patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=pending),
             patch.object(
-                module.requester_identity_resolver,
+                module.dependencies.requester_identity_resolver,
                 "latest_identity",
                 side_effect=[pending, verified, verified, verified],
             ),
-            patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)),
+            patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.05)),
         ):
-            await module.create_session(FakeConnectedRequest())
-            await module.session_event(
+            await create_session(module.runtime, FakeConnectedRequest())
+            await session_event(
+                module.runtime,
                 "session-123",
                 {"session_token": "session-token", "event": "connected"},
             )
-            await module.session_event(
+            await session_event(
+                module.runtime,
                 "session-123",
                 {"session_token": "session-token", "event": "disconnected"},
             )
@@ -1163,33 +1158,34 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_pre_connect_compute_rejection_does_not_penalize_requester(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeSessionManager(allocation_wait_ms=40)
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeSessionManager(allocation_wait_ms=40)
 
-        with patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.05)):
-            await module.create_session(FakeConnectedRequest())
+        with patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.05)):
+            await create_session(module.runtime, FakeConnectedRequest())
 
-        await module.session_event(
+        await session_event(
+            module.runtime,
             "session-123",
             {"session_token": "session-token", "event": "disconnected"},
         )
 
-        totals = module.requester_rate_limiter.status()["totals"]
+        totals = module.dependencies.requester_rate_limiter.status()["totals"]
         self.assertNotIn("no_connects", totals)
-        self.assertEqual(module.requester_rate_limiter.status()["active_allocations"], 0)
+        self.assertEqual(module.dependencies.requester_rate_limiter.status()["active_allocations"], 0)
 
     async def test_failed_session_allocation_logs_outcome(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeFailingSessionManager()
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeFailingSessionManager()
 
         with (
-            patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.25)),
+            patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.25)),
             self.assertLogs("s2s-endpoint", level="WARNING") as logs,
             self.assertRaises(HTTPException) as raised,
         ):
-            await module.create_session(FakeConnectedRequest())
+            await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(fake_dashboard.calls, ["request", "failure"])
@@ -1208,17 +1204,17 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_capacity_timeout_session_allocation_logs_waited_for_capacity(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
-        module.dashboard = fake_dashboard
-        module.session_manager = FakeFailingSessionManager(
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeFailingSessionManager(
             EndpointCapacityTimeoutError("timed out waiting for an available compute endpoint")
         )
 
         with (
-            patch.object(module, "monotonic", new=monotonic_sequence(20.0, 20.25)),
+            patch("app.load_balancer_app.monotonic", new=monotonic_sequence(20.0, 20.25)),
             self.assertLogs("s2s-endpoint", level="WARNING") as logs,
             self.assertRaises(HTTPException) as raised,
         ):
-            await module.create_session(FakeConnectedRequest())
+            await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(fake_dashboard.calls, ["request", "failure"])
@@ -1229,20 +1225,7 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(record.waited_for_capacity)
 
     def _import_load_balancer(self, env=None):
-        sys.modules.pop("app.load_balancer_main", None)
-        with patch.dict(
-            "os.environ",
-            {
-                "COMPUTE_ENDPOINT_NAMES": "TEST",
-                "DASHBOARD_BUCKET_ID": "",
-                "DASHBOARD_PREVIEW_MODE": "",
-                "SESSION_SHARED_SECRET": "",
-                "SESSION_REQUIRE_VERIFIED_HF_TOKEN": "false",
-                **(env or {}),
-            },
-            clear=False,
-        ):
-            return importlib.import_module("app.load_balancer_main")
+        return load_balancer_fixture(env)
 
 
 class FakeDashboard:

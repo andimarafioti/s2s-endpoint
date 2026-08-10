@@ -22,12 +22,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
 from fastapi.testclient import TestClient
 
-from app import compute_main
+from app import compute_app as compute_main
 from app.session_tokens import create_session_token, llm_token_fingerprint
 
 SECRET = "compute-test-secret"
@@ -171,17 +172,14 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         self.stub = StubInternalPipeline()
         self.addCleanup(self.stub.close)
 
-    def gated_client(self, *, rate_limit_rpm: int = 100, enable_llm_proxy: bool = True) -> TestClient:
-        self.enterContext(patch.object(compute_main, "ENABLE_LLM_PROXY", enable_llm_proxy))
-        self.enterContext(patch.object(compute_main, "SESSION_SHARED_SECRET", SECRET))
-        self.enterContext(patch.object(compute_main, "INTERNAL_HTTP_BASE_URL", self.stub.base_url))
-        self.enterContext(
-            patch.object(compute_main, "_connected_llm_fingerprints", compute_main._ConnectedFingerprintRegistry())
-        )
-        self.enterContext(
-            patch.object(compute_main, "_llm_rate_limiter", compute_main._FingerprintRateLimiter(rate_limit_rpm))
-        )
-
+    def gated_client(
+        self,
+        *,
+        rate_limit_rpm: int = 100,
+        enable_llm_proxy: bool = True,
+        secret: str = SECRET,
+        time_fn: Callable[[], float] = time.monotonic,
+    ) -> TestClient:
         async def _fake_acquire():
             return SimpleNamespace(slot_id=0, ws_url="ws://127.0.0.1:1/v1/realtime")
 
@@ -191,11 +189,23 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         async def _no_lb_callback(*args: Any, **kwargs: Any) -> None:
             pass
 
-        self.enterContext(patch.object(compute_main.session_router, "acquire", _fake_acquire))
-        self.enterContext(patch.object(compute_main.session_router, "release", _fake_release))
-        self.enterContext(patch.object(compute_main, "_notify_lb_session_event", _no_lb_callback))
         self.enterContext(patch("app.ws_proxy.websockets.connect", _FakeUpstreamConnect))
-        return TestClient(compute_main.app)
+        stub_url = urlsplit(self.stub.base_url)
+        settings = compute_main.ComputeSettings(
+            internal_ws_host=str(stub_url.hostname),
+            internal_ws_base_port=int(stub_url.port),
+            enable_llm_proxy=enable_llm_proxy,
+            session_shared_secret=secret,
+        )
+        dependencies = compute_main.ComputeDependencies(
+            session_router=SimpleNamespace(acquire=_fake_acquire, release=_fake_release),
+            connected_llm_fingerprints=compute_main._ConnectedFingerprintRegistry(),
+            llm_rate_limiter=compute_main._FingerprintRateLimiter(rate_limit_rpm, time_fn=time_fn),
+            http_get_json=compute_main._http_get_json,
+            notify_lb_session_event=_no_lb_callback,
+            proxy_websocket=compute_main.proxy_websocket,
+        )
+        return TestClient(compute_main.create_app(settings, dependencies))
 
     def post_chat(self, client: TestClient, headers: dict[str, str] | None = None):
         if headers is None:
@@ -298,14 +308,10 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
             (0.4, b"data: second\n\n"),
         ]
         self.stub.responder = lambda path: (200, "text/event-stream", frames)
-        self.enterContext(patch.object(compute_main, "ENABLE_LLM_PROXY", True))
-        self.enterContext(patch.object(compute_main, "INTERNAL_HTTP_BASE_URL", self.stub.base_url))
-        self.enterContext(patch.object(compute_main, "SESSION_SHARED_SECRET", SECRET))
-        registry = compute_main._ConnectedFingerprintRegistry()
+        configured_client = self.gated_client()
+        registry = configured_client.app.state.dependencies.connected_llm_fingerprints
         registry.add(llm_token_fingerprint(SECRET, HF_TOKEN))
-        self.enterContext(patch.object(compute_main, "_connected_llm_fingerprints", registry))
-        self.enterContext(patch.object(compute_main, "_llm_rate_limiter", compute_main._FingerprintRateLimiter(100)))
-        live = LiveApp()
+        live = LiveApp(configured_client.app)
         self.addCleanup(live.close)
 
         arrivals: list[tuple[float, bytes]] = []
@@ -433,10 +439,7 @@ class HfTokenGateTests(ComputeLlmProxyTestCase):
         self.assertEqual(self.post_until_401(client).status_code, 401)
 
     def test_missing_shared_secret_fails_closed(self) -> None:
-        self.enterContext(patch.object(compute_main, "ENABLE_LLM_PROXY", True))
-        self.enterContext(patch.object(compute_main, "SESSION_SHARED_SECRET", ""))
-        self.enterContext(patch.object(compute_main, "INTERNAL_HTTP_BASE_URL", self.stub.base_url))
-        client = TestClient(compute_main.app)
+        client = self.gated_client(secret="")
 
         response = self.post_chat(client)
 
@@ -484,8 +487,7 @@ class FingerprintRateLimitTests(ComputeLlmProxyTestCase):
 
     def test_rate_limit_window_slides_and_recovers(self) -> None:
         clock = {"now": 1000.0}
-        self.enterContext(patch.object(compute_main, "_now", lambda: clock["now"]))
-        client = self.gated_client(rate_limit_rpm=2)
+        client = self.gated_client(rate_limit_rpm=2, time_fn=lambda: clock["now"])
         with _connected_session(client):
             self.assertEqual(self.post_chat(client).status_code, 200)
             clock["now"] += 30.0
@@ -532,8 +534,7 @@ class PoolPassthroughTests(ComputeLlmProxyTestCase):
             ],
         }
         self.stub.responder = lambda path: (200, pool_payload)
-        self.enterContext(patch.object(compute_main, "INTERNAL_POOL_URL", f"{self.stub.base_url}/v1/pool"))
-        client = TestClient(compute_main.app)
+        client = self.gated_client()
 
         response = client.get("/v1/pool")
 
@@ -549,12 +550,12 @@ class PoolPassthroughTests(ComputeLlmProxyTestCase):
 
 
 class LiveApp:
-    """compute_main.app on a real uvicorn server, lifespan off (the real
+    """A configured compute app on a real uvicorn server, lifespan off (the real
     lifespan would spawn a speech-to-speech process)."""
 
-    def __init__(self) -> None:
+    def __init__(self, application) -> None:
         config = uvicorn.Config(
-            compute_main.app,
+            application,
             host="127.0.0.1",
             port=0,
             log_level="error",
