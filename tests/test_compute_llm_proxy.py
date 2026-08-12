@@ -250,7 +250,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
     def test_health_attributes_responses_api_requests(self) -> None:
         client = self.gated_client(llm="responses-api")
         with _connected_session(client):
-            response = client.post("/v1/responses", content=b'{}', headers=_auth())
+            response = client.post("/v1/responses", content=b"{}", headers=_auth())
         self.assertEqual(response.status_code, 200)
 
         payload = client.get("/health").json()["llm_proxy_usage"]

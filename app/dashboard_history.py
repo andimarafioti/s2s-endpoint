@@ -356,9 +356,7 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             else {}
         )
         llm_proxy_requests = max(int(raw_record.get("llm_proxy_requests", 0)), 0)
-        llm_proxy_request_counts = _coerce_llm_proxy_request_counts(
-            raw_record.get("llm_proxy_request_counts")
-        )
+        llm_proxy_request_counts = _coerce_llm_proxy_request_counts(raw_record.get("llm_proxy_request_counts"))
         if not llm_proxy_request_counts and llm_proxy_requests > 0:
             llm_proxy_request_counts["legacy"] = llm_proxy_requests
         usage[actor_id] = {
@@ -407,10 +405,7 @@ def _coerce_llm_proxy_request_counts(value: object) -> dict[str, int]:
     return {
         writer_id[:128]: max(int(count), 0)
         for writer_id, count in value.items()
-        if isinstance(writer_id, str)
-        and writer_id
-        and isinstance(count, int)
-        and not isinstance(count, bool)
+        if isinstance(writer_id, str) and writer_id and isinstance(count, int) and not isinstance(count, bool)
     }
 
 

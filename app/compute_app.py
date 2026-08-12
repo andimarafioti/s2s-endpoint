@@ -501,17 +501,14 @@ async def _proxy_llm_request(
         await client.aclose()
         raise
 
-    if (
-        (path == "/v1/chat/completions" and settings.llm == "chat-completions")
-        or (path == "/v1/responses" and settings.llm == "responses-api")
+    if (path == "/v1/chat/completions" and settings.llm == "chat-completions") or (
+        path == "/v1/responses" and settings.llm == "responses-api"
     ):
         token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
         if token is None:
             token = bearer_token(request.headers.get("authorization"))
         if token is not None:
-            dependencies.llm_proxy_attribution.record(
-                llm_token_fingerprint(settings.session_shared_secret, token)
-            )
+            dependencies.llm_proxy_attribution.record(llm_token_fingerprint(settings.session_shared_secret, token))
 
     async def _cleanup() -> None:
         await upstream.aclose()

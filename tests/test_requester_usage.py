@@ -177,9 +177,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         await service.history.record_llm_proxy_usage(
             requests=1000,
-            requester_counts=[
-                (proxy_requester.actor_id, proxy_requester.history_metadata(), 1000)
-            ],
+            requester_counts=[(proxy_requester.actor_id, proxy_requester.history_metadata(), 1000)],
             observations={},
             requesters={},
             observed_at_s=clock.now(),

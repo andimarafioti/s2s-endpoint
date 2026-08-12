@@ -1043,9 +1043,7 @@ class EndpointPoolRouter:
                         {
                             "instance_id": endpoint.llm_proxy_usage.instance_id,
                             "requests": endpoint.llm_proxy_usage.requests,
-                            "requests_by_fingerprint": dict(
-                                endpoint.llm_proxy_usage.requests_by_fingerprint
-                            ),
+                            "requests_by_fingerprint": dict(endpoint.llm_proxy_usage.requests_by_fingerprint),
                         }
                         if endpoint.llm_proxy_usage is not None
                         else None

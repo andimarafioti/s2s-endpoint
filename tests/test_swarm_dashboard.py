@@ -376,9 +376,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
                     "requests_by_fingerprint": {"proxy-a": 10},
                 }
             },
-            llm_proxy_requesters={
-                "proxy-a": {"actor_id": requester.actor_id, **requester.history_metadata()}
-            },
+            llm_proxy_requesters={"proxy-a": {"actor_id": requester.actor_id, **requester.history_metadata()}},
         )
         store = FakeHistoryStore(initial_buckets=[persisted])
         payload = _health_snapshot(
@@ -442,9 +440,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
                     "requests_by_fingerprint": {"proxy-a": 10},
                 }
             },
-            llm_proxy_requesters={
-                "proxy-a": {"actor_id": requester.actor_id, **requester.history_metadata()}
-            },
+            llm_proxy_requesters={"proxy-a": {"actor_id": requester.actor_id, **requester.history_metadata()}},
         )
         store = FakeHistoryStore()
         payload = _health_snapshot(

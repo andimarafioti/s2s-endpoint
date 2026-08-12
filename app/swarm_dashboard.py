@@ -310,9 +310,7 @@ class SwarmDashboard:
         self._latest_sample: Optional[SwarmStateSample] = None
         self._sample_task: Optional[asyncio.Task] = None
         self._llm_proxy_observations: dict[str, tuple[str, int, dict[str, int]]] = {}
-        self._llm_proxy_pending_observations: dict[
-            str, list[tuple[str, int, dict[str, int]]]
-        ] = {}
+        self._llm_proxy_pending_observations: dict[str, list[tuple[str, int, dict[str, int]]]] = {}
         self._llm_proxy_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
         self._llm_proxy_requester_limit = max_requester_records
         self._llm_proxy_lock = asyncio.Lock()
