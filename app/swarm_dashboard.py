@@ -2,6 +2,7 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass, field
+from statistics import median
 from typing import Awaitable, Callable, Iterable, Optional
 
 from app.dashboard_history import (
@@ -22,16 +23,6 @@ ROLLING_VIEW_WINDOWS: tuple[tuple[str, int], ...] = (
     ("6h", 6 * 60),
     ("24h", 24 * 60),
 )
-
-
-def _median(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    sorted_values = sorted(values)
-    middle = len(sorted_values) // 2
-    if len(sorted_values) % 2:
-        return sorted_values[middle]
-    return (sorted_values[middle - 1] + sorted_values[middle]) / 2.0
 
 
 def _parse_window_minutes(window: str | None) -> int:
@@ -128,7 +119,9 @@ class SwarmBucketAggregate:
 
     @property
     def median_conversation_duration_s(self) -> float:
-        return round(_median(self.completed_conversation_duration_samples_s), 2)
+        if not self.completed_conversation_duration_samples_s:
+            return 0.0
+        return round(median(self.completed_conversation_duration_samples_s), 2)
 
     def as_summary_dict(self) -> dict[str, object]:
         return {

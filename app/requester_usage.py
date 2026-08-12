@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from statistics import median
 from typing import Callable, Iterable
 
 from app.dashboard_history import (
@@ -308,7 +309,7 @@ def aggregate_requester_usage(
     peer_request_counts = [
         actor.requests for actor_id, actor in actors.items() if actor_id != "overflow" and actor.requests > 0
     ]
-    median_peer_requests = _median([float(value) for value in peer_request_counts])
+    median_peer_requests = float(median(peer_request_counts)) if peer_request_counts else 0.0
     relative_threshold = max(20, int(median_peer_requests * 5))
     window_hours = max(window_minutes / 60.0, 1.0 / 60.0)
 
@@ -508,13 +509,3 @@ def _usage_signals(
     if completed_sessions >= 3 and short_sessions / completed_sessions >= 0.8:
         signals.append(f"mostly short sessions: {short_sessions:,}/{completed_sessions:,}")
     return signals
-
-
-def _median(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    sorted_values = sorted(values)
-    middle = len(sorted_values) // 2
-    if len(sorted_values) % 2:
-        return sorted_values[middle]
-    return (sorted_values[middle - 1] + sorted_values[middle]) / 2.0
