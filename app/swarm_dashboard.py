@@ -400,37 +400,7 @@ class SwarmDashboard:
             points = []
             for bucket_start in range(start_bucket, end_bucket + 1, 60):
                 bucket = minute_map.get(bucket_start)
-                if bucket is None:
-                    points.append(
-                        {
-                            "timestamp": _isoformat(bucket_start),
-                            "running_endpoints": 0,
-                            "warming_endpoints": 0,
-                            "transitioning_endpoints": 0,
-                            "parked_endpoints": 0,
-                            "connected_sessions": 0,
-                            "pending_sessions": 0,
-                            "free_slots": 0,
-                            "effective_free_slots": 0,
-                            "router_active_sessions": 0,
-                            "errors_count": 0,
-                            "healthy": False,
-                            "session_requests": 0,
-                            "session_allocation_successes": 0,
-                            "session_allocation_failures": 0,
-                            "session_auth_rejections": 0,
-                            "session_rate_limited": 0,
-                            "session_connected_events": 0,
-                            "session_disconnected_events": 0,
-                            "completed_conversations": 0,
-                            "avg_conversation_duration_s": 0.0,
-                            "avg_conversation_duration_min": 0.0,
-                            "max_conversation_duration_s": 0.0,
-                            "max_conversation_duration_min": 0.0,
-                        }
-                    )
-                else:
-                    points.append(bucket.as_minute_point())
+                points.append((bucket or SwarmHistoryBucket(bucket_start_s=bucket_start)).as_minute_point())
             return points
 
         return self._aggregate_hourly(minute_map, start_bucket, end_bucket)
