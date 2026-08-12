@@ -766,6 +766,12 @@ class DashboardHistory:
         restore_task = self._restore_task
         if restore_task is not None and restore_task is not asyncio.current_task() and not restore_task.done():
             await restore_task
+        if self._history_restore_status == "failed":
+            async with self._persistence_lock:
+                if self._history_restore_status == "failed":
+                    await self._restore_history()
+                    if self._history_restore_status == "failed":
+                        raise RuntimeError(self._history_restore_detail or "Failed to restore dashboard history")
         now = self._time_fn()
         counted = False
         async with self._lock:

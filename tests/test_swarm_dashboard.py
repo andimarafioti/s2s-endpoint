@@ -77,8 +77,8 @@ class SlowHistoryStore(FakeHistoryStore):
 
 
 class FailingLoadHistoryStore(FakeHistoryStore):
-    def __init__(self, *, fail_on_load_calls):
-        super().__init__()
+    def __init__(self, *, fail_on_load_calls, initial_buckets=None):
+        super().__init__(initial_buckets=initial_buckets)
         self.fail_on_load_calls = set(fail_on_load_calls)
 
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float):
@@ -383,6 +383,34 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         persisted = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
         self.assertEqual(persisted.llm_proxy_requests, 1)
         self.assertEqual(persisted.llm_proxy_sequences, {"process-a": 1})
+
+    async def test_llm_proxy_usage_recovers_failed_restore_before_persisting(self):
+        clock = FakeClock(2 * 3600)
+        persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
+        persisted.llm_proxy_requests = 5
+        persisted.llm_proxy_sequences = {"old-process": 5}
+        store = FailingLoadHistoryStore(
+            fail_on_load_calls={1},
+            initial_buckets=[persisted],
+        )
+        history = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
+        await history.start()
+        try:
+            counted = await history.record_llm_proxy_request(
+                "new-process",
+                1,
+                "hf:alice",
+                {"label": "@alice", "kind": "authenticated", "verification": "verified"},
+            )
+            current = next(bucket for bucket in await history.snapshot() if bucket.bucket_start_s == 2 * 3600)
+        finally:
+            await history.stop()
+
+        self.assertTrue(counted)
+        self.assertEqual(current.llm_proxy_requests, 6)
+        saved = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
+        self.assertEqual(saved.llm_proxy_requests, 6)
+        self.assertEqual(saved.llm_proxy_sequences, {"old-process": 5, "new-process": 1})
 
     async def test_restore_merges_current_minute_usage_into_startup_sample(self):
         clock = FakeClock(2 * 3600)
