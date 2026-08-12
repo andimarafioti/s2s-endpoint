@@ -628,7 +628,6 @@ class SwarmDashboard:
                             request_delta = requests
                             fingerprint_deltas = requests_by_fingerprint
                         elif requests < previous_requests:
-                            previous = observation
                             continue
                         else:
                             request_delta = requests - previous_requests
