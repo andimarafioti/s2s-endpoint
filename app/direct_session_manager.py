@@ -5,15 +5,14 @@ import secrets
 from collections import OrderedDict
 from dataclasses import dataclass
 from time import monotonic
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 from app.app_utils import elapsed_ms, http_base_url_from_ws_url
 from app.endpoint_pool_router import EndpointLease, EndpointPoolRouter
+from app.session_manager import SessionReleaseHandler, TicketExpiredHandler
 from app.session_tokens import attach_session_token, create_session_token, verify_session_token
 
 logger = logging.getLogger("s2s-endpoint")
-SessionReleaseHandler = Callable[[dict[str, object]], Awaitable[None]]
-TicketExpiredHandler = Callable[[str], Awaitable[None]]
 
 
 class QueueAtCapacityError(RuntimeError):
