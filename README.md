@@ -170,6 +170,7 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - free slots and effective free capacity
 - `POST /session` request counts, authentication rejections, allocation
   successes/failures, and connect/disconnect events
+- authorized LLM proxy requests across the compute fleet and by requester
 - conversation starts/completions plus average and max completed conversation duration
 - distinct verified Hugging Face users, token fingerprints, anonymous network
   fingerprints, and client-reported robot fingerprints

@@ -1,11 +1,13 @@
 import asyncio
+import hmac
 import json
 import subprocess
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Mapping, Optional
 
 import httpx
@@ -27,6 +29,7 @@ PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_POOL_PATH = "/v1/pool"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
+MAX_LLM_PROXY_REQUESTERS = 50_000
 
 
 @dataclass(frozen=True)
@@ -232,7 +235,7 @@ async def root(settings: ComputeSettings):
     }
 
 
-async def health(settings: ComputeSettings, dependencies: "ComputeDependencies"):
+async def health(request: Request, settings: ComputeSettings, dependencies: "ComputeDependencies"):
     healthy, detail, snapshot = await dependencies.session_router.healthcheck()
     if not healthy:
         raise HTTPException(status_code=503, detail=detail or "compute router is not ready")
@@ -248,6 +251,15 @@ async def health(settings: ComputeSettings, dependencies: "ComputeDependencies")
             "llm": settings.llm,
             "tts": settings.tts,
             "router": snapshot,
+            "llm_proxy_usage": dependencies.llm_proxy_usage.snapshot(
+                include_attribution=bool(
+                    settings.session_shared_secret
+                    and hmac.compare_digest(
+                        request.headers.get("x-s2s-internal-auth", ""),
+                        settings.session_shared_secret,
+                    )
+                ),
+            ),
         }
     )
 
@@ -341,6 +353,30 @@ class _FingerprintRateLimiter:
                 {k: v for k, v in self._hits.items() if v and now - v[-1] < _RATE_LIMIT_WINDOW_S},
             )
         return True
+
+
+@dataclass
+class _LLMProxyUsage:
+    """Authorized request counts, reset with the compute process."""
+
+    instance_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    requests: int = 0
+    requests_by_fingerprint: dict[str, int] = field(default_factory=dict)
+
+    def record(self, fingerprint: str) -> None:
+        self.requests += 1
+        if (
+            fingerprint not in self.requests_by_fingerprint
+            and len(self.requests_by_fingerprint) >= MAX_LLM_PROXY_REQUESTERS - 1
+        ):
+            fingerprint = "overflow"
+        self.requests_by_fingerprint[fingerprint] = self.requests_by_fingerprint.get(fingerprint, 0) + 1
+
+    def snapshot(self, *, include_attribution: bool) -> dict[str, object]:
+        result: dict[str, object] = {"instance_id": self.instance_id, "requests": self.requests}
+        if include_attribution:
+            result["requests_by_fingerprint"] = dict(self.requests_by_fingerprint)
+        return result
 
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
@@ -441,6 +477,12 @@ async def _proxy_llm_request(
     denial = _llm_proxy_denial(request, settings, dependencies)
     if denial is not None:
         return denial
+
+    token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
+    if token is None:
+        token = bearer_token(request.headers.get("authorization"))
+    assert token is not None
+    dependencies.llm_proxy_usage.record(llm_token_fingerprint(settings.session_shared_secret, token))
 
     headers = {}
     content_type = request.headers.get("content-type")
@@ -712,6 +754,7 @@ class ComputeDependencies:
     http_get_json: Callable[[str], dict[str, object]]
     notify_lb_session_event: Callable[..., Awaitable[None]]
     proxy_websocket: Callable[..., Awaitable[None]]
+    llm_proxy_usage: _LLMProxyUsage = field(default_factory=_LLMProxyUsage)
 
 
 @dataclass(frozen=True)
@@ -776,6 +819,7 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
         http_get_json=_http_get_json,
         notify_lb_session_event=notify_lb_session_event,
         proxy_websocket=proxy_websocket,
+        llm_proxy_usage=_LLMProxyUsage(),
     )
 
 
@@ -798,8 +842,8 @@ def create_app(
     async def root_route():
         return await root(settings)
 
-    async def health_route():
-        return await health(settings, resolved_dependencies)
+    async def health_route(request: Request):
+        return await health(request, settings, resolved_dependencies)
 
     async def pool_route():
         return await pool(settings, resolved_dependencies)

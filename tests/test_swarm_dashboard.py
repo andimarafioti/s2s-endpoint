@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app.dashboard_history import DashboardHistory, SwarmHistoryBucket, SwarmStateSample
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
+from app.requester_identity import RequesterIdentity
 from app.swarm_dashboard import SwarmDashboard
 
 
@@ -273,6 +274,50 @@ def _bucket_store(api: FakeBucketApi) -> HuggingFaceBucketHistoryStore:
 
 
 class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_llm_proxy_counts_are_aggregated_attributed_and_reset_safe(self):
+        clock = FakeClock(2 * 3600)
+        payload = _health_snapshot(
+            connected=1,
+            pending=0,
+            running=2,
+            waking=0,
+            free_slots=1,
+            effective_free_slots=1,
+        )
+        endpoints = payload[2]["router"]["endpoints"]
+        endpoints[0]["llm_proxy_usage"] = {"instance_id": "process-a", "requests": 0, "requests_by_fingerprint": {}}
+        endpoints[1]["llm_proxy_usage"] = {"instance_id": "process-b", "requests": 0, "requests_by_fingerprint": {}}
+        dashboard = SwarmDashboard(snapshot_provider=FakeSnapshotProvider(payload), time_fn=clock.now)
+        dashboard.register_llm_proxy_requester(
+            "fingerprint-a",
+            RequesterIdentity("token:a", "@alice", "authenticated", "verified", "a", "alice"),
+        )
+
+        await dashboard.capture_sample()
+        endpoints[0]["llm_proxy_usage"] = {
+            "instance_id": "process-a",
+            "requests": 2,
+            "requests_by_fingerprint": {"fingerprint-a": 2},
+        }
+        endpoints[1]["llm_proxy_usage"] = {
+            "instance_id": "process-b",
+            "requests": 3,
+            "requests_by_fingerprint": {"fingerprint-b": 3},
+        }
+        await dashboard.capture_sample()
+        endpoints[0]["llm_proxy_usage"] = {
+            "instance_id": "process-a2",
+            "requests": 1,
+            "requests_by_fingerprint": {"fingerprint-a": 1},
+        }
+        await dashboard.capture_sample()
+
+        result = await dashboard.data(window="60m", resolution="minute")
+        self.assertEqual(result["summary"]["llm_proxy_requests_window"], 6)
+        alice = next(row for row in result["requesters"]["leaderboard"] if row["actor_id"] == "hf:alice")
+        self.assertEqual(alice["llm_proxy_requests"], 3)
+        self.assertNotIn("requests_by_fingerprint", result["current"]["endpoints"][0]["llm_proxy_usage"])
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(

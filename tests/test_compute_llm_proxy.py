@@ -186,6 +186,9 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         async def _fake_release(slot_id) -> None:
             pass
 
+        async def _fake_healthcheck():
+            return True, None, {"active_sessions": 1, "max_sessions": 1}
+
         async def _no_lb_callback(*args: Any, **kwargs: Any) -> None:
             pass
 
@@ -198,7 +201,11 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
             session_shared_secret=secret,
         )
         dependencies = compute_main.ComputeDependencies(
-            session_router=SimpleNamespace(acquire=_fake_acquire, release=_fake_release),
+            session_router=SimpleNamespace(
+                acquire=_fake_acquire,
+                release=_fake_release,
+                healthcheck=_fake_healthcheck,
+            ),
             connected_llm_fingerprints=compute_main._ConnectedFingerprintRegistry(),
             llm_rate_limiter=compute_main._FingerprintRateLimiter(rate_limit_rpm, time_fn=time_fn),
             http_get_json=compute_main._http_get_json,
@@ -339,6 +346,22 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"]["type"], "upstream_unreachable")
+
+        public_usage = client.get("/health").json()["llm_proxy_usage"]
+        internal_usage = client.get("/health", headers={"X-S2S-Internal-Auth": SECRET}).json()["llm_proxy_usage"]
+        self.assertEqual(public_usage["requests"], 1)
+        self.assertNotIn("requests_by_fingerprint", public_usage)
+        self.assertEqual(internal_usage["requests_by_fingerprint"], {llm_token_fingerprint(SECRET, HF_TOKEN): 1})
+
+    def test_authorized_alternate_route_is_counted(self) -> None:
+        client = self.gated_client()
+        with _connected_session(client):
+            response = client.post("/v1/responses", content=b"{}", headers=_auth())
+
+        self.assertEqual(response.status_code, 200)
+        usage = client.get("/health", headers={"X-S2S-Internal-Auth": SECRET}).json()["llm_proxy_usage"]
+        self.assertEqual(usage["requests"], 1)
+        self.assertEqual(usage["requests_by_fingerprint"], {llm_token_fingerprint(SECRET, HF_TOKEN): 1})
 
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()

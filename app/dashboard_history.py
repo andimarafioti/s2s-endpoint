@@ -84,7 +84,11 @@ class SwarmStateSample:
         captured_at_s: float,
     ) -> "SwarmStateSample":
         router = snapshot.get("router") or {}
-        endpoints = list(router.get("endpoints") or [])
+        endpoints = copy.deepcopy(list(router.get("endpoints") or []))
+        for endpoint in endpoints:
+            usage = endpoint.get("llm_proxy_usage") if isinstance(endpoint, dict) else None
+            if isinstance(usage, dict):
+                usage.pop("requests_by_fingerprint", None)
         status_counts: dict[str, int] = {}
         for endpoint in endpoints:
             status = _normalize_status(endpoint.get("status", "unknown"))
@@ -166,6 +170,7 @@ class SwarmHistoryBucket:
     session_rate_limited: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
+    llm_proxy_requests: int = 0
     completed_conversations: int = 0
     completed_conversation_duration_total_s: float = 0.0
     completed_conversation_duration_max_s: float = 0.0
@@ -219,6 +224,7 @@ class SwarmHistoryBucket:
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
+            "llm_proxy_requests": self.llm_proxy_requests,
             "completed_conversations": self.completed_conversations,
             "avg_conversation_duration_s": (
                 round(self.completed_conversation_duration_total_s / self.completed_conversations, 2)
@@ -280,6 +286,7 @@ _HISTORY_BUCKET_INT_FIELDS = {
     "session_rate_limited",
     "session_connected_events",
     "session_disconnected_events",
+    "llm_proxy_requests",
     "completed_conversations",
 }
 _HISTORY_BUCKET_FLOAT_FIELDS = {
@@ -349,6 +356,7 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "rate_limited": max(int(raw_record.get("rate_limited", 0)), 0),
             "abandoned": max(int(raw_record.get("abandoned", 0)), 0),
             "connections": max(int(raw_record.get("connections", 0)), 0),
+            "llm_proxy_requests": max(int(raw_record.get("llm_proxy_requests", 0)), 0),
             "completed_sessions": max(int(raw_record.get("completed_sessions", 0)), 0),
             "short_sessions": max(int(raw_record.get("short_sessions", 0)), 0),
             "connected_duration_total_s": max(
@@ -398,6 +406,7 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
         "rate_limited": 0,
         "abandoned": 0,
         "connections": 0,
+        "llm_proxy_requests": 0,
         "completed_sessions": 0,
         "short_sessions": 0,
         "connected_duration_total_s": 0.0,
@@ -734,6 +743,42 @@ class DashboardHistory:
         async with self._lock:
             bucket = self._get_bucket_unlocked(now)
             setattr(bucket, field_name, getattr(bucket, field_name) + 1)
+            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
+            self._prune_unlocked(now)
+            self._wake_persistence_unlocked()
+
+    async def record_llm_proxy_usage(
+        self,
+        requests: int,
+        requesters: list[tuple[str, dict[str, object], int]],
+    ) -> None:
+        if requests <= 0:
+            return
+        now = self._time_fn()
+        async with self._lock:
+            bucket = self._get_bucket_unlocked(now)
+            bucket.llm_proxy_requests += requests
+            for actor_id, metadata, count in requesters:
+                resolved_actor_id = actor_id
+                resolved_metadata = metadata
+                if (
+                    resolved_actor_id not in bucket.requester_usage
+                    and len(bucket.requester_usage) >= self.max_requesters_per_bucket
+                ):
+                    resolved_actor_id = "overflow"
+                    resolved_metadata = {
+                        "label": "Other requesters (cardinality limit)",
+                        "kind": "overflow",
+                        "verification": "not_applicable",
+                    }
+                record = bucket.requester_usage.get(resolved_actor_id)
+                if record is None:
+                    self._make_requester_record_capacity_unlocked()
+                    record = _new_requester_usage_record(resolved_metadata)
+                    bucket.requester_usage[resolved_actor_id] = record
+                    self._requester_record_count += 1
+                _merge_requester_identity(record, resolved_metadata)
+                record["llm_proxy_requests"] = int(record.get("llm_proxy_requests", 0)) + count
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(now)
             self._wake_persistence_unlocked()

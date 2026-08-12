@@ -146,6 +146,26 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(usage, ComputeUsage(active_sessions=2, max_sessions=4))
 
+    def test_fetch_compute_usage_reads_llm_proxy_counts(self):
+        payload = {
+            "router": {"active_sessions": 1, "max_sessions": 2},
+            "llm_proxy_usage": {
+                "instance_id": "process-a",
+                "requests": 3,
+                "requests_by_fingerprint": {"fingerprint-a": 3},
+            },
+        }
+        with patch(
+            "app.endpoint_pool_router.urllib.request.urlopen",
+            return_value=FakeUrlopenResponse(payload),
+        ) as urlopen:
+            usage = fetch_compute_usage("https://compute.example", internal_auth_token="shared")
+
+        self.assertEqual(usage.llm_proxy_instance_id, "process-a")
+        self.assertEqual(usage.llm_proxy_requests, 3)
+        self.assertEqual(usage.llm_proxy_requests_by_fingerprint, {"fingerprint-a": 3})
+        self.assertEqual(urlopen.call_args.args[0].headers["X-s2s-internal-auth"], "shared")
+
     def test_huggingface_controller_uses_an_isolated_bounded_http_client(self):
         from huggingface_hub import get_session
 

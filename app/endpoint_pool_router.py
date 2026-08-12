@@ -20,6 +20,9 @@ logger = logging.getLogger("s2s-endpoint")
 class ComputeUsage:
     active_sessions: int
     max_sessions: int
+    llm_proxy_instance_id: Optional[str] = None
+    llm_proxy_requests: int = 0
+    llm_proxy_requests_by_fingerprint: dict[str, int] = field(default_factory=dict)
 
 
 ComputeUsageFetcher = Callable[[str], ComputeUsage]
@@ -71,10 +74,13 @@ class ComputeUnhealthyError(RuntimeError):
     """The compute endpoint explicitly reported that it is not ready."""
 
 
-def fetch_compute_usage(base_url: str) -> ComputeUsage:
+def fetch_compute_usage(base_url: str, *, internal_auth_token: str = "") -> ComputeUsage:
+    headers = {"Accept": "application/json"}
+    if internal_auth_token:
+        headers["X-S2S-Internal-Auth"] = internal_auth_token
     request = urllib.request.Request(
         _to_health_url(base_url),
-        headers={"Accept": "application/json"},
+        headers=headers,
         method="GET",
     )
     try:
@@ -125,9 +131,40 @@ def fetch_compute_usage(base_url: str) -> ComputeUsage:
     if active_sessions > max_sessions:
         raise ComputeUsageSchemaError("compute health reported more active sessions than max_sessions")
 
+    llm_proxy_instance_id = None
+    llm_proxy_requests = 0
+    llm_proxy_requests_by_fingerprint: dict[str, int] = {}
+    llm_proxy = payload.get("llm_proxy_usage")
+    if isinstance(llm_proxy, dict):
+        instance_id = llm_proxy.get("instance_id")
+        requests = llm_proxy.get("requests")
+        requests_by_fingerprint = llm_proxy.get("requests_by_fingerprint")
+        if (
+            isinstance(instance_id, str)
+            and instance_id
+            and isinstance(requests, int)
+            and not isinstance(requests, bool)
+            and requests >= 0
+            and isinstance(requests_by_fingerprint, dict)
+            and all(
+                isinstance(fingerprint, str)
+                and fingerprint
+                and isinstance(count, int)
+                and not isinstance(count, bool)
+                and count >= 0
+                for fingerprint, count in requests_by_fingerprint.items()
+            )
+        ):
+            llm_proxy_instance_id = instance_id
+            llm_proxy_requests = requests
+            llm_proxy_requests_by_fingerprint = dict(requests_by_fingerprint)
+
     return ComputeUsage(
         active_sessions=active_sessions,
         max_sessions=max_sessions,
+        llm_proxy_instance_id=llm_proxy_instance_id,
+        llm_proxy_requests=llm_proxy_requests,
+        llm_proxy_requests_by_fingerprint=llm_proxy_requests_by_fingerprint,
     )
 
 
@@ -413,6 +450,9 @@ class ManagedEndpoint:
     drain_lease_id: Optional[str] = None
     last_drain_warning_at: Optional[float] = None
     last_sync_failure_log_at: Optional[float] = None
+    llm_proxy_instance_id: Optional[str] = None
+    llm_proxy_requests: int = 0
+    llm_proxy_requests_by_fingerprint: dict[str, int] = field(default_factory=dict)
 
     def apply_snapshot(self, snapshot: EndpointSnapshot) -> None:
         self.status = snapshot.status
@@ -450,6 +490,9 @@ class ManagedEndpoint:
         self.usage_synced = True
         self.last_usage_sync_at = synced_at
         self.usage_sync_drain_generation = drain_generation
+        self.llm_proxy_instance_id = usage.llm_proxy_instance_id
+        self.llm_proxy_requests = usage.llm_proxy_requests
+        self.llm_proxy_requests_by_fingerprint = dict(usage.llm_proxy_requests_by_fingerprint)
         self.last_sync_failure_log_at = None
         self.last_error = None
         if observed_increase:
@@ -988,6 +1031,15 @@ class EndpointPoolRouter:
                     "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
                     "url": endpoint.url,
                     "last_error": endpoint.last_error,
+                    "llm_proxy_usage": (
+                        {
+                            "instance_id": endpoint.llm_proxy_instance_id,
+                            "requests": endpoint.llm_proxy_requests,
+                            "requests_by_fingerprint": dict(endpoint.llm_proxy_requests_by_fingerprint),
+                        }
+                        if endpoint.llm_proxy_instance_id is not None
+                        else None
+                    ),
                 }
                 for endpoint in sorted(endpoints, key=lambda item: item.name)
             ],

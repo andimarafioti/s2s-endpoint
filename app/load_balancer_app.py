@@ -1,3 +1,4 @@
+import copy
 import logging
 import secrets
 from dataclasses import dataclass
@@ -342,7 +343,10 @@ def build_endpoint_router(settings: LoadBalancerSettings) -> EndpointPoolRouter:
         drain_lease_ttl_s=settings.compute_endpoint_drain_lease_ttl_s,
         drain_warning_after_s=settings.compute_endpoint_drain_warning_after_s,
         drain_warning_interval_s=settings.compute_endpoint_drain_warning_interval_s,
-        compute_usage_fetcher=fetch_compute_usage,
+        compute_usage_fetcher=lambda url: fetch_compute_usage(
+            url,
+            internal_auth_token=settings.session_shared_secret,
+        ),
         # How long a previously observed usage count stays trusted when
         # health polls fail transiently. Must be comfortably above the
         # reconcile interval (10s): the default 60s means roughly six
@@ -917,11 +921,22 @@ async def health(runtime: LoadBalancerRuntime):
         "dashboard_preview_mode": settings.dashboard_preview_mode,
         "dashboard_history": dependencies.dashboard.persistence_status(),
         "requester_tracking": requester_tracking,
-        "sessions": snapshot,
+        "sessions": _public_session_snapshot(snapshot),
     }
     if not healthy:
         payload["detail"] = detail or "endpoint router is not ready"
     return JSONResponse(payload, status_code=200 if healthy else 503)
+
+
+def _public_session_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
+    result = copy.deepcopy(snapshot)
+    router = result.get("router")
+    endpoints = router.get("endpoints") if isinstance(router, dict) else None
+    for endpoint in endpoints if isinstance(endpoints, list) else []:
+        usage = endpoint.get("llm_proxy_usage") if isinstance(endpoint, dict) else None
+        if isinstance(usage, dict):
+            usage.pop("requests_by_fingerprint", None)
+    return result
 
 
 async def create_session(runtime: LoadBalancerRuntime, request: Request):
@@ -964,9 +979,13 @@ async def create_session(runtime: LoadBalancerRuntime, request: Request):
         )
     allocation_started_at = monotonic()
     try:
+        llm_fingerprint = await _llm_proxy_fingerprint(runtime, request, requester)
+        if llm_fingerprint is not None:
+            requester = await _refresh_requester_identity(runtime, requester)
+            dependencies.dashboard.register_llm_proxy_requester(llm_fingerprint, requester)
         allocation = await dependencies.session_manager.allocate(
             public_base_url(request),
-            llm_fingerprint=await _llm_proxy_fingerprint(runtime, request, requester),
+            llm_fingerprint=llm_fingerprint,
         )
     except QueueAtCapacityError as exc:
         dependencies.requester_rate_limiter.record_allocation_failure(requester)
@@ -1333,6 +1352,7 @@ async def get_endpoint_snapshot(
         raise HTTPException(status_code=503, detail="Endpoint status is not available")
 
     _, _, snapshot = await session_manager.healthcheck()
+    snapshot = _public_session_snapshot(snapshot)
     router_snapshot = snapshot.get("router", {})
     endpoints = router_snapshot.get("endpoints", []) if isinstance(router_snapshot, dict) else []
     endpoint_snapshot = next(

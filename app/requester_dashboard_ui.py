@@ -23,6 +23,7 @@ REQUESTER_DASHBOARD_MARKUP = """
                 <th>Requester</th>
                 <th>Status</th>
                 <th>Requests</th>
+                <th>LLM proxy</th>
                 <th>Allocated</th>
                 <th>Connected</th>
                 <th>Duration</th>
@@ -138,6 +139,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
               <div style="margin-top:6px;"><span class="tiny-pill risk-pill ${htmlEscape(row.risk || 'normal')}">${htmlEscape(row.risk || 'normal')}</span></div>
             </td>
             <td><strong>${htmlEscape(prettyNumber(row.requests || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.requests_per_hour || 0))}/h</div></td>
+            <td><strong>${htmlEscape(prettyNumber(row.llm_proxy_requests || 0))}</strong></td>
             <td>${htmlEscape(prettyNumber(row.successes || 0))}<div class="muted">${htmlEscape(row.success_rate_pct || 0)}%</div></td>
             <td><strong>${htmlEscape(prettyNumber(row.connections || 0))}</strong><div class="muted">websocket joins</div></td>
             <td><strong>${htmlEscape(formatDuration(row.avg_connected_duration_s || 0))} avg</strong><div class="muted">${htmlEscape(prettyNumber(row.short_sessions || 0))} short · ${htmlEscape(formatDuration(row.max_connected_duration_s || 0))} max</div></td>
@@ -150,7 +152,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td class="requester-signals">${htmlEscape(signals)}</td>
           </tr>
         `;
-      }).join('') : '<tr><td colspan="13" class="muted">No attributed session requests in this window yet.</td></tr>';
+      }).join('') : '<tr><td colspan="14" class="muted">No attributed requests in this window yet.</td></tr>';
 
       const unattributed = Number(requesters?.unattributed_requests || 0);
       const attributionDetail = unattributed
