@@ -1104,6 +1104,11 @@ class DashboardHistory:
                     bucket.bucket_start_s,
                     (0, {}),
                 )
+                if not any(
+                    sequence > current_bucket.llm_proxy_sequences.get(instance_id, 0)
+                    for instance_id, sequence in bucket.llm_proxy_sequences.items()
+                ):
+                    continue
                 total_delta = max(bucket.llm_proxy_requests - previous_total, 0)
                 current_bucket.llm_proxy_requests += total_delta
                 for instance_id, sequence in bucket.llm_proxy_sequences.items():

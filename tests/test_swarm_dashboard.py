@@ -385,6 +385,36 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         alice = next(row for row in result["requesters"]["leaderboard"] if row["actor_id"] == "hf:alice")
         self.assertEqual(alice["llm_proxy_requests"], 1)
 
+    async def test_delayed_merge_does_not_reimport_locally_flushed_usage(self):
+        clock = FakeClock(2 * 3600)
+        persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
+        persisted.llm_proxy_requests = 1
+        persisted.llm_proxy_sequences = {"process-a": 1}
+        history = DashboardHistory(retention_minutes=60, time_fn=clock.now)
+
+        await history.record_sample(
+            SwarmStateSample.from_health_snapshot(
+                healthy=True,
+                detail=None,
+                snapshot=_health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )[2],
+                captured_at_s=clock.now(),
+            )
+        )
+        await history._merge_persisted_history_buckets([persisted])
+        await history.record_llm_proxy_request("process-a", 2, "hf:alice", {"label": "@alice"})
+        flushed = next(bucket for bucket in await history.snapshot() if bucket.bucket_start_s == 2 * 3600)
+        await history._merge_persisted_history_buckets([SwarmHistoryBucket.from_dict(flushed.to_dict())])
+
+        current = next(bucket for bucket in await history.snapshot() if bucket.bucket_start_s == 2 * 3600)
+        self.assertEqual(current.llm_proxy_requests, 2)
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(

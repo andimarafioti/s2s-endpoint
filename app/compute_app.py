@@ -422,6 +422,12 @@ class _LLMProxyUsage:
                     await asyncio.sleep(1.0)
             self._queue.task_done()
 
+    async def stop(self) -> None:
+        await self._queue.join()
+        if self._worker is not None:
+            await self._worker
+            self._worker = None
+
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": error_type}}, status_code=status_code)
@@ -823,6 +829,13 @@ class ComputeRuntime:
     settings: ComputeSettings
     dependencies: ComputeDependencies
 
+    async def start(self) -> None:
+        await self.dependencies.session_router.start()
+
+    async def stop(self) -> None:
+        await self.dependencies.llm_proxy_usage.stop()
+        await self.dependencies.session_router.stop()
+
 
 def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies:
     async def wait_for_ready(
@@ -897,7 +910,7 @@ def create_app(
             "SESSION_SHARED_SECRET is unset; the LLM proxy paths fail closed and answer 401 for every request"
         )
     runtime = ComputeRuntime(settings, resolved_dependencies)
-    application = FastAPI(lifespan=build_lifespan(resolved_dependencies.session_router))
+    application = FastAPI(lifespan=build_lifespan(runtime))
     application.state.runtime = runtime
     application.state.settings = settings
     application.state.dependencies = resolved_dependencies

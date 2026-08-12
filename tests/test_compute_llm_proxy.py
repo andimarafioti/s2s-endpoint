@@ -378,6 +378,29 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(self.stub.requests), 1)
 
+    def test_compute_shutdown_drains_queued_usage(self) -> None:
+        async def exercise() -> bool:
+            delivered = False
+
+            async def notify(*args: Any, **kwargs: Any) -> None:
+                nonlocal delivered
+                await asyncio.sleep(0)
+                delivered = True
+
+            usage = compute_main._LLMProxyUsage()
+            usage.record(
+                "https://lb.example/event",
+                "session-token",
+                "session-1",
+                SECRET,
+                notify,
+                attempts=1,
+            )
+            await usage.stop()
+            return delivered
+
+        self.assertTrue(asyncio.run(exercise()))
+
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()
         for path in ("/v1/chat/completions", "/v1/responses"):
