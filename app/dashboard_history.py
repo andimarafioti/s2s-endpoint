@@ -172,6 +172,8 @@ class SwarmHistoryBucket:
     completed_conversation_duration_max_s: float = 0.0
     completed_conversation_duration_samples_s: list[float] = field(default_factory=list)
     requester_usage: dict[str, dict[str, object]] = field(default_factory=dict)
+    llm_proxy_observations: dict[str, dict[str, object]] | None = None
+    llm_proxy_requesters: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def record_sample(self, sample: SwarmStateSample) -> None:
         self.sample_count += 1
@@ -317,6 +319,12 @@ def _coerce_history_bucket_field(name: str, payload: dict[str, object]) -> objec
         return [max(float(value), 0.0) for value in list(payload.get(name) or [])]
     if name == "requester_usage":
         return _coerce_requester_usage(payload.get(name))
+    if name == "llm_proxy_observations":
+        value = payload.get(name)
+        return copy.deepcopy(value) if isinstance(value, dict) else None
+    if name == "llm_proxy_requesters":
+        value = payload.get(name)
+        return copy.deepcopy(value) if isinstance(value, dict) else {}
     raise KeyError(f"Unknown SwarmHistoryBucket field: {name}")
 
 
@@ -603,6 +611,18 @@ class DashboardHistory:
         async with self._lock:
             return list(self._history.values())
 
+    async def latest_llm_proxy_checkpoint(
+        self,
+    ) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]] | None:
+        async with self._lock:
+            for bucket in reversed(self._history.values()):
+                if bucket.llm_proxy_observations is not None:
+                    return (
+                        copy.deepcopy(bucket.llm_proxy_observations),
+                        copy.deepcopy(bucket.llm_proxy_requesters),
+                    )
+        return None
+
     def history_restore_status(self) -> dict[str, object]:
         now_s = time.monotonic()
         started_at_s = self._history_restore_started_at_s
@@ -815,12 +835,12 @@ class DashboardHistory:
         *,
         requests: int,
         requester_counts: list[tuple[str, dict[str, object], int]],
+        observations: dict[str, dict[str, object]],
+        requesters: dict[str, dict[str, object]],
         observed_at_s: float,
     ) -> None:
         if requests < 0:
             raise ValueError("requests must be >= 0")
-        if requests == 0 and not requester_counts:
-            return
 
         async with self._lock:
             bucket = self._get_bucket_unlocked(observed_at_s)
@@ -850,6 +870,8 @@ class DashboardHistory:
                 _merge_requester_identity(record, resolved_metadata)
                 record["llm_proxy_requests"] = int(record.get("llm_proxy_requests", 0)) + count
 
+            bucket.llm_proxy_observations = copy.deepcopy(observations)
+            bucket.llm_proxy_requesters = copy.deepcopy(requesters)
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(observed_at_s)
             self._wake_persistence_unlocked()
@@ -1077,6 +1099,14 @@ class DashboardHistory:
                         bucket.bucket_start_s in self._dirty_bucket_starts
                         or bucket.bucket_start_s in self._locally_sampled_bucket_starts
                     ):
+                        current_bucket = self._history.get(bucket.bucket_start_s)
+                        if (
+                            current_bucket is not None
+                            and current_bucket.llm_proxy_observations is None
+                            and bucket.llm_proxy_observations is not None
+                        ):
+                            current_bucket.llm_proxy_observations = copy.deepcopy(bucket.llm_proxy_observations)
+                            current_bucket.llm_proxy_requesters = copy.deepcopy(bucket.llm_proxy_requesters)
                         continue
                     current_bucket = self._history.get(bucket.bucket_start_s)
                     if current_bucket is None or current_bucket.to_dict() != serialized_bucket:

@@ -75,6 +75,43 @@ def _coerce_llm_proxy_observation(
     return instance_id, requests, requests_by_fingerprint
 
 
+def _serialize_llm_proxy_observation(
+    observation: tuple[str, int, dict[str, int]],
+) -> dict[str, object]:
+    instance_id, requests, requests_by_fingerprint = observation
+    return {
+        "instance_id": instance_id,
+        "requests": requests,
+        "requests_by_fingerprint": dict(requests_by_fingerprint),
+    }
+
+
+def _serialize_llm_proxy_requester(requester: RequesterIdentity) -> dict[str, object]:
+    return {"actor_id": requester.actor_id, **requester.history_metadata()}
+
+
+def _coerce_llm_proxy_requester(value: object) -> RequesterIdentity | None:
+    if not isinstance(value, dict):
+        return None
+    actor_id = value.get("actor_id")
+    if not isinstance(actor_id, str) or not actor_id:
+        return None
+    account_name = value.get("account_name")
+    network_id = value.get("network_id")
+    reported_robot_id = value.get("reported_robot_id")
+    return RequesterIdentity(
+        actor_id=actor_id[:128],
+        label=str(value.get("label") or "Unknown requester")[:160],
+        kind=str(value.get("kind") or "unknown")[:40],
+        verification=str(value.get("verification") or "unknown")[:40],
+        fingerprint=str(value.get("fingerprint") or "")[:40],
+        account_name=str(account_name)[:80] if account_name is not None else None,
+        network_id=str(network_id)[:128] if network_id is not None else None,
+        reported_robot_id=str(reported_robot_id)[:128] if reported_robot_id is not None else None,
+        client_kind=str(value.get("client_kind") or "unknown")[:80],
+    )
+
+
 @dataclass
 class SwarmBucketAggregate:
     sample_count: int = 0
@@ -276,6 +313,7 @@ class SwarmDashboard:
         self._llm_proxy_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
         self._llm_proxy_requester_limit = max_requester_records
         self._llm_proxy_lock = asyncio.Lock()
+        self._llm_proxy_checkpoint_loaded = history_store is None
 
     async def start(self) -> None:
         await self.capture_sample()
@@ -527,6 +565,32 @@ class SwarmDashboard:
         endpoints = router.get("endpoints") if isinstance(router, dict) else None
 
         async with self._llm_proxy_lock:
+            if not self._llm_proxy_checkpoint_loaded:
+                restore_status = self.history.history_restore_status()["status"]
+                if restore_status in {"pending", "running"}:
+                    return
+                checkpoint = await self.history.latest_llm_proxy_checkpoint()
+                if checkpoint is not None:
+                    raw_observations, raw_requesters = checkpoint
+                    for endpoint_name, raw_observation in raw_observations.items():
+                        if not isinstance(endpoint_name, str):
+                            continue
+                        observation = _coerce_llm_proxy_observation(raw_observation)
+                        if observation is not None:
+                            self._llm_proxy_observations[endpoint_name] = observation
+                    restored_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
+                    for fingerprint, raw_requester in raw_requesters.items():
+                        if not isinstance(fingerprint, str):
+                            continue
+                        requester = _coerce_llm_proxy_requester(raw_requester)
+                        if requester is not None:
+                            restored_requesters[fingerprint] = requester
+                    restored_requesters.update(self._llm_proxy_requesters)
+                    self._llm_proxy_requesters = restored_requesters
+                    while len(self._llm_proxy_requesters) > self._llm_proxy_requester_limit:
+                        self._llm_proxy_requesters.popitem(last=False)
+                self._llm_proxy_checkpoint_loaded = True
+
             observations: list[tuple[str, tuple[str, int, dict[str, int]]]] = []
             for endpoint in endpoints if isinstance(endpoints, list) else []:
                 if not isinstance(endpoint, dict):
@@ -571,12 +635,22 @@ class SwarmDashboard:
                 current_requester, current_count = attributed.get(requester.actor_id, (requester, 0))
                 attributed[requester.actor_id] = (current_requester, current_count + count)
 
+            checkpoint_observations = dict(self._llm_proxy_observations)
+            checkpoint_observations.update(observations)
             await self.history.record_llm_proxy_usage(
                 requests=total_delta,
                 requester_counts=[
                     (actor_id, requester.history_metadata(), count)
                     for actor_id, (requester, count) in attributed.items()
                 ],
+                observations={
+                    endpoint_name: _serialize_llm_proxy_observation(observation)
+                    for endpoint_name, observation in checkpoint_observations.items()
+                },
+                requesters={
+                    fingerprint: _serialize_llm_proxy_requester(requester)
+                    for fingerprint, requester in self._llm_proxy_requesters.items()
+                },
                 observed_at_s=observed_at_s,
             )
             for endpoint_name, observation in observations:
