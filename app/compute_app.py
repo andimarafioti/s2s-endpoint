@@ -33,6 +33,7 @@ PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_POOL_PATH = "/v1/pool"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
+LLM_USAGE_SHUTDOWN_TIMEOUT_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -422,11 +423,18 @@ class _LLMProxyUsage:
                     await asyncio.sleep(1.0)
             self._queue.task_done()
 
-    async def stop(self) -> None:
-        await self._queue.join()
-        if self._worker is not None:
-            await self._worker
-            self._worker = None
+    async def stop(self, *, timeout_s: float = LLM_USAGE_SHUTDOWN_TIMEOUT_S) -> None:
+        try:
+            await asyncio.wait_for(self._queue.join(), timeout=max(timeout_s, 0.0))
+        except asyncio.TimeoutError:
+            logger.error("Discarding %d undelivered LLM usage events during shutdown", self._queue.qsize() + 1)
+            if self._worker is not None:
+                self._worker.cancel()
+                await asyncio.gather(self._worker, return_exceptions=True)
+        else:
+            if self._worker is not None:
+                await self._worker
+        self._worker = None
 
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:

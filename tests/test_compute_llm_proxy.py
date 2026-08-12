@@ -401,6 +401,26 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
 
         self.assertTrue(asyncio.run(exercise()))
 
+    def test_compute_shutdown_bounds_an_unavailable_usage_callback(self) -> None:
+        async def exercise() -> None:
+            async def notify(*args: Any, **kwargs: Any) -> None:
+                raise RuntimeError("LB unavailable")
+
+            usage = compute_main._LLMProxyUsage()
+            usage.record(
+                "https://lb.example/event",
+                "session-token",
+                "session-1",
+                SECRET,
+                notify,
+                attempts=1,
+            )
+            with self.assertLogs("s2s-endpoint", level="ERROR") as logs:
+                await usage.stop(timeout_s=0.01)
+            self.assertIn("undelivered LLM usage events", logs.output[-1])
+
+        asyncio.run(exercise())
+
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()
         for path in ("/v1/chat/completions", "/v1/responses"):
