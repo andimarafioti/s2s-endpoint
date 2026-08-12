@@ -39,6 +39,7 @@ from app.requester_rate_limiter import (
     RequesterRateLimitConfig,
     RequesterRateLimiter,
 )
+from app.session_manager import SessionManager
 from app.session_request_metadata import reported_hardware_id
 from app.session_requester_tracker import SessionRequesterTracker
 from app.session_tokens import llm_token_fingerprint
@@ -355,7 +356,7 @@ def build_endpoint_router(settings: LoadBalancerSettings) -> EndpointPoolRouter:
 
 @dataclass
 class LoadBalancerDependencies:
-    session_manager: Any
+    session_manager: SessionManager
     dashboard_history_store: Any | None
     dashboard: SwarmDashboard
     requester_identity_resolver: RequesterIdentityResolver
@@ -506,11 +507,8 @@ class LoadBalancerRuntime:
         async def expired_ticket(ticket_id: str) -> None:
             await record_expired_queue_ticket(self, ticket_id)
 
-        # Dashboard preview mode uses a synthetic manager with no real sessions.
-        if hasattr(dependencies.session_manager, "set_abnormal_disconnect_handler"):
-            dependencies.session_manager.set_abnormal_disconnect_handler(abnormal_disconnect)
-        if hasattr(dependencies.session_manager, "set_ticket_expired_handler"):
-            dependencies.session_manager.set_ticket_expired_handler(expired_ticket)
+        dependencies.session_manager.set_abnormal_disconnect_handler(abnormal_disconnect)
+        dependencies.session_manager.set_ticket_expired_handler(expired_ticket)
         logger.info(
             "Session queue %s",
             "enabled" if dependencies.session_manager.queue_enabled else "disabled",
@@ -1140,7 +1138,7 @@ async def _deliver_grant(
     if settings.session_require_verified_hf_token:
         requester = await _refresh_requester_identity(runtime, requester)
         if not _session_verification_is_fresh(runtime, requester):
-            if session_id and hasattr(dependencies.session_manager, "cancel_pending_session"):
+            if session_id:
                 await dependencies.session_manager.cancel_pending_session(session_id)
             dependencies.requester_rate_limiter.record_allocation_auth_rejection(requester)
             await _raise_session_auth_rejection(
@@ -1168,7 +1166,7 @@ async def _deliver_grant(
         no_connect_penalty_excluded = bool(allocation.get("waited_for_capacity")) or (
             http_route == "GET /queue/{queue_id}"
         )
-        if session_id and hasattr(dependencies.session_manager, "cancel_pending_session"):
+        if session_id:
             await dependencies.session_manager.cancel_pending_session(session_id)
         if session_id:
             dependencies.requester_rate_limiter.record_disconnected(

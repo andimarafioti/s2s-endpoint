@@ -2,6 +2,8 @@ import math
 import time
 from typing import Optional
 
+from app.session_manager import SessionReleaseHandler, TicketExpiredHandler
+
 
 class DashboardPreviewSessionManager:
     """Synthetic session manager used to preview dashboard UI without HF endpoints."""
@@ -47,8 +49,23 @@ class DashboardPreviewSessionManager:
     async def stop(self) -> None:
         self._running = False
 
+    def set_abnormal_disconnect_handler(self, handler: Optional[SessionReleaseHandler]) -> None:
+        pass
+
+    def set_ticket_expired_handler(self, handler: Optional[TicketExpiredHandler]) -> None:
+        pass
+
     async def allocate(self, lb_base_url: str, *, llm_fingerprint: Optional[str] = None) -> dict[str, object]:
         raise RuntimeError("session allocation is disabled in dashboard preview mode")
+
+    async def poll(self, ticket_id: str, lb_base_url: str) -> dict[str, object]:
+        raise RuntimeError("session queue is disabled in dashboard preview mode")
+
+    async def leave(self, ticket_id: str) -> bool:
+        return False
+
+    async def cancel_pending_session(self, session_id: str) -> None:
+        pass
 
     async def handle_event(self, session_id: str, session_token: str, event: str) -> dict[str, object]:
         raise KeyError("dashboard preview mode does not track real sessions")

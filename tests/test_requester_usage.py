@@ -117,6 +117,7 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["auth_rejected_requests_window"], 1)
         self.assertEqual(summary["rate_limited_requests_window"], 1)
         self.assertEqual(summary["unattributed_requests_window"], 0)
+        self.assertEqual(payload["median_requests_per_requester"], 2.0)
         self.assertEqual(leaderboard[0]["actor_id"], "hf:reachy-user")
         self.assertEqual(leaderboard[0]["label"], "@reachy-user")
         self.assertEqual(leaderboard[0]["token_count"], 1)
@@ -144,6 +145,13 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("many networks: 2", leaderboard[0]["signals"])
         self.assertIn("rate limited: 1 request", leaderboard[0]["signals"])
         self.assertFalse(any(signal.startswith("mostly short sessions") for signal in leaderboard[0]["signals"]))
+
+    async def test_empty_usage_has_zero_median(self):
+        service = self._service(FakeClock(2 * 3600))
+
+        payload = await service.data(window_minutes=60)
+
+        self.assertEqual(payload["median_requests_per_requester"], 0.0)
 
     async def test_auth_rejections_raise_risk_from_watch_to_high_even_with_prior_connections(self):
         service = self._service(FakeClock(2 * 3600))

@@ -348,6 +348,26 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.llm_proxy_requests, 9)
         self.assertEqual(restored.requester_usage["token:a"]["llm_proxy_requests"], 5)
 
+    async def test_empty_minute_point_uses_history_bucket_shape(self):
+        clock = FakeClock(2 * 3600)
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=0,
+                    waking=0,
+                    free_slots=0,
+                    effective_free_slots=0,
+                )
+            ),
+            time_fn=clock.now,
+        )
+
+        points = await dashboard.series(window_minutes=1, resolution="minute")
+
+        self.assertEqual(points, [SwarmHistoryBucket(bucket_start_s=2 * 3600).as_minute_point()])
+
     async def test_data_exposes_minute_series_and_event_counters(self):
         clock = FakeClock(2 * 3600)
         provider = FakeSnapshotProvider(

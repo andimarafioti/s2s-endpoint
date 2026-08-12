@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import hashlib
 import json
 import logging
@@ -11,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional, Protocol
 from urllib.parse import urlparse, urlunparse
+
+from app.app_utils import cancel_and_await
 
 logger = logging.getLogger("s2s-endpoint")
 
@@ -707,17 +708,11 @@ class EndpointPoolRouter:
             self._closed = True
             self._condition.notify_all()
 
-        if self._initial_warm_task is not None:
-            self._initial_warm_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._initial_warm_task
-            self._initial_warm_task = None
+        await cancel_and_await(self._initial_warm_task)
+        self._initial_warm_task = None
 
-        if self._reconcile_task is not None:
-            self._reconcile_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._reconcile_task
-            self._reconcile_task = None
+        await cancel_and_await(self._reconcile_task)
+        self._reconcile_task = None
 
         self._control_fetch_executor.shutdown(wait=False, cancel_futures=True)
         self._control_transition_executor.shutdown(wait=False, cancel_futures=True)

@@ -3,8 +3,10 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from statistics import median
 from typing import Awaitable, Callable, Iterable, Optional
 
+from app.app_utils import cancel_and_await
 from app.dashboard_history import (
     DashboardHistory,
     DashboardHistoryStore,
@@ -23,16 +25,6 @@ ROLLING_VIEW_WINDOWS: tuple[tuple[str, int], ...] = (
     ("6h", 6 * 60),
     ("24h", 24 * 60),
 )
-
-
-def _median(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    sorted_values = sorted(values)
-    middle = len(sorted_values) // 2
-    if len(sorted_values) % 2:
-        return sorted_values[middle]
-    return (sorted_values[middle - 1] + sorted_values[middle]) / 2.0
 
 
 def _parse_window_minutes(window: str | None) -> int:
@@ -161,7 +153,9 @@ class SwarmBucketAggregate:
 
     @property
     def median_conversation_duration_s(self) -> float:
-        return round(_median(self.completed_conversation_duration_samples_s), 2)
+        if not self.completed_conversation_duration_samples_s:
+            return 0.0
+        return round(median(self.completed_conversation_duration_samples_s), 2)
 
     def as_summary_dict(self) -> dict[str, object]:
         return {
@@ -289,13 +283,8 @@ class SwarmDashboard:
         self._sample_task = asyncio.create_task(self._sample_loop())
 
     async def stop(self) -> None:
-        if self._sample_task is not None:
-            self._sample_task.cancel()
-            try:
-                await self._sample_task
-            except asyncio.CancelledError:
-                pass
-            self._sample_task = None
+        await cancel_and_await(self._sample_task)
+        self._sample_task = None
         await self.history.stop()
 
     async def capture_sample(self) -> SwarmStateSample:
@@ -454,38 +443,7 @@ class SwarmDashboard:
             points = []
             for bucket_start in range(start_bucket, end_bucket + 1, 60):
                 bucket = minute_map.get(bucket_start)
-                if bucket is None:
-                    points.append(
-                        {
-                            "timestamp": _isoformat(bucket_start),
-                            "running_endpoints": 0,
-                            "warming_endpoints": 0,
-                            "transitioning_endpoints": 0,
-                            "parked_endpoints": 0,
-                            "connected_sessions": 0,
-                            "pending_sessions": 0,
-                            "free_slots": 0,
-                            "effective_free_slots": 0,
-                            "router_active_sessions": 0,
-                            "errors_count": 0,
-                            "healthy": False,
-                            "session_requests": 0,
-                            "session_allocation_successes": 0,
-                            "session_allocation_failures": 0,
-                            "session_auth_rejections": 0,
-                            "session_rate_limited": 0,
-                            "llm_proxy_requests": 0,
-                            "session_connected_events": 0,
-                            "session_disconnected_events": 0,
-                            "completed_conversations": 0,
-                            "avg_conversation_duration_s": 0.0,
-                            "avg_conversation_duration_min": 0.0,
-                            "max_conversation_duration_s": 0.0,
-                            "max_conversation_duration_min": 0.0,
-                        }
-                    )
-                else:
-                    points.append(bucket.as_minute_point())
+                points.append((bucket or SwarmHistoryBucket(bucket_start_s=bucket_start)).as_minute_point())
             return points
 
         return self._aggregate_hourly(minute_map, start_bucket, end_bucket)

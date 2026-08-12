@@ -9,6 +9,8 @@ from dataclasses import fields as dataclass_fields
 from datetime import datetime, timezone
 from typing import Callable, Optional, Protocol
 
+from app.app_utils import cancel_and_await
+
 logger = logging.getLogger("s2s-endpoint")
 DAY_MINUTES = 24 * 60
 DAY_SECONDS = DAY_MINUTES * 60
@@ -560,19 +562,11 @@ class DashboardHistory:
 
     async def stop(self) -> None:
         if self._startup_merge_task is not None and not self._startup_merge_task.done():
-            self._startup_merge_task.cancel()
-            try:
-                await self._startup_merge_task
-            except asyncio.CancelledError:
-                pass
+            await cancel_and_await(self._startup_merge_task)
             self._startup_merge_task = None
 
         if self._restore_task is not None and not self._restore_task.done():
-            self._restore_task.cancel()
-            try:
-                await self._restore_task
-            except asyncio.CancelledError:
-                pass
+            await cancel_and_await(self._restore_task)
             self._restore_task = None
 
         if not self._history_store_is_writable():

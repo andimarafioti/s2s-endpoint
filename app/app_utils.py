@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -17,6 +18,16 @@ class LifecycleManager(Protocol):
 
 
 TRUE_ENV_VALUES = frozenset({"1", "true", "yes"})
+
+
+async def cancel_and_await(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 def env_text(
