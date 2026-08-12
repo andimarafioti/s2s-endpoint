@@ -327,7 +327,9 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         pending = dashboard._llm_proxy_pending_observations["reachy-s2s-01"]
         self.assertEqual(list(pending), ["generation-a", "generation-b"])
-        self.assertEqual(pending["generation-a"][1], 100)
+        first, latest = pending["generation-a"]
+        self.assertEqual(first[1], 11)
+        self.assertEqual(latest[1], 100)
 
         payload[2]["router"]["endpoints"][0]["llm_proxy_usage"] = {
             "instance_id": "generation-b",
