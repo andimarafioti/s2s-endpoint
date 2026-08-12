@@ -234,6 +234,23 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
 
 
 class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
+    def test_attribution_cardinality_is_bounded_without_losing_total(self) -> None:
+        attribution = compute_main._LLMProxyAttribution(max_fingerprints=2, instance_id="generation-a")
+
+        attribution.record("proxy-a")
+        attribution.record("proxy-a")
+        attribution.record("proxy-b")
+        attribution.record("proxy-c")
+
+        self.assertEqual(
+            attribution.snapshot(),
+            {
+                "instance_id": "generation-a",
+                "requests": 4,
+                "requests_by_fingerprint": {"proxy-a": 2, "overflow": 2},
+            },
+        )
+
     def test_health_exposes_atomic_privacy_safe_chat_usage(self) -> None:
         client = self.gated_client()
         with _connected_session(client):

@@ -457,6 +457,9 @@ load-balancer variable is ignored and can be removed from existing deployments.
   without the feature.
 - `LLM_PROXY_REQUESTS_PER_MINUTE`: per-token sliding-window rate limit on the
   replica's LLM proxy paths (defaults to 20; zero or negative closes the paths)
+- `LLM_PROXY_ATTRIBUTION_MAX_FINGERPRINTS`: maximum compute-replica requester
+  counters retained for dashboard attribution (defaults to 50000; additional
+  requesters are grouped as unattributed overflow while the fleet total remains exact)
 
 The compute endpoint serves `/v1/realtime`. The LB now serves `POST /session` for allocation.
 

@@ -59,6 +59,7 @@ class ComputeSettings:
     lb_callback_retry_attempts: int = 5
     lb_callback_retry_backoff_s: float = 1.0
     llm_proxy_requests_per_minute: int = 20
+    llm_proxy_attribution_max_fingerprints: int = 50_000
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "ComputeSettings":
@@ -98,6 +99,10 @@ class ComputeSettings:
                 0.0,
             ),
             llm_proxy_requests_per_minute=int(env_text("LLM_PROXY_REQUESTS_PER_MINUTE", "20", environ=environ)),
+            llm_proxy_attribution_max_fingerprints=max(
+                int(env_text("LLM_PROXY_ATTRIBUTION_MAX_FINGERPRINTS", "50000", environ=environ)),
+                1,
+            ),
         )
 
     @property
@@ -350,6 +355,7 @@ class _FingerprintRateLimiter:
 class _LLMProxyAttribution:
     """Atomically sampled replica-local LLM proxy counters."""
 
+    max_fingerprints: int = 50_000
     instance_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     requests: int = 0
     requests_by_fingerprint: dict[str, int] = field(default_factory=dict)
@@ -358,7 +364,13 @@ class _LLMProxyAttribution:
     def record(self, fingerprint: str) -> None:
         with self._lock:
             self.requests += 1
-            self.requests_by_fingerprint[fingerprint] = self.requests_by_fingerprint.get(fingerprint, 0) + 1
+            if fingerprint in self.requests_by_fingerprint:
+                key = fingerprint
+            elif len(self.requests_by_fingerprint) < self.max_fingerprints - 1:
+                key = fingerprint
+            else:
+                key = "overflow"
+            self.requests_by_fingerprint[key] = self.requests_by_fingerprint.get(key, 0) + 1
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
@@ -806,6 +818,7 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
         session_router=router,
         connected_llm_fingerprints=_ConnectedFingerprintRegistry(),
         llm_rate_limiter=_FingerprintRateLimiter(settings.llm_proxy_requests_per_minute),
+        llm_proxy_attribution=_LLMProxyAttribution(settings.llm_proxy_attribution_max_fingerprints),
         http_get_json=_http_get_json,
         notify_lb_session_event=notify_lb_session_event,
         proxy_websocket=proxy_websocket,
