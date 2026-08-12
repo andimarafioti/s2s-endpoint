@@ -379,22 +379,31 @@ class _LLMProxyUsage:
     ) -> None:
         async with self._lock:
             self.requests += 1
-            await notify(
-                callback_url,
-                session_token,
-                "llm_proxy_request",
-                attempts=attempts,
-                extra_payload={
-                    "instance_id": self.instance_id,
-                    "sequence": self.requests,
-                    "signature": llm_usage_event_signature(
-                        shared_secret,
-                        session_id,
-                        self.instance_id,
-                        self.requests,
-                    ),
-                },
-            )
+            extra_payload = {
+                "instance_id": self.instance_id,
+                "sequence": self.requests,
+                "signature": llm_usage_event_signature(
+                    shared_secret,
+                    session_id,
+                    self.instance_id,
+                    self.requests,
+                ),
+            }
+            while True:
+                try:
+                    await notify(
+                        callback_url,
+                        session_token,
+                        "llm_proxy_request",
+                        attempts=attempts,
+                        extra_payload=extra_payload,
+                    )
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Failed to record LLM proxy usage; retrying before forwarding")
+                    await asyncio.sleep(1.0)
 
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:

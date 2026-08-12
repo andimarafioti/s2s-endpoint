@@ -366,6 +366,33 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         usage_events = [event for event in self.lb_events if event[0] == "llm_proxy_request"]
         self.assertEqual(len(usage_events), 1)
 
+    def test_accounting_retries_until_acknowledged(self) -> None:
+        async def exercise() -> int:
+            calls = 0
+
+            async def notify(*args: Any, **kwargs: Any) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("LB unavailable")
+
+            async def no_sleep(delay: float) -> None:
+                pass
+
+            usage = compute_main._LLMProxyUsage()
+            with patch("app.compute_app.asyncio.sleep", new=no_sleep):
+                await usage.record(
+                    "https://lb.example/event",
+                    "session-token",
+                    "session-1",
+                    SECRET,
+                    notify,
+                    attempts=1,
+                )
+            return calls
+
+        self.assertEqual(asyncio.run(exercise()), 2)
+
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()
         for path in ("/v1/chat/completions", "/v1/responses"):
