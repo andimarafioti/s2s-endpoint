@@ -310,6 +310,9 @@ class SwarmDashboard:
         self._latest_sample: Optional[SwarmStateSample] = None
         self._sample_task: Optional[asyncio.Task] = None
         self._llm_proxy_observations: dict[str, tuple[str, int, dict[str, int]]] = {}
+        self._llm_proxy_pending_observations: dict[
+            str, list[tuple[str, int, dict[str, int]]]
+        ] = {}
         self._llm_proxy_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
         self._llm_proxy_requester_limit = max_requester_records
         self._llm_proxy_lock = asyncio.Lock()
@@ -565,9 +568,27 @@ class SwarmDashboard:
         endpoints = router.get("endpoints") if isinstance(router, dict) else None
 
         async with self._llm_proxy_lock:
+            current_observations: dict[str, tuple[str, int, dict[str, int]]] = {}
+            for endpoint in endpoints if isinstance(endpoints, list) else []:
+                if not isinstance(endpoint, dict):
+                    continue
+                endpoint_name = endpoint.get("name")
+                usage = endpoint.get("llm_proxy_usage")
+                if not isinstance(endpoint_name, str) or not isinstance(usage, dict):
+                    continue
+                observation = _coerce_llm_proxy_observation(usage)
+                if observation is not None:
+                    current_observations[endpoint_name] = observation
+
             if not self._llm_proxy_checkpoint_loaded:
                 restore_status = self.history.history_restore_status()["status"]
-                if restore_status in {"pending", "running"}:
+                startup_merge_status = self.history.startup_merge_status()["status"]
+                if restore_status in {"pending", "running"} or startup_merge_status in {
+                    "pending",
+                    "waiting",
+                    "running",
+                }:
+                    self._remember_pending_llm_proxy_observations(current_observations)
                     return
                 checkpoint = await self.history.latest_llm_proxy_checkpoint()
                 if checkpoint is not None:
@@ -592,40 +613,36 @@ class SwarmDashboard:
                 self._llm_proxy_checkpoint_loaded = True
 
             observations: list[tuple[str, tuple[str, int, dict[str, int]]]] = []
-            for endpoint in endpoints if isinstance(endpoints, list) else []:
-                if not isinstance(endpoint, dict):
-                    continue
-                endpoint_name = endpoint.get("name")
-                usage = endpoint.get("llm_proxy_usage")
-                if not isinstance(endpoint_name, str) or not isinstance(usage, dict):
-                    continue
-                observation = _coerce_llm_proxy_observation(usage)
-                if observation is None:
-                    continue
-
-                instance_id, requests, requests_by_fingerprint = observation
+            endpoint_names = set(self._llm_proxy_pending_observations) | set(current_observations)
+            for endpoint_name in endpoint_names:
+                sequence = self._llm_proxy_pending_observations.pop(endpoint_name, [])
+                current_observation = current_observations.get(endpoint_name)
+                if current_observation is not None and (not sequence or sequence[-1] != current_observation):
+                    sequence.append(current_observation)
                 previous = self._llm_proxy_observations.get(endpoint_name)
-                observations.append((endpoint_name, observation))
-                if previous is None:
-                    continue
-
-                previous_instance_id, previous_requests, previous_by_fingerprint = previous
-                if instance_id != previous_instance_id:
-                    request_delta = requests
-                    fingerprint_deltas = requests_by_fingerprint
-                elif requests < previous_requests:
-                    continue
-                else:
-                    request_delta = requests - previous_requests
-                    fingerprint_deltas = {
-                        fingerprint: count - previous_by_fingerprint.get(fingerprint, 0)
-                        for fingerprint, count in requests_by_fingerprint.items()
-                        if count > previous_by_fingerprint.get(fingerprint, 0)
-                    }
-
-                total_delta += request_delta
-                for fingerprint, count in fingerprint_deltas.items():
-                    deltas_by_fingerprint[fingerprint] = deltas_by_fingerprint.get(fingerprint, 0) + count
+                for observation in sequence:
+                    instance_id, requests, requests_by_fingerprint = observation
+                    if previous is not None:
+                        previous_instance_id, previous_requests, previous_by_fingerprint = previous
+                        if instance_id != previous_instance_id:
+                            request_delta = requests
+                            fingerprint_deltas = requests_by_fingerprint
+                        elif requests < previous_requests:
+                            previous = observation
+                            continue
+                        else:
+                            request_delta = requests - previous_requests
+                            fingerprint_deltas = {
+                                fingerprint: count - previous_by_fingerprint.get(fingerprint, 0)
+                                for fingerprint, count in requests_by_fingerprint.items()
+                                if count > previous_by_fingerprint.get(fingerprint, 0)
+                            }
+                        total_delta += request_delta
+                        for fingerprint, count in fingerprint_deltas.items():
+                            deltas_by_fingerprint[fingerprint] = deltas_by_fingerprint.get(fingerprint, 0) + count
+                    previous = observation
+                if previous is not None:
+                    observations.append((endpoint_name, previous))
 
             attributed: dict[str, tuple[RequesterIdentity, int]] = {}
             for fingerprint, count in deltas_by_fingerprint.items():
@@ -655,6 +672,15 @@ class SwarmDashboard:
             )
             for endpoint_name, observation in observations:
                 self._llm_proxy_observations[endpoint_name] = observation
+
+    def _remember_pending_llm_proxy_observations(
+        self,
+        observations: dict[str, tuple[str, int, dict[str, int]]],
+    ) -> None:
+        for endpoint_name, observation in observations.items():
+            sequence = self._llm_proxy_pending_observations.setdefault(endpoint_name, [])
+            if not sequence or sequence[-1] != observation:
+                sequence.append(observation)
 
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()

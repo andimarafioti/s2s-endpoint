@@ -416,6 +416,118 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["summary"]["llm_proxy_requests_window"], 10)
         self.assertEqual(second["requesters"]["unattributed_llm_proxy_requests"], 0)
 
+    async def test_late_checkpoint_merge_recovers_counts_once(self):
+        clock = FakeClock(2 * 3600)
+        requester = RequesterIdentity(
+            actor_id="token:a",
+            label="@alice · token •a",
+            kind="authenticated",
+            verification="verified",
+            fingerprint="a",
+            account_name="alice",
+        )
+        persisted = SwarmHistoryBucket(
+            bucket_start_s=2 * 3600,
+            llm_proxy_requests=7,
+            requester_usage={
+                requester.actor_id: {
+                    **requester.history_metadata(),
+                    "llm_proxy_requests": 7,
+                }
+            },
+            llm_proxy_observations={
+                "reachy-s2s-01": {
+                    "instance_id": "generation-a",
+                    "requests": 10,
+                    "requests_by_fingerprint": {"proxy-a": 10},
+                }
+            },
+            llm_proxy_requesters={
+                "proxy-a": {"actor_id": requester.actor_id, **requester.history_metadata()}
+            },
+        )
+        store = FakeHistoryStore()
+        payload = _health_snapshot(
+            connected=0,
+            pending=0,
+            running=1,
+            waking=0,
+            free_slots=1,
+            effective_free_slots=1,
+        )
+        payload[2]["router"]["endpoints"][0]["llm_proxy_usage"] = {
+            "instance_id": "generation-a",
+            "requests": 13,
+            "requests_by_fingerprint": {"proxy-a": 13},
+        }
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(payload),
+            sample_interval_s=3600,
+            retention_minutes=24 * 60,
+            history_store=store,
+            restore_history_in_background=True,
+            startup_merge_delay_s=0.02,
+            time_fn=clock.now,
+        )
+
+        await dashboard.start()
+        try:
+            await dashboard.history._restore_task
+            store.saved[persisted.bucket_start_s] = persisted.to_dict()
+            await dashboard.history._startup_merge_task
+            first = await dashboard.data(window="60m", resolution="minute")
+            second = await dashboard.data(window="60m", resolution="minute")
+        finally:
+            await dashboard.stop()
+
+        rows = {row["actor_id"]: row for row in first["requesters"]["leaderboard"]}
+        self.assertEqual(first["summary"]["llm_proxy_requests_window"], 10)
+        self.assertEqual(rows["hf:alice"]["llm_proxy_requests"], 10)
+        self.assertEqual(second["summary"]["llm_proxy_requests_window"], 10)
+        self.assertEqual(second["requesters"]["unattributed_llm_proxy_requests"], 0)
+
+    async def test_startup_observations_preserve_growth_without_checkpoint(self):
+        clock = FakeClock(2 * 3600)
+        payload = _health_snapshot(
+            connected=0,
+            pending=0,
+            running=1,
+            waking=0,
+            free_slots=1,
+            effective_free_slots=1,
+        )
+        usage = {
+            "instance_id": "generation-a",
+            "requests": 10,
+            "requests_by_fingerprint": {"proxy-a": 10},
+        }
+        payload[2]["router"]["endpoints"][0]["llm_proxy_usage"] = usage
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(payload),
+            sample_interval_s=3600,
+            retention_minutes=24 * 60,
+            history_store=FakeHistoryStore(),
+            restore_history_in_background=True,
+            startup_merge_delay_s=0.02,
+            time_fn=clock.now,
+        )
+
+        await dashboard.start()
+        try:
+            await dashboard.history._restore_task
+            usage["requests"] = 13
+            usage["requests_by_fingerprint"]["proxy-a"] = 13
+            await dashboard.capture_sample()
+            await dashboard.history._startup_merge_task
+            first = await dashboard.data(window="60m", resolution="minute")
+            second = await dashboard.data(window="60m", resolution="minute")
+        finally:
+            await dashboard.stop()
+
+        self.assertEqual(first["summary"]["llm_proxy_requests_window"], 3)
+        self.assertEqual(first["requesters"]["unattributed_llm_proxy_requests"], 3)
+        self.assertEqual(second["summary"]["llm_proxy_requests_window"], 3)
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(

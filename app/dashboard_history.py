@@ -3,6 +3,7 @@ import copy
 import logging
 import re
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
@@ -167,6 +168,7 @@ class SwarmHistoryBucket:
     session_connected_events: int = 0
     session_disconnected_events: int = 0
     llm_proxy_requests: int = 0
+    llm_proxy_request_counts: dict[str, int] = field(default_factory=dict)
     completed_conversations: int = 0
     completed_conversation_duration_total_s: float = 0.0
     completed_conversation_duration_max_s: float = 0.0
@@ -309,6 +311,9 @@ def _coerce_history_bucket_field(name: str, payload: dict[str, object]) -> objec
             int(payload.get("connected_sessions_max", 0)),
             int(payload.get("connected_sessions_last", 0)),
         )
+    if name == "llm_proxy_requests":
+        components = _coerce_llm_proxy_request_counts(payload.get("llm_proxy_request_counts"))
+        return sum(components.values()) if components else int(payload.get(name, 0))
     if name in _HISTORY_BUCKET_INT_FIELDS:
         return int(payload.get(name, 0))
     if name in _HISTORY_BUCKET_FLOAT_FIELDS:
@@ -319,6 +324,11 @@ def _coerce_history_bucket_field(name: str, payload: dict[str, object]) -> objec
         return [max(float(value), 0.0) for value in list(payload.get(name) or [])]
     if name == "requester_usage":
         return _coerce_requester_usage(payload.get(name))
+    if name == "llm_proxy_request_counts":
+        components = _coerce_llm_proxy_request_counts(payload.get(name))
+        if not components and int(payload.get("llm_proxy_requests", 0)) > 0:
+            components["legacy"] = int(payload["llm_proxy_requests"])
+        return components
     if name == "llm_proxy_observations":
         value = payload.get(name)
         return copy.deepcopy(value) if isinstance(value, dict) else None
@@ -345,6 +355,12 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             if isinstance(raw_client_kinds, dict)
             else {}
         )
+        llm_proxy_requests = max(int(raw_record.get("llm_proxy_requests", 0)), 0)
+        llm_proxy_request_counts = _coerce_llm_proxy_request_counts(
+            raw_record.get("llm_proxy_request_counts")
+        )
+        if not llm_proxy_request_counts and llm_proxy_requests > 0:
+            llm_proxy_request_counts["legacy"] = llm_proxy_requests
         usage[actor_id] = {
             "label": str(raw_record.get("label") or "Unknown requester")[:160],
             "kind": str(raw_record.get("kind") or "unknown")[:40],
@@ -360,7 +376,8 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "rate_limited": max(int(raw_record.get("rate_limited", 0)), 0),
             "abandoned": max(int(raw_record.get("abandoned", 0)), 0),
             "connections": max(int(raw_record.get("connections", 0)), 0),
-            "llm_proxy_requests": max(int(raw_record.get("llm_proxy_requests", 0)), 0),
+            "llm_proxy_requests": sum(llm_proxy_request_counts.values()),
+            "llm_proxy_request_counts": llm_proxy_request_counts,
             "completed_sessions": max(int(raw_record.get("completed_sessions", 0)), 0),
             "short_sessions": max(int(raw_record.get("short_sessions", 0)), 0),
             "connected_duration_total_s": max(
@@ -382,6 +399,19 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "client_kinds": client_kinds,
         }
     return usage
+
+
+def _coerce_llm_proxy_request_counts(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        writer_id[:128]: max(int(count), 0)
+        for writer_id, count in value.items()
+        if isinstance(writer_id, str)
+        and writer_id
+        and isinstance(count, int)
+        and not isinstance(count, bool)
+    }
 
 
 _VERIFICATION_RANK = {
@@ -411,6 +441,7 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
         "abandoned": 0,
         "connections": 0,
         "llm_proxy_requests": 0,
+        "llm_proxy_request_counts": {},
         "completed_sessions": 0,
         "short_sessions": 0,
         "connected_duration_total_s": 0.0,
@@ -508,6 +539,7 @@ class DashboardHistory:
         self._lock = asyncio.Lock()
         self._history: "OrderedDict[int, SwarmHistoryBucket]" = OrderedDict()
         self._requester_record_count = 0
+        self._writer_id = uuid.uuid4().hex
         self._restore_task: Optional[asyncio.Task] = None
         self._startup_merge_task: Optional[asyncio.Task] = None
         self._persistence_task: Optional[asyncio.Task] = None
@@ -844,7 +876,11 @@ class DashboardHistory:
 
         async with self._lock:
             bucket = self._get_bucket_unlocked(observed_at_s)
-            bucket.llm_proxy_requests += requests
+            if requests:
+                bucket.llm_proxy_request_counts[self._writer_id] = (
+                    bucket.llm_proxy_request_counts.get(self._writer_id, 0) + requests
+                )
+                bucket.llm_proxy_requests = sum(bucket.llm_proxy_request_counts.values())
             for actor_id, metadata, count in requester_counts:
                 if count <= 0:
                     continue
@@ -868,7 +904,12 @@ class DashboardHistory:
                     bucket.requester_usage[resolved_actor_id] = record
                     self._requester_record_count += 1
                 _merge_requester_identity(record, resolved_metadata)
-                record["llm_proxy_requests"] = int(record.get("llm_proxy_requests", 0)) + count
+                component_counts = record.setdefault("llm_proxy_request_counts", {})
+                if not isinstance(component_counts, dict):
+                    component_counts = {}
+                    record["llm_proxy_request_counts"] = component_counts
+                component_counts[self._writer_id] = int(component_counts.get(self._writer_id, 0)) + count
+                record["llm_proxy_requests"] = sum(int(value) for value in component_counts.values())
 
             bucket.llm_proxy_observations = copy.deepcopy(observations)
             bucket.llm_proxy_requesters = copy.deepcopy(requesters)
@@ -1100,11 +1141,7 @@ class DashboardHistory:
                         or bucket.bucket_start_s in self._locally_sampled_bucket_starts
                     ):
                         current_bucket = self._history.get(bucket.bucket_start_s)
-                        if (
-                            current_bucket is not None
-                            and current_bucket.llm_proxy_observations is None
-                            and bucket.llm_proxy_observations is not None
-                        ):
+                        if current_bucket is not None and bucket.llm_proxy_observations is not None:
                             self._merge_persisted_llm_proxy_bucket_unlocked(current_bucket, bucket)
                         continue
                     current_bucket = self._history.get(bucket.bucket_start_s)
@@ -1137,7 +1174,13 @@ class DashboardHistory:
         current_bucket: SwarmHistoryBucket,
         persisted_bucket: SwarmHistoryBucket,
     ) -> None:
-        current_bucket.llm_proxy_requests += persisted_bucket.llm_proxy_requests
+        before = current_bucket.to_dict()
+        for writer_id, count in persisted_bucket.llm_proxy_request_counts.items():
+            current_bucket.llm_proxy_request_counts[writer_id] = max(
+                current_bucket.llm_proxy_request_counts.get(writer_id, 0),
+                count,
+            )
+        current_bucket.llm_proxy_requests = sum(current_bucket.llm_proxy_request_counts.values())
         for actor_id, persisted_record in persisted_bucket.requester_usage.items():
             count = max(int(persisted_record.get("llm_proxy_requests", 0)), 0)
             if count == 0:
@@ -1162,12 +1205,26 @@ class DashboardHistory:
                 current_bucket.requester_usage[resolved_actor_id] = current_record
                 self._requester_record_count += 1
             _merge_requester_identity(current_record, resolved_record)
-            current_record["llm_proxy_requests"] = int(current_record.get("llm_proxy_requests", 0)) + count
+            current_counts = current_record.setdefault("llm_proxy_request_counts", {})
+            persisted_counts = persisted_record.get("llm_proxy_request_counts") or {"legacy": count}
+            if not isinstance(current_counts, dict) or not isinstance(persisted_counts, dict):
+                continue
+            for writer_id, component_count in persisted_counts.items():
+                current_counts[writer_id] = max(
+                    int(current_counts.get(writer_id, 0)),
+                    int(component_count),
+                )
+            current_record["llm_proxy_requests"] = sum(int(value) for value in current_counts.values())
 
-        current_bucket.llm_proxy_observations = copy.deepcopy(persisted_bucket.llm_proxy_observations)
-        current_bucket.llm_proxy_requesters = copy.deepcopy(persisted_bucket.llm_proxy_requesters)
-        self._mark_bucket_dirty_unlocked(current_bucket.bucket_start_s)
-        self._wake_persistence_unlocked()
+        merged_observations = copy.deepcopy(persisted_bucket.llm_proxy_observations) or {}
+        merged_observations.update(copy.deepcopy(current_bucket.llm_proxy_observations) or {})
+        current_bucket.llm_proxy_observations = merged_observations
+        merged_requesters = copy.deepcopy(persisted_bucket.llm_proxy_requesters)
+        merged_requesters.update(copy.deepcopy(current_bucket.llm_proxy_requesters))
+        current_bucket.llm_proxy_requesters = merged_requesters
+        if current_bucket.to_dict() != before:
+            self._mark_bucket_dirty_unlocked(current_bucket.bucket_start_s)
+            self._wake_persistence_unlocked()
 
     def _wake_persistence_unlocked(self) -> None:
         if not self._history_store_is_writable():
