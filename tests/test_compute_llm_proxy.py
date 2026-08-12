@@ -234,17 +234,7 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
 
 
 class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
-    def test_health_exposes_internal_total_with_privacy_safe_chat_attribution(self) -> None:
-        internal_requests = 0
-
-        def responder(path):
-            nonlocal internal_requests
-            if path == "/v1/usage":
-                return 200, {"llm_proxy": {"requests": internal_requests}}
-            internal_requests += 1
-            return 200, {"ok": True}
-
-        self.stub.responder = responder
+    def test_health_exposes_atomic_privacy_safe_chat_usage(self) -> None:
         client = self.gated_client()
         with _connected_session(client):
             self.assertEqual(self.post_chat(client).status_code, 200)
@@ -255,18 +245,9 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertEqual(payload["requests"], 2)
         self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 2})
         self.assertNotIn(HF_TOKEN, json.dumps(payload))
+        self.assertNotIn("/v1/usage", [request["path"] for request in self.stub.requests])
 
     def test_health_attributes_responses_api_requests(self) -> None:
-        internal_requests = 0
-
-        def responder(path):
-            nonlocal internal_requests
-            if path == "/v1/usage":
-                return 200, {"llm_proxy": {"requests": internal_requests}}
-            internal_requests += 1
-            return 200, {"ok": True}
-
-        self.stub.responder = responder
         client = self.gated_client(llm="responses-api")
         with _connected_session(client):
             response = client.post("/v1/responses", content=b'{}', headers=_auth())

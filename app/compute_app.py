@@ -1,6 +1,7 @@
 import asyncio
 import json
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -28,7 +29,6 @@ PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_POOL_PATH = "/v1/pool"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
-LLM_PROXY_USAGE_TIMEOUT_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -250,23 +250,7 @@ async def health(settings: ComputeSettings, dependencies: "ComputeDependencies")
         "tts": settings.tts,
         "router": snapshot,
     }
-    try:
-        internal_usage = await asyncio.wait_for(
-            asyncio.to_thread(
-                dependencies.http_get_json,
-                settings.internal_usage_url,
-            ),
-            timeout=LLM_PROXY_USAGE_TIMEOUT_S,
-        )
-    except Exception as exc:
-        logger.warning("Failed to read internal LLM proxy usage: %s", exc)
-    else:
-        llm_proxy = internal_usage.get("llm_proxy") if isinstance(internal_usage, dict) else None
-        requests = llm_proxy.get("requests") if isinstance(llm_proxy, dict) else None
-        if isinstance(requests, int) and not isinstance(requests, bool) and requests >= 0:
-            payload["llm_proxy_usage"] = dependencies.llm_proxy_attribution.snapshot(
-                requests=requests,
-            )
+    payload["llm_proxy_usage"] = dependencies.llm_proxy_attribution.snapshot()
 
     return JSONResponse(payload)
 
@@ -364,20 +348,25 @@ class _FingerprintRateLimiter:
 
 @dataclass
 class _LLMProxyAttribution:
-    """Replica-local requester counters paired with the internal total."""
+    """Atomically sampled replica-local LLM proxy counters."""
 
     instance_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    requests: int = 0
     requests_by_fingerprint: dict[str, int] = field(default_factory=dict)
+    _lock: object = field(default_factory=threading.Lock, init=False, repr=False)
 
     def record(self, fingerprint: str) -> None:
-        self.requests_by_fingerprint[fingerprint] = self.requests_by_fingerprint.get(fingerprint, 0) + 1
+        with self._lock:
+            self.requests += 1
+            self.requests_by_fingerprint[fingerprint] = self.requests_by_fingerprint.get(fingerprint, 0) + 1
 
-    def snapshot(self, *, requests: int) -> dict[str, object]:
-        return {
-            "instance_id": self.instance_id,
-            "requests": requests,
-            "requests_by_fingerprint": dict(self.requests_by_fingerprint),
-        }
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "instance_id": self.instance_id,
+                "requests": self.requests,
+                "requests_by_fingerprint": dict(self.requests_by_fingerprint),
+            }
 
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
