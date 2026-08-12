@@ -902,7 +902,17 @@ class EndpointPoolRouter:
         self._spawn_wake_tasks(wake_names)
 
     async def healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
-        snapshot = await self.snapshot()
+        return await self._healthcheck(include_llm_proxy_attribution=False)
+
+    async def dashboard_healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
+        return await self._healthcheck(include_llm_proxy_attribution=True)
+
+    async def _healthcheck(
+        self,
+        *,
+        include_llm_proxy_attribution: bool,
+    ) -> tuple[bool, Optional[str], dict[str, object]]:
+        snapshot = await self.snapshot(include_llm_proxy_attribution=include_llm_proxy_attribution)
         if snapshot["reconciliation_stale"]:
             age = snapshot["reconcile_age_s"]
             detail = (
@@ -934,7 +944,7 @@ class EndpointPoolRouter:
             return False, str(errors[0]["error"]), snapshot
         return False, "no compute endpoint is ready", snapshot
 
-    async def snapshot(self) -> dict[str, object]:
+    async def snapshot(self, *, include_llm_proxy_attribution: bool = False) -> dict[str, object]:
         async with self._lock:
             endpoints = list(self._endpoints.values())
             last_reconcile_success_at = self._last_reconcile_success_at
@@ -1043,7 +1053,11 @@ class EndpointPoolRouter:
                         {
                             "instance_id": endpoint.llm_proxy_usage.instance_id,
                             "requests": endpoint.llm_proxy_usage.requests,
-                            "requests_by_fingerprint": dict(endpoint.llm_proxy_usage.requests_by_fingerprint),
+                            **(
+                                {"requests_by_fingerprint": dict(endpoint.llm_proxy_usage.requests_by_fingerprint)}
+                                if include_llm_proxy_attribution
+                                else {}
+                            ),
                         }
                         if endpoint.llm_proxy_usage is not None
                         else None

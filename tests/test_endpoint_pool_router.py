@@ -175,6 +175,32 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_public_snapshot_redacts_llm_requester_fingerprints(self):
+        self.router = _make_test_router(
+            endpoint_names=["endpoint-a"],
+            endpoint_slots=1,
+            min_warm_endpoints=0,
+            wake_threshold_slots=0,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=60,
+            waking_capacity_timeout_s=300,
+            park_cooldown_s=0,
+            controller=FakeEndpointController([("endpoint-a", "running", "https://endpoint-a.example")]),
+        )
+        self.router._endpoints["endpoint-a"].llm_proxy_usage = LLMProxyUsage(
+            instance_id="generation-a",
+            requests=9,
+            requests_by_fingerprint={"fingerprint-a": 9},
+        )
+
+        public_snapshot = await self.router.snapshot()
+        dashboard_snapshot = await self.router.snapshot(include_llm_proxy_attribution=True)
+
+        public_usage = public_snapshot["endpoints"][0]["llm_proxy_usage"]
+        dashboard_usage = dashboard_snapshot["endpoints"][0]["llm_proxy_usage"]
+        self.assertEqual(public_usage, {"instance_id": "generation-a", "requests": 9})
+        self.assertEqual(dashboard_usage["requests_by_fingerprint"], {"fingerprint-a": 9})
+
     def test_invalid_llm_proxy_counters_do_not_revoke_session_capacity(self):
         payload = {
             "router": {"active_sessions": 1, "max_sessions": 2},

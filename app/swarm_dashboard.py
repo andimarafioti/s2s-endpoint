@@ -311,7 +311,10 @@ class SwarmDashboard:
         self._sample_task: Optional[asyncio.Task] = None
         self._capture_lock = asyncio.Lock()
         self._llm_proxy_observations: dict[str, tuple[str, int, dict[str, int]]] = {}
-        self._llm_proxy_pending_observations: dict[str, list[tuple[str, int, dict[str, int]]]] = {}
+        self._llm_proxy_pending_observations: dict[
+            str,
+            "OrderedDict[str, tuple[str, int, dict[str, int]]]",
+        ] = {}
         self._llm_proxy_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
         self._llm_proxy_requester_limit = max_requester_records
         self._llm_proxy_lock = asyncio.Lock()
@@ -615,7 +618,7 @@ class SwarmDashboard:
             observations: list[tuple[str, tuple[str, int, dict[str, int]]]] = []
             endpoint_names = set(self._llm_proxy_pending_observations) | set(current_observations)
             for endpoint_name in endpoint_names:
-                sequence = self._llm_proxy_pending_observations.pop(endpoint_name, [])
+                sequence = list(self._llm_proxy_pending_observations.pop(endpoint_name, {}).values())
                 current_observation = current_observations.get(endpoint_name)
                 if current_observation is not None and (not sequence or sequence[-1] != current_observation):
                     sequence.append(current_observation)
@@ -677,9 +680,11 @@ class SwarmDashboard:
         observations: dict[str, tuple[str, int, dict[str, int]]],
     ) -> None:
         for endpoint_name, observation in observations.items():
-            sequence = self._llm_proxy_pending_observations.setdefault(endpoint_name, [])
-            if not sequence or sequence[-1] != observation:
-                sequence.append(observation)
+            instance_id, requests, _ = observation
+            generations = self._llm_proxy_pending_observations.setdefault(endpoint_name, OrderedDict())
+            previous = generations.get(instance_id)
+            if previous is None or requests > previous[1]:
+                generations[instance_id] = observation
 
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()

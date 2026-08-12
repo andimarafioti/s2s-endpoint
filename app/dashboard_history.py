@@ -117,7 +117,17 @@ class SwarmStateSample:
         captured_at_s: float,
     ) -> "SwarmStateSample":
         router = snapshot.get("router") or {}
-        endpoints = list(router.get("endpoints") or [])
+        endpoints = []
+        for raw_endpoint in list(router.get("endpoints") or []):
+            if not isinstance(raw_endpoint, dict):
+                continue
+            endpoint = copy.deepcopy(raw_endpoint)
+            llm_proxy_usage = endpoint.get("llm_proxy_usage")
+            if isinstance(llm_proxy_usage, dict):
+                endpoint["llm_proxy_usage"] = {
+                    "requests": max(int(llm_proxy_usage.get("requests", 0)), 0),
+                }
+            endpoints.append(endpoint)
         status_counts: dict[str, int] = {}
         for endpoint in endpoints:
             status = _normalize_status(endpoint.get("status", "unknown"))

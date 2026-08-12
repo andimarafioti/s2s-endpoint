@@ -397,7 +397,7 @@ def build_load_balancer_dependencies(settings: LoadBalancerSettings) -> LoadBala
             dashboard_history_store = ReadOnlyDashboardHistoryStore(dashboard_history_store)
 
     dashboard = SwarmDashboard(
-        snapshot_provider=session_manager.healthcheck,
+        snapshot_provider=session_manager.dashboard_healthcheck,
         sample_interval_s=settings.dashboard_sample_interval_s,
         retention_minutes=settings.dashboard_retention_minutes,
         history_store=dashboard_history_store,

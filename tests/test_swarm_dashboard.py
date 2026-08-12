@@ -302,6 +302,43 @@ def _bucket_store(api: FakeBucketApi) -> HuggingFaceBucketHistoryStore:
 
 
 class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_llm_observations_keep_only_latest_snapshot_per_generation(self):
+        clock = FakeClock(2 * 3600)
+        payload = _health_snapshot(
+            connected=0,
+            pending=0,
+            running=1,
+            waking=0,
+            free_slots=1,
+            effective_free_slots=1,
+        )
+        dashboard = SwarmDashboard(snapshot_provider=FakeSnapshotProvider(payload), time_fn=clock.now)
+        dashboard._llm_proxy_observations["reachy-s2s-01"] = (
+            "generation-a",
+            10,
+            {"proxy-a": 10},
+        )
+        for requests in range(11, 101):
+            dashboard._remember_pending_llm_proxy_observations(
+                {"reachy-s2s-01": ("generation-a", requests, {"proxy-a": requests})}
+            )
+        dashboard._remember_pending_llm_proxy_observations({"reachy-s2s-01": ("generation-a", 99, {"proxy-a": 99})})
+        dashboard._remember_pending_llm_proxy_observations({"reachy-s2s-01": ("generation-b", 2, {"proxy-a": 2})})
+
+        pending = dashboard._llm_proxy_pending_observations["reachy-s2s-01"]
+        self.assertEqual(list(pending), ["generation-a", "generation-b"])
+        self.assertEqual(pending["generation-a"][1], 100)
+
+        payload[2]["router"]["endpoints"][0]["llm_proxy_usage"] = {
+            "instance_id": "generation-b",
+            "requests": 2,
+            "requests_by_fingerprint": {"proxy-a": 2},
+        }
+        await dashboard._record_llm_proxy_usage(payload[2], observed_at_s=clock.now())
+
+        result = await dashboard.summary(window_minutes=60, requested_window="60m")
+        self.assertEqual(result["llm_proxy_requests_window"], 92)
+
     async def test_history_restore_retries_commit_between_history_and_checkpoint_reads(self):
         clock = FakeClock(2 * 3600)
         initial_bucket = SwarmHistoryBucket(bucket_start_s=2 * 3600, llm_proxy_requests=7)
@@ -493,6 +530,11 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows["hf:alice"]["llm_proxy_requests"], 5)
         self.assertEqual(rows["hf:bob"]["llm_proxy_requests"], 4)
         self.assertEqual(result["requesters"]["unattributed_llm_proxy_requests"], 0)
+        for endpoint in result["current"]["endpoints"]:
+            usage = endpoint.get("llm_proxy_usage")
+            if usage is not None:
+                self.assertNotIn("instance_id", usage)
+                self.assertNotIn("requests_by_fingerprint", usage)
 
         restored = SwarmHistoryBucket.from_dict((await dashboard.history.snapshot())[-1].to_dict())
         self.assertEqual(restored.llm_proxy_requests, 9)

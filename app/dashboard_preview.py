@@ -127,3 +127,6 @@ class DashboardPreviewSessionManager:
             },
         }
         return True, "Dashboard preview mode uses synthetic endpoint data.", snapshot
+
+    async def dashboard_healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
+        return await self.healthcheck()
