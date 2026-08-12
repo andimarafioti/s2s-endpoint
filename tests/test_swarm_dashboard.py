@@ -65,6 +65,25 @@ class FakeHistoryStore:
             self.checkpoint_write_calls.append(llm_proxy_checkpoint.to_dict())
 
 
+class AdvancingHistoryStore(FakeHistoryStore):
+    def __init__(self, *, initial_bucket, initial_checkpoint, updated_bucket, updated_checkpoint):
+        super().__init__(
+            initial_buckets=[initial_bucket],
+            initial_llm_proxy_checkpoint=initial_checkpoint,
+        )
+        self.updated_bucket = updated_bucket
+        self.updated_checkpoint = updated_checkpoint
+        self.checkpoint_load_calls = 0
+
+    def load_llm_proxy_checkpoint(self):
+        self.checkpoint_load_calls += 1
+        checkpoint = super().load_llm_proxy_checkpoint()
+        if self.checkpoint_load_calls == 1:
+            self.saved[self.updated_bucket.bucket_start_s] = self.updated_bucket.to_dict()
+            self.llm_proxy_checkpoint = self.updated_checkpoint
+        return checkpoint
+
+
 class DayRolloverHistoryStore(FakeHistoryStore):
     def __init__(self, initial_buckets=None):
         super().__init__(initial_buckets=initial_buckets)
@@ -283,6 +302,39 @@ def _bucket_store(api: FakeBucketApi) -> HuggingFaceBucketHistoryStore:
 
 
 class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_restore_retries_commit_between_history_and_checkpoint_reads(self):
+        clock = FakeClock(2 * 3600)
+        initial_bucket = SwarmHistoryBucket(bucket_start_s=2 * 3600, llm_proxy_requests=7)
+        updated_bucket = SwarmHistoryBucket(bucket_start_s=2 * 3600, llm_proxy_requests=8)
+        initial_checkpoint = LLMProxyCheckpoint(
+            observed_at_s=2 * 3600,
+            observations={"reachy-s2s-01": {"instance_id": "generation-a", "requests": 10}},
+            requesters={},
+        )
+        updated_checkpoint = LLMProxyCheckpoint(
+            observed_at_s=2 * 3600 + 1,
+            observations={"reachy-s2s-01": {"instance_id": "generation-a", "requests": 11}},
+            requesters={},
+        )
+        store = AdvancingHistoryStore(
+            initial_bucket=initial_bucket,
+            initial_checkpoint=initial_checkpoint,
+            updated_bucket=updated_bucket,
+            updated_checkpoint=updated_checkpoint,
+        )
+        history = DashboardHistory(
+            retention_minutes=60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+
+        buckets, checkpoint = await history._load_consistent_persisted_state()
+
+        self.assertEqual(buckets[0].llm_proxy_requests, 8)
+        self.assertEqual(checkpoint, updated_checkpoint)
+        self.assertEqual(store.load_calls, 2)
+        self.assertEqual(store.checkpoint_load_calls, 4)
+
     async def test_stale_lower_same_generation_observation_does_not_lower_baseline(self):
         clock = FakeClock(2 * 3600)
         payload = _health_snapshot(

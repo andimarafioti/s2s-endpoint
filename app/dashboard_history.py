@@ -20,6 +20,7 @@ PERSISTENCE_WORKER_RETRY_DELAY_S = 1.0
 FLUSH_RETRY_INITIAL_DELAY_S = 15.0
 FLUSH_RETRY_MAX_DELAY_S = 300.0
 STARTUP_MERGE_PASS_COUNT = 2
+PERSISTED_STATE_LOAD_ATTEMPTS = 3
 
 
 def _normalize_status(status: object) -> str:
@@ -930,14 +931,20 @@ class DashboardHistory:
                 component_counts[self._writer_id] = int(component_counts.get(self._writer_id, 0)) + count
                 record["llm_proxy_requests"] = sum(int(value) for value in component_counts.values())
 
-            checkpoint = LLMProxyCheckpoint(
-                observed_at_s=observed_at_s,
-                observations=copy.deepcopy(observations),
-                requesters=copy.deepcopy(requesters),
-            )
-            self._llm_proxy_checkpoint = checkpoint
-            if self._history_store_is_writable():
-                self._pending_llm_proxy_checkpoints[bucket.bucket_start_s] = checkpoint
+            current_checkpoint = self._llm_proxy_checkpoint
+            if (
+                current_checkpoint is None
+                or current_checkpoint.observations != observations
+                or current_checkpoint.requesters != requesters
+            ):
+                checkpoint = LLMProxyCheckpoint(
+                    observed_at_s=observed_at_s,
+                    observations=copy.deepcopy(observations),
+                    requesters=copy.deepcopy(requesters),
+                )
+                self._llm_proxy_checkpoint = checkpoint
+                if self._history_store_is_writable():
+                    self._pending_llm_proxy_checkpoints[bucket.bucket_start_s] = checkpoint
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(observed_at_s)
             self._wake_persistence_unlocked()
@@ -1039,10 +1046,7 @@ class DashboardHistory:
         self._history_restore_status = "running"
         self._history_restore_detail = "Loading persisted dashboard history"
         try:
-            buckets, checkpoint = await asyncio.gather(
-                self._load_persisted_history(),
-                self._load_persisted_llm_proxy_checkpoint(),
-            )
+            buckets, checkpoint = await self._load_consistent_persisted_state()
         except asyncio.CancelledError:
             self._history_restore_status = "cancelled"
             self._history_restore_detail = "Dashboard history restore was cancelled"
@@ -1102,14 +1106,13 @@ class DashboardHistory:
                 self._startup_merge_attempted_passes += 1
                 try:
                     now_epoch_s = self._time_fn()
-                    buckets = await self._load_persisted_history(
+                    buckets, checkpoint = await self._load_consistent_persisted_state(
                         retention_minutes=min(
                             self.retention_minutes,
                             _startup_merge_retention_minutes(now_epoch_s),
                         ),
                         now_epoch_s=now_epoch_s,
                     )
-                    checkpoint = await self._load_persisted_llm_proxy_checkpoint()
                     updated_bucket_count = await self._merge_persisted_history_buckets(buckets)
                     await self._merge_persisted_llm_proxy_checkpoint(checkpoint)
                 except asyncio.CancelledError:
@@ -1165,6 +1168,28 @@ class DashboardHistory:
         if self.history_store is None:
             return None
         return await asyncio.to_thread(self.history_store.load_llm_proxy_checkpoint)
+
+    async def _load_consistent_persisted_state(
+        self,
+        *,
+        retention_minutes: Optional[int] = None,
+        now_epoch_s: Optional[float] = None,
+    ) -> tuple[list[SwarmHistoryBucket], Optional[LLMProxyCheckpoint]]:
+        for attempt in range(1, PERSISTED_STATE_LOAD_ATTEMPTS + 1):
+            checkpoint_before = await self._load_persisted_llm_proxy_checkpoint()
+            buckets = await self._load_persisted_history(
+                retention_minutes=retention_minutes,
+                now_epoch_s=now_epoch_s,
+            )
+            checkpoint_after = await self._load_persisted_llm_proxy_checkpoint()
+            if checkpoint_before == checkpoint_after:
+                return buckets, checkpoint_after
+            logger.info(
+                "Dashboard history changed during restore; retrying consistent load (%s/%s)",
+                attempt,
+                PERSISTED_STATE_LOAD_ATTEMPTS,
+            )
+        raise RuntimeError("Dashboard history kept changing during restore")
 
     async def _merge_persisted_llm_proxy_checkpoint(
         self,
