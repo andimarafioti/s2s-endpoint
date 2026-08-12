@@ -309,6 +309,7 @@ class SwarmDashboard:
         )
         self._latest_sample: Optional[SwarmStateSample] = None
         self._sample_task: Optional[asyncio.Task] = None
+        self._capture_lock = asyncio.Lock()
         self._llm_proxy_observations: dict[str, tuple[str, int, dict[str, int]]] = {}
         self._llm_proxy_pending_observations: dict[str, list[tuple[str, int, dict[str, int]]]] = {}
         self._llm_proxy_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
@@ -327,16 +328,17 @@ class SwarmDashboard:
         await self.history.stop()
 
     async def capture_sample(self) -> SwarmStateSample:
-        healthy, detail, snapshot = await self.snapshot_provider()
-        sample = SwarmStateSample.from_health_snapshot(
-            healthy=healthy,
-            detail=detail,
-            snapshot=snapshot,
-            captured_at_s=self._time_fn(),
-        )
-        await self.record_sample(sample)
-        await self._record_llm_proxy_usage(snapshot, observed_at_s=sample.captured_at_s)
-        return sample
+        async with self._capture_lock:
+            healthy, detail, snapshot = await self.snapshot_provider()
+            sample = SwarmStateSample.from_health_snapshot(
+                healthy=healthy,
+                detail=detail,
+                snapshot=snapshot,
+                captured_at_s=self._time_fn(),
+            )
+            await self.record_sample(sample)
+            await self._record_llm_proxy_usage(snapshot, observed_at_s=sample.captured_at_s)
+            return sample
 
     async def record_sample(self, sample: SwarmStateSample) -> None:
         await self.history.record_sample(sample)

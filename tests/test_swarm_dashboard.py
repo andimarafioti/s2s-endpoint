@@ -274,6 +274,95 @@ def _bucket_store(api: FakeBucketApi) -> HuggingFaceBucketHistoryStore:
 
 
 class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_lower_same_generation_observation_does_not_lower_baseline(self):
+        clock = FakeClock(2 * 3600)
+        payload = _health_snapshot(
+            connected=0,
+            pending=0,
+            running=1,
+            waking=0,
+            free_slots=1,
+            effective_free_slots=1,
+        )
+        usage = {
+            "instance_id": "generation-a",
+            "requests": 10,
+            "requests_by_fingerprint": {"proxy-a": 10},
+        }
+        payload[2]["router"]["endpoints"][0]["llm_proxy_usage"] = usage
+        dashboard = SwarmDashboard(snapshot_provider=FakeSnapshotProvider(payload), time_fn=clock.now)
+
+        await dashboard.capture_sample()
+        usage["requests"] = 12
+        usage["requests_by_fingerprint"]["proxy-a"] = 12
+        await dashboard.capture_sample()
+        usage["requests"] = 11
+        usage["requests_by_fingerprint"]["proxy-a"] = 11
+        await dashboard.capture_sample()
+        usage["requests"] = 13
+        usage["requests_by_fingerprint"]["proxy-a"] = 13
+        await dashboard.capture_sample()
+
+        result = await dashboard.summary(window_minutes=60, requested_window="60m")
+        self.assertEqual(result["llm_proxy_requests_window"], 3)
+
+    async def test_concurrent_samples_record_compute_generations_in_acquisition_order(self):
+        clock = FakeClock(2 * 3600)
+        old_payload = _health_snapshot(
+            connected=0,
+            pending=0,
+            running=1,
+            waking=0,
+            free_slots=1,
+            effective_free_slots=1,
+        )
+        old_payload[2]["router"]["endpoints"][0]["llm_proxy_usage"] = {
+            "instance_id": "generation-a",
+            "requests": 10,
+            "requests_by_fingerprint": {"proxy-a": 10},
+        }
+        new_payload = _health_snapshot(
+            connected=0,
+            pending=0,
+            running=1,
+            waking=0,
+            free_slots=1,
+            effective_free_slots=1,
+        )
+        new_payload[2]["router"]["endpoints"][0]["llm_proxy_usage"] = {
+            "instance_id": "generation-b",
+            "requests": 2,
+            "requests_by_fingerprint": {"proxy-a": 2},
+        }
+        delayed_sample_started = asyncio.Event()
+        release_delayed_sample = asyncio.Event()
+        provider_calls = 0
+
+        async def provider():
+            nonlocal provider_calls
+            provider_calls += 1
+            if provider_calls == 1:
+                return old_payload
+            if provider_calls == 2:
+                delayed_sample_started.set()
+                await release_delayed_sample.wait()
+                return old_payload
+            return new_payload
+
+        dashboard = SwarmDashboard(snapshot_provider=provider, time_fn=clock.now)
+        await dashboard.capture_sample()
+
+        delayed_sample = asyncio.create_task(dashboard.capture_sample())
+        await delayed_sample_started.wait()
+        restarted_sample = asyncio.create_task(dashboard.capture_sample())
+        await asyncio.sleep(0)
+        release_delayed_sample.set()
+        await asyncio.gather(delayed_sample, restarted_sample)
+
+        result = await dashboard.summary(window_minutes=60, requested_window="60m")
+        self.assertEqual(provider_calls, 3)
+        self.assertEqual(result["llm_proxy_requests_window"], 2)
+
     async def test_llm_proxy_usage_aggregates_replicas_attributes_requesters_and_handles_restarts(self):
         clock = FakeClock(2 * 3600)
         payload = _health_snapshot(
