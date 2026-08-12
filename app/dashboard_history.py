@@ -1105,8 +1105,7 @@ class DashboardHistory:
                             and current_bucket.llm_proxy_observations is None
                             and bucket.llm_proxy_observations is not None
                         ):
-                            current_bucket.llm_proxy_observations = copy.deepcopy(bucket.llm_proxy_observations)
-                            current_bucket.llm_proxy_requesters = copy.deepcopy(bucket.llm_proxy_requesters)
+                            self._merge_persisted_llm_proxy_bucket_unlocked(current_bucket, bucket)
                         continue
                     current_bucket = self._history.get(bucket.bucket_start_s)
                     if current_bucket is None or current_bucket.to_dict() != serialized_bucket:
@@ -1132,6 +1131,43 @@ class DashboardHistory:
             self._recount_requester_records_unlocked()
             self._enforce_requester_record_limit_unlocked()
         return updated_bucket_count
+
+    def _merge_persisted_llm_proxy_bucket_unlocked(
+        self,
+        current_bucket: SwarmHistoryBucket,
+        persisted_bucket: SwarmHistoryBucket,
+    ) -> None:
+        current_bucket.llm_proxy_requests += persisted_bucket.llm_proxy_requests
+        for actor_id, persisted_record in persisted_bucket.requester_usage.items():
+            count = max(int(persisted_record.get("llm_proxy_requests", 0)), 0)
+            if count == 0:
+                continue
+            resolved_actor_id = actor_id
+            resolved_record = persisted_record
+            if (
+                resolved_actor_id not in current_bucket.requester_usage
+                and len(current_bucket.requester_usage) >= self.max_requesters_per_bucket
+            ):
+                resolved_actor_id = "overflow"
+                resolved_record = {
+                    "label": "Other requesters (cardinality limit)",
+                    "kind": "overflow",
+                    "verification": "not_applicable",
+                    "fingerprint": "",
+                }
+            current_record = current_bucket.requester_usage.get(resolved_actor_id)
+            if current_record is None:
+                self._make_requester_record_capacity_unlocked()
+                current_record = _new_requester_usage_record(resolved_record)
+                current_bucket.requester_usage[resolved_actor_id] = current_record
+                self._requester_record_count += 1
+            _merge_requester_identity(current_record, resolved_record)
+            current_record["llm_proxy_requests"] = int(current_record.get("llm_proxy_requests", 0)) + count
+
+        current_bucket.llm_proxy_observations = copy.deepcopy(persisted_bucket.llm_proxy_observations)
+        current_bucket.llm_proxy_requesters = copy.deepcopy(persisted_bucket.llm_proxy_requesters)
+        self._mark_bucket_dirty_unlocked(current_bucket.bucket_start_s)
+        self._wake_persistence_unlocked()
 
     def _wake_persistence_unlocked(self) -> None:
         if not self._history_store_is_writable():

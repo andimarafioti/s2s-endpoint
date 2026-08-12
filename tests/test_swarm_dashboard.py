@@ -362,6 +362,13 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         )
         persisted = SwarmHistoryBucket(
             bucket_start_s=2 * 3600,
+            llm_proxy_requests=7,
+            requester_usage={
+                requester.actor_id: {
+                    **requester.history_metadata(),
+                    "llm_proxy_requests": 7,
+                }
+            },
             llm_proxy_observations={
                 "reachy-s2s-01": {
                     "instance_id": "generation-a",
@@ -404,9 +411,9 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             await dashboard.stop()
 
         rows = {row["actor_id"]: row for row in first["requesters"]["leaderboard"]}
-        self.assertEqual(first["summary"]["llm_proxy_requests_window"], 3)
-        self.assertEqual(rows["hf:alice"]["llm_proxy_requests"], 3)
-        self.assertEqual(second["summary"]["llm_proxy_requests_window"], 3)
+        self.assertEqual(first["summary"]["llm_proxy_requests_window"], 10)
+        self.assertEqual(rows["hf:alice"]["llm_proxy_requests"], 10)
+        self.assertEqual(second["summary"]["llm_proxy_requests_window"], 10)
         self.assertEqual(second["requesters"]["unattributed_llm_proxy_requests"], 0)
 
     async def test_empty_minute_point_uses_history_bucket_shape(self):
