@@ -232,6 +232,12 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
                 return response
             time.sleep(0.05)
 
+    def internal_llm_proxy_usage(self, client: TestClient) -> dict[str, Any]:
+        return client.get(
+            "/health",
+            headers={"X-S2S-Internal-Auth": SECRET},
+        ).json()["llm_proxy_usage"]
+
 
 class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
     def test_attribution_cardinality_is_bounded_without_losing_total(self) -> None:
@@ -257,12 +263,34 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
             self.assertEqual(self.post_chat(client).status_code, 200)
             self.assertEqual(self.post_chat(client).status_code, 200)
 
-        payload = client.get("/health").json()["llm_proxy_usage"]
+        payload = self.internal_llm_proxy_usage(client)
         fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
         self.assertEqual(payload["requests"], 2)
         self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 2})
         self.assertNotIn(HF_TOKEN, json.dumps(payload))
         self.assertNotIn("/v1/usage", [request["path"] for request in self.stub.requests])
+
+    def test_public_health_redacts_attribution_and_internal_health_requires_shared_secret(self) -> None:
+        client = self.gated_client()
+        with _connected_session(client):
+            self.assertEqual(self.post_chat(client).status_code, 200)
+
+        public_usage = client.get("/health").json()["llm_proxy_usage"]
+        denied_usage = client.get(
+            "/health",
+            headers={"X-S2S-Internal-Auth": "wrong-secret"},
+        ).json()["llm_proxy_usage"]
+        internal_usage = client.get(
+            "/health",
+            headers={"X-S2S-Internal-Auth": SECRET},
+        ).json()["llm_proxy_usage"]
+
+        self.assertNotIn("requests_by_fingerprint", public_usage)
+        self.assertNotIn("requests_by_fingerprint", denied_usage)
+        self.assertEqual(
+            internal_usage["requests_by_fingerprint"],
+            {llm_token_fingerprint(SECRET, HF_TOKEN): 1},
+        )
 
     def test_health_attributes_responses_api_requests(self) -> None:
         client = self.gated_client(llm="responses-api")
@@ -270,7 +298,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
             response = client.post("/v1/responses", content=b"{}", headers=_auth())
         self.assertEqual(response.status_code, 200)
 
-        payload = client.get("/health").json()["llm_proxy_usage"]
+        payload = self.internal_llm_proxy_usage(client)
         fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
         self.assertEqual(payload["requests"], 1)
         self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 1})
@@ -281,7 +309,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
             response = client.post("/v1/responses", content=b"{}", headers=_auth())
         self.assertEqual(response.status_code, 200)
 
-        payload = client.get("/health").json()["llm_proxy_usage"]
+        payload = self.internal_llm_proxy_usage(client)
         fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
         self.assertEqual(payload["requests"], 1)
         self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 1})
@@ -297,7 +325,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
                 response = self.post_chat(client)
         self.assertEqual(response.status_code, 502)
 
-        payload = client.get("/health").json()["llm_proxy_usage"]
+        payload = self.internal_llm_proxy_usage(client)
         fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
         self.assertEqual(payload["requests"], 1)
         self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 1})

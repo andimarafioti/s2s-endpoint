@@ -175,6 +175,24 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    def test_fetch_compute_usage_sends_internal_attribution_auth(self):
+        payload = {
+            "router": {"active_sessions": 0, "max_sessions": 1},
+            "llm_proxy_usage": {
+                "instance_id": "replica-generation",
+                "requests": 1,
+                "requests_by_fingerprint": {"fingerprint-a": 1},
+            },
+        }
+        with patch(
+            "app.endpoint_pool_router.urllib.request.urlopen",
+            return_value=FakeUrlopenResponse(payload),
+        ) as urlopen:
+            fetch_compute_usage("https://compute.example", internal_auth_token="shared-secret")
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("X-s2s-internal-auth"), "shared-secret")
+
     async def test_public_snapshot_redacts_llm_requester_fingerprints(self):
         self.router = _make_test_router(
             endpoint_names=["endpoint-a"],

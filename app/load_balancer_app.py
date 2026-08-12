@@ -342,7 +342,10 @@ def build_endpoint_router(settings: LoadBalancerSettings) -> EndpointPoolRouter:
         drain_lease_ttl_s=settings.compute_endpoint_drain_lease_ttl_s,
         drain_warning_after_s=settings.compute_endpoint_drain_warning_after_s,
         drain_warning_interval_s=settings.compute_endpoint_drain_warning_interval_s,
-        compute_usage_fetcher=fetch_compute_usage,
+        compute_usage_fetcher=lambda url: fetch_compute_usage(
+            url,
+            internal_auth_token=settings.session_shared_secret,
+        ),
         # How long a previously observed usage count stays trusted when
         # health polls fail transiently. Must be comfortably above the
         # reconcile interval (10s): the default 60s means roughly six

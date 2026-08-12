@@ -953,8 +953,10 @@ class DashboardHistory:
                     requesters=copy.deepcopy(requesters),
                 )
                 self._llm_proxy_checkpoint = checkpoint
-                if self._history_store_is_writable():
-                    self._pending_llm_proxy_checkpoints[bucket.bucket_start_s] = checkpoint
+            else:
+                checkpoint = current_checkpoint
+            if self._history_store_is_writable():
+                self._pending_llm_proxy_checkpoints[bucket.bucket_start_s] = checkpoint
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(observed_at_s)
             self._wake_persistence_unlocked()

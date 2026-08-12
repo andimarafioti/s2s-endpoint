@@ -1286,6 +1286,41 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.llm_proxy_checkpoint.observations, second_observation)
         self.assertEqual(history.persistence_status()["dirty_bucket_count"], 0)
 
+    async def test_unchanged_checkpoint_repairs_stale_remote_checkpoint(self):
+        clock = FakeClock(2 * 60)
+        store = FakeHistoryStore()
+        history = DashboardHistory(
+            retention_minutes=60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+        observations = {"reachy-s2s-01": {"instance_id": "generation-a", "requests": 11}}
+        await history.record_llm_proxy_usage(
+            requests=0,
+            requester_counts=[],
+            observations=observations,
+            requesters={},
+            observed_at_s=0,
+        )
+        await history._flush_dirty_buckets(include_open_bucket=False)
+        latest = store.llm_proxy_checkpoint
+        store.llm_proxy_checkpoint = LLMProxyCheckpoint(
+            observed_at_s=-1,
+            observations={"reachy-s2s-01": {"instance_id": "generation-a", "requests": 10}},
+            requesters={},
+        )
+
+        await history.record_llm_proxy_usage(
+            requests=0,
+            requester_counts=[],
+            observations=observations,
+            requesters={},
+            observed_at_s=60,
+        )
+        await history._flush_dirty_buckets(include_open_bucket=False)
+
+        self.assertEqual(store.llm_proxy_checkpoint, latest)
+
     async def test_stalled_flush_remains_single_flight_and_writes_newest_snapshot_last(self):
         clock = FakeClock(2 * 60)
         store = BlockingFirstWriteHistoryStore()

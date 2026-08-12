@@ -79,10 +79,13 @@ class ComputeUnhealthyError(RuntimeError):
     """The compute endpoint explicitly reported that it is not ready."""
 
 
-def fetch_compute_usage(base_url: str) -> ComputeUsage:
+def fetch_compute_usage(base_url: str, *, internal_auth_token: str = "") -> ComputeUsage:
+    headers = {"Accept": "application/json"}
+    if internal_auth_token:
+        headers["X-S2S-Internal-Auth"] = internal_auth_token
     request = urllib.request.Request(
         _to_health_url(base_url),
-        headers={"Accept": "application/json"},
+        headers=headers,
         method="GET",
     )
     try:

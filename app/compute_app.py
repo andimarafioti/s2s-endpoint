@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import subprocess
 import threading
@@ -239,7 +240,7 @@ async def root(settings: ComputeSettings):
     }
 
 
-async def health(settings: ComputeSettings, dependencies: "ComputeDependencies"):
+async def health(request: Request, settings: ComputeSettings, dependencies: "ComputeDependencies"):
     healthy, detail, snapshot = await dependencies.session_router.healthcheck()
     if not healthy:
         raise HTTPException(status_code=503, detail=detail or "compute router is not ready")
@@ -255,7 +256,16 @@ async def health(settings: ComputeSettings, dependencies: "ComputeDependencies")
         "tts": settings.tts,
         "router": snapshot,
     }
-    payload["llm_proxy_usage"] = dependencies.llm_proxy_attribution.snapshot()
+    llm_proxy_usage = dependencies.llm_proxy_attribution.snapshot()
+    if not (
+        settings.session_shared_secret
+        and hmac.compare_digest(
+            request.headers.get("x-s2s-internal-auth", ""),
+            settings.session_shared_secret,
+        )
+    ):
+        llm_proxy_usage.pop("requests_by_fingerprint", None)
+    payload["llm_proxy_usage"] = llm_proxy_usage
 
     return JSONResponse(payload)
 
@@ -844,8 +854,8 @@ def create_app(
     async def root_route():
         return await root(settings)
 
-    async def health_route():
-        return await health(settings, resolved_dependencies)
+    async def health_route(request: Request):
+        return await health(request, settings, resolved_dependencies)
 
     async def pool_route():
         return await pool(settings, resolved_dependencies)
