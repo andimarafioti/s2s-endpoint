@@ -244,6 +244,7 @@ class SwarmDashboard:
         self._sample_task: Optional[asyncio.Task] = None
         self._capture_lock = asyncio.Lock()
         self._llm_proxy_observations: dict[str, tuple[str, int, dict[str, int]]] = {}
+        self._llm_proxy_baselined = False
         self._llm_proxy_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
         self._max_llm_proxy_requesters = max_requester_records
 
@@ -343,7 +344,8 @@ class SwarmDashboard:
             previous = self._llm_proxy_observations.get(endpoint["name"])
             if previous is None:
                 self._llm_proxy_observations[endpoint["name"]] = (instance_id, requests, dict(by_fingerprint))
-                continue
+                if not self._llm_proxy_baselined:
+                    continue
             previous_total = previous[1] if previous is not None and previous[0] == instance_id else 0
             previous_by_fingerprint = previous[2] if previous is not None and previous[0] == instance_id else {}
             if requests < previous_total:
@@ -355,6 +357,8 @@ class SwarmDashboard:
                     if delta > 0:
                         requester_deltas[fingerprint] = requester_deltas.get(fingerprint, 0) + delta
             self._llm_proxy_observations[endpoint["name"]] = (instance_id, requests, dict(by_fingerprint))
+
+        self._llm_proxy_baselined = True
 
         attributed: dict[str, tuple[RequesterIdentity, int]] = {}
         for fingerprint, count in requester_deltas.items():

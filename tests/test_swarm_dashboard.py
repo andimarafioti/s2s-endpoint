@@ -318,6 +318,31 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(alice["llm_proxy_requests"], 3)
         self.assertNotIn("requests_by_fingerprint", result["current"]["endpoints"][0]["llm_proxy_usage"])
 
+    async def test_new_replica_after_initial_baseline_counts_its_requests(self):
+        clock = FakeClock(2 * 3600)
+        payload = _health_snapshot(
+            connected=0,
+            pending=0,
+            running=1,
+            waking=0,
+            free_slots=1,
+            effective_free_slots=1,
+        )
+        endpoints = payload[2]["router"]["endpoints"]
+        endpoints[0]["llm_proxy_usage"] = {"instance_id": "process-a", "requests": 0, "requests_by_fingerprint": {}}
+        dashboard = SwarmDashboard(snapshot_provider=FakeSnapshotProvider(payload), time_fn=clock.now)
+
+        await dashboard.capture_sample()
+        endpoints[1]["llm_proxy_usage"] = {
+            "instance_id": "process-b",
+            "requests": 2,
+            "requests_by_fingerprint": {},
+        }
+        await dashboard.capture_sample()
+
+        summary = await dashboard.summary(window_minutes=60, requested_window="60m")
+        self.assertEqual(summary["llm_proxy_requests_window"], 2)
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(
