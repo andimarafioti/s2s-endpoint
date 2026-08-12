@@ -4,8 +4,9 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Mapping, Optional
 
 import httpx
@@ -27,6 +28,7 @@ PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_POOL_PATH = "/v1/pool"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
+LLM_PROXY_USAGE_TIMEOUT_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -237,19 +239,36 @@ async def health(settings: ComputeSettings, dependencies: "ComputeDependencies")
     if not healthy:
         raise HTTPException(status_code=503, detail=detail or "compute router is not ready")
 
-    return JSONResponse(
-        {
-            "status": "ok",
-            "role": APP_ROLE,
-            "internal_ws_base": settings.internal_ws_url,
-            "internal_usage_url": settings.internal_usage_url,
-            "public_websocket": PUBLIC_WS_PATH,
-            "stt": settings.stt,
-            "llm": settings.llm,
-            "tts": settings.tts,
-            "router": snapshot,
-        }
-    )
+    payload: dict[str, object] = {
+        "status": "ok",
+        "role": APP_ROLE,
+        "internal_ws_base": settings.internal_ws_url,
+        "internal_usage_url": settings.internal_usage_url,
+        "public_websocket": PUBLIC_WS_PATH,
+        "stt": settings.stt,
+        "llm": settings.llm,
+        "tts": settings.tts,
+        "router": snapshot,
+    }
+    try:
+        internal_usage = await asyncio.wait_for(
+            asyncio.to_thread(
+                dependencies.http_get_json,
+                settings.internal_usage_url,
+            ),
+            timeout=LLM_PROXY_USAGE_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("Failed to read internal LLM proxy usage: %s", exc)
+    else:
+        llm_proxy = internal_usage.get("llm_proxy") if isinstance(internal_usage, dict) else None
+        requests = llm_proxy.get("requests") if isinstance(llm_proxy, dict) else None
+        if isinstance(requests, int) and not isinstance(requests, bool) and requests >= 0:
+            payload["llm_proxy_usage"] = dependencies.llm_proxy_attribution.snapshot(
+                requests=requests,
+            )
+
+    return JSONResponse(payload)
 
 
 async def pool(settings: ComputeSettings, dependencies: "ComputeDependencies"):
@@ -341,6 +360,24 @@ class _FingerprintRateLimiter:
                 {k: v for k, v in self._hits.items() if v and now - v[-1] < _RATE_LIMIT_WINDOW_S},
             )
         return True
+
+
+@dataclass
+class _LLMProxyAttribution:
+    """Replica-local requester counters paired with the internal total."""
+
+    instance_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    requests_by_fingerprint: dict[str, int] = field(default_factory=dict)
+
+    def record(self, fingerprint: str) -> None:
+        self.requests_by_fingerprint[fingerprint] = self.requests_by_fingerprint.get(fingerprint, 0) + 1
+
+    def snapshot(self, *, requests: int) -> dict[str, object]:
+        return {
+            "instance_id": self.instance_id,
+            "requests": requests,
+            "requests_by_fingerprint": dict(self.requests_by_fingerprint),
+        }
 
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
@@ -474,6 +511,18 @@ async def _proxy_llm_request(
     except Exception:
         await client.aclose()
         raise
+
+    if (
+        (path == "/v1/chat/completions" and settings.llm == "chat-completions")
+        or (path == "/v1/responses" and settings.llm == "responses-api")
+    ):
+        token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
+        if token is None:
+            token = bearer_token(request.headers.get("authorization"))
+        if token is not None:
+            dependencies.llm_proxy_attribution.record(
+                llm_token_fingerprint(settings.session_shared_secret, token)
+            )
 
     async def _cleanup() -> None:
         await upstream.aclose()
@@ -712,6 +761,7 @@ class ComputeDependencies:
     http_get_json: Callable[[str], dict[str, object]]
     notify_lb_session_event: Callable[..., Awaitable[None]]
     proxy_websocket: Callable[..., Awaitable[None]]
+    llm_proxy_attribution: _LLMProxyAttribution = field(default_factory=_LLMProxyAttribution)
 
 
 @dataclass(frozen=True)

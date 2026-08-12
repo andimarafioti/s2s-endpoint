@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app.dashboard_history import DashboardHistory, SwarmHistoryBucket, SwarmStateSample
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
+from app.requester_identity import RequesterIdentity
 from app.swarm_dashboard import SwarmDashboard
 
 
@@ -273,6 +274,80 @@ def _bucket_store(api: FakeBucketApi) -> HuggingFaceBucketHistoryStore:
 
 
 class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_llm_proxy_usage_aggregates_replicas_attributes_requesters_and_handles_restarts(self):
+        clock = FakeClock(2 * 3600)
+        payload = _health_snapshot(
+            connected=0,
+            pending=0,
+            running=2,
+            waking=0,
+            free_slots=2,
+            effective_free_slots=2,
+        )
+        endpoints = payload[2]["router"]["endpoints"]
+        endpoints[0]["llm_proxy_usage"] = {
+            "instance_id": "generation-a",
+            "requests": 10,
+            "requests_by_fingerprint": {"proxy-a": 10},
+        }
+        endpoints[1]["llm_proxy_usage"] = {
+            "instance_id": "generation-b",
+            "requests": 5,
+            "requests_by_fingerprint": {"proxy-b": 5},
+        }
+        provider = FakeSnapshotProvider(payload)
+        dashboard = SwarmDashboard(
+            snapshot_provider=provider,
+            sample_interval_s=15,
+            retention_minutes=24 * 60,
+            time_fn=clock.now,
+        )
+        requester_a = RequesterIdentity(
+            actor_id="token:a",
+            label="@alice · token •a",
+            kind="authenticated",
+            verification="verified",
+            fingerprint="a",
+            account_name="alice",
+        )
+        requester_b = RequesterIdentity(
+            actor_id="token:b",
+            label="@bob · token •b",
+            kind="authenticated",
+            verification="verified",
+            fingerprint="b",
+            account_name="bob",
+        )
+        dashboard.register_llm_proxy_requester("proxy-a", requester_a)
+        dashboard.register_llm_proxy_requester("proxy-b", requester_b)
+
+        await dashboard.capture_sample()  # Establish cumulative baselines.
+        endpoints[0]["llm_proxy_usage"]["requests"] = 13
+        endpoints[0]["llm_proxy_usage"]["requests_by_fingerprint"]["proxy-a"] = 13
+        endpoints[1]["llm_proxy_usage"]["requests"] = 9
+        endpoints[1]["llm_proxy_usage"]["requests_by_fingerprint"]["proxy-b"] = 9
+        await dashboard.capture_sample()
+        await dashboard.capture_sample()  # Re-reading the same counters is a no-op.
+
+        endpoints[0]["llm_proxy_usage"] = {
+            "instance_id": "generation-a-restarted",
+            "requests": 2,
+            "requests_by_fingerprint": {"proxy-a": 2},
+        }
+        await dashboard.capture_sample()
+
+        result = await dashboard.data(window="60m", resolution="minute")
+        rows = {row["actor_id"]: row for row in result["requesters"]["leaderboard"]}
+        self.assertEqual(result["summary"]["llm_proxy_requests_window"], 9)
+        self.assertEqual(result["series"][-1]["llm_proxy_requests"], 9)
+        self.assertEqual(rows["hf:alice"]["llm_proxy_requests"], 5)
+        self.assertEqual(rows["hf:bob"]["llm_proxy_requests"], 4)
+        self.assertEqual(result["requesters"]["unattributed_llm_proxy_requests"], 0)
+
+        restored = SwarmHistoryBucket.from_dict((await dashboard.history.snapshot())[-1].to_dict())
+        self.assertEqual(restored.llm_proxy_requests, 9)
+        self.assertEqual(restored.requester_usage["token:a"]["llm_proxy_requests"], 5)
+
     async def test_data_exposes_minute_series_and_event_counters(self):
         clock = FakeClock(2 * 3600)
         provider = FakeSnapshotProvider(

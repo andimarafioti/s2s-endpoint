@@ -22,6 +22,7 @@ from app.load_balancer_app import (
 from app.requester_identity import RequesterIdentity
 from app.requester_rate_limiter import RequesterRateLimitConfig, RequesterRateLimiter
 from app.session_requester_tracker import SessionRequesterTracker
+from app.session_tokens import llm_token_fingerprint
 from app.verification_admission_limiter import (
     VerificationAdmissionConfig,
     VerificationAdmissionLimiter,
@@ -820,6 +821,30 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_session_manager.allocation_calls, 1)
         self.assertEqual(fake_dashboard.calls, ["request", "success"])
 
+    async def test_verified_session_registers_llm_proxy_attribution(self):
+        module = self._import_load_balancer(
+            {
+                "SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true",
+                "SESSION_SHARED_SECRET": "session-secret",
+            }
+        )
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
+        verified = _requester_identity(verification="verified", kind="authenticated")
+        raw_token = "hf_verifiedrequesttoken"
+        request = FakeHeaderRequest({"authorization": f"Bearer {raw_token}"})
+
+        with patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified):
+            response = await create_session(module.runtime, request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_dashboard.llm_proxy_requesters,
+            [(llm_token_fingerprint(module.settings.session_shared_secret, raw_token), verified)],
+        )
+
     async def test_default_verification_age_allows_the_full_default_allocation_wait(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
@@ -1236,6 +1261,7 @@ class FakeDashboard:
         self.connected_requesters = []
         self.disconnected_requesters = []
         self.identity_updates = []
+        self.llm_proxy_requesters = []
 
     async def record_session_request(self, requester=None):
         self.calls.append("request")
@@ -1273,6 +1299,9 @@ class FakeDashboard:
 
     async def update_requester_identity(self, requester):
         self.identity_updates.append(requester)
+
+    def register_llm_proxy_requester(self, fingerprint, requester):
+        self.llm_proxy_requesters.append((fingerprint, requester))
 
 
 class FakeSessionManager:

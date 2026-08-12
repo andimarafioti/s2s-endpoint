@@ -966,9 +966,13 @@ async def create_session(runtime: LoadBalancerRuntime, request: Request):
         )
     allocation_started_at = monotonic()
     try:
+        llm_fingerprint = await _llm_proxy_fingerprint(runtime, request, requester)
+        if llm_fingerprint is not None:
+            requester = await _refresh_requester_identity(runtime, requester)
+            dependencies.dashboard.register_llm_proxy_requester(llm_fingerprint, requester)
         allocation = await dependencies.session_manager.allocate(
             public_base_url(request),
-            llm_fingerprint=await _llm_proxy_fingerprint(runtime, request, requester),
+            llm_fingerprint=llm_fingerprint,
         )
     except QueueAtCapacityError as exc:
         dependencies.requester_rate_limiter.record_allocation_failure(requester)

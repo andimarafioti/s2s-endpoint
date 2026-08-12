@@ -1,6 +1,7 @@
 import asyncio
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Iterable, Optional
 
@@ -52,6 +53,36 @@ def _parse_window_minutes(window: str | None) -> int:
     return amount * 24 * 60
 
 
+def _coerce_llm_proxy_observation(
+    value: dict[str, object],
+) -> tuple[str, int, dict[str, int]] | None:
+    instance_id = value.get("instance_id")
+    requests = value.get("requests")
+    raw_by_fingerprint = value.get("requests_by_fingerprint")
+    if (
+        not isinstance(instance_id, str)
+        or not instance_id
+        or not isinstance(requests, int)
+        or isinstance(requests, bool)
+        or requests < 0
+        or not isinstance(raw_by_fingerprint, dict)
+    ):
+        return None
+
+    requests_by_fingerprint: dict[str, int] = {}
+    for fingerprint, count in raw_by_fingerprint.items():
+        if (
+            not isinstance(fingerprint, str)
+            or not fingerprint
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+        ):
+            return None
+        requests_by_fingerprint[fingerprint] = count
+    return instance_id, requests, requests_by_fingerprint
+
+
 @dataclass
 class SwarmBucketAggregate:
     sample_count: int = 0
@@ -74,6 +105,7 @@ class SwarmBucketAggregate:
     session_rate_limited: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
+    llm_proxy_requests: int = 0
     completed_conversations: int = 0
     completed_conversation_duration_total_s: float = 0.0
     completed_conversation_duration_max_s: float = 0.0
@@ -105,6 +137,7 @@ class SwarmBucketAggregate:
             aggregate.session_rate_limited += bucket.session_rate_limited
             aggregate.session_connected_events += bucket.session_connected_events
             aggregate.session_disconnected_events += bucket.session_disconnected_events
+            aggregate.llm_proxy_requests += bucket.llm_proxy_requests
             aggregate.completed_conversations += bucket.completed_conversations
             aggregate.completed_conversation_duration_total_s += bucket.completed_conversation_duration_total_s
             aggregate.completed_conversation_duration_max_s = max(
@@ -139,6 +172,7 @@ class SwarmBucketAggregate:
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
+            "llm_proxy_requests": self.llm_proxy_requests,
             "completed_conversations": self.completed_conversations,
             "active_conversation_minutes": round(self.active_conversation_minutes, 2),
             "active_conversation_hours": round(self.active_conversation_minutes / 60.0, 2),
@@ -170,6 +204,7 @@ class SwarmBucketAggregate:
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
+            "llm_proxy_requests": self.llm_proxy_requests,
             "completed_conversations": self.completed_conversations,
             "avg_conversation_duration_s": self.avg_conversation_duration_s,
             "avg_conversation_duration_min": round(self.avg_conversation_duration_s / 60.0, 2),
@@ -243,6 +278,10 @@ class SwarmDashboard:
         )
         self._latest_sample: Optional[SwarmStateSample] = None
         self._sample_task: Optional[asyncio.Task] = None
+        self._llm_proxy_observations: dict[str, tuple[str, int, dict[str, int]]] = {}
+        self._llm_proxy_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
+        self._llm_proxy_requester_limit = max_requester_records
+        self._llm_proxy_lock = asyncio.Lock()
 
     async def start(self) -> None:
         await self.capture_sample()
@@ -268,6 +307,7 @@ class SwarmDashboard:
             captured_at_s=self._time_fn(),
         )
         await self.record_sample(sample)
+        await self._record_llm_proxy_usage(snapshot, observed_at_s=sample.captured_at_s)
         return sample
 
     async def record_sample(self, sample: SwarmStateSample) -> None:
@@ -310,6 +350,19 @@ class SwarmDashboard:
 
     async def update_requester_identity(self, requester: RequesterIdentity) -> None:
         await self.requesters.update_identity(requester)
+        for fingerprint, current in list(self._llm_proxy_requesters.items()):
+            if current.actor_id == requester.actor_id:
+                self._llm_proxy_requesters[fingerprint] = requester
+
+    def register_llm_proxy_requester(
+        self,
+        fingerprint: str,
+        requester: RequesterIdentity,
+    ) -> None:
+        self._llm_proxy_requesters[fingerprint] = requester
+        self._llm_proxy_requesters.move_to_end(fingerprint)
+        while len(self._llm_proxy_requesters) > self._llm_proxy_requester_limit:
+            self._llm_proxy_requesters.popitem(last=False)
 
     async def record_session_event(
         self,
@@ -372,6 +425,7 @@ class SwarmDashboard:
             "session_successes_window": selected["session_allocation_successes"],
             "session_auth_rejections_window": selected["session_auth_rejections"],
             "session_rate_limited_window": selected["session_rate_limited"],
+            "llm_proxy_requests_window": selected["llm_proxy_requests"],
             "session_connects_window": selected["session_connected_events"],
             "session_disconnects_window": selected["session_disconnected_events"],
             "conversations_started_window": selected["session_connected_events"],
@@ -420,6 +474,7 @@ class SwarmDashboard:
                             "session_allocation_failures": 0,
                             "session_auth_rejections": 0,
                             "session_rate_limited": 0,
+                            "llm_proxy_requests": 0,
                             "session_connected_events": 0,
                             "session_disconnected_events": 0,
                             "completed_conversations": 0,
@@ -501,6 +556,73 @@ class SwarmDashboard:
                 await self.capture_sample()
         except asyncio.CancelledError:
             raise
+
+    async def _record_llm_proxy_usage(
+        self,
+        snapshot: dict[str, object],
+        *,
+        observed_at_s: float,
+    ) -> None:
+        total_delta = 0
+        deltas_by_fingerprint: dict[str, int] = {}
+        router = snapshot.get("router")
+        endpoints = router.get("endpoints") if isinstance(router, dict) else None
+
+        async with self._llm_proxy_lock:
+            observations: list[tuple[str, tuple[str, int, dict[str, int]]]] = []
+            for endpoint in endpoints if isinstance(endpoints, list) else []:
+                if not isinstance(endpoint, dict):
+                    continue
+                endpoint_name = endpoint.get("name")
+                usage = endpoint.get("llm_proxy_usage")
+                if not isinstance(endpoint_name, str) or not isinstance(usage, dict):
+                    continue
+                observation = _coerce_llm_proxy_observation(usage)
+                if observation is None:
+                    continue
+
+                instance_id, requests, requests_by_fingerprint = observation
+                previous = self._llm_proxy_observations.get(endpoint_name)
+                observations.append((endpoint_name, observation))
+                if previous is None:
+                    continue
+
+                previous_instance_id, previous_requests, previous_by_fingerprint = previous
+                if instance_id != previous_instance_id:
+                    request_delta = requests
+                    fingerprint_deltas = requests_by_fingerprint
+                elif requests < previous_requests:
+                    continue
+                else:
+                    request_delta = requests - previous_requests
+                    fingerprint_deltas = {
+                        fingerprint: count - previous_by_fingerprint.get(fingerprint, 0)
+                        for fingerprint, count in requests_by_fingerprint.items()
+                        if count > previous_by_fingerprint.get(fingerprint, 0)
+                    }
+
+                total_delta += request_delta
+                for fingerprint, count in fingerprint_deltas.items():
+                    deltas_by_fingerprint[fingerprint] = deltas_by_fingerprint.get(fingerprint, 0) + count
+
+            attributed: dict[str, tuple[RequesterIdentity, int]] = {}
+            for fingerprint, count in deltas_by_fingerprint.items():
+                requester = self._llm_proxy_requesters.get(fingerprint)
+                if requester is None:
+                    continue
+                current_requester, current_count = attributed.get(requester.actor_id, (requester, 0))
+                attributed[requester.actor_id] = (current_requester, current_count + count)
+
+            await self.history.record_llm_proxy_usage(
+                requests=total_delta,
+                requester_counts=[
+                    (actor_id, requester.history_metadata(), count)
+                    for actor_id, (requester, count) in attributed.items()
+                ],
+                observed_at_s=observed_at_s,
+            )
+            for endpoint_name, observation in observations:
+                self._llm_proxy_observations[endpoint_name] = observation
 
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()
@@ -1049,6 +1171,7 @@ __REQUESTER_DASHBOARD_STYLES__
         <h2>Requests And Session Events</h2>
         <div class="legend">
           <span style="color: #182125">Session Requests</span>
+          <span style="color: #e67e22">LLM Proxy Requests</span>
           <span style="color: #117a65">Allocations</span>
           <span style="color: #bb2d3b">Allocation Failures</span>
           <span style="color: #0b5cab">Session Connects</span>
@@ -1299,6 +1422,7 @@ __REQUESTER_DASHBOARD_MARKUP__
         kpiCard('Live conversations', prettyNumber(current.connected_sessions), 'Current live websocket sessions'),
         kpiCard('Pending joins', prettyNumber(current.pending_sessions), 'Reserved sessions waiting to connect'),
         kpiCard(`Requests / ${windowLabel}`, prettyNumber(summary.session_requests_window), `POST /session requests in the last ${windowLabel}`),
+        kpiCard(`LLM proxy / ${windowLabel}`, prettyNumber(summary.llm_proxy_requests_window), `Authorized /v1/chat/completions and /v1/responses requests in the last ${windowLabel}`),
         kpiCard(`Failures / ${windowLabel}`, prettyNumber(summary.session_failures_window), `Allocation failures in the last ${windowLabel}`),
 __REQUESTER_DASHBOARD_KPI_CARDS__
         kpiCard(`Started / ${windowLabel}`, prettyNumber(summary.conversations_started_window), `Conversation starts recorded in the last ${windowLabel}`),
@@ -1671,6 +1795,7 @@ __REQUESTER_DASHBOARD_SCRIPT__
 
       drawChart(document.getElementById('requests-chart'), series, [
         { key: 'session_requests', color: '#182125' },
+        { key: 'llm_proxy_requests', color: '#e67e22' },
         { key: 'session_allocation_successes', color: '#117a65' },
         { key: 'session_allocation_failures', color: '#bb2d3b' },
         { key: 'session_auth_rejections', color: '#c0392b' },

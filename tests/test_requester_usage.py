@@ -534,6 +534,8 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertNotIn("__REQUESTER_DASHBOARD_", html)
         self.assertIn('id="requester-leaderboard"', html)
         self.assertIn("Requester Usage", html)
+        self.assertIn("<th>LLM proxy</th>", html)
+        self.assertIn("row.llm_proxy_requests", html)
         self.assertIn("Reported robots", html)
         self.assertIn("Connected requesters", html)
         self.assertIn("first compute websocket callback", html)

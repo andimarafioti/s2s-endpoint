@@ -178,6 +178,7 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         rate_limit_rpm: int = 100,
         enable_llm_proxy: bool = True,
         secret: str = SECRET,
+        llm: str = "chat-completions",
         time_fn: Callable[[], float] = time.monotonic,
     ) -> TestClient:
         async def _fake_acquire():
@@ -185,6 +186,9 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
 
         async def _fake_release(slot_id) -> None:
             pass
+
+        async def _fake_healthcheck():
+            return True, None, {"active_sessions": 0, "max_sessions": 1}
 
         async def _no_lb_callback(*args: Any, **kwargs: Any) -> None:
             pass
@@ -196,9 +200,14 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
             internal_ws_base_port=int(stub_url.port),
             enable_llm_proxy=enable_llm_proxy,
             session_shared_secret=secret,
+            llm=llm,
         )
         dependencies = compute_main.ComputeDependencies(
-            session_router=SimpleNamespace(acquire=_fake_acquire, release=_fake_release),
+            session_router=SimpleNamespace(
+                acquire=_fake_acquire,
+                release=_fake_release,
+                healthcheck=_fake_healthcheck,
+            ),
             connected_llm_fingerprints=compute_main._ConnectedFingerprintRegistry(),
             llm_rate_limiter=compute_main._FingerprintRateLimiter(rate_limit_rpm, time_fn=time_fn),
             http_get_json=compute_main._http_get_json,
@@ -225,6 +234,49 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
 
 
 class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
+    def test_health_exposes_internal_total_with_privacy_safe_chat_attribution(self) -> None:
+        internal_requests = 0
+
+        def responder(path):
+            nonlocal internal_requests
+            if path == "/v1/usage":
+                return 200, {"llm_proxy": {"requests": internal_requests}}
+            internal_requests += 1
+            return 200, {"ok": True}
+
+        self.stub.responder = responder
+        client = self.gated_client()
+        with _connected_session(client):
+            self.assertEqual(self.post_chat(client).status_code, 200)
+            self.assertEqual(self.post_chat(client).status_code, 200)
+
+        payload = client.get("/health").json()["llm_proxy_usage"]
+        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
+        self.assertEqual(payload["requests"], 2)
+        self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 2})
+        self.assertNotIn(HF_TOKEN, json.dumps(payload))
+
+    def test_health_attributes_responses_api_requests(self) -> None:
+        internal_requests = 0
+
+        def responder(path):
+            nonlocal internal_requests
+            if path == "/v1/usage":
+                return 200, {"llm_proxy": {"requests": internal_requests}}
+            internal_requests += 1
+            return 200, {"ok": True}
+
+        self.stub.responder = responder
+        client = self.gated_client(llm="responses-api")
+        with _connected_session(client):
+            response = client.post("/v1/responses", content=b'{}', headers=_auth())
+        self.assertEqual(response.status_code, 200)
+
+        payload = client.get("/health").json()["llm_proxy_usage"]
+        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
+        self.assertEqual(payload["requests"], 1)
+        self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 1})
+
     def test_chat_completions_reaches_internal_pipeline_verbatim(self) -> None:
         self.stub.responder = lambda path: (
             200,
