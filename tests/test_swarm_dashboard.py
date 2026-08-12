@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from app.dashboard_history import DashboardHistory, SwarmHistoryBucket, SwarmStateSample
+from app.dashboard_history import DashboardHistory, LLMProxyCheckpoint, SwarmHistoryBucket, SwarmStateSample
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.requester_identity import RequesterIdentity
 from app.swarm_dashboard import SwarmDashboard
@@ -34,9 +34,11 @@ class FakeSnapshotProvider:
 
 
 class FakeHistoryStore:
-    def __init__(self, initial_buckets=None):
+    def __init__(self, initial_buckets=None, initial_llm_proxy_checkpoint=None):
         self.saved = {bucket.bucket_start_s: bucket.to_dict() for bucket in (initial_buckets or [])}
+        self.llm_proxy_checkpoint = initial_llm_proxy_checkpoint
         self.write_calls = []
+        self.checkpoint_write_calls = []
         self.load_calls = 0
         self.load_requests = []
 
@@ -50,10 +52,17 @@ class FakeHistoryStore:
             if bucket_start_s >= min_bucket
         ]
 
-    def write_buckets(self, buckets):
+    def load_llm_proxy_checkpoint(self):
+        checkpoint = self.llm_proxy_checkpoint
+        return LLMProxyCheckpoint.from_dict(checkpoint.to_dict()) if checkpoint is not None else None
+
+    def write_buckets(self, buckets, *, llm_proxy_checkpoint=None):
         self.write_calls.append([bucket.bucket_start_s for bucket in buckets])
         for bucket in buckets:
             self.saved[bucket.bucket_start_s] = bucket.to_dict()
+        if llm_proxy_checkpoint is not None:
+            self.llm_proxy_checkpoint = LLMProxyCheckpoint.from_dict(llm_proxy_checkpoint.to_dict())
+            self.checkpoint_write_calls.append(llm_proxy_checkpoint.to_dict())
 
 
 class DayRolloverHistoryStore(FakeHistoryStore):
@@ -100,12 +109,12 @@ class BlockingFirstWriteHistoryStore(FakeHistoryStore):
         self.release_first_write = threading.Event()
         self.write_attempts = 0
 
-    def write_buckets(self, buckets):
+    def write_buckets(self, buckets, *, llm_proxy_checkpoint=None):
         self.write_attempts += 1
         if self.write_attempts == 1:
             self.first_write_started.set()
             self.release_first_write.wait()
-        super().write_buckets(buckets)
+        super().write_buckets(buckets, llm_proxy_checkpoint=llm_proxy_checkpoint)
 
 
 class FlakyWriteHistoryStore(FakeHistoryStore):
@@ -115,12 +124,12 @@ class FlakyWriteHistoryStore(FakeHistoryStore):
         self.write_attempts = 0
         self.write_attempt_started_at = []
 
-    def write_buckets(self, buckets):
+    def write_buckets(self, buckets, *, llm_proxy_checkpoint=None):
         self.write_attempts += 1
         self.write_attempt_started_at.append(time.monotonic())
         if self.write_attempts in self.fail_on_write_attempts:
             raise RuntimeError(f"write failure {self.write_attempts}")
-        super().write_buckets(buckets)
+        super().write_buckets(buckets, llm_proxy_checkpoint=llm_proxy_checkpoint)
 
 
 class BlockingFailingFirstWriteHistoryStore(FakeHistoryStore):
@@ -131,14 +140,14 @@ class BlockingFailingFirstWriteHistoryStore(FakeHistoryStore):
         self.write_attempts = 0
         self.write_attempt_started_at = []
 
-    def write_buckets(self, buckets):
+    def write_buckets(self, buckets, *, llm_proxy_checkpoint=None):
         self.write_attempts += 1
         self.write_attempt_started_at.append(time.monotonic())
         if self.write_attempts == 1:
             self.first_write_started.set()
             self.release_first_write.wait()
             raise RuntimeError("blocked write failed")
-        super().write_buckets(buckets)
+        super().write_buckets(buckets, llm_proxy_checkpoint=llm_proxy_checkpoint)
 
 
 class FakeBucketItem:
@@ -436,8 +445,11 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         restored = SwarmHistoryBucket.from_dict((await dashboard.history.snapshot())[-1].to_dict())
         self.assertEqual(restored.llm_proxy_requests, 9)
         self.assertEqual(restored.requester_usage["token:a"]["llm_proxy_requests"], 5)
-        self.assertEqual(restored.llm_proxy_observations["reachy-s2s-01"]["requests"], 2)
-        self.assertEqual(restored.llm_proxy_requesters["proxy-a"]["actor_id"], "token:a")
+        checkpoint = await dashboard.history.latest_llm_proxy_checkpoint()
+        self.assertEqual(checkpoint[0]["reachy-s2s-01"]["requests"], 2)
+        self.assertEqual(checkpoint[1]["proxy-a"]["actor_id"], "token:a")
+        self.assertNotIn("llm_proxy_observations", restored.to_dict())
+        self.assertNotIn("llm_proxy_requesters", restored.to_dict())
 
     async def test_llm_proxy_checkpoint_survives_load_balancer_restart(self):
         clock = FakeClock(2 * 3600)
@@ -458,16 +470,19 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
                     "llm_proxy_requests": 7,
                 }
             },
-            llm_proxy_observations={
+        )
+        checkpoint = LLMProxyCheckpoint(
+            observed_at_s=2 * 3600,
+            observations={
                 "reachy-s2s-01": {
                     "instance_id": "generation-a",
                     "requests": 10,
                     "requests_by_fingerprint": {"proxy-a": 10},
                 }
             },
-            llm_proxy_requesters={"proxy-a": {"actor_id": requester.actor_id, **requester.history_metadata()}},
+            requesters={"proxy-a": {"actor_id": requester.actor_id, **requester.history_metadata()}},
         )
-        store = FakeHistoryStore(initial_buckets=[persisted])
+        store = FakeHistoryStore(initial_buckets=[persisted], initial_llm_proxy_checkpoint=checkpoint)
         payload = _health_snapshot(
             connected=0,
             pending=0,
@@ -522,14 +537,17 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
                     "llm_proxy_requests": 7,
                 }
             },
-            llm_proxy_observations={
+        )
+        checkpoint = LLMProxyCheckpoint(
+            observed_at_s=2 * 3600,
+            observations={
                 "reachy-s2s-01": {
                     "instance_id": "generation-a",
                     "requests": 10,
                     "requests_by_fingerprint": {"proxy-a": 10},
                 }
             },
-            llm_proxy_requesters={"proxy-a": {"actor_id": requester.actor_id, **requester.history_metadata()}},
+            requesters={"proxy-a": {"actor_id": requester.actor_id, **requester.history_metadata()}},
         )
         store = FakeHistoryStore()
         payload = _health_snapshot(
@@ -559,6 +577,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         try:
             await dashboard.history._restore_task
             store.saved[persisted.bucket_start_s] = persisted.to_dict()
+            store.llm_proxy_checkpoint = checkpoint
             await dashboard.history._startup_merge_task
             first = await dashboard.data(window="60m", resolution="minute")
             second = await dashboard.data(window="60m", resolution="minute")
@@ -1085,6 +1104,91 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(status["last_flush_started_at"])
         self.assertIsNotNone(status["last_flush_finished_at"])
         self.assertIsNone(status["last_flush_error"])
+
+    async def test_llm_proxy_checkpoint_is_persisted_once_outside_minute_history(self):
+        clock = FakeClock(2 * 60)
+        store = FakeHistoryStore()
+        history = DashboardHistory(
+            retention_minutes=60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+        requesters = {
+            f"proxy-{index}": {"actor_id": f"token:{index}", "label": f"Requester {index}"} for index in range(1_000)
+        }
+        first_observation = {
+            "reachy-s2s-01": {
+                "instance_id": "generation-a",
+                "requests": 1_000,
+                "requests_by_fingerprint": {fingerprint: 1 for fingerprint in requesters},
+            }
+        }
+        second_observation = {
+            "reachy-s2s-01": {
+                "instance_id": "generation-a",
+                "requests": 2_000,
+                "requests_by_fingerprint": {fingerprint: 2 for fingerprint in requesters},
+            }
+        }
+
+        await history.record_llm_proxy_usage(
+            requests=0,
+            requester_counts=[],
+            observations=first_observation,
+            requesters=requesters,
+            observed_at_s=0,
+        )
+        await history.record_llm_proxy_usage(
+            requests=0,
+            requester_counts=[],
+            observations=second_observation,
+            requesters=requesters,
+            observed_at_s=60,
+        )
+        await history._flush_dirty_buckets(include_open_bucket=False)
+
+        self.assertEqual(set(store.saved), {0, 60})
+        for minute_payload in store.saved.values():
+            self.assertNotIn("llm_proxy_observations", minute_payload)
+            self.assertNotIn("llm_proxy_requesters", minute_payload)
+        self.assertEqual(len(store.checkpoint_write_calls), 1)
+        self.assertEqual(store.llm_proxy_checkpoint.observations, second_observation)
+        self.assertEqual(store.llm_proxy_checkpoint.requesters, requesters)
+
+    async def test_checkpoint_updated_during_flush_is_written_by_followup_batch(self):
+        clock = FakeClock(2 * 60)
+        store = BlockingFirstWriteHistoryStore()
+        history = DashboardHistory(
+            retention_minutes=60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+        first_observation = {"reachy-s2s-01": {"instance_id": "generation-a", "requests": 1}}
+        second_observation = {"reachy-s2s-01": {"instance_id": "generation-a", "requests": 2}}
+        await history.record_llm_proxy_usage(
+            requests=0,
+            requester_counts=[],
+            observations=first_observation,
+            requesters={},
+            observed_at_s=0,
+        )
+
+        flush_task = asyncio.create_task(history._flush_dirty_buckets(include_open_bucket=False))
+        while not store.first_write_started.is_set():
+            await asyncio.sleep(0.001)
+        await history.record_llm_proxy_usage(
+            requests=0,
+            requester_counts=[],
+            observations=second_observation,
+            requesters={},
+            observed_at_s=0,
+        )
+        store.release_first_write.set()
+        await flush_task
+
+        self.assertEqual(store.write_attempts, 2)
+        self.assertEqual(store.llm_proxy_checkpoint.observations, second_observation)
+        self.assertEqual(history.persistence_status()["dirty_bucket_count"], 0)
 
     async def test_stalled_flush_remains_single_flight_and_writes_newest_snapshot_last(self):
         clock = FakeClock(2 * 60)
@@ -2179,6 +2283,29 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         store.write_buckets([bucket])
 
         self.assertEqual(api.batch_adds[0][1], f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json")
+
+    def test_write_buckets_persists_llm_proxy_checkpoint_in_same_batch(self):
+        day_start = _day_start(2026, 5, 18)
+        bucket = SwarmHistoryBucket(bucket_start_s=day_start, llm_proxy_requests=1)
+        checkpoint = LLMProxyCheckpoint(
+            observed_at_s=day_start,
+            observations={"reachy-s2s-01": {"instance_id": "generation-a", "requests": 1}},
+            requesters={"proxy-a": {"actor_id": "token:a"}},
+        )
+        api = FakeBucketApi({})
+        store = _bucket_store(api)
+
+        store.write_buckets([bucket], llm_proxy_checkpoint=checkpoint)
+
+        self.assertEqual(len(api.batch_calls), 1)
+        self.assertEqual(
+            {path for _, path in api.batch_adds},
+            {
+                f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json",
+                "reachy-s2s-lb/checkpoints/llm-proxy.json",
+            },
+        )
+        self.assertEqual(store.load_llm_proxy_checkpoint(), checkpoint)
 
     def test_write_day_buckets_uses_day_path(self):
         day_start = _day_start(2026, 5, 18)

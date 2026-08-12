@@ -46,7 +46,10 @@ class FakeHistoryStore:
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float):
         return list(self.buckets)
 
-    def write_buckets(self, buckets):
+    def load_llm_proxy_checkpoint(self):
+        return None
+
+    def write_buckets(self, buckets, *, llm_proxy_checkpoint=None):
         self.write_calls.append(list(buckets))
 
 
