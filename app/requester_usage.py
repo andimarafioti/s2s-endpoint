@@ -367,7 +367,13 @@ def aggregate_requester_usage(
             )
         )
 
-    rows.sort(key=lambda row: (-int(row["requests"]), str(row["label"])))
+    rows.sort(
+        key=lambda row: (
+            -(int(row["requests"]) + int(row["llm_proxy_requests"])),
+            -int(row["llm_proxy_requests"]),
+            str(row["label"]),
+        )
+    )
     unattributed_requests = max(total_session_requests - tracked_requests, 0)
     summary = {
         "unique_requesters_window": sum(
