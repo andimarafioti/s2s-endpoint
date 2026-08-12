@@ -258,6 +258,33 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertEqual(payload["requests"], 1)
         self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 1})
 
+    def test_health_attributes_authorized_request_to_alternate_proxy_route(self) -> None:
+        client = self.gated_client(llm="chat-completions")
+        with _connected_session(client):
+            response = client.post("/v1/responses", content=b"{}", headers=_auth())
+        self.assertEqual(response.status_code, 200)
+
+        payload = client.get("/health").json()["llm_proxy_usage"]
+        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
+        self.assertEqual(payload["requests"], 1)
+        self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 1})
+
+    def test_health_attributes_authorized_request_when_pipeline_is_unreachable(self) -> None:
+        client = self.gated_client()
+        error = httpx.ConnectError(
+            "test pipeline unavailable",
+            request=httpx.Request("POST", f"{self.stub.base_url}/v1/chat/completions"),
+        )
+        with _connected_session(client):
+            with patch.object(httpx.AsyncClient, "send", side_effect=error):
+                response = self.post_chat(client)
+        self.assertEqual(response.status_code, 502)
+
+        payload = client.get("/health").json()["llm_proxy_usage"]
+        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
+        self.assertEqual(payload["requests"], 1)
+        self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 1})
+
     def test_chat_completions_reaches_internal_pipeline_verbatim(self) -> None:
         self.stub.responder = lambda path: (
             200,
