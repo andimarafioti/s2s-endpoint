@@ -347,6 +347,44 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(counted)
         self.assertEqual(sum(item.llm_proxy_requests for item in snapshot), 1)
 
+    async def test_restore_merges_current_minute_usage_into_startup_sample(self):
+        clock = FakeClock(2 * 3600)
+        persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
+        persisted.llm_proxy_requests = 1
+        persisted.llm_proxy_sequences = {"process-a": 1}
+        persisted.requester_usage = {
+            "hf:alice": {
+                "label": "@alice",
+                "kind": "authenticated",
+                "verification": "verified",
+                "llm_proxy_requests": 1,
+            }
+        }
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )
+            ),
+            history_store=FakeHistoryStore(initial_buckets=[persisted]),
+            time_fn=clock.now,
+        )
+
+        await dashboard.start()
+        try:
+            result = await dashboard.data(window="60m", resolution="minute")
+        finally:
+            await dashboard.stop()
+
+        self.assertEqual(result["summary"]["llm_proxy_requests_window"], 1)
+        alice = next(row for row in result["requesters"]["leaderboard"] if row["actor_id"] == "hf:alice")
+        self.assertEqual(alice["llm_proxy_requests"], 1)
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(

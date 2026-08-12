@@ -510,6 +510,7 @@ class DashboardHistory:
         self._lock = asyncio.Lock()
         self._history: "OrderedDict[int, SwarmHistoryBucket]" = OrderedDict()
         self._llm_proxy_sequences: dict[str, int] = {}
+        self._merged_llm_proxy_usage: dict[int, tuple[int, dict[str, int]]] = {}
         self._requester_record_count = 0
         self._restore_task: Optional[asyncio.Task] = None
         self._startup_merge_task: Optional[asyncio.Task] = None
@@ -1095,6 +1096,41 @@ class DashboardHistory:
 
         updated_bucket_count = 0
         async with self._lock:
+            for bucket in sorted_buckets:
+                current_bucket = self._history.get(bucket.bucket_start_s)
+                if current_bucket is None or bucket.bucket_start_s not in self._locally_sampled_bucket_starts:
+                    continue
+                previous_total, previous_requesters = self._merged_llm_proxy_usage.get(
+                    bucket.bucket_start_s,
+                    (0, {}),
+                )
+                total_delta = max(bucket.llm_proxy_requests - previous_total, 0)
+                current_bucket.llm_proxy_requests += total_delta
+                for instance_id, sequence in bucket.llm_proxy_sequences.items():
+                    current_bucket.llm_proxy_sequences[instance_id] = max(
+                        current_bucket.llm_proxy_sequences.get(instance_id, 0),
+                        sequence,
+                    )
+                requester_counts: dict[str, int] = {}
+                for actor_id, record in bucket.requester_usage.items():
+                    count = int(record.get("llm_proxy_requests", 0))
+                    requester_counts[actor_id] = count
+                    delta = max(count - previous_requesters.get(actor_id, 0), 0)
+                    if delta <= 0:
+                        continue
+                    current_record = current_bucket.requester_usage.get(actor_id)
+                    if current_record is None:
+                        current_record = _new_requester_usage_record(record)
+                        current_bucket.requester_usage[actor_id] = current_record
+                    _merge_requester_identity(current_record, record)
+                    current_record["llm_proxy_requests"] = int(current_record["llm_proxy_requests"]) + delta
+                self._merged_llm_proxy_usage[bucket.bucket_start_s] = (
+                    max(previous_total, bucket.llm_proxy_requests),
+                    requester_counts,
+                )
+                if total_delta > 0:
+                    self._mark_bucket_dirty_unlocked(current_bucket.bucket_start_s)
+                    updated_bucket_count += 1
             for bucket, compared_bucket in merge_candidates:
                 if (
                     bucket.bucket_start_s in self._dirty_bucket_starts

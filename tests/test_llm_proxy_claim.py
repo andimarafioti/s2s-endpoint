@@ -256,6 +256,32 @@ class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(summary["llm_proxy_requests_window"], 1)
 
+    async def test_usage_callback_accepts_an_expired_connected_session_token(self):
+        module = self._import_load_balancer()
+        requester = self._requester("verified")
+        with patch("app.session_tokens.time.time", return_value=100):
+            session_token = create_session_token(
+                SECRET,
+                session_id="session-1",
+                websocket_url="wss://compute-01.example/v1/realtime",
+                callback_url="https://lb.example/internal/sessions/session-1/event",
+                ttl_s=1,
+                llm_fingerprint=llm_token_fingerprint(SECRET, HF_TOKEN),
+                llm_requester={"actor_id": requester.actor_id, **requester.history_metadata()},
+            )
+        payload = {
+            "session_token": session_token,
+            "event": "llm_proxy_request",
+            "instance_id": "process-a",
+            "sequence": 1,
+            "signature": llm_usage_event_signature(SECRET, "session-1", "process-a", 1),
+        }
+
+        with patch("app.session_tokens.time.time", return_value=102):
+            response = await session_event(module.runtime, "session-1", payload)
+
+        self.assertEqual(response.status_code, 200)
+
     async def test_reachy_authorization_header_wins_over_authorization(self):
         module = self._import_load_balancer()
         result = await _llm_proxy_fingerprint(

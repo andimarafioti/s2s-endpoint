@@ -181,6 +181,7 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         time_fn: Callable[[], float] = time.monotonic,
     ) -> TestClient:
         self.lb_events: list[tuple[str, dict[str, Any]]] = []
+        self.fail_usage_callback = False
 
         async def _fake_acquire():
             return SimpleNamespace(slot_id=0, ws_url="ws://127.0.0.1:1/v1/realtime")
@@ -192,6 +193,8 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
             return True, None, {"active_sessions": 1, "max_sessions": 1}
 
         async def _no_lb_callback(callback_url, session_token, event, **kwargs: Any) -> None:
+            if event == "llm_proxy_request" and self.fail_usage_callback:
+                raise RuntimeError("LB unavailable")
             self.lb_events.append((event, kwargs.get("extra_payload") or {}))
 
         self.enterContext(patch("app.ws_proxy.websockets.connect", _FakeUpstreamConnect))
@@ -365,6 +368,15 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertEqual(response.status_code, 200)
         usage_events = [event for event in self.lb_events if event[0] == "llm_proxy_request"]
         self.assertEqual(len(usage_events), 1)
+
+    def test_usage_callback_failure_does_not_block_proxying(self) -> None:
+        client = self.gated_client()
+        self.fail_usage_callback = True
+        with _connected_session(client):
+            response = self.post_chat(client)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.stub.requests), 1)
 
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()

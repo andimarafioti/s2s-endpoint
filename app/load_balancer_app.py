@@ -1277,7 +1277,14 @@ async def _record_llm_proxy_request(
     if not runtime.settings.session_shared_secret:
         raise HTTPException(status_code=503, detail="session shared secret is not configured")
     try:
-        claims = verify_session_token(session_token, runtime.settings.session_shared_secret)
+        # Compute captured this token while the websocket was valid and now
+        # authenticates the event separately. An open websocket may outlive
+        # the token's connection TTL.
+        claims = verify_session_token(
+            session_token,
+            runtime.settings.session_shared_secret,
+            allow_expired=True,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     if claims.get("sid") != session_id:
