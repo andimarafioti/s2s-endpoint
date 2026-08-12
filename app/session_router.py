@@ -1,11 +1,12 @@
 import asyncio
-import contextlib
 import logging
 import os
 import signal
 import subprocess
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
+
+from app.app_utils import cancel_and_await
 
 logger = logging.getLogger("s2s-endpoint")
 
@@ -71,11 +72,8 @@ class SessionRouter:
     async def stop(self) -> None:
         self._closed = True
         await asyncio.to_thread(self._stop_process)
-        if self._watchdog_task is not None:
-            self._watchdog_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._watchdog_task
-            self._watchdog_task = None
+        await cancel_and_await(self._watchdog_task)
+        self._watchdog_task = None
 
     async def acquire(self) -> PipelineSlot:
         if self._closed:

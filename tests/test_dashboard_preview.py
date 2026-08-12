@@ -82,6 +82,17 @@ class DashboardPreviewSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "preview mode"):
             await manager.allocate("https://lb.example")
 
+    async def test_supports_common_session_manager_interface(self):
+        manager = DashboardPreviewSessionManager()
+
+        manager.set_abnormal_disconnect_handler(None)
+        manager.set_ticket_expired_handler(None)
+        await manager.cancel_pending_session("unknown-session")
+
+        self.assertFalse(await manager.leave("unknown-ticket"))
+        with self.assertRaisesRegex(RuntimeError, "queue is disabled"):
+            await manager.poll("unknown-ticket", "https://lb.example")
+
     async def test_healthcheck_uses_each_endpoints_last_known_capacity(self):
         clock = FakeClock(1000.0)
         manager = DashboardPreviewSessionManager(

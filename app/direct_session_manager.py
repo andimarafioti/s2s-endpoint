@@ -1,19 +1,17 @@
 import asyncio
-import contextlib
 import logging
 import secrets
 from collections import OrderedDict
 from dataclasses import dataclass
 from time import monotonic
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
-from app.app_utils import elapsed_ms, http_base_url_from_ws_url
+from app.app_utils import cancel_and_await, elapsed_ms, http_base_url_from_ws_url
 from app.endpoint_pool_router import EndpointLease, EndpointPoolRouter
+from app.session_manager import SessionReleaseHandler, TicketExpiredHandler
 from app.session_tokens import attach_session_token, create_session_token, verify_session_token
 
 logger = logging.getLogger("s2s-endpoint")
-SessionReleaseHandler = Callable[[dict[str, object]], Awaitable[None]]
-TicketExpiredHandler = Callable[[str], Awaitable[None]]
 
 
 class QueueAtCapacityError(RuntimeError):
@@ -114,11 +112,8 @@ class DirectSessionManager:
     async def stop(self) -> None:
         for task_attr in ("_reaper_task", "_ticket_reaper_task"):
             task = getattr(self, task_attr)
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-                setattr(self, task_attr, None)
+            await cancel_and_await(task)
+            setattr(self, task_attr, None)
 
         async with self._lock:
             sessions = list(self._sessions.values())
