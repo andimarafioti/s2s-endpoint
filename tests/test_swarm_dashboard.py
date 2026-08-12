@@ -347,6 +347,43 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(counted)
         self.assertEqual(sum(item.llm_proxy_requests for item in snapshot), 1)
 
+    async def test_llm_proxy_usage_is_persisted_before_record_returns(self):
+        clock = FakeClock(2 * 3600)
+        store = FakeHistoryStore()
+        history = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
+
+        counted = await history.record_llm_proxy_request(
+            "process-a",
+            1,
+            "hf:alice",
+            {"label": "@alice", "kind": "authenticated", "verification": "verified"},
+        )
+
+        self.assertTrue(counted)
+        persisted = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
+        self.assertEqual(persisted.llm_proxy_requests, 1)
+        self.assertEqual(persisted.llm_proxy_sequences, {"process-a": 1})
+
+    async def test_llm_proxy_retry_persists_without_counting_twice(self):
+        clock = FakeClock(2 * 3600)
+        store = FlakyWriteHistoryStore(fail_on_write_attempts={1})
+        history = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
+        request = (
+            "process-a",
+            1,
+            "hf:alice",
+            {"label": "@alice", "kind": "authenticated", "verification": "verified"},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "write failure"):
+            await history.record_llm_proxy_request(*request)
+        counted = await history.record_llm_proxy_request(*request)
+
+        self.assertFalse(counted)
+        persisted = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
+        self.assertEqual(persisted.llm_proxy_requests, 1)
+        self.assertEqual(persisted.llm_proxy_sequences, {"process-a": 1})
+
     async def test_restore_merges_current_minute_usage_into_startup_sample(self):
         clock = FakeClock(2 * 3600)
         persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
