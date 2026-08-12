@@ -17,17 +17,9 @@ logger = logging.getLogger("s2s-endpoint")
 
 
 @dataclass(frozen=True)
-class LLMProxyUsage:
-    instance_id: str
-    requests: int
-    requests_by_fingerprint: dict[str, int]
-
-
-@dataclass(frozen=True)
 class ComputeUsage:
     active_sessions: int
     max_sessions: int
-    llm_proxy: Optional[LLMProxyUsage] = None
 
 
 ComputeUsageFetcher = Callable[[str], ComputeUsage]
@@ -79,13 +71,10 @@ class ComputeUnhealthyError(RuntimeError):
     """The compute endpoint explicitly reported that it is not ready."""
 
 
-def fetch_compute_usage(base_url: str, *, internal_auth_token: str = "") -> ComputeUsage:
-    headers = {"Accept": "application/json"}
-    if internal_auth_token:
-        headers["X-S2S-Internal-Auth"] = internal_auth_token
+def fetch_compute_usage(base_url: str) -> ComputeUsage:
     request = urllib.request.Request(
         _to_health_url(base_url),
-        headers=headers,
+        headers={"Accept": "application/json"},
         method="GET",
     )
     try:
@@ -136,48 +125,9 @@ def fetch_compute_usage(base_url: str, *, internal_auth_token: str = "") -> Comp
     if active_sessions > max_sessions:
         raise ComputeUsageSchemaError("compute health reported more active sessions than max_sessions")
 
-    llm_proxy = None
-    raw_llm_proxy = payload.get("llm_proxy_usage")
-    if raw_llm_proxy is not None:
-        try:
-            llm_proxy = _parse_llm_proxy_usage(raw_llm_proxy)
-        except (TypeError, ValueError) as exc:
-            logger.warning("Ignoring invalid LLM proxy usage from %s: %s", base_url, exc)
-
     return ComputeUsage(
         active_sessions=active_sessions,
         max_sessions=max_sessions,
-        llm_proxy=llm_proxy,
-    )
-
-
-def _parse_llm_proxy_usage(value: object) -> LLMProxyUsage:
-    if not isinstance(value, dict):
-        raise TypeError("llm_proxy_usage must be an object")
-
-    instance_id = value.get("instance_id")
-    if not isinstance(instance_id, str) or not instance_id or len(instance_id) > 128:
-        raise ValueError("llm_proxy_usage.instance_id must be a non-empty string")
-
-    requests = value.get("requests")
-    if not isinstance(requests, int) or isinstance(requests, bool) or requests < 0:
-        raise ValueError("llm_proxy_usage.requests must be a non-negative integer")
-
-    raw_by_fingerprint = value.get("requests_by_fingerprint")
-    if not isinstance(raw_by_fingerprint, dict):
-        raise TypeError("llm_proxy_usage.requests_by_fingerprint must be an object")
-    requests_by_fingerprint: dict[str, int] = {}
-    for raw_fingerprint, raw_count in raw_by_fingerprint.items():
-        if not isinstance(raw_fingerprint, str) or not raw_fingerprint or len(raw_fingerprint) > 128:
-            raise ValueError("LLM proxy requester fingerprints must be non-empty strings")
-        if not isinstance(raw_count, int) or isinstance(raw_count, bool) or raw_count < 0:
-            raise ValueError("LLM proxy requester counts must be non-negative integers")
-        requests_by_fingerprint[raw_fingerprint] = raw_count
-
-    return LLMProxyUsage(
-        instance_id=instance_id,
-        requests=requests,
-        requests_by_fingerprint=requests_by_fingerprint,
     )
 
 
@@ -463,7 +413,6 @@ class ManagedEndpoint:
     drain_lease_id: Optional[str] = None
     last_drain_warning_at: Optional[float] = None
     last_sync_failure_log_at: Optional[float] = None
-    llm_proxy_usage: Optional[LLMProxyUsage] = None
 
     def apply_snapshot(self, snapshot: EndpointSnapshot) -> None:
         self.status = snapshot.status
@@ -478,7 +427,6 @@ class ManagedEndpoint:
 
     def reset_usage_after_fresh_process(self) -> None:
         self.observed_active_sessions = 0
-        self.llm_proxy_usage = None
         self.invalidate_usage_sync(forget_last_success=True)
 
     def reset_usage_after_process_stop(self, *, clear_local_sessions: bool) -> None:
@@ -487,7 +435,6 @@ class ManagedEndpoint:
             self.connected_sessions = 0
         self.observed_active_sessions = 0
         self.unobserved_connected_sessions = 0
-        self.llm_proxy_usage = None
         self.invalidate_usage_sync(forget_last_success=True)
 
     def apply_usage_sync(
@@ -500,7 +447,6 @@ class ManagedEndpoint:
         observed_increase = max(usage.active_sessions - self.observed_active_sessions, 0)
         self.slots = usage.max_sessions
         self.observed_active_sessions = usage.active_sessions
-        self.llm_proxy_usage = usage.llm_proxy
         self.usage_synced = True
         self.last_usage_sync_at = synced_at
         self.usage_sync_drain_generation = drain_generation
@@ -905,17 +851,7 @@ class EndpointPoolRouter:
         self._spawn_wake_tasks(wake_names)
 
     async def healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
-        return await self._healthcheck(include_llm_proxy_attribution=False)
-
-    async def dashboard_healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
-        return await self._healthcheck(include_llm_proxy_attribution=True)
-
-    async def _healthcheck(
-        self,
-        *,
-        include_llm_proxy_attribution: bool,
-    ) -> tuple[bool, Optional[str], dict[str, object]]:
-        snapshot = await self.snapshot(include_llm_proxy_attribution=include_llm_proxy_attribution)
+        snapshot = await self.snapshot()
         if snapshot["reconciliation_stale"]:
             age = snapshot["reconcile_age_s"]
             detail = (
@@ -947,7 +883,7 @@ class EndpointPoolRouter:
             return False, str(errors[0]["error"]), snapshot
         return False, "no compute endpoint is ready", snapshot
 
-    async def snapshot(self, *, include_llm_proxy_attribution: bool = False) -> dict[str, object]:
+    async def snapshot(self) -> dict[str, object]:
         async with self._lock:
             endpoints = list(self._endpoints.values())
             last_reconcile_success_at = self._last_reconcile_success_at
@@ -1052,19 +988,6 @@ class EndpointPoolRouter:
                     "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
                     "url": endpoint.url,
                     "last_error": endpoint.last_error,
-                    "llm_proxy_usage": (
-                        {
-                            "instance_id": endpoint.llm_proxy_usage.instance_id,
-                            "requests": endpoint.llm_proxy_usage.requests,
-                            **(
-                                {"requests_by_fingerprint": dict(endpoint.llm_proxy_usage.requests_by_fingerprint)}
-                                if include_llm_proxy_attribution
-                                else {}
-                            ),
-                        }
-                        if endpoint.llm_proxy_usage is not None
-                        else None
-                    ),
                 }
                 for endpoint in sorted(endpoints, key=lambda item: item.name)
             ],

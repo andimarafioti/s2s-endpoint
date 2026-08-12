@@ -153,43 +153,6 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["median_requests_per_requester"], 0.0)
 
-    async def test_llm_proxy_activity_keeps_requester_in_limited_leaderboard(self):
-        clock = FakeClock(2 * 3600)
-        service = self._service(clock)
-        for index in range(20):
-            await service.record(
-                "request",
-                RequesterIdentity(
-                    actor_id=f"anonymous:{index}",
-                    label=f"Anonymous {index:02d}",
-                    kind="anonymous",
-                    verification="not_provided",
-                    fingerprint=str(index),
-                ),
-            )
-        proxy_requester = RequesterIdentity(
-            actor_id="token:proxy",
-            label="@proxy-user · token •proxy",
-            kind="authenticated",
-            verification="verified",
-            fingerprint="proxy",
-            account_name="proxy-user",
-        )
-        await service.history.record_llm_proxy_usage(
-            requests=1000,
-            requester_counts=[(proxy_requester.actor_id, proxy_requester.history_metadata(), 1000)],
-            observations={},
-            requesters={},
-            observed_at_s=clock.now(),
-        )
-
-        leaderboard = (await service.data(window_minutes=60))["leaderboard"]
-
-        self.assertEqual(len(leaderboard), 20)
-        self.assertEqual(leaderboard[0]["actor_id"], "hf:proxy-user")
-        self.assertEqual(leaderboard[0]["requests"], 0)
-        self.assertEqual(leaderboard[0]["llm_proxy_requests"], 1000)
-
     async def test_auth_rejections_raise_risk_from_watch_to_high_even_with_prior_connections(self):
         service = self._service(FakeClock(2 * 3600))
         requester = RequesterIdentity(
@@ -579,8 +542,6 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertNotIn("__REQUESTER_DASHBOARD_", html)
         self.assertIn('id="requester-leaderboard"', html)
         self.assertIn("Requester Usage", html)
-        self.assertIn("<th>LLM proxy</th>", html)
-        self.assertIn("row.llm_proxy_requests", html)
         self.assertIn("Reported robots", html)
         self.assertIn("Connected requesters", html)
         self.assertIn("first compute websocket callback", html)

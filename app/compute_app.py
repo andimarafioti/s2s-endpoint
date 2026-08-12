@@ -1,14 +1,11 @@
 import asyncio
-import hmac
 import json
 import subprocess
-import threading
 import time
 import urllib.error
 import urllib.request
-import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Awaitable, Callable, Mapping, Optional
 
 import httpx
@@ -60,7 +57,6 @@ class ComputeSettings:
     lb_callback_retry_attempts: int = 5
     lb_callback_retry_backoff_s: float = 1.0
     llm_proxy_requests_per_minute: int = 20
-    llm_proxy_attribution_max_fingerprints: int = 50_000
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "ComputeSettings":
@@ -100,10 +96,6 @@ class ComputeSettings:
                 0.0,
             ),
             llm_proxy_requests_per_minute=int(env_text("LLM_PROXY_REQUESTS_PER_MINUTE", "20", environ=environ)),
-            llm_proxy_attribution_max_fingerprints=max(
-                int(env_text("LLM_PROXY_ATTRIBUTION_MAX_FINGERPRINTS", "50000", environ=environ)),
-                1,
-            ),
         )
 
     @property
@@ -240,34 +232,24 @@ async def root(settings: ComputeSettings):
     }
 
 
-async def health(request: Request, settings: ComputeSettings, dependencies: "ComputeDependencies"):
+async def health(settings: ComputeSettings, dependencies: "ComputeDependencies"):
     healthy, detail, snapshot = await dependencies.session_router.healthcheck()
     if not healthy:
         raise HTTPException(status_code=503, detail=detail or "compute router is not ready")
 
-    payload: dict[str, object] = {
-        "status": "ok",
-        "role": APP_ROLE,
-        "internal_ws_base": settings.internal_ws_url,
-        "internal_usage_url": settings.internal_usage_url,
-        "public_websocket": PUBLIC_WS_PATH,
-        "stt": settings.stt,
-        "llm": settings.llm,
-        "tts": settings.tts,
-        "router": snapshot,
-    }
-    llm_proxy_usage = dependencies.llm_proxy_attribution.snapshot()
-    if not (
-        settings.session_shared_secret
-        and hmac.compare_digest(
-            request.headers.get("x-s2s-internal-auth", ""),
-            settings.session_shared_secret,
-        )
-    ):
-        llm_proxy_usage.pop("requests_by_fingerprint", None)
-    payload["llm_proxy_usage"] = llm_proxy_usage
-
-    return JSONResponse(payload)
+    return JSONResponse(
+        {
+            "status": "ok",
+            "role": APP_ROLE,
+            "internal_ws_base": settings.internal_ws_url,
+            "internal_usage_url": settings.internal_usage_url,
+            "public_websocket": PUBLIC_WS_PATH,
+            "stt": settings.stt,
+            "llm": settings.llm,
+            "tts": settings.tts,
+            "router": snapshot,
+        }
+    )
 
 
 async def pool(settings: ComputeSettings, dependencies: "ComputeDependencies"):
@@ -359,36 +341,6 @@ class _FingerprintRateLimiter:
                 {k: v for k, v in self._hits.items() if v and now - v[-1] < _RATE_LIMIT_WINDOW_S},
             )
         return True
-
-
-@dataclass
-class _LLMProxyAttribution:
-    """Atomically sampled replica-local LLM proxy counters."""
-
-    max_fingerprints: int = 50_000
-    instance_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    requests: int = 0
-    requests_by_fingerprint: dict[str, int] = field(default_factory=dict)
-    _lock: object = field(default_factory=threading.Lock, init=False, repr=False)
-
-    def record(self, fingerprint: str) -> None:
-        with self._lock:
-            self.requests += 1
-            if fingerprint in self.requests_by_fingerprint:
-                key = fingerprint
-            elif len(self.requests_by_fingerprint) < self.max_fingerprints - 1:
-                key = fingerprint
-            else:
-                key = "overflow"
-            self.requests_by_fingerprint[key] = self.requests_by_fingerprint.get(key, 0) + 1
-
-    def snapshot(self) -> dict[str, object]:
-        with self._lock:
-            return {
-                "instance_id": self.instance_id,
-                "requests": self.requests,
-                "requests_by_fingerprint": dict(self.requests_by_fingerprint),
-            }
 
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
@@ -489,12 +441,6 @@ async def _proxy_llm_request(
     denial = _llm_proxy_denial(request, settings, dependencies)
     if denial is not None:
         return denial
-
-    token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
-    if token is None:
-        token = bearer_token(request.headers.get("authorization"))
-    if token is not None:
-        dependencies.llm_proxy_attribution.record(llm_token_fingerprint(settings.session_shared_secret, token))
 
     headers = {}
     content_type = request.headers.get("content-type")
@@ -766,7 +712,6 @@ class ComputeDependencies:
     http_get_json: Callable[[str], dict[str, object]]
     notify_lb_session_event: Callable[..., Awaitable[None]]
     proxy_websocket: Callable[..., Awaitable[None]]
-    llm_proxy_attribution: _LLMProxyAttribution = field(default_factory=_LLMProxyAttribution)
 
 
 @dataclass(frozen=True)
@@ -828,7 +773,6 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
         session_router=router,
         connected_llm_fingerprints=_ConnectedFingerprintRegistry(),
         llm_rate_limiter=_FingerprintRateLimiter(settings.llm_proxy_requests_per_minute),
-        llm_proxy_attribution=_LLMProxyAttribution(settings.llm_proxy_attribution_max_fingerprints),
         http_get_json=_http_get_json,
         notify_lb_session_event=notify_lb_session_event,
         proxy_websocket=proxy_websocket,
@@ -854,8 +798,8 @@ def create_app(
     async def root_route():
         return await root(settings)
 
-    async def health_route(request: Request):
-        return await health(request, settings, resolved_dependencies)
+    async def health_route():
+        return await health(settings, resolved_dependencies)
 
     async def pool_route():
         return await pool(settings, resolved_dependencies)

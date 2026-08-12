@@ -412,20 +412,7 @@ class DirectSessionManager:
         }
 
     async def healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
-        return await self._healthcheck(include_llm_proxy_attribution=False)
-
-    async def dashboard_healthcheck(self) -> tuple[bool, Optional[str], dict[str, object]]:
-        return await self._healthcheck(include_llm_proxy_attribution=True)
-
-    async def _healthcheck(
-        self,
-        *,
-        include_llm_proxy_attribution: bool,
-    ) -> tuple[bool, Optional[str], dict[str, object]]:
-        if include_llm_proxy_attribution:
-            healthy, detail, router_snapshot = await self.endpoint_router.dashboard_healthcheck()
-        else:
-            healthy, detail, router_snapshot = await self.endpoint_router.healthcheck()
+        healthy, detail, router_snapshot = await self.endpoint_router.healthcheck()
         snapshot = await self.snapshot()
         router_active_sessions = int(router_snapshot.get("active_sessions", 0))
         pending_sessions = int(snapshot.get("pending_sessions", 0))

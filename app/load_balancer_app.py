@@ -342,10 +342,7 @@ def build_endpoint_router(settings: LoadBalancerSettings) -> EndpointPoolRouter:
         drain_lease_ttl_s=settings.compute_endpoint_drain_lease_ttl_s,
         drain_warning_after_s=settings.compute_endpoint_drain_warning_after_s,
         drain_warning_interval_s=settings.compute_endpoint_drain_warning_interval_s,
-        compute_usage_fetcher=lambda url: fetch_compute_usage(
-            url,
-            internal_auth_token=settings.session_shared_secret,
-        ),
+        compute_usage_fetcher=fetch_compute_usage,
         # How long a previously observed usage count stays trusted when
         # health polls fail transiently. Must be comfortably above the
         # reconcile interval (10s): the default 60s means roughly six
@@ -400,7 +397,7 @@ def build_load_balancer_dependencies(settings: LoadBalancerSettings) -> LoadBala
             dashboard_history_store = ReadOnlyDashboardHistoryStore(dashboard_history_store)
 
     dashboard = SwarmDashboard(
-        snapshot_provider=session_manager.dashboard_healthcheck,
+        snapshot_provider=session_manager.healthcheck,
         sample_interval_s=settings.dashboard_sample_interval_s,
         retention_minutes=settings.dashboard_retention_minutes,
         history_store=dashboard_history_store,
@@ -967,13 +964,9 @@ async def create_session(runtime: LoadBalancerRuntime, request: Request):
         )
     allocation_started_at = monotonic()
     try:
-        llm_fingerprint = await _llm_proxy_fingerprint(runtime, request, requester)
-        if llm_fingerprint is not None:
-            requester = await _refresh_requester_identity(runtime, requester)
-            dependencies.dashboard.register_llm_proxy_requester(llm_fingerprint, requester)
         allocation = await dependencies.session_manager.allocate(
             public_base_url(request),
-            llm_fingerprint=llm_fingerprint,
+            llm_fingerprint=await _llm_proxy_fingerprint(runtime, request, requester),
         )
     except QueueAtCapacityError as exc:
         dependencies.requester_rate_limiter.record_allocation_failure(requester)

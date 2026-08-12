@@ -178,7 +178,6 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         rate_limit_rpm: int = 100,
         enable_llm_proxy: bool = True,
         secret: str = SECRET,
-        llm: str = "chat-completions",
         time_fn: Callable[[], float] = time.monotonic,
     ) -> TestClient:
         async def _fake_acquire():
@@ -186,9 +185,6 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
 
         async def _fake_release(slot_id) -> None:
             pass
-
-        async def _fake_healthcheck():
-            return True, None, {"active_sessions": 0, "max_sessions": 1}
 
         async def _no_lb_callback(*args: Any, **kwargs: Any) -> None:
             pass
@@ -200,14 +196,9 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
             internal_ws_base_port=int(stub_url.port),
             enable_llm_proxy=enable_llm_proxy,
             session_shared_secret=secret,
-            llm=llm,
         )
         dependencies = compute_main.ComputeDependencies(
-            session_router=SimpleNamespace(
-                acquire=_fake_acquire,
-                release=_fake_release,
-                healthcheck=_fake_healthcheck,
-            ),
+            session_router=SimpleNamespace(acquire=_fake_acquire, release=_fake_release),
             connected_llm_fingerprints=compute_main._ConnectedFingerprintRegistry(),
             llm_rate_limiter=compute_main._FingerprintRateLimiter(rate_limit_rpm, time_fn=time_fn),
             http_get_json=compute_main._http_get_json,
@@ -232,104 +223,8 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
                 return response
             time.sleep(0.05)
 
-    def internal_llm_proxy_usage(self, client: TestClient) -> dict[str, Any]:
-        return client.get(
-            "/health",
-            headers={"X-S2S-Internal-Auth": SECRET},
-        ).json()["llm_proxy_usage"]
-
 
 class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
-    def test_attribution_cardinality_is_bounded_without_losing_total(self) -> None:
-        attribution = compute_main._LLMProxyAttribution(max_fingerprints=2, instance_id="generation-a")
-
-        attribution.record("proxy-a")
-        attribution.record("proxy-a")
-        attribution.record("proxy-b")
-        attribution.record("proxy-c")
-
-        self.assertEqual(
-            attribution.snapshot(),
-            {
-                "instance_id": "generation-a",
-                "requests": 4,
-                "requests_by_fingerprint": {"proxy-a": 2, "overflow": 2},
-            },
-        )
-
-    def test_health_exposes_atomic_privacy_safe_chat_usage(self) -> None:
-        client = self.gated_client()
-        with _connected_session(client):
-            self.assertEqual(self.post_chat(client).status_code, 200)
-            self.assertEqual(self.post_chat(client).status_code, 200)
-
-        payload = self.internal_llm_proxy_usage(client)
-        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
-        self.assertEqual(payload["requests"], 2)
-        self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 2})
-        self.assertNotIn(HF_TOKEN, json.dumps(payload))
-        self.assertNotIn("/v1/usage", [request["path"] for request in self.stub.requests])
-
-    def test_public_health_redacts_attribution_and_internal_health_requires_shared_secret(self) -> None:
-        client = self.gated_client()
-        with _connected_session(client):
-            self.assertEqual(self.post_chat(client).status_code, 200)
-
-        public_usage = client.get("/health").json()["llm_proxy_usage"]
-        denied_usage = client.get(
-            "/health",
-            headers={"X-S2S-Internal-Auth": "wrong-secret"},
-        ).json()["llm_proxy_usage"]
-        internal_usage = client.get(
-            "/health",
-            headers={"X-S2S-Internal-Auth": SECRET},
-        ).json()["llm_proxy_usage"]
-
-        self.assertNotIn("requests_by_fingerprint", public_usage)
-        self.assertNotIn("requests_by_fingerprint", denied_usage)
-        self.assertEqual(
-            internal_usage["requests_by_fingerprint"],
-            {llm_token_fingerprint(SECRET, HF_TOKEN): 1},
-        )
-
-    def test_health_attributes_responses_api_requests(self) -> None:
-        client = self.gated_client(llm="responses-api")
-        with _connected_session(client):
-            response = client.post("/v1/responses", content=b"{}", headers=_auth())
-        self.assertEqual(response.status_code, 200)
-
-        payload = self.internal_llm_proxy_usage(client)
-        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
-        self.assertEqual(payload["requests"], 1)
-        self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 1})
-
-    def test_health_attributes_authorized_request_to_alternate_proxy_route(self) -> None:
-        client = self.gated_client(llm="chat-completions")
-        with _connected_session(client):
-            response = client.post("/v1/responses", content=b"{}", headers=_auth())
-        self.assertEqual(response.status_code, 200)
-
-        payload = self.internal_llm_proxy_usage(client)
-        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
-        self.assertEqual(payload["requests"], 1)
-        self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 1})
-
-    def test_health_attributes_authorized_request_when_pipeline_is_unreachable(self) -> None:
-        client = self.gated_client()
-        error = httpx.ConnectError(
-            "test pipeline unavailable",
-            request=httpx.Request("POST", f"{self.stub.base_url}/v1/chat/completions"),
-        )
-        with _connected_session(client):
-            with patch.object(httpx.AsyncClient, "send", side_effect=error):
-                response = self.post_chat(client)
-        self.assertEqual(response.status_code, 502)
-
-        payload = self.internal_llm_proxy_usage(client)
-        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
-        self.assertEqual(payload["requests"], 1)
-        self.assertEqual(payload["requests_by_fingerprint"], {fingerprint: 1})
-
     def test_chat_completions_reaches_internal_pipeline_verbatim(self) -> None:
         self.stub.responder = lambda path: (
             200,

@@ -13,7 +13,6 @@ from app.endpoint_pool_router import (
     EndpointDrainLeaseConflictError,
     EndpointSnapshot,
     EndpointTransitionConflictError,
-    LLMProxyUsage,
     ManagedEndpoint,
     _to_health_url,
     _to_ws_url,
@@ -146,98 +145,6 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             usage = fetch_compute_usage("https://compute.example")
 
         self.assertEqual(usage, ComputeUsage(active_sessions=2, max_sessions=4))
-
-    def test_fetch_compute_usage_reads_llm_proxy_counters(self):
-        payload = {
-            "router": {"active_sessions": 2, "max_sessions": 4},
-            "llm_proxy_usage": {
-                "instance_id": "replica-generation",
-                "requests": 9,
-                "requests_by_fingerprint": {"fingerprint-a": 4, "fingerprint-b": 5},
-            },
-        }
-        with patch(
-            "app.endpoint_pool_router.urllib.request.urlopen",
-            return_value=FakeUrlopenResponse(payload),
-        ):
-            usage = fetch_compute_usage("https://compute.example")
-
-        self.assertEqual(
-            usage,
-            ComputeUsage(
-                active_sessions=2,
-                max_sessions=4,
-                llm_proxy=LLMProxyUsage(
-                    instance_id="replica-generation",
-                    requests=9,
-                    requests_by_fingerprint={"fingerprint-a": 4, "fingerprint-b": 5},
-                ),
-            ),
-        )
-
-    def test_fetch_compute_usage_sends_internal_attribution_auth(self):
-        payload = {
-            "router": {"active_sessions": 0, "max_sessions": 1},
-            "llm_proxy_usage": {
-                "instance_id": "replica-generation",
-                "requests": 1,
-                "requests_by_fingerprint": {"fingerprint-a": 1},
-            },
-        }
-        with patch(
-            "app.endpoint_pool_router.urllib.request.urlopen",
-            return_value=FakeUrlopenResponse(payload),
-        ) as urlopen:
-            fetch_compute_usage("https://compute.example", internal_auth_token="shared-secret")
-
-        request = urlopen.call_args.args[0]
-        self.assertEqual(request.get_header("X-s2s-internal-auth"), "shared-secret")
-
-    async def test_public_snapshot_redacts_llm_requester_fingerprints(self):
-        self.router = _make_test_router(
-            endpoint_names=["endpoint-a"],
-            endpoint_slots=1,
-            min_warm_endpoints=0,
-            wake_threshold_slots=0,
-            idle_park_timeout_s=60,
-            reconcile_interval_s=60,
-            waking_capacity_timeout_s=300,
-            park_cooldown_s=0,
-            controller=FakeEndpointController([("endpoint-a", "running", "https://endpoint-a.example")]),
-        )
-        self.router._endpoints["endpoint-a"].llm_proxy_usage = LLMProxyUsage(
-            instance_id="generation-a",
-            requests=9,
-            requests_by_fingerprint={"fingerprint-a": 9},
-        )
-
-        public_snapshot = await self.router.snapshot()
-        dashboard_snapshot = await self.router.snapshot(include_llm_proxy_attribution=True)
-
-        public_usage = public_snapshot["endpoints"][0]["llm_proxy_usage"]
-        dashboard_usage = dashboard_snapshot["endpoints"][0]["llm_proxy_usage"]
-        self.assertEqual(public_usage, {"instance_id": "generation-a", "requests": 9})
-        self.assertEqual(dashboard_usage["requests_by_fingerprint"], {"fingerprint-a": 9})
-
-    def test_invalid_llm_proxy_counters_do_not_revoke_session_capacity(self):
-        payload = {
-            "router": {"active_sessions": 1, "max_sessions": 2},
-            "llm_proxy_usage": {
-                "instance_id": "replica-generation",
-                "requests": -1,
-                "requests_by_fingerprint": {},
-            },
-        }
-        with (
-            patch(
-                "app.endpoint_pool_router.urllib.request.urlopen",
-                return_value=FakeUrlopenResponse(payload),
-            ),
-            self.assertLogs("s2s-endpoint", level="WARNING"),
-        ):
-            usage = fetch_compute_usage("https://compute.example")
-
-        self.assertEqual(usage, ComputeUsage(active_sessions=1, max_sessions=2))
 
     def test_huggingface_controller_uses_an_isolated_bounded_http_client(self):
         from huggingface_hub import get_session

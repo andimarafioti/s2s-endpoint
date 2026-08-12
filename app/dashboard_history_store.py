@@ -8,12 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.dashboard_history import (
-    DashboardHistoryStore,
-    LLMProxyCheckpoint,
-    SwarmHistoryBucket,
-    _bucket_start_epoch_s,
-)
+from app.dashboard_history import DashboardHistoryStore, SwarmHistoryBucket, _bucket_start_epoch_s
 
 logger = logging.getLogger("s2s-endpoint")
 
@@ -134,33 +129,6 @@ class HuggingFaceBucketHistoryStore:
         ]
         logger.info("Loaded %s dashboard history buckets from %s", len(loaded), self.bucket_id)
         return loaded
-
-    def load_llm_proxy_checkpoint(self) -> Optional[LLMProxyCheckpoint]:
-        remote_path = self._llm_proxy_checkpoint_path()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            local_path = Path(tmpdir) / "llm-proxy.json"
-            self._download_bucket_files(
-                self.bucket_id,
-                files=[(remote_path, local_path)],
-                raise_on_missing_files=False,
-                token=self.token,
-            )
-            if not local_path.exists():
-                return None
-            try:
-                payload = json.loads(local_path.read_text())
-                checkpoint_payload = payload.get("checkpoint")
-                if not isinstance(checkpoint_payload, dict):
-                    return None
-                return LLMProxyCheckpoint.from_dict(checkpoint_payload)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to load LLM proxy checkpoint from %s/%s: %s",
-                    self.bucket_id,
-                    remote_path,
-                    exc,
-                )
-                return None
 
     def _list_day_candidates(self, *, min_bucket: int, max_bucket: int) -> list[tuple[int, str]]:
         candidates: list[tuple[int, str]] = []
@@ -980,13 +948,8 @@ class HuggingFaceBucketHistoryStore:
             "read_only": self.read_only,
         }
 
-    def write_buckets(
-        self,
-        buckets: list[SwarmHistoryBucket],
-        *,
-        llm_proxy_checkpoint: Optional[LLMProxyCheckpoint] = None,
-    ) -> None:
-        if not buckets and llm_proxy_checkpoint is None:
+    def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
+        if not buckets:
             return
 
         add = []
@@ -999,15 +962,6 @@ class HuggingFaceBucketHistoryStore:
                 sort_keys=True,
             ).encode("utf-8")
             add.append((payload, self._bucket_path(bucket.bucket_start_s)))
-        if llm_proxy_checkpoint is not None:
-            payload = json.dumps(
-                {
-                    "version": 1,
-                    "checkpoint": llm_proxy_checkpoint.to_dict(),
-                },
-                sort_keys=True,
-            ).encode("utf-8")
-            add.append((payload, self._llm_proxy_checkpoint_path()))
 
         self._batch_bucket_files(
             self.bucket_id,
@@ -1024,11 +978,6 @@ class HuggingFaceBucketHistoryStore:
         if self.prefix:
             return f"{self.prefix}/days"
         return "days"
-
-    def _llm_proxy_checkpoint_path(self) -> str:
-        if self.prefix:
-            return f"{self.prefix}/checkpoints/llm-proxy.json"
-        return "checkpoints/llm-proxy.json"
 
     def _day_minutes_prefix(self, day_start_s: int) -> str:
         return f"{self._minutes_prefix()}/{_day_key(day_start_s)}"
@@ -1088,16 +1037,8 @@ class ReadOnlyDashboardHistoryStore:
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list[SwarmHistoryBucket]:
         return self.wrapped.load_recent(retention_minutes=retention_minutes, now_epoch_s=now_epoch_s)
 
-    def load_llm_proxy_checkpoint(self) -> Optional[LLMProxyCheckpoint]:
-        return self.wrapped.load_llm_proxy_checkpoint()
-
-    def write_buckets(
-        self,
-        buckets: list[SwarmHistoryBucket],
-        *,
-        llm_proxy_checkpoint: Optional[LLMProxyCheckpoint] = None,
-    ) -> None:
-        if buckets or llm_proxy_checkpoint is not None:
+    def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
+        if buckets:
             logger.debug("Skipping dashboard history write because history store is read-only")
 
     def write_day_buckets(self, *, day_start_s: int, buckets: list[SwarmHistoryBucket]) -> Optional[str]:

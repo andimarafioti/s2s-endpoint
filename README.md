@@ -170,14 +170,12 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - free slots and effective free capacity
 - `POST /session` request counts, authentication rejections, allocation
   successes/failures, and connect/disconnect events
-- authorized LLM proxy request counts across `/v1/chat/completions` and
-  `/v1/responses`, aggregated across compute replicas
 - conversation starts/completions plus average and max completed conversation duration
 - distinct verified Hugging Face users, token fingerprints, anonymous network
   fingerprints, and client-reported robot fingerprints
-- a per-requester leaderboard with allocation and connection outcomes, LLM
-  proxy request counts, traffic share, burst rate, network count, reported
-  robot count, client type, and unusual-usage signals
+- a per-requester leaderboard with allocation and connection outcomes, traffic
+  share, burst rate, network count, reported robot count, client type, and
+  unusual-usage signals
 
 Clients can optionally send a Hugging Face user access token as
 `X-Reachy-Mini-Authorization: Bearer <token>` on `POST /session`. Standard
@@ -457,9 +455,6 @@ load-balancer variable is ignored and can be removed from existing deployments.
   without the feature.
 - `LLM_PROXY_REQUESTS_PER_MINUTE`: per-token sliding-window rate limit on the
   replica's LLM proxy paths (defaults to 20; zero or negative closes the paths)
-- `LLM_PROXY_ATTRIBUTION_MAX_FINGERPRINTS`: maximum compute-replica requester
-  counters retained for dashboard attribution (defaults to 50000; additional
-  requesters are grouped as unattributed overflow while the fleet total remains exact)
 
 The compute endpoint serves `/v1/realtime`. The LB now serves `POST /session` for allocation.
 

@@ -1,7 +1,6 @@
 import asyncio
 import re
 import time
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from statistics import median
 from typing import Awaitable, Callable, Iterable, Optional
@@ -45,73 +44,6 @@ def _parse_window_minutes(window: str | None) -> int:
     return amount * 24 * 60
 
 
-def _coerce_llm_proxy_observation(
-    value: dict[str, object],
-) -> tuple[str, int, dict[str, int]] | None:
-    instance_id = value.get("instance_id")
-    requests = value.get("requests")
-    raw_by_fingerprint = value.get("requests_by_fingerprint")
-    if (
-        not isinstance(instance_id, str)
-        or not instance_id
-        or not isinstance(requests, int)
-        or isinstance(requests, bool)
-        or requests < 0
-        or not isinstance(raw_by_fingerprint, dict)
-    ):
-        return None
-
-    requests_by_fingerprint: dict[str, int] = {}
-    for fingerprint, count in raw_by_fingerprint.items():
-        if (
-            not isinstance(fingerprint, str)
-            or not fingerprint
-            or not isinstance(count, int)
-            or isinstance(count, bool)
-            or count < 0
-        ):
-            return None
-        requests_by_fingerprint[fingerprint] = count
-    return instance_id, requests, requests_by_fingerprint
-
-
-def _serialize_llm_proxy_observation(
-    observation: tuple[str, int, dict[str, int]],
-) -> dict[str, object]:
-    instance_id, requests, requests_by_fingerprint = observation
-    return {
-        "instance_id": instance_id,
-        "requests": requests,
-        "requests_by_fingerprint": dict(requests_by_fingerprint),
-    }
-
-
-def _serialize_llm_proxy_requester(requester: RequesterIdentity) -> dict[str, object]:
-    return {"actor_id": requester.actor_id, **requester.history_metadata()}
-
-
-def _coerce_llm_proxy_requester(value: object) -> RequesterIdentity | None:
-    if not isinstance(value, dict):
-        return None
-    actor_id = value.get("actor_id")
-    if not isinstance(actor_id, str) or not actor_id:
-        return None
-    account_name = value.get("account_name")
-    network_id = value.get("network_id")
-    reported_robot_id = value.get("reported_robot_id")
-    return RequesterIdentity(
-        actor_id=actor_id[:128],
-        label=str(value.get("label") or "Unknown requester")[:160],
-        kind=str(value.get("kind") or "unknown")[:40],
-        verification=str(value.get("verification") or "unknown")[:40],
-        fingerprint=str(value.get("fingerprint") or "")[:40],
-        account_name=str(account_name)[:80] if account_name is not None else None,
-        network_id=str(network_id)[:128] if network_id is not None else None,
-        reported_robot_id=str(reported_robot_id)[:128] if reported_robot_id is not None else None,
-        client_kind=str(value.get("client_kind") or "unknown")[:80],
-    )
-
-
 @dataclass
 class SwarmBucketAggregate:
     sample_count: int = 0
@@ -134,7 +66,6 @@ class SwarmBucketAggregate:
     session_rate_limited: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
-    llm_proxy_requests: int = 0
     completed_conversations: int = 0
     completed_conversation_duration_total_s: float = 0.0
     completed_conversation_duration_max_s: float = 0.0
@@ -166,7 +97,6 @@ class SwarmBucketAggregate:
             aggregate.session_rate_limited += bucket.session_rate_limited
             aggregate.session_connected_events += bucket.session_connected_events
             aggregate.session_disconnected_events += bucket.session_disconnected_events
-            aggregate.llm_proxy_requests += bucket.llm_proxy_requests
             aggregate.completed_conversations += bucket.completed_conversations
             aggregate.completed_conversation_duration_total_s += bucket.completed_conversation_duration_total_s
             aggregate.completed_conversation_duration_max_s = max(
@@ -203,7 +133,6 @@ class SwarmBucketAggregate:
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
-            "llm_proxy_requests": self.llm_proxy_requests,
             "completed_conversations": self.completed_conversations,
             "active_conversation_minutes": round(self.active_conversation_minutes, 2),
             "active_conversation_hours": round(self.active_conversation_minutes / 60.0, 2),
@@ -235,7 +164,6 @@ class SwarmBucketAggregate:
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
-            "llm_proxy_requests": self.llm_proxy_requests,
             "completed_conversations": self.completed_conversations,
             "avg_conversation_duration_s": self.avg_conversation_duration_s,
             "avg_conversation_duration_min": round(self.avg_conversation_duration_s / 60.0, 2),
@@ -309,16 +237,6 @@ class SwarmDashboard:
         )
         self._latest_sample: Optional[SwarmStateSample] = None
         self._sample_task: Optional[asyncio.Task] = None
-        self._capture_lock = asyncio.Lock()
-        self._llm_proxy_observations: dict[str, tuple[str, int, dict[str, int]]] = {}
-        self._llm_proxy_pending_observations: dict[
-            str,
-            "OrderedDict[str, tuple[tuple[str, int, dict[str, int]], tuple[str, int, dict[str, int]]]]",
-        ] = {}
-        self._llm_proxy_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
-        self._llm_proxy_requester_limit = max_requester_records
-        self._llm_proxy_lock = asyncio.Lock()
-        self._llm_proxy_checkpoint_loaded = history_store is None
 
     async def start(self) -> None:
         await self.capture_sample()
@@ -331,17 +249,15 @@ class SwarmDashboard:
         await self.history.stop()
 
     async def capture_sample(self) -> SwarmStateSample:
-        async with self._capture_lock:
-            healthy, detail, snapshot = await self.snapshot_provider()
-            sample = SwarmStateSample.from_health_snapshot(
-                healthy=healthy,
-                detail=detail,
-                snapshot=snapshot,
-                captured_at_s=self._time_fn(),
-            )
-            await self.record_sample(sample)
-            await self._record_llm_proxy_usage(snapshot, observed_at_s=sample.captured_at_s)
-            return sample
+        healthy, detail, snapshot = await self.snapshot_provider()
+        sample = SwarmStateSample.from_health_snapshot(
+            healthy=healthy,
+            detail=detail,
+            snapshot=snapshot,
+            captured_at_s=self._time_fn(),
+        )
+        await self.record_sample(sample)
+        return sample
 
     async def record_sample(self, sample: SwarmStateSample) -> None:
         await self.history.record_sample(sample)
@@ -383,19 +299,6 @@ class SwarmDashboard:
 
     async def update_requester_identity(self, requester: RequesterIdentity) -> None:
         await self.requesters.update_identity(requester)
-        for fingerprint, current in list(self._llm_proxy_requesters.items()):
-            if current.actor_id == requester.actor_id:
-                self._llm_proxy_requesters[fingerprint] = requester
-
-    def register_llm_proxy_requester(
-        self,
-        fingerprint: str,
-        requester: RequesterIdentity,
-    ) -> None:
-        self._llm_proxy_requesters[fingerprint] = requester
-        self._llm_proxy_requesters.move_to_end(fingerprint)
-        while len(self._llm_proxy_requesters) > self._llm_proxy_requester_limit:
-            self._llm_proxy_requesters.popitem(last=False)
 
     async def record_session_event(
         self,
@@ -458,7 +361,6 @@ class SwarmDashboard:
             "session_successes_window": selected["session_allocation_successes"],
             "session_auth_rejections_window": selected["session_auth_rejections"],
             "session_rate_limited_window": selected["session_rate_limited"],
-            "llm_proxy_requests_window": selected["llm_proxy_requests"],
             "session_connects_window": selected["session_connected_events"],
             "session_disconnects_window": selected["session_disconnected_events"],
             "conversations_started_window": selected["session_connected_events"],
@@ -558,141 +460,6 @@ class SwarmDashboard:
                 await self.capture_sample()
         except asyncio.CancelledError:
             raise
-
-    async def _record_llm_proxy_usage(
-        self,
-        snapshot: dict[str, object],
-        *,
-        observed_at_s: float,
-    ) -> None:
-        total_delta = 0
-        deltas_by_fingerprint: dict[str, int] = {}
-        router = snapshot.get("router")
-        endpoints = router.get("endpoints") if isinstance(router, dict) else None
-
-        async with self._llm_proxy_lock:
-            current_observations: dict[str, tuple[str, int, dict[str, int]]] = {}
-            for endpoint in endpoints if isinstance(endpoints, list) else []:
-                if not isinstance(endpoint, dict):
-                    continue
-                endpoint_name = endpoint.get("name")
-                usage = endpoint.get("llm_proxy_usage")
-                if not isinstance(endpoint_name, str) or not isinstance(usage, dict):
-                    continue
-                observation = _coerce_llm_proxy_observation(usage)
-                if observation is not None:
-                    current_observations[endpoint_name] = observation
-
-            if not self._llm_proxy_checkpoint_loaded:
-                restore_status = self.history.history_restore_status()["status"]
-                startup_merge_status = self.history.startup_merge_status()["status"]
-                if restore_status in {"pending", "running"} or startup_merge_status in {
-                    "pending",
-                    "waiting",
-                    "running",
-                }:
-                    self._remember_pending_llm_proxy_observations(current_observations)
-                    return
-                checkpoint = await self.history.latest_llm_proxy_checkpoint()
-                if checkpoint is not None:
-                    raw_observations, raw_requesters = checkpoint
-                    for endpoint_name, raw_observation in raw_observations.items():
-                        if not isinstance(endpoint_name, str):
-                            continue
-                        observation = _coerce_llm_proxy_observation(raw_observation)
-                        if observation is not None:
-                            self._llm_proxy_observations[endpoint_name] = observation
-                    restored_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
-                    for fingerprint, raw_requester in raw_requesters.items():
-                        if not isinstance(fingerprint, str):
-                            continue
-                        requester = _coerce_llm_proxy_requester(raw_requester)
-                        if requester is not None:
-                            restored_requesters[fingerprint] = requester
-                    restored_requesters.update(self._llm_proxy_requesters)
-                    self._llm_proxy_requesters = restored_requesters
-                    while len(self._llm_proxy_requesters) > self._llm_proxy_requester_limit:
-                        self._llm_proxy_requesters.popitem(last=False)
-                self._llm_proxy_checkpoint_loaded = True
-
-            observations: list[tuple[str, tuple[str, int, dict[str, int]]]] = []
-            endpoint_names = set(self._llm_proxy_pending_observations) | set(current_observations)
-            for endpoint_name in endpoint_names:
-                sequence = []
-                for first, latest in self._llm_proxy_pending_observations.pop(endpoint_name, {}).values():
-                    sequence.append(first)
-                    if latest != first:
-                        sequence.append(latest)
-                current_observation = current_observations.get(endpoint_name)
-                if current_observation is not None and (not sequence or sequence[-1] != current_observation):
-                    sequence.append(current_observation)
-                previous = self._llm_proxy_observations.get(endpoint_name)
-                for observation in sequence:
-                    instance_id, requests, requests_by_fingerprint = observation
-                    if previous is not None:
-                        previous_instance_id, previous_requests, previous_by_fingerprint = previous
-                        if instance_id != previous_instance_id:
-                            request_delta = requests
-                            fingerprint_deltas = requests_by_fingerprint
-                        elif requests < previous_requests:
-                            continue
-                        else:
-                            request_delta = requests - previous_requests
-                            fingerprint_deltas = {
-                                fingerprint: count - previous_by_fingerprint.get(fingerprint, 0)
-                                for fingerprint, count in requests_by_fingerprint.items()
-                                if count > previous_by_fingerprint.get(fingerprint, 0)
-                            }
-                        total_delta += request_delta
-                        for fingerprint, count in fingerprint_deltas.items():
-                            deltas_by_fingerprint[fingerprint] = deltas_by_fingerprint.get(fingerprint, 0) + count
-                    previous = observation
-                if previous is not None:
-                    observations.append((endpoint_name, previous))
-
-            attributed: dict[str, tuple[RequesterIdentity, int]] = {}
-            for fingerprint, count in deltas_by_fingerprint.items():
-                requester = self._llm_proxy_requesters.get(fingerprint)
-                if requester is None:
-                    continue
-                current_requester, current_count = attributed.get(requester.actor_id, (requester, 0))
-                attributed[requester.actor_id] = (current_requester, current_count + count)
-
-            checkpoint_observations = dict(self._llm_proxy_observations)
-            checkpoint_observations.update(observations)
-            await self.history.record_llm_proxy_usage(
-                requests=total_delta,
-                requester_counts=[
-                    (actor_id, requester.history_metadata(), count)
-                    for actor_id, (requester, count) in attributed.items()
-                ],
-                observations={
-                    endpoint_name: _serialize_llm_proxy_observation(observation)
-                    for endpoint_name, observation in checkpoint_observations.items()
-                },
-                requesters={
-                    fingerprint: _serialize_llm_proxy_requester(requester)
-                    for fingerprint, requester in self._llm_proxy_requesters.items()
-                },
-                observed_at_s=observed_at_s,
-            )
-            for endpoint_name, observation in observations:
-                self._llm_proxy_observations[endpoint_name] = observation
-
-    def _remember_pending_llm_proxy_observations(
-        self,
-        observations: dict[str, tuple[str, int, dict[str, int]]],
-    ) -> None:
-        for endpoint_name, observation in observations.items():
-            instance_id, requests, _ = observation
-            generations = self._llm_proxy_pending_observations.setdefault(endpoint_name, OrderedDict())
-            pending = generations.get(instance_id)
-            if pending is None:
-                generations[instance_id] = (observation, observation)
-                continue
-            first, latest = pending
-            if requests > latest[1]:
-                generations[instance_id] = (first, observation)
 
     def _aggregate_recent(self, minute_buckets: list[SwarmHistoryBucket], *, window_minutes: int) -> dict[str, object]:
         now = self._time_fn()
@@ -1241,7 +1008,6 @@ __REQUESTER_DASHBOARD_STYLES__
         <h2>Requests And Session Events</h2>
         <div class="legend">
           <span style="color: #182125">Session Requests</span>
-          <span style="color: #e67e22">LLM Proxy Requests</span>
           <span style="color: #117a65">Allocations</span>
           <span style="color: #bb2d3b">Allocation Failures</span>
           <span style="color: #0b5cab">Session Connects</span>
@@ -1492,7 +1258,6 @@ __REQUESTER_DASHBOARD_MARKUP__
         kpiCard('Live conversations', prettyNumber(current.connected_sessions), 'Current live websocket sessions'),
         kpiCard('Pending joins', prettyNumber(current.pending_sessions), 'Reserved sessions waiting to connect'),
         kpiCard(`Requests / ${windowLabel}`, prettyNumber(summary.session_requests_window), `POST /session requests in the last ${windowLabel}`),
-        kpiCard(`LLM proxy / ${windowLabel}`, prettyNumber(summary.llm_proxy_requests_window), `Authorized /v1/chat/completions and /v1/responses requests in the last ${windowLabel}`),
         kpiCard(`Failures / ${windowLabel}`, prettyNumber(summary.session_failures_window), `Allocation failures in the last ${windowLabel}`),
 __REQUESTER_DASHBOARD_KPI_CARDS__
         kpiCard(`Started / ${windowLabel}`, prettyNumber(summary.conversations_started_window), `Conversation starts recorded in the last ${windowLabel}`),
@@ -1865,7 +1630,6 @@ __REQUESTER_DASHBOARD_SCRIPT__
 
       drawChart(document.getElementById('requests-chart'), series, [
         { key: 'session_requests', color: '#182125' },
-        { key: 'llm_proxy_requests', color: '#e67e22' },
         { key: 'session_allocation_successes', color: '#117a65' },
         { key: 'session_allocation_failures', color: '#bb2d3b' },
         { key: 'session_auth_rejections', color: '#c0392b' },
