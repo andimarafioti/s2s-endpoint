@@ -1274,6 +1274,8 @@ async def _record_llm_proxy_request(
     session_token: str,
     payload: dict[str, Any],
 ) -> None:
+    if not runtime.settings.session_shared_secret:
+        raise HTTPException(status_code=503, detail="session shared secret is not configured")
     try:
         claims = verify_session_token(session_token, runtime.settings.session_shared_secret)
     except ValueError as exc:
