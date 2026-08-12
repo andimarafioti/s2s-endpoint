@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from statistics import median
 from typing import Awaitable, Callable, Iterable, Optional
 
+from app.app_utils import cancel_and_await
 from app.dashboard_history import (
     DashboardHistory,
     DashboardHistoryStore,
@@ -243,13 +244,8 @@ class SwarmDashboard:
         self._sample_task = asyncio.create_task(self._sample_loop())
 
     async def stop(self) -> None:
-        if self._sample_task is not None:
-            self._sample_task.cancel()
-            try:
-                await self._sample_task
-            except asyncio.CancelledError:
-                pass
-            self._sample_task = None
+        await cancel_and_await(self._sample_task)
+        self._sample_task = None
         await self.history.stop()
 
     async def capture_sample(self) -> SwarmStateSample:
