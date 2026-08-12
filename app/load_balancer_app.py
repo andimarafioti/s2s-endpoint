@@ -1,4 +1,3 @@
-import copy
 import logging
 import secrets
 from dataclasses import dataclass
@@ -43,7 +42,7 @@ from app.requester_rate_limiter import (
 from app.session_manager import SessionManager
 from app.session_request_metadata import reported_hardware_id
 from app.session_requester_tracker import SessionRequesterTracker
-from app.session_tokens import llm_token_fingerprint
+from app.session_tokens import llm_token_fingerprint, llm_usage_event_signature, verify_session_token
 from app.swarm_dashboard import SwarmDashboard
 from app.verification_admission_limiter import (
     VerificationAdmissionConfig,
@@ -343,10 +342,7 @@ def build_endpoint_router(settings: LoadBalancerSettings) -> EndpointPoolRouter:
         drain_lease_ttl_s=settings.compute_endpoint_drain_lease_ttl_s,
         drain_warning_after_s=settings.compute_endpoint_drain_warning_after_s,
         drain_warning_interval_s=settings.compute_endpoint_drain_warning_interval_s,
-        compute_usage_fetcher=lambda url: fetch_compute_usage(
-            url,
-            internal_auth_token=settings.session_shared_secret,
-        ),
+        compute_usage_fetcher=fetch_compute_usage,
         # How long a previously observed usage count stays trusted when
         # health polls fail transiently. Must be comfortably above the
         # reconcile interval (10s): the default 60s means roughly six
@@ -921,22 +917,11 @@ async def health(runtime: LoadBalancerRuntime):
         "dashboard_preview_mode": settings.dashboard_preview_mode,
         "dashboard_history": dependencies.dashboard.persistence_status(),
         "requester_tracking": requester_tracking,
-        "sessions": _public_session_snapshot(snapshot),
+        "sessions": snapshot,
     }
     if not healthy:
         payload["detail"] = detail or "endpoint router is not ready"
     return JSONResponse(payload, status_code=200 if healthy else 503)
-
-
-def _public_session_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
-    result = copy.deepcopy(snapshot)
-    router = result.get("router")
-    endpoints = router.get("endpoints") if isinstance(router, dict) else None
-    for endpoint in endpoints if isinstance(endpoints, list) else []:
-        usage = endpoint.get("llm_proxy_usage") if isinstance(endpoint, dict) else None
-        if isinstance(usage, dict):
-            usage.pop("requests_by_fingerprint", None)
-    return result
 
 
 async def create_session(runtime: LoadBalancerRuntime, request: Request):
@@ -982,11 +967,17 @@ async def create_session(runtime: LoadBalancerRuntime, request: Request):
         llm_fingerprint = await _llm_proxy_fingerprint(runtime, request, requester)
         if llm_fingerprint is not None:
             requester = await _refresh_requester_identity(runtime, requester)
-            dependencies.dashboard.register_llm_proxy_requester(llm_fingerprint, requester)
-        allocation = await dependencies.session_manager.allocate(
-            public_base_url(request),
-            llm_fingerprint=llm_fingerprint,
-        )
+        allocation_kwargs: dict[str, object] = {"llm_fingerprint": llm_fingerprint}
+        if llm_fingerprint is not None:
+            allocation_kwargs["llm_requester"] = {
+                "actor_id": requester.actor_id,
+                **{
+                    key: value
+                    for key, value in requester.history_metadata().items()
+                    if key in {"label", "kind", "verification", "fingerprint", "account_name"}
+                },
+            }
+        allocation = await dependencies.session_manager.allocate(public_base_url(request), **allocation_kwargs)
     except QueueAtCapacityError as exc:
         dependencies.requester_rate_limiter.record_allocation_failure(requester)
         requester = await _refresh_requester_identity(runtime, requester)
@@ -1232,6 +1223,10 @@ async def session_event(
     if not event:
         raise HTTPException(status_code=400, detail="event is required")
 
+    if event == "llm_proxy_request":
+        await _record_llm_proxy_request(runtime, session_id, session_token, payload)
+        return JSONResponse({"status": "ok", "session_id": session_id})
+
     try:
         result = await dependencies.session_manager.handle_event(session_id, session_token, event)
     except KeyError:
@@ -1271,6 +1266,48 @@ async def session_event(
             )
         dependencies.session_requester_tracker.discard(session_id)
     return JSONResponse(result)
+
+
+async def _record_llm_proxy_request(
+    runtime: LoadBalancerRuntime,
+    session_id: str,
+    session_token: str,
+    payload: dict[str, Any],
+) -> None:
+    try:
+        claims = verify_session_token(session_token, runtime.settings.session_shared_secret)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if claims.get("sid") != session_id:
+        raise HTTPException(status_code=403, detail="session token does not match session id")
+
+    instance_id = payload.get("instance_id")
+    sequence = payload.get("sequence")
+    signature = payload.get("signature")
+    requester = claims.get("llmr")
+    if not isinstance(instance_id, str) or not instance_id or len(instance_id) > 64:
+        raise HTTPException(status_code=400, detail="instance_id is invalid")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+        raise HTTPException(status_code=400, detail="sequence is invalid")
+    expected_signature = llm_usage_event_signature(
+        runtime.settings.session_shared_secret,
+        session_id,
+        instance_id,
+        sequence,
+    )
+    if not isinstance(signature, str) or not secrets.compare_digest(signature, expected_signature):
+        raise HTTPException(status_code=403, detail="usage event signature is invalid")
+    if not isinstance(requester, dict) or not isinstance(requester.get("actor_id"), str):
+        raise HTTPException(status_code=403, detail="session token has no LLM requester claim")
+
+    actor_id = requester["actor_id"]
+    metadata = {key: value for key, value in requester.items() if key != "actor_id"}
+    await runtime.dependencies.dashboard.record_llm_proxy_request(
+        instance_id,
+        sequence,
+        actor_id,
+        metadata,
+    )
 
 
 async def endpoint_status(runtime: LoadBalancerRuntime, endpoint_name: str, request: Request):
@@ -1352,7 +1389,6 @@ async def get_endpoint_snapshot(
         raise HTTPException(status_code=503, detail="Endpoint status is not available")
 
     _, _, snapshot = await session_manager.healthcheck()
-    snapshot = _public_session_snapshot(snapshot)
     router_snapshot = snapshot.get("router", {})
     endpoints = router_snapshot.get("endpoints", []) if isinstance(router_snapshot, dict) else []
     endpoint_snapshot = next(

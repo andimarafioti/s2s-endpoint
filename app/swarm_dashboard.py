@@ -1,7 +1,6 @@
 import asyncio
 import re
 import time
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from statistics import median
 from typing import Awaitable, Callable, Iterable, Optional
@@ -242,11 +241,6 @@ class SwarmDashboard:
         )
         self._latest_sample: Optional[SwarmStateSample] = None
         self._sample_task: Optional[asyncio.Task] = None
-        self._capture_lock = asyncio.Lock()
-        self._llm_proxy_observations: dict[str, tuple[str, int, dict[str, int]]] = {}
-        self._llm_proxy_baselined = False
-        self._llm_proxy_requesters: "OrderedDict[str, RequesterIdentity]" = OrderedDict()
-        self._max_llm_proxy_requesters = max_requester_records
 
     async def start(self) -> None:
         await self.capture_sample()
@@ -259,17 +253,15 @@ class SwarmDashboard:
         await self.history.stop()
 
     async def capture_sample(self) -> SwarmStateSample:
-        async with self._capture_lock:
-            healthy, detail, snapshot = await self.snapshot_provider()
-            sample = SwarmStateSample.from_health_snapshot(
-                healthy=healthy,
-                detail=detail,
-                snapshot=snapshot,
-                captured_at_s=self._time_fn(),
-            )
-            await self.record_sample(sample)
-            await self._record_llm_proxy_usage(snapshot)
-            return sample
+        healthy, detail, snapshot = await self.snapshot_provider()
+        sample = SwarmStateSample.from_health_snapshot(
+            healthy=healthy,
+            detail=detail,
+            snapshot=snapshot,
+            captured_at_s=self._time_fn(),
+        )
+        await self.record_sample(sample)
+        return sample
 
     async def record_sample(self, sample: SwarmStateSample) -> None:
         await self.history.record_sample(sample)
@@ -311,65 +303,15 @@ class SwarmDashboard:
 
     async def update_requester_identity(self, requester: RequesterIdentity) -> None:
         await self.requesters.update_identity(requester)
-        for fingerprint, current in list(self._llm_proxy_requesters.items()):
-            if current.actor_id == requester.actor_id:
-                self._llm_proxy_requesters[fingerprint] = requester
 
-    def register_llm_proxy_requester(self, fingerprint: str, requester: RequesterIdentity) -> None:
-        self._llm_proxy_requesters[fingerprint] = requester
-        self._llm_proxy_requesters.move_to_end(fingerprint)
-        while len(self._llm_proxy_requesters) > self._max_llm_proxy_requesters:
-            self._llm_proxy_requesters.popitem(last=False)
-
-    async def _record_llm_proxy_usage(self, snapshot: dict[str, object]) -> None:
-        router = snapshot.get("router")
-        endpoints = router.get("endpoints") if isinstance(router, dict) else None
-        total_delta = 0
-        requester_deltas: dict[str, int] = {}
-        for endpoint in endpoints if isinstance(endpoints, list) else []:
-            if not isinstance(endpoint, dict) or not isinstance(endpoint.get("name"), str):
-                continue
-            usage = endpoint.get("llm_proxy_usage")
-            if not isinstance(usage, dict):
-                continue
-            instance_id = usage.get("instance_id")
-            requests = usage.get("requests")
-            by_fingerprint = usage.get("requests_by_fingerprint")
-            if (
-                not isinstance(instance_id, str)
-                or not isinstance(requests, int)
-                or not isinstance(by_fingerprint, dict)
-            ):
-                continue
-            previous = self._llm_proxy_observations.get(endpoint["name"])
-            if previous is None:
-                self._llm_proxy_observations[endpoint["name"]] = (instance_id, requests, dict(by_fingerprint))
-                if not self._llm_proxy_baselined:
-                    continue
-            previous_total = previous[1] if previous is not None and previous[0] == instance_id else 0
-            previous_by_fingerprint = previous[2] if previous is not None and previous[0] == instance_id else {}
-            if requests < previous_total:
-                continue
-            total_delta += requests - previous_total
-            for fingerprint, count in by_fingerprint.items():
-                if isinstance(fingerprint, str) and isinstance(count, int):
-                    delta = count - previous_by_fingerprint.get(fingerprint, 0)
-                    if delta > 0:
-                        requester_deltas[fingerprint] = requester_deltas.get(fingerprint, 0) + delta
-            self._llm_proxy_observations[endpoint["name"]] = (instance_id, requests, dict(by_fingerprint))
-
-        self._llm_proxy_baselined = True
-
-        attributed: dict[str, tuple[RequesterIdentity, int]] = {}
-        for fingerprint, count in requester_deltas.items():
-            requester = self._llm_proxy_requesters.get(fingerprint)
-            if requester is not None:
-                current, current_count = attributed.get(requester.actor_id, (requester, 0))
-                attributed[requester.actor_id] = (current, current_count + count)
-        await self.history.record_llm_proxy_usage(
-            total_delta,
-            [(actor_id, requester.history_metadata(), count) for actor_id, (requester, count) in attributed.items()],
-        )
+    async def record_llm_proxy_request(
+        self,
+        instance_id: str,
+        sequence: int,
+        actor_id: str,
+        metadata: dict[str, object],
+    ) -> bool:
+        return await self.history.record_llm_proxy_request(instance_id, sequence, actor_id, metadata)
 
     async def record_session_event(
         self,

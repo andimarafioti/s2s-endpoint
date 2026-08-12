@@ -274,7 +274,7 @@ def _bucket_store(api: FakeBucketApi) -> HuggingFaceBucketHistoryStore:
 
 
 class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
-    async def test_llm_proxy_counts_are_aggregated_attributed_and_reset_safe(self):
+    async def test_llm_proxy_counts_are_aggregated_attributed_and_restart_safe(self):
         clock = FakeClock(2 * 3600)
         payload = _health_snapshot(
             connected=1,
@@ -284,41 +284,27 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             free_slots=1,
             effective_free_slots=1,
         )
-        endpoints = payload[2]["router"]["endpoints"]
-        endpoints[0]["llm_proxy_usage"] = {"instance_id": "process-a", "requests": 0, "requests_by_fingerprint": {}}
-        endpoints[1]["llm_proxy_usage"] = {"instance_id": "process-b", "requests": 0, "requests_by_fingerprint": {}}
         dashboard = SwarmDashboard(snapshot_provider=FakeSnapshotProvider(payload), time_fn=clock.now)
-        dashboard.register_llm_proxy_requester(
-            "fingerprint-a",
-            RequesterIdentity("token:a", "@alice", "authenticated", "verified", "a", "alice"),
+        alice = RequesterIdentity("token:a", "@alice", "authenticated", "verified", "a", "alice")
+        bob = RequesterIdentity("token:b", "@bob", "authenticated", "verified", "b", "bob")
+
+        self.assertTrue(
+            await dashboard.record_llm_proxy_request("process-a", 1, alice.actor_id, alice.history_metadata())
+        )
+        self.assertFalse(
+            await dashboard.record_llm_proxy_request("process-a", 1, alice.actor_id, alice.history_metadata())
+        )
+        self.assertTrue(await dashboard.record_llm_proxy_request("process-b", 1, bob.actor_id, bob.history_metadata()))
+        self.assertTrue(
+            await dashboard.record_llm_proxy_request("process-a2", 1, alice.actor_id, alice.history_metadata())
         )
 
-        await dashboard.capture_sample()
-        endpoints[0]["llm_proxy_usage"] = {
-            "instance_id": "process-a",
-            "requests": 2,
-            "requests_by_fingerprint": {"fingerprint-a": 2},
-        }
-        endpoints[1]["llm_proxy_usage"] = {
-            "instance_id": "process-b",
-            "requests": 3,
-            "requests_by_fingerprint": {"fingerprint-b": 3},
-        }
-        await dashboard.capture_sample()
-        endpoints[0]["llm_proxy_usage"] = {
-            "instance_id": "process-a2",
-            "requests": 1,
-            "requests_by_fingerprint": {"fingerprint-a": 1},
-        }
-        await dashboard.capture_sample()
-
         result = await dashboard.data(window="60m", resolution="minute")
-        self.assertEqual(result["summary"]["llm_proxy_requests_window"], 6)
-        alice = next(row for row in result["requesters"]["leaderboard"] if row["actor_id"] == "hf:alice")
-        self.assertEqual(alice["llm_proxy_requests"], 3)
-        self.assertNotIn("requests_by_fingerprint", result["current"]["endpoints"][0]["llm_proxy_usage"])
+        self.assertEqual(result["summary"]["llm_proxy_requests_window"], 3)
+        alice_row = next(row for row in result["requesters"]["leaderboard"] if row["actor_id"] == "hf:alice")
+        self.assertEqual(alice_row["llm_proxy_requests"], 2)
 
-    async def test_new_replica_after_initial_baseline_counts_its_requests(self):
+    async def test_new_replica_counts_its_first_request(self):
         clock = FakeClock(2 * 3600)
         payload = _health_snapshot(
             connected=0,
@@ -328,20 +314,38 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             free_slots=1,
             effective_free_slots=1,
         )
-        endpoints = payload[2]["router"]["endpoints"]
-        endpoints[0]["llm_proxy_usage"] = {"instance_id": "process-a", "requests": 0, "requests_by_fingerprint": {}}
         dashboard = SwarmDashboard(snapshot_provider=FakeSnapshotProvider(payload), time_fn=clock.now)
-
-        await dashboard.capture_sample()
-        endpoints[1]["llm_proxy_usage"] = {
-            "instance_id": "process-b",
-            "requests": 2,
-            "requests_by_fingerprint": {},
-        }
-        await dashboard.capture_sample()
+        requester = RequesterIdentity("token:a", "@alice", "authenticated", "verified", "a", "alice")
+        await dashboard.record_llm_proxy_request("process-b", 1, requester.actor_id, requester.history_metadata())
 
         summary = await dashboard.summary(window_minutes=60, requested_window="60m")
-        self.assertEqual(summary["llm_proxy_requests_window"], 2)
+        self.assertEqual(summary["llm_proxy_requests_window"], 1)
+
+    async def test_restored_usage_sequence_deduplicates_a_retry(self):
+        clock = FakeClock(2 * 3600)
+        bucket = SwarmHistoryBucket(bucket_start_s=2 * 3600)
+        bucket.llm_proxy_requests = 1
+        bucket.llm_proxy_sequences = {"process-a": 7}
+        store = FakeHistoryStore(initial_buckets=[bucket])
+        history = DashboardHistory(
+            retention_minutes=60,
+            history_store=store,
+            time_fn=clock.now,
+        )
+        await history.start()
+        try:
+            counted = await history.record_llm_proxy_request(
+                "process-a",
+                7,
+                "hf:alice",
+                {"label": "@alice", "kind": "authenticated", "verification": "verified"},
+            )
+            snapshot = await history.snapshot()
+        finally:
+            await history.stop()
+
+        self.assertFalse(counted)
+        self.assertEqual(sum(item.llm_proxy_requests for item in snapshot), 1)
 
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)

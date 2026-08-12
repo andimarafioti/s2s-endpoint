@@ -14,13 +14,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
 from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointLease
-from app.load_balancer_app import _llm_proxy_fingerprint
+from app.load_balancer_app import _llm_proxy_fingerprint, session_event
 from app.requester_identity import RequesterIdentity, RequesterIdentityResolver
 from app.session_tokens import (
     create_session_token,
     llm_token_fingerprint,
+    llm_usage_event_signature,
     verify_session_token,
 )
 from tests.helpers import load_balancer_fixture
@@ -74,6 +77,11 @@ class SessionTokenClaimTests(unittest.TestCase):
         payload = verify_session_token(self._mint(), SECRET)
         self.assertNotIn("llmf", payload)
 
+    def test_usage_signature_binds_the_session_process_and_sequence(self):
+        signature = llm_usage_event_signature(SECRET, "session-1", "process-a", 7)
+        self.assertEqual(signature, llm_usage_event_signature(SECRET, "session-1", "process-a", 7))
+        self.assertNotEqual(signature, llm_usage_event_signature(SECRET, "session-1", "process-a", 8))
+
 
 class _SingleLeaseRouter:
     LEASE = EndpointLease(
@@ -118,10 +126,16 @@ class GrantEmbedsClaimTests(unittest.IsolatedAsyncioTestCase):
         )
         fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
 
-        allocation = await manager.allocate("https://lb.example", llm_fingerprint=fingerprint)
+        requester = {"actor_id": "hf:alice", "label": "@alice"}
+        allocation = await manager.allocate(
+            "https://lb.example",
+            llm_fingerprint=fingerprint,
+            llm_requester=requester,
+        )
 
         payload = verify_session_token(str(allocation["session_token"]), SECRET)
         self.assertEqual(payload["llmf"], fingerprint)
+        self.assertEqual(payload["llmr"], requester)
 
     async def test_grant_without_fingerprint_carries_no_claim(self):
         manager = DirectSessionManager(
@@ -190,6 +204,57 @@ class LoadBalancerFingerprintTests(unittest.IsolatedAsyncioTestCase):
             self._requester("verified"),
         )
         self.assertEqual(result, llm_token_fingerprint(SECRET, HF_TOKEN))
+
+    async def test_usage_callback_requires_the_compute_signature(self):
+        module = self._import_load_balancer()
+        requester = self._requester("verified")
+        session_token = create_session_token(
+            SECRET,
+            session_id="session-1",
+            websocket_url="wss://compute-01.example/v1/realtime",
+            callback_url="https://lb.example/internal/sessions/session-1/event",
+            ttl_s=60,
+            llm_fingerprint=llm_token_fingerprint(SECRET, HF_TOKEN),
+            llm_requester={"actor_id": requester.actor_id, **requester.history_metadata()},
+        )
+        payload = {
+            "session_token": session_token,
+            "event": "llm_proxy_request",
+            "instance_id": "process-a",
+            "sequence": 1,
+            "signature": "forged",
+        }
+
+        with self.assertRaisesRegex(HTTPException, "usage event signature is invalid"):
+            await session_event(module.runtime, "session-1", payload)
+
+    async def test_usage_callback_is_counted_once_when_retried(self):
+        module = self._import_load_balancer()
+        requester = self._requester("verified")
+        session_token = create_session_token(
+            SECRET,
+            session_id="session-1",
+            websocket_url="wss://compute-01.example/v1/realtime",
+            callback_url="https://lb.example/internal/sessions/session-1/event",
+            ttl_s=60,
+            llm_fingerprint=llm_token_fingerprint(SECRET, HF_TOKEN),
+            llm_requester={"actor_id": requester.actor_id, **requester.history_metadata()},
+        )
+        payload = {
+            "session_token": session_token,
+            "event": "llm_proxy_request",
+            "instance_id": "process-a",
+            "sequence": 1,
+            "signature": llm_usage_event_signature(SECRET, "session-1", "process-a", 1),
+        }
+
+        first = await session_event(module.runtime, "session-1", payload)
+        second = await session_event(module.runtime, "session-1", payload)
+        summary = await module.dependencies.dashboard.summary(window_minutes=60, requested_window="60m")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(summary["llm_proxy_requests_window"], 1)
 
     async def test_reachy_authorization_header_wins_over_authorization(self):
         module = self._import_load_balancer()

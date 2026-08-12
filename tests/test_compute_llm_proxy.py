@@ -180,6 +180,8 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         secret: str = SECRET,
         time_fn: Callable[[], float] = time.monotonic,
     ) -> TestClient:
+        self.lb_events: list[tuple[str, dict[str, Any]]] = []
+
         async def _fake_acquire():
             return SimpleNamespace(slot_id=0, ws_url="ws://127.0.0.1:1/v1/realtime")
 
@@ -189,8 +191,8 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         async def _fake_healthcheck():
             return True, None, {"active_sessions": 1, "max_sessions": 1}
 
-        async def _no_lb_callback(*args: Any, **kwargs: Any) -> None:
-            pass
+        async def _no_lb_callback(callback_url, session_token, event, **kwargs: Any) -> None:
+            self.lb_events.append((event, kwargs.get("extra_payload") or {}))
 
         self.enterContext(patch("app.ws_proxy.websockets.connect", _FakeUpstreamConnect))
         stub_url = urlsplit(self.stub.base_url)
@@ -317,7 +319,12 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.stub.responder = lambda path: (200, "text/event-stream", frames)
         configured_client = self.gated_client()
         registry = configured_client.app.state.dependencies.connected_llm_fingerprints
-        registry.add(llm_token_fingerprint(SECRET, HF_TOKEN))
+        registry.add(
+            llm_token_fingerprint(SECRET, HF_TOKEN),
+            "https://lb.example/event",
+            "session-token",
+            "session-under-test",
+        )
         live = LiveApp(configured_client.app)
         self.addCleanup(live.close)
 
@@ -347,11 +354,8 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"]["type"], "upstream_unreachable")
 
-        public_usage = client.get("/health").json()["llm_proxy_usage"]
-        internal_usage = client.get("/health", headers={"X-S2S-Internal-Auth": SECRET}).json()["llm_proxy_usage"]
-        self.assertEqual(public_usage["requests"], 1)
-        self.assertNotIn("requests_by_fingerprint", public_usage)
-        self.assertEqual(internal_usage["requests_by_fingerprint"], {llm_token_fingerprint(SECRET, HF_TOKEN): 1})
+        usage_events = [event for event in self.lb_events if event[0] == "llm_proxy_request"]
+        self.assertEqual(len(usage_events), 1)
 
     def test_authorized_alternate_route_is_counted(self) -> None:
         client = self.gated_client()
@@ -359,9 +363,8 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
             response = client.post("/v1/responses", content=b"{}", headers=_auth())
 
         self.assertEqual(response.status_code, 200)
-        usage = client.get("/health", headers={"X-S2S-Internal-Auth": SECRET}).json()["llm_proxy_usage"]
-        self.assertEqual(usage["requests"], 1)
-        self.assertEqual(usage["requests_by_fingerprint"], {llm_token_fingerprint(SECRET, HF_TOKEN): 1})
+        usage_events = [event for event in self.lb_events if event[0] == "llm_proxy_request"]
+        self.assertEqual(len(usage_events), 1)
 
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()

@@ -1,5 +1,4 @@
 import asyncio
-import hmac
 import json
 import subprocess
 import time
@@ -18,7 +17,12 @@ from starlette.background import BackgroundTask
 from app.app_utils import build_lifespan, env_bool, env_text, setup_logging
 from app.requester_identity import bearer_token
 from app.session_router import SessionRouter
-from app.session_tokens import llm_token_fingerprint, verify_session_token, websocket_host_matches
+from app.session_tokens import (
+    llm_token_fingerprint,
+    llm_usage_event_signature,
+    verify_session_token,
+    websocket_host_matches,
+)
 from app.ws_proxy import proxy_websocket
 
 logger = setup_logging()
@@ -29,7 +33,6 @@ PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_POOL_PATH = "/v1/pool"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
-MAX_LLM_PROXY_REQUESTERS = 50_000
 
 
 @dataclass(frozen=True)
@@ -235,7 +238,7 @@ async def root(settings: ComputeSettings):
     }
 
 
-async def health(request: Request, settings: ComputeSettings, dependencies: "ComputeDependencies"):
+async def health(settings: ComputeSettings, dependencies: "ComputeDependencies"):
     healthy, detail, snapshot = await dependencies.session_router.healthcheck()
     if not healthy:
         raise HTTPException(status_code=503, detail=detail or "compute router is not ready")
@@ -251,15 +254,6 @@ async def health(request: Request, settings: ComputeSettings, dependencies: "Com
             "llm": settings.llm,
             "tts": settings.tts,
             "router": snapshot,
-            "llm_proxy_usage": dependencies.llm_proxy_usage.snapshot(
-                include_attribution=bool(
-                    settings.session_shared_secret
-                    and hmac.compare_digest(
-                        request.headers.get("x-s2s-internal-auth", ""),
-                        settings.session_shared_secret,
-                    )
-                ),
-            ),
         }
     )
 
@@ -296,25 +290,35 @@ class _ConnectedFingerprintRegistry:
 
     Membership is the LLM proxy access window: a fingerprint is added when
     its session's websocket connects and removed when it disconnects.
-    Refcounted because one token may hold several concurrent sessions.
+    A token may hold several concurrent sessions, each with its own signed
+    load-balancer callback.
     Single event loop, so no locking.
     """
 
     def __init__(self) -> None:
-        self._counts: dict[str, int] = {}
+        self._sessions: dict[str, dict[str, tuple[str, str]]] = {}
 
-    def add(self, fingerprint: str) -> None:
-        self._counts[fingerprint] = self._counts.get(fingerprint, 0) + 1
+    def add(self, fingerprint: str, callback_url: str, session_token: str, session_id: str) -> None:
+        self._sessions.setdefault(fingerprint, {})[session_token] = (callback_url, session_id)
 
-    def remove(self, fingerprint: str) -> None:
-        count = self._counts.get(fingerprint, 0) - 1
-        if count > 0:
-            self._counts[fingerprint] = count
-        else:
-            self._counts.pop(fingerprint, None)
+    def remove(self, fingerprint: str, session_token: str) -> None:
+        sessions = self._sessions.get(fingerprint)
+        if sessions is None:
+            return
+        sessions.pop(session_token, None)
+        if not sessions:
+            self._sessions.pop(fingerprint, None)
 
     def __contains__(self, fingerprint: str) -> bool:
-        return fingerprint in self._counts
+        return fingerprint in self._sessions
+
+    def callback(self, fingerprint: str) -> Optional[tuple[str, str, str]]:
+        sessions = self._sessions.get(fingerprint)
+        if not sessions:
+            return None
+        session_token = next(reversed(sessions))
+        callback_url, session_id = sessions[session_token]
+        return callback_url, session_token, session_id
 
 
 def _now() -> float:
@@ -357,26 +361,40 @@ class _FingerprintRateLimiter:
 
 @dataclass
 class _LLMProxyUsage:
-    """Authorized request counts, reset with the compute process."""
+    """Serialize idempotent usage callbacks from this compute process."""
 
     instance_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     requests: int = 0
-    requests_by_fingerprint: dict[str, int] = field(default_factory=dict)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def record(self, fingerprint: str) -> None:
-        self.requests += 1
-        if (
-            fingerprint not in self.requests_by_fingerprint
-            and len(self.requests_by_fingerprint) >= MAX_LLM_PROXY_REQUESTERS - 1
-        ):
-            fingerprint = "overflow"
-        self.requests_by_fingerprint[fingerprint] = self.requests_by_fingerprint.get(fingerprint, 0) + 1
-
-    def snapshot(self, *, include_attribution: bool) -> dict[str, object]:
-        result: dict[str, object] = {"instance_id": self.instance_id, "requests": self.requests}
-        if include_attribution:
-            result["requests_by_fingerprint"] = dict(self.requests_by_fingerprint)
-        return result
+    async def record(
+        self,
+        callback_url: str,
+        session_token: str,
+        session_id: str,
+        shared_secret: str,
+        notify: Callable[..., Awaitable[None]],
+        *,
+        attempts: int,
+    ) -> None:
+        async with self._lock:
+            self.requests += 1
+            await notify(
+                callback_url,
+                session_token,
+                "llm_proxy_request",
+                attempts=attempts,
+                extra_payload={
+                    "instance_id": self.instance_id,
+                    "sequence": self.requests,
+                    "signature": llm_usage_event_signature(
+                        shared_secret,
+                        session_id,
+                        self.instance_id,
+                        self.requests,
+                    ),
+                },
+            )
 
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
@@ -482,7 +500,15 @@ async def _proxy_llm_request(
     if token is None:
         token = bearer_token(request.headers.get("authorization"))
     assert token is not None
-    dependencies.llm_proxy_usage.record(llm_token_fingerprint(settings.session_shared_secret, token))
+    fingerprint = llm_token_fingerprint(settings.session_shared_secret, token)
+    callback = dependencies.connected_llm_fingerprints.callback(fingerprint)
+    assert callback is not None
+    await dependencies.llm_proxy_usage.record(
+        *callback,
+        settings.session_shared_secret,
+        dependencies.notify_lb_session_event,
+        attempts=settings.lb_callback_retry_attempts,
+    )
 
     headers = {}
     content_type = request.headers.get("content-type")
@@ -583,7 +609,12 @@ async def websocket_proxy(
         # the finally below, alongside the disconnected notification.
         nonlocal llm_fingerprint_registered
         if llm_fingerprint is not None:
-            dependencies.connected_llm_fingerprints.add(llm_fingerprint)
+            dependencies.connected_llm_fingerprints.add(
+                llm_fingerprint,
+                session_payload["callback_url"],
+                session_payload["session_token"],
+                session_payload["sid"],
+            )
             llm_fingerprint_registered = True
 
     try:
@@ -604,7 +635,7 @@ async def websocket_proxy(
             pass
     finally:
         if llm_fingerprint_registered and llm_fingerprint is not None:
-            dependencies.connected_llm_fingerprints.remove(llm_fingerprint)
+            dependencies.connected_llm_fingerprints.remove(llm_fingerprint, session_payload["session_token"])
         if session_payload is not None:
             # Always tell the LB the session is over. For a normal session this
             # completes the conversation; for a capacity rejection it releases
@@ -665,10 +696,11 @@ async def _notify_lb_session_event(
     session_token: str,
     event: str,
     *,
-    post_json: Callable[[str, dict[str, str]], None],
+    post_json: Callable[[str, dict[str, object]], None],
     default_backoff_s: float,
     attempts: int = 1,
     backoff_s: Optional[float] = None,
+    extra_payload: Optional[dict[str, object]] = None,
 ) -> None:
     """Post a session lifecycle event to the LB callback URL.
 
@@ -681,6 +713,8 @@ async def _notify_lb_session_event(
         "session_token": session_token,
         "event": event,
     }
+    if extra_payload:
+        payload.update(extra_payload)
     if backoff_s is None:
         backoff_s = default_backoff_s
     attempts = max(attempts, 1)
@@ -725,7 +759,7 @@ def _http_get_json(url: str) -> dict[str, object]:
 
 def _post_json(
     url: str,
-    payload: dict[str, str],
+    payload: dict[str, object],
     *,
     callback_auth_token: str,
 ) -> None:
@@ -778,7 +812,7 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
             http_get_json=_http_get_json,
         )
 
-    def post_json(url: str, payload: dict[str, str]) -> None:
+    def post_json(url: str, payload: dict[str, object]) -> None:
         _post_json(
             url,
             payload,
@@ -792,6 +826,7 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
         *,
         attempts: int = 1,
         backoff_s: Optional[float] = None,
+        extra_payload: Optional[dict[str, object]] = None,
     ) -> None:
         await _notify_lb_session_event(
             callback_url,
@@ -801,6 +836,7 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
             default_backoff_s=settings.lb_callback_retry_backoff_s,
             attempts=attempts,
             backoff_s=backoff_s,
+            extra_payload=extra_payload,
         )
 
     router = SessionRouter(
@@ -842,8 +878,8 @@ def create_app(
     async def root_route():
         return await root(settings)
 
-    async def health_route(request: Request):
-        return await health(request, settings, resolved_dependencies)
+    async def health_route():
+        return await health(settings, resolved_dependencies)
 
     async def pool_route():
         return await pool(settings, resolved_dependencies)

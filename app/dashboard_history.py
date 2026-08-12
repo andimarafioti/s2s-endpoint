@@ -84,11 +84,7 @@ class SwarmStateSample:
         captured_at_s: float,
     ) -> "SwarmStateSample":
         router = snapshot.get("router") or {}
-        endpoints = copy.deepcopy(list(router.get("endpoints") or []))
-        for endpoint in endpoints:
-            usage = endpoint.get("llm_proxy_usage") if isinstance(endpoint, dict) else None
-            if isinstance(usage, dict):
-                usage.pop("requests_by_fingerprint", None)
+        endpoints = list(router.get("endpoints") or [])
         status_counts: dict[str, int] = {}
         for endpoint in endpoints:
             status = _normalize_status(endpoint.get("status", "unknown"))
@@ -176,6 +172,7 @@ class SwarmHistoryBucket:
     completed_conversation_duration_max_s: float = 0.0
     completed_conversation_duration_samples_s: list[float] = field(default_factory=list)
     requester_usage: dict[str, dict[str, object]] = field(default_factory=dict)
+    llm_proxy_sequences: dict[str, int] = field(default_factory=dict)
 
     def record_sample(self, sample: SwarmStateSample) -> None:
         self.sample_count += 1
@@ -321,6 +318,15 @@ def _coerce_history_bucket_field(name: str, payload: dict[str, object]) -> objec
         return [max(float(value), 0.0) for value in list(payload.get(name) or [])]
     if name == "requester_usage":
         return _coerce_requester_usage(payload.get(name))
+    if name == "llm_proxy_sequences":
+        value = payload.get(name)
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(instance_id)[:64]: max(int(sequence), 0)
+            for instance_id, sequence in value.items()
+            if isinstance(instance_id, str) and instance_id
+        }
     raise KeyError(f"Unknown SwarmHistoryBucket field: {name}")
 
 
@@ -503,6 +509,7 @@ class DashboardHistory:
         self._time_fn = time_fn
         self._lock = asyncio.Lock()
         self._history: "OrderedDict[int, SwarmHistoryBucket]" = OrderedDict()
+        self._llm_proxy_sequences: dict[str, int] = {}
         self._requester_record_count = 0
         self._restore_task: Optional[asyncio.Task] = None
         self._startup_merge_task: Optional[asyncio.Task] = None
@@ -747,41 +754,48 @@ class DashboardHistory:
             self._prune_unlocked(now)
             self._wake_persistence_unlocked()
 
-    async def record_llm_proxy_usage(
+    async def record_llm_proxy_request(
         self,
-        requests: int,
-        requesters: list[tuple[str, dict[str, object], int]],
-    ) -> None:
-        if requests <= 0:
-            return
+        instance_id: str,
+        sequence: int,
+        actor_id: str,
+        metadata: dict[str, object],
+    ) -> bool:
+        restore_task = self._restore_task
+        if restore_task is not None and restore_task is not asyncio.current_task() and not restore_task.done():
+            await restore_task
         now = self._time_fn()
         async with self._lock:
+            if sequence <= self._llm_proxy_sequences.get(instance_id, 0):
+                return False
             bucket = self._get_bucket_unlocked(now)
-            bucket.llm_proxy_requests += requests
-            for actor_id, metadata, count in requesters:
-                resolved_actor_id = actor_id
-                resolved_metadata = metadata
-                if (
-                    resolved_actor_id not in bucket.requester_usage
-                    and len(bucket.requester_usage) >= self.max_requesters_per_bucket
-                ):
-                    resolved_actor_id = "overflow"
-                    resolved_metadata = {
-                        "label": "Other requesters (cardinality limit)",
-                        "kind": "overflow",
-                        "verification": "not_applicable",
-                    }
-                record = bucket.requester_usage.get(resolved_actor_id)
-                if record is None:
-                    self._make_requester_record_capacity_unlocked()
-                    record = _new_requester_usage_record(resolved_metadata)
-                    bucket.requester_usage[resolved_actor_id] = record
-                    self._requester_record_count += 1
-                _merge_requester_identity(record, resolved_metadata)
-                record["llm_proxy_requests"] = int(record.get("llm_proxy_requests", 0)) + count
+            bucket.llm_proxy_requests += 1
+            bucket.llm_proxy_sequences[instance_id] = sequence
+            self._llm_proxy_sequences[instance_id] = sequence
+            resolved_actor_id = actor_id
+            resolved_metadata = metadata
+            if (
+                resolved_actor_id not in bucket.requester_usage
+                and len(bucket.requester_usage) >= self.max_requesters_per_bucket
+            ):
+                resolved_actor_id = "overflow"
+                resolved_metadata = {
+                    "label": "Other requesters (cardinality limit)",
+                    "kind": "overflow",
+                    "verification": "not_applicable",
+                }
+            record = bucket.requester_usage.get(resolved_actor_id)
+            if record is None:
+                self._make_requester_record_capacity_unlocked()
+                record = _new_requester_usage_record(resolved_metadata)
+                bucket.requester_usage[resolved_actor_id] = record
+                self._requester_record_count += 1
+            _merge_requester_identity(record, resolved_metadata)
+            record["llm_proxy_requests"] = int(record.get("llm_proxy_requests", 0)) + 1
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(now)
             self._wake_persistence_unlocked()
+            return True
 
     async def record_requester_event(
         self,
@@ -1097,6 +1111,12 @@ class DashboardHistory:
             self._prune_unlocked(self._time_fn())
             self._recount_requester_records_unlocked()
             self._enforce_requester_record_limit_unlocked()
+            for bucket in self._history.values():
+                for instance_id, sequence in bucket.llm_proxy_sequences.items():
+                    self._llm_proxy_sequences[instance_id] = max(
+                        self._llm_proxy_sequences.get(instance_id, 0),
+                        sequence,
+                    )
         return updated_bucket_count
 
     def _wake_persistence_unlocked(self) -> None:
