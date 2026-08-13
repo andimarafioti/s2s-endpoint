@@ -370,6 +370,7 @@ class _LLMProxyUsage:
         default_factory=asyncio.Queue
     )
     _worker: Optional[asyncio.Task[None]] = None
+    _delivering: bool = False
 
     def record(
         self,
@@ -404,36 +405,38 @@ class _LLMProxyUsage:
             self._worker = asyncio.create_task(self._deliver())
 
     async def _deliver(self) -> None:
-        while not self._queue.empty():
+        while True:
             callback_url, session_token, notify, attempts, extra_payload = await self._queue.get()
-            while True:
-                try:
-                    await notify(
-                        callback_url,
-                        session_token,
-                        "llm_proxy_request",
-                        attempts=attempts,
-                        extra_payload=extra_payload,
-                    )
-                    break
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("Failed to record LLM proxy usage; retrying in background")
-                    await asyncio.sleep(1.0)
-            self._queue.task_done()
+            self._delivering = True
+            try:
+                while True:
+                    try:
+                        await notify(
+                            callback_url,
+                            session_token,
+                            "llm_proxy_request",
+                            attempts=attempts,
+                            extra_payload=extra_payload,
+                        )
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("Failed to record LLM proxy usage; retrying in background")
+                        await asyncio.sleep(1.0)
+            finally:
+                self._delivering = False
+                self._queue.task_done()
 
     async def stop(self, *, timeout_s: float = LLM_USAGE_SHUTDOWN_TIMEOUT_S) -> None:
         try:
             await asyncio.wait_for(self._queue.join(), timeout=max(timeout_s, 0.0))
         except asyncio.TimeoutError:
-            logger.error("Discarding %d undelivered LLM usage events during shutdown", self._queue.qsize() + 1)
-            if self._worker is not None:
-                self._worker.cancel()
-                await asyncio.gather(self._worker, return_exceptions=True)
-        else:
-            if self._worker is not None:
-                await self._worker
+            pending = self._queue.qsize() + int(self._delivering)
+            logger.error("Discarding %d undelivered LLM usage events during shutdown", pending)
+        if self._worker is not None:
+            self._worker.cancel()
+            await asyncio.gather(self._worker, return_exceptions=True)
         self._worker = None
 
 

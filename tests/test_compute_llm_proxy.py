@@ -405,6 +405,36 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
 
         self.assertEqual(asyncio.run(exercise()), 2)
 
+    def test_accounting_worker_accepts_events_after_becoming_idle(self) -> None:
+        async def exercise() -> list[int]:
+            sequences: list[int] = []
+
+            async def notify(*args: Any, **kwargs: Any) -> None:
+                sequences.append(kwargs["extra_payload"]["sequence"])
+
+            usage = compute_main._LLMProxyUsage()
+            usage.record(
+                "https://lb.example/event",
+                "session-token",
+                "session-1",
+                SECRET,
+                notify,
+                attempts=1,
+            )
+            await usage._queue.join()
+            usage.record(
+                "https://lb.example/event",
+                "session-token",
+                "session-1",
+                SECRET,
+                notify,
+                attempts=1,
+            )
+            await usage.stop()
+            return sequences
+
+        self.assertEqual(asyncio.run(exercise()), [1, 2])
+
     def test_accounting_failure_does_not_block_proxying(self) -> None:
         client = self.gated_client()
         self.fail_usage_callback = True
