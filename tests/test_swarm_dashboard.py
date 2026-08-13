@@ -325,7 +325,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 3600)
         bucket = SwarmHistoryBucket(bucket_start_s=2 * 3600)
         bucket.llm_proxy_requests = 1
-        bucket.llm_proxy_sequences = {"process-a": 7}
+        bucket.llm_proxy_events = {"process-a": {7: "hf:alice"}}
         store = FakeHistoryStore(initial_buckets=[bucket])
         history = DashboardHistory(
             retention_minutes=60,
@@ -362,7 +362,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(counted)
         persisted = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
         self.assertEqual(persisted.llm_proxy_requests, 1)
-        self.assertEqual(persisted.llm_proxy_sequences, {"process-a": 1})
+        self.assertEqual(persisted.llm_proxy_events, {"process-a": {1: "hf:alice"}})
 
     async def test_llm_proxy_retry_persists_without_counting_twice(self):
         clock = FakeClock(2 * 3600)
@@ -382,13 +382,13 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(counted)
         persisted = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
         self.assertEqual(persisted.llm_proxy_requests, 1)
-        self.assertEqual(persisted.llm_proxy_sequences, {"process-a": 1})
+        self.assertEqual(persisted.llm_proxy_events, {"process-a": {1: "hf:alice"}})
 
     async def test_llm_proxy_usage_recovers_failed_restore_before_persisting(self):
         clock = FakeClock(2 * 3600)
         persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
         persisted.llm_proxy_requests = 5
-        persisted.llm_proxy_sequences = {"old-process": 5}
+        persisted.llm_proxy_events = {"old-process": {sequence: "hf:alice" for sequence in range(1, 6)}}
         store = FailingLoadHistoryStore(
             fail_on_load_calls={1},
             initial_buckets=[persisted],
@@ -410,13 +410,14 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.llm_proxy_requests, 6)
         saved = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
         self.assertEqual(saved.llm_proxy_requests, 6)
-        self.assertEqual(saved.llm_proxy_sequences, {"old-process": 5, "new-process": 1})
+        self.assertEqual(saved.llm_proxy_events["new-process"], {1: "hf:alice"})
+        self.assertEqual(len(saved.llm_proxy_events["old-process"]), 5)
 
     async def test_failed_restore_is_recovered_before_normal_flush(self):
         clock = FakeClock(2 * 3600)
         persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
         persisted.llm_proxy_requests = 5
-        persisted.llm_proxy_sequences = {"old-process": 5}
+        persisted.llm_proxy_events = {"old-process": {sequence: "hf:alice" for sequence in range(1, 6)}}
         store = FailingLoadHistoryStore(fail_on_load_calls={1}, initial_buckets=[persisted])
         history = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
         await history._restore_history()
@@ -446,7 +447,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 3600)
         persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
         persisted.llm_proxy_requests = 5
-        persisted.llm_proxy_sequences = {"old-process": 5}
+        persisted.llm_proxy_events = {"old-process": {sequence: "hf:alice" for sequence in range(1, 6)}}
         store = SlowHistoryStore(delay_s=0.05, initial_buckets=[persisted])
         history = DashboardHistory(
             retention_minutes=60,
@@ -475,7 +476,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         saved = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
         self.assertEqual(saved.llm_proxy_requests, 5)
-        self.assertEqual(saved.llm_proxy_sequences, {"old-process": 5})
+        self.assertEqual(len(saved.llm_proxy_events["old-process"]), 5)
 
     async def test_shutdown_recovers_restore_cancelled_during_merge(self):
         class FirstMergeBlockingHistory(DashboardHistory):
@@ -494,7 +495,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 3600)
         persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
         persisted.llm_proxy_requests = 5
-        persisted.llm_proxy_sequences = {"old-process": 5}
+        persisted.llm_proxy_events = {"old-process": {sequence: "hf:alice" for sequence in range(1, 6)}}
         store = FakeHistoryStore(initial_buckets=[persisted])
         history = FirstMergeBlockingHistory(
             retention_minutes=60,
@@ -525,13 +526,13 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         saved = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
         self.assertGreaterEqual(history.merge_calls, 2)
         self.assertEqual(saved.llm_proxy_requests, 5)
-        self.assertEqual(saved.llm_proxy_sequences, {"old-process": 5})
+        self.assertEqual(len(saved.llm_proxy_events["old-process"]), 5)
 
     async def test_delayed_merge_uses_initial_restore_as_its_baseline(self):
         clock = FakeClock(2 * 3600)
         initial = SwarmHistoryBucket(bucket_start_s=2 * 3600)
         initial.llm_proxy_requests = 5
-        initial.llm_proxy_sequences = {"process-a": 5}
+        initial.llm_proxy_events = {"process-a": {sequence: "hf:alice" for sequence in range(1, 6)}}
         history = DashboardHistory(retention_minutes=60, time_fn=clock.now)
 
         await history._merge_persisted_history_buckets([initial])
@@ -552,7 +553,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         )
         updated = SwarmHistoryBucket.from_dict(initial.to_dict())
         updated.llm_proxy_requests = 6
-        updated.llm_proxy_sequences = {"process-a": 6}
+        updated.llm_proxy_events = {"process-a": {sequence: "hf:alice" for sequence in range(1, 7)}}
         await history._merge_persisted_history_buckets([updated])
 
         current = next(bucket for bucket in await history.snapshot() if bucket.bucket_start_s == 2 * 3600)
@@ -562,7 +563,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 3600)
         persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
         persisted.llm_proxy_requests = 1
-        persisted.llm_proxy_sequences = {"process-a": 1}
+        persisted.llm_proxy_events = {"process-a": {1: "hf:alice"}}
         persisted.requester_usage = {
             "hf:alice": {
                 "label": "@alice",
@@ -600,7 +601,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 3600)
         persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
         persisted.llm_proxy_requests = 1
-        persisted.llm_proxy_sequences = {"process-a": 1}
+        persisted.llm_proxy_events = {"process-a": {1: "hf:alice"}}
         history = DashboardHistory(retention_minutes=60, time_fn=clock.now)
 
         await history.record_sample(
@@ -630,7 +631,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock(2 * 3600)
         stale = SwarmHistoryBucket(bucket_start_s=2 * 3600)
         stale.llm_proxy_requests = 1
-        stale.llm_proxy_sequences = {"old-process": 1}
+        stale.llm_proxy_events = {"old-process": {1: "hf:alice"}}
         store = FakeHistoryStore(initial_buckets=[stale])
         history = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
 
@@ -644,7 +645,37 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         await history._flush_dirty_buckets(include_open_bucket=True)
 
         self.assertEqual(store.saved[2 * 3600]["llm_proxy_requests"], 2)
-        self.assertEqual(store.saved[2 * 3600]["llm_proxy_sequences"], {"old-process": 1, "new-process": 1})
+        self.assertEqual(
+            store.saved[2 * 3600]["llm_proxy_events"],
+            {"old-process": {1: "hf:alice"}, "new-process": {1: "hf:alice"}},
+        )
+
+    async def test_delayed_merge_unions_events_split_across_load_balancers(self):
+        clock = FakeClock(2 * 3600)
+        old = SwarmHistoryBucket(bucket_start_s=2 * 3600)
+        old.llm_proxy_requests = 1
+        old.llm_proxy_events = {"compute-a": {1: "hf:alice"}}
+        old.requester_usage = {
+            "hf:alice": {
+                "label": "@alice",
+                "kind": "authenticated",
+                "verification": "verified",
+                "llm_proxy_requests": 1,
+            }
+        }
+        store = FakeHistoryStore()
+        history = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
+
+        await history.record_llm_proxy_request("compute-a", 2, "hf:bob", {"label": "@bob"})
+        store.saved[2 * 3600] = old.to_dict()
+        await history._merge_persisted_history_buckets([old])
+        await history._flush_dirty_buckets(include_open_bucket=True)
+
+        saved = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
+        self.assertEqual(saved.llm_proxy_requests, 2)
+        self.assertEqual(saved.llm_proxy_events, {"compute-a": {1: "hf:alice", 2: "hf:bob"}})
+        self.assertEqual(saved.requester_usage["hf:alice"]["llm_proxy_requests"], 1)
+        self.assertEqual(saved.requester_usage["hf:bob"]["llm_proxy_requests"], 1)
 
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
