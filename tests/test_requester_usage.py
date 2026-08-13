@@ -146,8 +146,18 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("rate limited: 1 request", leaderboard[0]["signals"])
         self.assertFalse(any(signal.startswith("mostly short sessions") for signal in leaderboard[0]["signals"]))
 
-    async def test_proxy_only_requester_is_included_in_the_leaderboard(self):
+    async def test_proxy_only_requester_preserves_session_kpis_and_ordering(self):
         service = self._service(FakeClock(2 * 3600))
+        await service.record(
+            "request",
+            RequesterIdentity(
+                actor_id="anonymous:session",
+                label="Session requester",
+                kind="anonymous",
+                verification="not_provided",
+                fingerprint="session",
+            ),
+        )
         await service.history.record_llm_proxy_usage(
             {
                 "reachy-s2s-01": {
@@ -186,12 +196,14 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
 
         payload = await service.data(window_minutes=60)
 
-        self.assertEqual(payload["summary"]["authenticated_users_window"], 1)
+        self.assertEqual(payload["summary"]["unique_requesters_window"], 1)
+        self.assertEqual(payload["summary"]["authenticated_users_window"], 0)
         self.assertEqual(payload["tracked_llm_proxy_requests"], 2)
-        self.assertEqual(payload["leaderboard"][0]["actor_id"], "hf:reachy-user")
-        self.assertEqual(payload["leaderboard"][0]["llm_proxy_requests"], 2)
-        self.assertEqual(payload["leaderboard"][0]["llm_proxy_accepted"], 1)
-        self.assertEqual(payload["leaderboard"][0]["llm_proxy_rejected"], 1)
+        self.assertEqual(payload["leaderboard"][0]["actor_id"], "anonymous:session")
+        proxy_row = next(row for row in payload["leaderboard"] if row["actor_id"] == "hf:reachy-user")
+        self.assertEqual(proxy_row["llm_proxy_requests"], 2)
+        self.assertEqual(proxy_row["llm_proxy_accepted"], 1)
+        self.assertEqual(proxy_row["llm_proxy_rejected"], 1)
 
     async def test_empty_usage_has_zero_median(self):
         service = self._service(FakeClock(2 * 3600))

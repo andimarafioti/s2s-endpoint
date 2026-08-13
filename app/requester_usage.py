@@ -340,7 +340,7 @@ def aggregate_requester_usage(
     attributed_connections = 0
 
     for actor_id, actor in actors.items():
-        if (actor.requests > 0 or actor.llm_proxy_requests > 0) and actor_id != "overflow":
+        if actor.requests > 0 and actor_id != "overflow":
             token_actors.update(actor.requesting_token_actor_ids)
             authenticated_accounts.update(actor.authenticated_account_names)
             if actor.kind == "authenticated" and actor.verification == "verified":
@@ -373,18 +373,11 @@ def aggregate_requester_usage(
             )
         )
 
-    rows.sort(
-        key=lambda row: (
-            -(int(row["requests"]) + int(row["llm_proxy_requests"])),
-            str(row["label"]),
-        )
-    )
+    rows.sort(key=lambda row: (-int(row["requests"]), str(row["label"])))
     unattributed_requests = max(total_session_requests - tracked_requests, 0)
     summary = {
         "unique_requesters_window": sum(
-            1
-            for row in rows
-            if row["actor_id"] != "overflow" and (int(row["requests"]) > 0 or int(row["llm_proxy_requests"]) > 0)
+            1 for row in rows if row["actor_id"] != "overflow" and int(row["requests"]) > 0
         ),
         "authenticated_users_window": len(authenticated_accounts),
         "tokens_window": len(token_actors),
