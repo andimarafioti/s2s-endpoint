@@ -107,34 +107,25 @@ def build_endpoint_env(
 ) -> dict[str, str]:
     endpoint_env = dict(base_env)
 
-    if session_shared_secret is not None:
-        session_shared_secret = session_shared_secret.strip()
-        if not session_shared_secret:
-            raise ValueError("--session-shared-secret must be a non-empty string")
-        endpoint_env["SESSION_SHARED_SECRET"] = session_shared_secret
-    elif not endpoint_env.get("SESSION_SHARED_SECRET", "").strip():
-        raise ValueError("--session-shared-secret is required unless copied from --copy-env-from")
+    for name, value, flag in (
+        ("SESSION_SHARED_SECRET", session_shared_secret, "--session-shared-secret"),
+        ("LB_CALLBACK_AUTH_TOKEN", lb_callback_auth_token, "--lb-callback-auth-token"),
+        (
+            "LLM_PROXY_ACCOUNTING_CALLBACK_URL",
+            llm_proxy_accounting_callback_url,
+            "--llm-proxy-accounting-callback-url",
+        ),
+    ):
+        if value is not None:
+            endpoint_env[name] = value.strip()
+        if not endpoint_env.get(name, "").strip():
+            raise ValueError(f"{flag} is required unless copied from --copy-env-from")
 
     if num_pipelines is not None:
         endpoint_env["NUM_PIPELINES"] = str(num_pipelines)
     elif "NUM_PIPELINES" not in endpoint_env:
         endpoint_env["NUM_PIPELINES"] = "1"
 
-    if lb_callback_auth_token is not None:
-        lb_callback_auth_token = lb_callback_auth_token.strip()
-        if not lb_callback_auth_token:
-            raise ValueError("--lb-callback-auth-token must be a non-empty string")
-        endpoint_env["LB_CALLBACK_AUTH_TOKEN"] = lb_callback_auth_token
-    elif not endpoint_env.get("LB_CALLBACK_AUTH_TOKEN", "").strip():
-        raise ValueError("--lb-callback-auth-token is required unless copied from --copy-env-from")
-
-    if llm_proxy_accounting_callback_url is not None:
-        llm_proxy_accounting_callback_url = llm_proxy_accounting_callback_url.strip()
-        if not llm_proxy_accounting_callback_url:
-            raise ValueError("--llm-proxy-accounting-callback-url must be a non-empty string")
-        endpoint_env["LLM_PROXY_ACCOUNTING_CALLBACK_URL"] = llm_proxy_accounting_callback_url
-    elif not endpoint_env.get("LLM_PROXY_ACCOUNTING_CALLBACK_URL", "").strip():
-        raise ValueError("--llm-proxy-accounting-callback-url is required unless copied from --copy-env-from")
     callback_url = endpoint_env["LLM_PROXY_ACCOUNTING_CALLBACK_URL"].strip()
     parsed_callback_url = urlsplit(callback_url)
     if parsed_callback_url.scheme != "https" or not parsed_callback_url.netloc:

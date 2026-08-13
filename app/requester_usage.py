@@ -12,6 +12,7 @@ from app.dashboard_history import (
     _isoformat,
     _merge_requester_identity,
 )
+from app.llm_proxy_usage import llm_proxy_counts
 from app.requester_identity import RequesterIdentity
 
 
@@ -38,9 +39,7 @@ class _ActorUsageAccumulator:
     failures: int = 0
     auth_rejected: int = 0
     rate_limited: int = 0
-    llm_proxy_accepted: int = 0
-    llm_proxy_rejected: int = 0
-    llm_proxy_rejection_reasons: Counter[str] = field(default_factory=Counter)
+    llm_proxy_reasons: Counter[str] = field(default_factory=Counter)
     abandoned: int = 0
     connections: int = 0
     completed_sessions: int = 0
@@ -114,10 +113,8 @@ class _ActorUsageAccumulator:
         self.failures += max(int(record.get("failures", 0)), 0)
         self.auth_rejected += max(int(record.get("auth_rejected", 0)), 0)
         self.rate_limited += max(int(record.get("rate_limited", 0)), 0)
-        self.llm_proxy_accepted += max(int(record.get("llm_proxy_accepted", 0)), 0)
-        self.llm_proxy_rejected += max(int(record.get("llm_proxy_rejected", 0)), 0)
-        for reason, count in dict(record.get("llm_proxy_rejection_reasons") or {}).items():
-            self.llm_proxy_rejection_reasons[str(reason)] += max(int(count), 0)
+        for reason, count in dict(record.get("llm_proxy_reasons") or {}).items():
+            self.llm_proxy_reasons[str(reason)] += max(int(count), 0)
         self.abandoned += max(int(record.get("abandoned", 0)), 0)
         connections = max(int(record.get("connections", 0)), 0)
         self.connections += connections
@@ -224,10 +221,7 @@ class _ActorUsageAccumulator:
             "failures": self.failures,
             "auth_rejected": self.auth_rejected,
             "rate_limited": self.rate_limited,
-            "llm_proxy_requests": self.llm_proxy_accepted + self.llm_proxy_rejected,
-            "llm_proxy_accepted": self.llm_proxy_accepted,
-            "llm_proxy_rejected": self.llm_proxy_rejected,
-            "llm_proxy_rejection_reasons": dict(self.llm_proxy_rejection_reasons),
+            **llm_proxy_counts(self.llm_proxy_reasons),
             "abandoned": self.abandoned,
             "connections": self.connections,
             "completed_sessions": self.completed_sessions,

@@ -370,8 +370,8 @@ def _llm_proxy_gate(
     token: Optional[str],
     settings: ComputeSettings,
     dependencies: "ComputeDependencies",
-) -> tuple[Optional[JSONResponse], str, bool]:
-    """Return the local gate response, accounting reason, and session match.
+) -> tuple[Optional[JSONResponse], str]:
+    """Return the local gate response and its canonical accounting reason.
 
     The api key must be the HF token the session was created with, checked by
     fingerprint against the sessions whose websocket is currently connected.
@@ -379,13 +379,14 @@ def _llm_proxy_gate(
     fail closed. Checked once at request start: an answer already streaming
     when its session disconnects finishes undisturbed.
     """
+    if not settings.enable_llm_proxy:
+        return None, "proxy_disabled"
+
     fingerprint = None
     if settings.session_shared_secret and token is not None:
         candidate = llm_token_fingerprint(settings.session_shared_secret, token)
         if candidate in dependencies.connected_llm_fingerprints:
             fingerprint = candidate
-    if not settings.enable_llm_proxy:
-        return None, "proxy_disabled", fingerprint is not None
     if fingerprint is None:
         denial = _llm_proxy_error(
             401,
@@ -393,7 +394,7 @@ def _llm_proxy_gate(
             "while the session's realtime websocket is connected.",
             "invalid_api_key",
         )
-        return denial, "missing_token" if token is None else "no_active_session_match", False
+        return denial, "missing_token" if token is None else "no_active_session_match"
     if not dependencies.llm_rate_limiter.allow(fingerprint):
         denial = _llm_proxy_error(
             429,
@@ -401,8 +402,8 @@ def _llm_proxy_gate(
             "per user. Back off and retry.",
             "rate_limit_exceeded",
         )
-        return denial, "rate_limited", True
-    return None, "accepted", True
+        return denial, "rate_limited"
+    return None, "accepted"
 
 
 async def _report_llm_proxy_request(
@@ -410,34 +411,32 @@ async def _report_llm_proxy_request(
     settings: ComputeSettings,
     dependencies: "ComputeDependencies",
     *,
-    outcome: str,
     reason: str,
     token: Optional[str],
-    session_matched: bool,
 ) -> None:
     if not settings.llm_proxy_accounting_callback_url:
         logger.warning("LLM proxy accounting skipped: no fleet callback URL is configured")
         return
 
-    payload: dict[str, object] = {
-        "outcome": outcome,
-        "reason": reason,
-        "session_matched": session_matched,
-        "credential_present": token is not None,
-    }
+    payload: dict[str, object] = {"reason": reason}
     if token is not None and is_validatable_hf_token(token):
         payload["token"] = token
     address = client_address(request, trust_proxy_headers=settings.llm_proxy_trust_proxy_headers)
     if address is not None:
         payload["client_ip"] = address
     try:
-        await dependencies.notify_lb_llm_proxy_usage(
-            settings.llm_proxy_accounting_callback_url,
-            payload,
-            timeout_s=LLM_PROXY_ACCOUNTING_TIMEOUT_S,
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                _post_json,
+                settings.llm_proxy_accounting_callback_url,
+                payload,
+                callback_auth_token=settings.lb_callback_auth_token,
+                timeout_s=LLM_PROXY_ACCOUNTING_TIMEOUT_S,
+            ),
+            timeout=LLM_PROXY_ACCOUNTING_TIMEOUT_S,
         )
     except Exception as exc:
-        logger.warning("Failed to record LLM proxy %s request: %s", outcome, exc)
+        logger.warning("Failed to record LLM proxy request reason=%s: %s", reason, exc)
 
 
 async def llm_proxy_chat_completions(
@@ -484,15 +483,13 @@ async def _proxy_llm_request(
     unreachable).
     """
     token = _llm_proxy_token(request)
-    denial, reason, session_matched = _llm_proxy_gate(token, settings, dependencies)
+    denial, reason = _llm_proxy_gate(token, settings, dependencies)
     await _report_llm_proxy_request(
         request,
         settings,
         dependencies,
-        outcome="accepted" if reason == "accepted" else "rejected",
         reason=reason,
         token=token,
-        session_matched=session_matched,
     )
     if reason == "proxy_disabled":
         raise HTTPException(status_code=404)
@@ -769,7 +766,6 @@ class ComputeDependencies:
     llm_rate_limiter: _FingerprintRateLimiter
     http_get_json: Callable[[str], dict[str, object]]
     notify_lb_session_event: Callable[..., Awaitable[None]]
-    notify_lb_llm_proxy_usage: Callable[..., Awaitable[None]]
     proxy_websocket: Callable[..., Awaitable[None]]
 
 
@@ -819,23 +815,6 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
             backoff_s=backoff_s,
         )
 
-    async def notify_lb_llm_proxy_usage(
-        callback_url: str,
-        payload: dict[str, object],
-        *,
-        timeout_s: float,
-    ) -> None:
-        await asyncio.wait_for(
-            asyncio.to_thread(
-                _post_json,
-                callback_url,
-                payload,
-                callback_auth_token=settings.lb_callback_auth_token,
-                timeout_s=timeout_s,
-            ),
-            timeout=timeout_s,
-        )
-
     router = SessionRouter(
         host=settings.internal_ws_host,
         base_port=settings.internal_ws_base_port,
@@ -851,7 +830,6 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
         llm_rate_limiter=_FingerprintRateLimiter(settings.llm_proxy_requests_per_minute),
         http_get_json=_http_get_json,
         notify_lb_session_event=notify_lb_session_event,
-        notify_lb_llm_proxy_usage=notify_lb_llm_proxy_usage,
         proxy_websocket=proxy_websocket,
     )
 

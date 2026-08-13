@@ -38,7 +38,6 @@ def _compute_dependencies(label: str) -> compute_app.ComputeDependencies:
         llm_rate_limiter=compute_app._FingerprintRateLimiter(10),
         http_get_json=lambda url: {},
         notify_lb_session_event=notify,
-        notify_lb_llm_proxy_usage=notify,
         proxy_websocket=proxy,
     )
 

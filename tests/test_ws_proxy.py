@@ -60,7 +60,6 @@ def _dependencies(router, notify):
         llm_rate_limiter=compute_main._FingerprintRateLimiter(100),
         http_get_json=lambda url: {},
         notify_lb_session_event=notify,
-        notify_lb_llm_proxy_usage=notify,
         proxy_websocket=proxy_websocket,
     )
 

@@ -32,7 +32,7 @@ from app.endpoint_pool_router import (
 from app.llm_proxy_usage import (
     LLM_PROXY_CALLBACK_BODY_MAX_BYTES,
     LLM_PROXY_CLIENT_IP_MAX_LENGTH,
-    LLM_PROXY_REJECTION_REASONS,
+    LLM_PROXY_REASONS,
 )
 from app.requester_identity import (
     RequesterIdentity,
@@ -1267,20 +1267,11 @@ async def llm_proxy_usage(
     payload: dict[str, Any],
 ):
     """Record one compute-reported LLM proxy gate decision."""
-    outcome = str(payload.get("outcome", "")).strip()
-    if outcome not in {"accepted", "rejected"}:
-        raise HTTPException(status_code=400, detail="outcome must be 'accepted' or 'rejected'")
-    reason = str(payload.get("reason", "")).strip()
-    allowed_reasons = {"accepted"} if outcome == "accepted" else set(LLM_PROXY_REJECTION_REASONS)
-    if reason not in allowed_reasons:
-        raise HTTPException(status_code=400, detail=f"invalid reason for {outcome} outcome")
-
-    session_matched = payload.get("session_matched")
-    if type(session_matched) is not bool:
-        raise HTTPException(status_code=400, detail="session_matched must be a boolean")
-    credential_present = payload.get("credential_present")
-    if type(credential_present) is not bool:
-        raise HTTPException(status_code=400, detail="credential_present must be a boolean")
+    if payload.keys() - {"reason", "token", "client_ip"}:
+        raise HTTPException(status_code=400, detail="callback payload contains unknown fields")
+    reason = payload.get("reason")
+    if reason not in LLM_PROXY_REASONS:
+        raise HTTPException(status_code=400, detail="invalid LLM proxy reason")
 
     token = payload.get("token")
     if token is not None and (not isinstance(token, str) or not is_validatable_hf_token(token)):
@@ -1291,15 +1282,22 @@ async def llm_proxy_usage(
         if not isinstance(client_ip, str) or not client_ip.strip() or len(client_ip) > LLM_PROXY_CLIENT_IP_MAX_LENGTH:
             raise HTTPException(status_code=400, detail="client_ip is malformed or too long")
 
-    requester = await _llm_proxy_usage_requester(
-        runtime,
-        token=token,
-        credential_present=credential_present,
-        client_ip=client_ip,
-    )
+    resolver = runtime.dependencies.requester_identity_resolver
+    requester = resolver.identify_values(token=None, address=client_ip)
+    if token is not None:
+        token_requester = await resolver.wait_for_verification(
+            resolver.identify_values(token=token, address=client_ip),
+            timeout_s=runtime.settings.llm_proxy_claim_verify_timeout_s,
+        )
+        requester = (
+            token_requester
+            if token_requester.verification == "verified"
+            else replace(requester, verification=token_requester.verification)
+        )
+    elif reason == "no_active_session_match":
+        requester = replace(requester, verification="unrecognized")
 
     await runtime.dependencies.dashboard.record_llm_proxy_request(
-        outcome,
         reason=reason,
         actor_id=requester.actor_id,
         metadata=requester.history_metadata(),
@@ -1320,31 +1318,6 @@ async def _llm_proxy_usage_payload(request: Request) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="callback payload must be an object")
     return payload
-
-
-async def _llm_proxy_usage_requester(
-    runtime: LoadBalancerRuntime,
-    *,
-    token: str | None,
-    credential_present: bool,
-    client_ip: str | None,
-) -> RequesterIdentity:
-    resolver = runtime.dependencies.requester_identity_resolver
-    if token is not None:
-        token_requester = await resolver.wait_for_verification(
-            resolver.identify_values(token=token, address=client_ip),
-            timeout_s=runtime.settings.llm_proxy_claim_verify_timeout_s,
-        )
-        if token_requester.verification == "verified":
-            return token_requester
-        verification = token_requester.verification
-    else:
-        verification = "unrecognized" if credential_present else "not_provided"
-
-    network_requester = resolver.identify_values(token=None, address=client_ip)
-    if credential_present:
-        network_requester = replace(network_requester, verification=verification)
-    return network_requester
 
 
 async def endpoint_status(runtime: LoadBalancerRuntime, endpoint_name: str, request: Request):

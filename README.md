@@ -449,8 +449,8 @@ load-balancer variable is ignored and can be removed from existing deployments.
   requester's HF token.
 - `LLM_PROXY_ACCOUNTING_CALLBACK_URL`: full load-balancer
   `/internal/llm-proxy-usage` URL. Every LLM proxy attempt sends one best-effort,
-  at-most-once callback after the local gate decision, including accepted calls
-  and requests rejected without an active session.
+  at-most-once callback containing its canonical gate reason and, when
+  available, the presented HF token and trusted client IP.
 - `LLM_PROXY_TRUST_PROXY_HEADERS`: whether proxy accounting trusts the first
   `X-Forwarded-For`/`X-Real-IP` address (defaults to `true`). Disable this
   outside a trusted reverse-proxy deployment.
