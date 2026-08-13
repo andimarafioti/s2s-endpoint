@@ -1199,6 +1199,7 @@ class DashboardHistory:
                 try:
                     buckets, updated_bucket_count = await self._reconcile_persisted_history()
                     await self._flush_dirty_buckets(include_open_bucket=True)
+                    await self._cleanup_llm_proxy_event_ledger()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -1236,19 +1237,24 @@ class DashboardHistory:
         )
         updated_bucket_count = await self._merge_persisted_history_buckets(buckets)
         if hasattr(self.history_store, "load_llm_proxy_events"):
-            min_bucket_start_s = _bucket_start_epoch_s(now_epoch_s, 1) - self.llm_usage_reconciliation_minutes * 60
             events = await asyncio.to_thread(
                 self.history_store.load_llm_proxy_events,
-                min_bucket_start_s=min_bucket_start_s,
+                min_bucket_start_s=0,
             )
             for event in events:
                 await self._record_llm_proxy_request_at(event)
-            if hasattr(self.history_store, "delete_llm_proxy_events_before"):
-                await asyncio.to_thread(
-                    self.history_store.delete_llm_proxy_events_before,
-                    min_bucket_start_s,
-                )
+            async with self._lock:
+                self._prune_unlocked(now_epoch_s)
         return buckets, updated_bucket_count
+
+    async def _cleanup_llm_proxy_event_ledger(self) -> None:
+        if not hasattr(self.history_store, "delete_llm_proxy_events_before"):
+            return
+        cutoff = _bucket_start_epoch_s(self._time_fn(), 1) - self.llm_usage_reconciliation_minutes * 60
+        async with self._lock:
+            if any(bucket_start_s < cutoff for bucket_start_s in self._dirty_bucket_starts):
+                return
+        await asyncio.to_thread(self.history_store.delete_llm_proxy_events_before, cutoff)
 
     async def _record_llm_proxy_request_at(self, event: LLMProxyUsageEvent) -> None:
         await self._record_llm_proxy_request_in_memory(

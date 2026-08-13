@@ -2036,6 +2036,27 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bucket.llm_proxy_requests, 2)
         self.assertEqual(bucket.llm_proxy_events, {"compute-a": {1: "hf:alice"}, "compute-b": {1: "hf:bob"}})
 
+    async def test_reconciliation_flushes_old_ledger_event_before_cleanup(self):
+        clock = FakeClock(2 * 3600 + 6 * 60)
+        store = FakeHistoryStore()
+        store.write_llm_proxy_event(LLMProxyUsageEvent(2 * 3600, "compute-a", 1, "hf:alice", {"label": "@alice"}))
+        history = DashboardHistory(
+            retention_minutes=60,
+            history_store=store,
+            startup_merge_delay_s=0.01,
+            time_fn=clock.now,
+        )
+
+        await history.start()
+        try:
+            while history.startup_merge_status()["completed_passes"] < 1:
+                await asyncio.sleep(0.005)
+        finally:
+            await history.stop()
+
+        self.assertEqual(store.saved[2 * 3600]["llm_proxy_requests"], 1)
+        self.assertEqual(store.llm_proxy_events, {})
+
     async def test_startup_merge_schedule_continues_after_a_failed_pass(self):
         clock = FakeClock(_day_start(2026, 5, 19) + 60)
         store = FailingLoadHistoryStore(fail_on_load_calls={2})
