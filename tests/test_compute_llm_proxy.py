@@ -452,8 +452,8 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertLess(elapsed, 1.0)
         self.assertEqual(len(self.stub.requests), 1)
 
-    def test_locked_outbox_does_not_block_accounting_or_reuse_sequence(self) -> None:
-        async def exercise(outbox_path: str) -> tuple[list[tuple[str, int]], bool]:
+    def test_locked_outbox_retries_persistence_before_delivery(self) -> None:
+        async def exercise(outbox_path: str) -> list[tuple[str, int]]:
             delivered: list[tuple[str, int]] = []
 
             async def notify(*args: Any, **kwargs: Any) -> None:
@@ -488,13 +488,52 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
                 attempts=1,
             )
             await recovered.stop()
-            return delivered, delivered[0][0] != delivered[1][0]
+            return delivered
 
         with tempfile.TemporaryDirectory() as directory:
             outbox_path = str(Path(directory) / "usage.sqlite3")
-            delivered, changed_epoch = asyncio.run(exercise(outbox_path))
-            self.assertEqual([sequence for _, sequence in delivered], [1, 1])
-            self.assertTrue(changed_epoch)
+            delivered = asyncio.run(exercise(outbox_path))
+            self.assertEqual([sequence for _, sequence in delivered], [1, 2])
+            self.assertEqual(delivered[0][0], delivered[1][0])
+
+    def test_locked_outbox_retains_usage_when_callback_is_unavailable(self) -> None:
+        async def exercise(outbox_path: str) -> list[int]:
+            async def unavailable(*args: Any, **kwargs: Any) -> None:
+                raise RuntimeError("LB unavailable")
+
+            usage = compute_main._LLMProxyUsage(outbox_path=outbox_path)
+            await usage.start()
+            blocker = sqlite3.connect(outbox_path)
+            blocker.execute("BEGIN EXCLUSIVE")
+            try:
+                with self.assertLogs("s2s-endpoint", level="ERROR"):
+                    await usage.record(
+                        "https://lb.example/event",
+                        "session-token",
+                        "session-1",
+                        SECRET,
+                        unavailable,
+                        attempts=1,
+                    )
+            finally:
+                blocker.rollback()
+                blocker.close()
+            with self.assertLogs("s2s-endpoint", level="ERROR"):
+                await usage.stop(timeout_s=0.01)
+
+            delivered: list[int] = []
+
+            async def recovered_notify(*args: Any, **kwargs: Any) -> None:
+                delivered.append(kwargs["extra_payload"]["sequence"])
+
+            recovered = compute_main._LLMProxyUsage(notify=recovered_notify, outbox_path=outbox_path)
+            await recovered.start()
+            await recovered.stop()
+            return delivered
+
+        with tempfile.TemporaryDirectory() as directory:
+            outbox_path = str(Path(directory) / "usage.sqlite3")
+            self.assertEqual(asyncio.run(exercise(outbox_path)), [1])
 
     def test_outbox_io_does_not_block_the_event_loop(self) -> None:
         async def exercise(outbox_path: str) -> bool:
