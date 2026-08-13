@@ -677,6 +677,25 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved.requester_usage["hf:alice"]["llm_proxy_requests"], 1)
         self.assertEqual(saved.requester_usage["hf:bob"]["llm_proxy_requests"], 1)
 
+    async def test_delayed_merge_deduplicates_an_event_across_minutes(self):
+        clock = FakeClock(2 * 3600 + 60)
+        previous = SwarmHistoryBucket(bucket_start_s=2 * 3600)
+        previous.llm_proxy_requests = 1
+        previous.llm_proxy_events = {"compute-a": {1: "hf:alice"}}
+        previous.requester_usage = {"hf:alice": {"label": "@alice", "llm_proxy_requests": 1}}
+        store = FakeHistoryStore()
+        history = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
+
+        await history.record_llm_proxy_request("compute-a", 1, "hf:alice", {"label": "@alice"})
+        await history._merge_persisted_history_buckets([previous])
+        await history._flush_dirty_buckets(include_open_bucket=True)
+
+        snapshot = await history.snapshot()
+        self.assertEqual(sum(bucket.llm_proxy_requests for bucket in snapshot), 1)
+        self.assertEqual(snapshot[0].llm_proxy_events, {"compute-a": {1: "hf:alice"}})
+        self.assertEqual(snapshot[1].llm_proxy_events, {})
+        self.assertEqual(snapshot[1].requester_usage["hf:alice"]["llm_proxy_requests"], 0)
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(

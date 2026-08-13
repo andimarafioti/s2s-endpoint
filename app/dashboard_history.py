@@ -454,6 +454,28 @@ def _normalize_llm_proxy_usage(
         bucket.requester_usage[actor_id] = record
 
 
+def _remove_duplicate_llm_proxy_events(buckets: list[SwarmHistoryBucket]) -> set[int]:
+    """Keep each event in its earliest minute when callbacks straddle a rollover."""
+    seen: set[tuple[str, int]] = set()
+    changed: set[int] = set()
+    for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
+        for instance_id, sequences in list(bucket.llm_proxy_events.items()):
+            unique = {
+                sequence: actor_id for sequence, actor_id in sequences.items() if (instance_id, sequence) not in seen
+            }
+            seen.update((instance_id, sequence) for sequence in unique)
+            if unique == sequences:
+                continue
+            changed.add(bucket.bucket_start_s)
+            if unique:
+                bucket.llm_proxy_events[instance_id] = unique
+            else:
+                bucket.llm_proxy_events.pop(instance_id)
+        if bucket.bucket_start_s in changed:
+            _normalize_llm_proxy_usage(bucket)
+    return changed
+
+
 def _merge_requester_identity(record: dict[str, object], metadata: dict[str, object]) -> None:
     current_verification = str(record.get("verification") or "unknown")
     new_verification = str(metadata.get("verification") or "unknown")
@@ -1196,6 +1218,10 @@ class DashboardHistory:
                         continue
                 self._history[bucket.bucket_start_s] = bucket
                 updated_bucket_count += 1
+            for bucket_start_s in _remove_duplicate_llm_proxy_events(list(self._history.values())):
+                if bucket_start_s not in self._dirty_bucket_starts:
+                    updated_bucket_count += 1
+                self._mark_bucket_dirty_unlocked(bucket_start_s)
             self._history = OrderedDict(sorted(self._history.items()))
             self._prune_unlocked(self._time_fn())
             self._recount_requester_records_unlocked()
