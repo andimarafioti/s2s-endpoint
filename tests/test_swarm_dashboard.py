@@ -477,6 +477,56 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved.llm_proxy_requests, 5)
         self.assertEqual(saved.llm_proxy_sequences, {"old-process": 5})
 
+    async def test_shutdown_recovers_restore_cancelled_during_merge(self):
+        class FirstMergeBlockingHistory(DashboardHistory):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.merge_started = asyncio.Event()
+                self.merge_calls = 0
+
+            async def _merge_persisted_history_buckets(self, buckets):
+                self.merge_calls += 1
+                if self.merge_calls == 1:
+                    self.merge_started.set()
+                    await asyncio.Event().wait()
+                return await super()._merge_persisted_history_buckets(buckets)
+
+        clock = FakeClock(2 * 3600)
+        persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
+        persisted.llm_proxy_requests = 5
+        persisted.llm_proxy_sequences = {"old-process": 5}
+        store = FakeHistoryStore(initial_buckets=[persisted])
+        history = FirstMergeBlockingHistory(
+            retention_minutes=60,
+            history_store=store,
+            restore_history_in_background=True,
+            time_fn=clock.now,
+        )
+        await history.record_sample(
+            SwarmStateSample.from_health_snapshot(
+                healthy=True,
+                detail=None,
+                snapshot=_health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )[2],
+                captured_at_s=clock.now(),
+            )
+        )
+
+        await history.start()
+        await history.merge_started.wait()
+        await history.stop()
+
+        saved = SwarmHistoryBucket.from_dict(store.saved[2 * 3600])
+        self.assertGreaterEqual(history.merge_calls, 2)
+        self.assertEqual(saved.llm_proxy_requests, 5)
+        self.assertEqual(saved.llm_proxy_sequences, {"old-process": 5})
+
     async def test_delayed_merge_uses_initial_restore_as_its_baseline(self):
         clock = FakeClock(2 * 3600)
         initial = SwarmHistoryBucket(bucket_start_s=2 * 3600)

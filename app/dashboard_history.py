@@ -1005,6 +1005,18 @@ class DashboardHistory:
         self._history_restore_detail = "Loading persisted dashboard history"
         try:
             buckets = await self._load_persisted_history()
+
+            if not buckets:
+                self._history_restore_status = "empty"
+                self._history_restore_detail = "No persisted dashboard history found"
+                self._history_restore_finished_at_s = time.monotonic()
+                logger.info(
+                    "No persisted dashboard history restored after %.2fs",
+                    time.monotonic() - started_s,
+                )
+                return
+
+            await self._merge_persisted_history_buckets(buckets)
         except asyncio.CancelledError:
             self._history_restore_status = "cancelled"
             self._history_restore_detail = "Dashboard history restore was cancelled"
@@ -1016,18 +1028,6 @@ class DashboardHistory:
             self._history_restore_finished_at_s = time.monotonic()
             logger.warning("Failed to restore dashboard history from bucket store: %s", exc)
             return
-
-        if not buckets:
-            self._history_restore_status = "empty"
-            self._history_restore_detail = "No persisted dashboard history found"
-            self._history_restore_finished_at_s = time.monotonic()
-            logger.info(
-                "No persisted dashboard history restored after %.2fs",
-                time.monotonic() - started_s,
-            )
-            return
-
-        await self._merge_persisted_history_buckets(buckets)
 
         self._history_restore_status = "complete"
         self._history_restore_detail = "Persisted dashboard history restored"
