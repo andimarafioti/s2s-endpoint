@@ -381,15 +381,30 @@ class _LLMProxyUsage:
     _worker: Optional[asyncio.Task[None]] = None
     _delivering: bool = False
     _outbox: Optional[sqlite3.Connection] = field(default=None, init=False, repr=False)
+    _outbox_writable: bool = field(default=True, init=False, repr=False)
+    _record_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _outbox_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
-    def __post_init__(self) -> None:
-        if not self.outbox_path:
-            return
+    async def start(self) -> None:
+        await self._ensure_outbox()
+        self._start_delivery()
+
+    async def _ensure_outbox(self) -> None:
+        async with self._outbox_lock:
+            if not self.outbox_path or self._outbox is not None or not self._outbox_writable:
+                return
+            try:
+                await asyncio.to_thread(self._open_outbox)
+            except Exception:
+                self._outbox_writable = False
+                logger.exception("Failed to open the LLM usage outbox; continuing with in-memory delivery")
+
+    def _open_outbox(self) -> None:
         outbox: Optional[sqlite3.Connection] = None
         try:
             path = Path(self.outbox_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            outbox = sqlite3.connect(path, timeout=0.1)
+            outbox = sqlite3.connect(path, timeout=0.1, check_same_thread=False)
             path.chmod(0o600)
             outbox.execute("PRAGMA synchronous=FULL")
             outbox.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -410,15 +425,12 @@ class _LLMProxyUsage:
             self.requests = int(stored_requests[0]) if stored_requests is not None else 0
             outbox.commit()
             self._outbox = outbox
-        except Exception:
-            logger.exception("Failed to open the LLM usage outbox; continuing with in-memory delivery")
+        except BaseException:
             if outbox is not None:
                 outbox.close()
+            raise
 
-    async def start(self) -> None:
-        self._start_delivery()
-
-    def record(
+    async def record(
         self,
         callback_url: str,
         session_token: str,
@@ -428,9 +440,47 @@ class _LLMProxyUsage:
         *,
         attempts: int,
     ) -> None:
-        self.notify = notify
-        self.requests += 1
-        event = (
+        async with self._record_lock:
+            await self._ensure_outbox()
+            self.notify = notify
+            self.requests += 1
+            event = self._event(
+                callback_url,
+                session_token,
+                session_id,
+                shared_secret,
+                attempts,
+            )
+            async with self._outbox_lock:
+                if self._outbox is not None and self._outbox_writable:
+                    try:
+                        await asyncio.to_thread(self._persist_event, event)
+                    except Exception:
+                        logger.exception("Failed to persist an LLM usage event; switching to an in-memory epoch")
+                        self.instance_id = uuid.uuid4().hex
+                        self.requests = 1
+                        self._outbox_writable = False
+                        event = self._event(
+                            callback_url,
+                            session_token,
+                            session_id,
+                            shared_secret,
+                            attempts,
+                        )
+                        self._pending.append(event)
+                else:
+                    self._pending.append(event)
+            self._start_delivery()
+
+    def _event(
+        self,
+        callback_url: str,
+        session_token: str,
+        session_id: str,
+        shared_secret: str,
+        attempts: int,
+    ) -> tuple[int, str, str, int, dict[str, object]]:
+        return (
             self.requests,
             callback_url,
             session_token,
@@ -446,8 +496,6 @@ class _LLMProxyUsage:
                 ),
             },
         )
-        self._persist_event(event)
-        self._start_delivery()
 
     def _start_delivery(self) -> None:
         if self.notify is None:
@@ -457,61 +505,60 @@ class _LLMProxyUsage:
                 self._worker = asyncio.create_task(self._deliver())
 
     def _persist_event(self, event: tuple[int, str, str, int, dict[str, object]]) -> None:
-        if self._outbox is None:
-            self._pending.append(event)
-            return
+        assert self._outbox is not None
         sequence, callback_url, session_token, attempts, extra_payload = event
-        try:
-            with self._outbox:
-                self._outbox.execute(
-                    "INSERT INTO events(sequence, callback_url, session_token, attempts, payload) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (sequence, callback_url, session_token, attempts, json.dumps(extra_payload)),
-                )
-                self._outbox.execute(
-                    "INSERT INTO metadata(key, value) VALUES ('requests', ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (str(sequence),),
-                )
-        except Exception:
-            logger.exception("Failed to persist an LLM usage event; continuing with in-memory delivery")
-            self._pending.append(event)
-
-    def _next_event(self) -> Optional[tuple[int, str, str, int, dict[str, object]]]:
-        pending = self._pending[0] if self._pending else None
-        row = (
+        with self._outbox:
             self._outbox.execute(
-                "SELECT sequence, callback_url, session_token, attempts, payload FROM events ORDER BY sequence LIMIT 1"
-            ).fetchone()
-            if self._outbox is not None
-            else None
-        )
-        if row is None:
-            return pending
-        sequence, callback_url, session_token, attempts, payload = row
-        persisted = int(sequence), str(callback_url), str(session_token), int(attempts), json.loads(str(payload))
-        if pending is not None and pending[0] < persisted[0]:
-            return pending
-        return persisted
+                "INSERT INTO events(sequence, callback_url, session_token, attempts, payload) VALUES (?, ?, ?, ?, ?)",
+                (sequence, callback_url, session_token, attempts, json.dumps(extra_payload)),
+            )
+            self._outbox.execute(
+                "INSERT INTO metadata(key, value) VALUES ('requests', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(sequence),),
+            )
 
-    def _acknowledge_event(self, sequence: int) -> bool:
-        if self._pending and self._pending[0][0] == sequence:
-            self._pending.popleft()
+    def _next_persisted_event(self) -> Optional[tuple[int, str, str, int, dict[str, object]]]:
+        assert self._outbox is not None
+        row = self._outbox.execute(
+            "SELECT sequence, callback_url, session_token, attempts, payload FROM events ORDER BY sequence LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        sequence, callback_url, session_token, attempts, payload = row
+        return int(sequence), str(callback_url), str(session_token), int(attempts), json.loads(str(payload))
+
+    async def _next_event(self) -> Optional[tuple[int, str, str, int, dict[str, object]]]:
+        async with self._outbox_lock:
+            if self._outbox is not None:
+                persisted = await asyncio.to_thread(self._next_persisted_event)
+                if persisted is not None:
+                    return persisted
+            return self._pending[0] if self._pending else None
+
+    def _acknowledge_persisted_event(self, sequence: int) -> None:
+        assert self._outbox is not None
+        with self._outbox:
+            self._outbox.execute("DELETE FROM events WHERE sequence = ?", (sequence,))
+
+    async def _acknowledge_event(self, sequence: int, instance_id: object) -> bool:
+        async with self._outbox_lock:
+            if self._pending and self._pending[0][0] == sequence and self._pending[0][4]["instance_id"] == instance_id:
+                self._pending.popleft()
+                return True
+            if self._outbox is None:
+                return True
+            try:
+                await asyncio.to_thread(self._acknowledge_persisted_event, sequence)
+            except Exception:
+                logger.exception("Failed to remove an acknowledged LLM usage event from the outbox")
+                return False
             return True
-        if self._outbox is None:
-            return True
-        try:
-            with self._outbox:
-                self._outbox.execute("DELETE FROM events WHERE sequence = ?", (sequence,))
-        except Exception:
-            logger.exception("Failed to remove an acknowledged LLM usage event from the outbox")
-            return False
-        return True
 
     async def _deliver(self) -> None:
         while True:
             try:
-                event = self._next_event()
+                event = await self._next_event()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -540,7 +587,7 @@ class _LLMProxyUsage:
                     except Exception:
                         logger.exception("Failed to record LLM proxy usage; retrying in background")
                         await asyncio.sleep(1.0)
-                if not self._acknowledge_event(sequence):
+                if not await self._acknowledge_event(sequence, extra_payload.get("instance_id")):
                     return
             finally:
                 self._delivering = False
@@ -551,20 +598,23 @@ class _LLMProxyUsage:
             try:
                 await asyncio.wait_for(asyncio.shield(self._worker), timeout=max(timeout_s, 0.0))
             except asyncio.TimeoutError:
-                logger.error("Retaining %d undelivered LLM usage events for restart", self._pending_count())
+                pending = await self._pending_count()
+                logger.error("Retaining %d undelivered LLM usage events for restart", pending)
                 self._worker.cancel()
                 await asyncio.gather(self._worker, return_exceptions=True)
         self._worker = None
-        if self._outbox is not None:
-            self._outbox.close()
-            self._outbox = None
+        async with self._outbox_lock:
+            if self._outbox is not None:
+                await asyncio.to_thread(self._outbox.close)
+                self._outbox = None
 
-    def _pending_count(self) -> int:
-        persisted = 0
-        if self._outbox is not None:
-            row = self._outbox.execute("SELECT COUNT(*) FROM events").fetchone()
-            persisted = int(row[0]) if row is not None else 0
-        return len(self._pending) + persisted
+    async def _pending_count(self) -> int:
+        async with self._outbox_lock:
+            persisted = 0
+            if self._outbox is not None:
+                row = await asyncio.to_thread(lambda: self._outbox.execute("SELECT COUNT(*) FROM events").fetchone())
+                persisted = int(row[0]) if row is not None else 0
+            return len(self._pending) + persisted
 
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
@@ -673,7 +723,7 @@ async def _proxy_llm_request(
     fingerprint = llm_token_fingerprint(settings.session_shared_secret, token)
     callback = dependencies.connected_llm_fingerprints.callback(fingerprint)
     assert callback is not None
-    dependencies.llm_proxy_usage.record(
+    await dependencies.llm_proxy_usage.record(
         *callback,
         settings.session_shared_secret,
         dependencies.notify_lb_session_event,

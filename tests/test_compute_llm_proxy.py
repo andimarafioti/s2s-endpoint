@@ -395,7 +395,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
 
             usage = compute_main._LLMProxyUsage()
             with patch("app.compute_app.asyncio.sleep", new=no_sleep):
-                usage.record(
+                await usage.record(
                     "https://lb.example/event",
                     "session-token",
                     "session-1",
@@ -416,7 +416,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
                 sequences.append(kwargs["extra_payload"]["sequence"])
 
             usage = compute_main._LLMProxyUsage()
-            usage.record(
+            await usage.record(
                 "https://lb.example/event",
                 "session-token",
                 "session-1",
@@ -426,7 +426,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
             )
             assert usage._worker is not None
             await usage._worker
-            usage.record(
+            await usage.record(
                 "https://lb.example/event",
                 "session-token",
                 "session-1",
@@ -452,19 +452,20 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertLess(elapsed, 1.0)
         self.assertEqual(len(self.stub.requests), 1)
 
-    def test_locked_outbox_does_not_block_accounting(self) -> None:
-        async def exercise(outbox_path: str) -> list[int]:
-            delivered: list[int] = []
+    def test_locked_outbox_does_not_block_accounting_or_reuse_sequence(self) -> None:
+        async def exercise(outbox_path: str) -> tuple[list[tuple[str, int]], bool]:
+            delivered: list[tuple[str, int]] = []
 
             async def notify(*args: Any, **kwargs: Any) -> None:
-                delivered.append(kwargs["extra_payload"]["sequence"])
+                payload = kwargs["extra_payload"]
+                delivered.append((payload["instance_id"], payload["sequence"]))
 
             usage = compute_main._LLMProxyUsage(outbox_path=outbox_path)
             blocker = sqlite3.connect(outbox_path)
             blocker.execute("BEGIN EXCLUSIVE")
             try:
                 with self.assertLogs("s2s-endpoint", level="ERROR"):
-                    usage.record(
+                    await usage.record(
                         "https://lb.example/event",
                         "session-token",
                         "session-1",
@@ -476,11 +477,58 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
                 blocker.rollback()
                 blocker.close()
             await usage.stop()
-            return delivered
+            recovered = compute_main._LLMProxyUsage(outbox_path=outbox_path)
+            await recovered.start()
+            await recovered.record(
+                "https://lb.example/event",
+                "session-token",
+                "session-1",
+                SECRET,
+                notify,
+                attempts=1,
+            )
+            await recovered.stop()
+            return delivered, delivered[0][0] != delivered[1][0]
 
         with tempfile.TemporaryDirectory() as directory:
             outbox_path = str(Path(directory) / "usage.sqlite3")
-            self.assertEqual(asyncio.run(exercise(outbox_path)), [1])
+            delivered, changed_epoch = asyncio.run(exercise(outbox_path))
+            self.assertEqual([sequence for _, sequence in delivered], [1, 1])
+            self.assertTrue(changed_epoch)
+
+    def test_outbox_io_does_not_block_the_event_loop(self) -> None:
+        async def exercise(outbox_path: str) -> bool:
+            async def notify(*args: Any, **kwargs: Any) -> None:
+                pass
+
+            usage = compute_main._LLMProxyUsage(outbox_path=outbox_path)
+            await usage.start()
+            blocker = sqlite3.connect(outbox_path)
+            blocker.execute("BEGIN EXCLUSIVE")
+            heartbeat = asyncio.Event()
+            asyncio.get_running_loop().call_later(0.01, heartbeat.set)
+            record_task = asyncio.create_task(
+                usage.record(
+                    "https://lb.example/event",
+                    "session-token",
+                    "session-1",
+                    SECRET,
+                    notify,
+                    attempts=1,
+                )
+            )
+            try:
+                await asyncio.wait_for(heartbeat.wait(), timeout=0.05)
+            finally:
+                blocker.rollback()
+                blocker.close()
+            await record_task
+            await usage.stop()
+            return heartbeat.is_set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            outbox_path = str(Path(directory) / "usage.sqlite3")
+            self.assertTrue(asyncio.run(exercise(outbox_path)))
 
     def test_shutdown_retains_unavailable_usage_for_restart(self) -> None:
         async def exercise() -> None:
@@ -490,7 +538,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
                 raise RuntimeError("LB unavailable")
 
             usage = compute_main._LLMProxyUsage(outbox_path=outbox_path)
-            usage.record(
+            await usage.record(
                 "https://lb.example/event",
                 "session-token",
                 "session-1",
@@ -511,9 +559,9 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
                 notify=recovered_notify,
                 outbox_path=outbox_path,
             )
-            instance_id = recovered.instance_id
             await recovered.start()
-            recovered.record(
+            instance_id = recovered.instance_id
+            await recovered.record(
                 "https://lb.example/event",
                 "session-token",
                 "session-1",
