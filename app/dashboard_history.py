@@ -69,10 +69,92 @@ def _cumulative_deltas(
     return ({field: current_values[field] - previous_values[field] for field in fields}, False)
 
 
+def _coerce_counter_triple(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        raise ValueError("counter record must be an object")
+    counters = {
+        field_name: max(int(value.get(field_name, 0)), 0) for field_name in ("requests", "accepted", "rejected")
+    }
+    if counters["accepted"] + counters["rejected"] != counters["requests"]:
+        raise ValueError("accepted plus rejected must equal requests")
+    return counters
+
+
+def _coerce_llm_proxy_baselines(value: object) -> dict[str, dict[str, object]]:
+    if not isinstance(value, dict):
+        raise ValueError("LLM proxy baselines must be an object")
+    baselines: dict[str, dict[str, object]] = {}
+    for raw_endpoint_name, raw_usage in value.items():
+        if not isinstance(raw_usage, dict):
+            raise ValueError("LLM proxy baseline must be an object")
+        endpoint_name = str(raw_endpoint_name)[:128]
+        instance_id = str(raw_usage.get("instance_id") or "")[:128]
+        if not endpoint_name or not instance_id:
+            raise ValueError("LLM proxy baseline must identify its endpoint and process")
+        counters = _coerce_counter_triple(raw_usage)
+        raw_requesters = raw_usage.get("requesters") or {}
+        if not isinstance(raw_requesters, dict):
+            raise ValueError("LLM proxy baseline requesters must be an object")
+        requesters: dict[str, dict[str, object]] = {}
+        for raw_actor_id, raw_record in raw_requesters.items():
+            if not isinstance(raw_record, dict):
+                raise ValueError("LLM proxy requester baseline must be an object")
+            actor_id = str(raw_actor_id)[:128]
+            if not actor_id:
+                raise ValueError("LLM proxy requester baseline must identify its requester")
+            requester_counters = _coerce_counter_triple(raw_record)
+            raw_metadata = raw_record.get("metadata") or {}
+            if not isinstance(raw_metadata, dict):
+                raise ValueError("LLM proxy requester metadata must be an object")
+            requesters[actor_id] = {
+                "metadata": {
+                    key: raw_metadata[key]
+                    for key in ("label", "kind", "verification", "fingerprint", "account_name")
+                    if raw_metadata.get(key) is not None
+                },
+                **requester_counters,
+            }
+        baselines[endpoint_name] = {
+            "instance_id": instance_id,
+            **counters,
+            "requesters": requesters,
+        }
+    return baselines
+
+
+def _coerce_llm_proxy_checkpoint(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("LLM proxy checkpoint must be an object")
+    counters = _coerce_counter_triple(value)
+    requester_usage = _coerce_requester_usage(value.get("requester_usage"))
+    for record in requester_usage.values():
+        _coerce_counter_triple(
+            {
+                "requests": record["llm_proxy_requests"],
+                "accepted": record["llm_proxy_accepted"],
+                "rejected": record["llm_proxy_rejected"],
+            }
+        )
+    return {
+        "version": 1,
+        "bucket_start_s": int(value.get("bucket_start_s", 0)),
+        **counters,
+        "requester_usage": requester_usage,
+        "baselines": _coerce_llm_proxy_baselines(value.get("baselines")),
+    }
+
+
 class DashboardHistoryStore(Protocol):
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list["SwarmHistoryBucket"]: ...
 
-    def write_buckets(self, buckets: list["SwarmHistoryBucket"]) -> None: ...
+    def load_llm_proxy_checkpoint(self) -> Optional[dict[str, object]]: ...
+
+    def write_buckets(
+        self,
+        buckets: list["SwarmHistoryBucket"],
+        *,
+        llm_proxy_checkpoint: Optional[dict[str, object]] = None,
+    ) -> None: ...
 
     def write_day_buckets(self, *, day_start_s: int, buckets: list["SwarmHistoryBucket"]) -> Optional[str]: ...
 
@@ -552,6 +634,10 @@ class DashboardHistory:
         self._last_dirty_bucket_warning_at_monotonic_s: Optional[float] = None
         self._day_rollover_cursor_s: Optional[int] = None
         self._llm_proxy_baselines: dict[str, dict[str, object]] = {}
+        self._restored_llm_proxy_checkpoint: Optional[dict[str, object]] = None
+        self._llm_proxy_checkpoint_dirty = False
+        self._llm_proxy_checkpoint_generation = 0
+        self._llm_proxy_checkpoint_bucket_start_s: Optional[int] = None
         self._history_restore_status = "disabled" if history_store is None else "pending"
         self._history_restore_detail: Optional[str] = None
         self._history_restore_started_at_s: Optional[float] = None
@@ -570,6 +656,7 @@ class DashboardHistory:
 
     async def start(self) -> None:
         if self.history_store is not None:
+            await self._restore_llm_proxy_checkpoint()
             if self.restore_history_in_background:
                 logger.info("Restoring dashboard history in the background")
                 self._history_restore_status = "running"
@@ -577,6 +664,8 @@ class DashboardHistory:
                 self._restore_task = asyncio.create_task(self._restore_history())
             else:
                 await self._restore_history()
+            async with self._lock:
+                self._apply_restored_llm_proxy_checkpoint_unlocked()
             if self._startup_merge_scheduled_passes > 0:
                 self._startup_merge_status = "waiting"
                 self._startup_merge_attempted_passes = 0
@@ -627,14 +716,16 @@ class DashboardHistory:
         async with self._lock:
             bucket = self._get_bucket_unlocked(sample.captured_at_s)
             bucket.record_sample(sample)
-            self._record_llm_proxy_usage_unlocked(
-                bucket,
-                {
-                    str(endpoint.get("name")): endpoint["llm_proxy_usage"]
-                    for endpoint in sample.endpoints
-                    if endpoint.get("name") and isinstance(endpoint.get("llm_proxy_usage"), dict)
-                },
-            )
+            usage_by_endpoint = {
+                str(endpoint.get("name")): endpoint["llm_proxy_usage"]
+                for endpoint in sample.endpoints
+                if endpoint.get("name") and isinstance(endpoint.get("llm_proxy_usage"), dict)
+            }
+            checkpoint_changed = self._record_llm_proxy_usage_unlocked(bucket, usage_by_endpoint)
+            if checkpoint_changed:
+                self._llm_proxy_checkpoint_dirty = True
+                self._llm_proxy_checkpoint_generation += 1
+                self._llm_proxy_checkpoint_bucket_start_s = bucket.bucket_start_s
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(sample.captured_at_s)
             self._wake_persistence_unlocked()
@@ -644,8 +735,11 @@ class DashboardHistory:
         now = self._time_fn()
         async with self._lock:
             bucket = self._get_bucket_unlocked(now)
-            changed = self._record_llm_proxy_usage_unlocked(bucket, usage_by_endpoint)
-            if changed:
+            checkpoint_changed = self._record_llm_proxy_usage_unlocked(bucket, usage_by_endpoint)
+            if checkpoint_changed:
+                self._llm_proxy_checkpoint_dirty = True
+                self._llm_proxy_checkpoint_generation += 1
+                self._llm_proxy_checkpoint_bucket_start_s = bucket.bucket_start_s
                 self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
                 self._wake_persistence_unlocked()
             self._prune_unlocked(now)
@@ -655,7 +749,7 @@ class DashboardHistory:
         bucket: SwarmHistoryBucket,
         usage_by_endpoint: dict[str, dict[str, object]],
     ) -> bool:
-        changed = False
+        checkpoint_changed = False
         for endpoint_name, current in usage_by_endpoint.items():
             instance_id = str(current.get("instance_id") or "")
             if not instance_id:
@@ -676,7 +770,6 @@ class DashboardHistory:
                 bucket.llm_proxy_requests += requests
                 bucket.llm_proxy_accepted += accepted
                 bucket.llm_proxy_rejected += rejected
-                changed = True
 
             raw_requesters = current.get("requesters") or {}
             previous_requesters = (previous.get("requesters") or {}) if same_instance and previous is not None else {}
@@ -711,10 +804,10 @@ class DashboardHistory:
                         metadata=metadata if isinstance(metadata, dict) else {},
                         deltas=requester_deltas,
                     )
-                    changed = True
-
-            self._llm_proxy_baselines[endpoint_name] = copy.deepcopy(current)
-        return changed
+            if previous != current:
+                self._llm_proxy_baselines[endpoint_name] = copy.deepcopy(current)
+                checkpoint_changed = True
+        return checkpoint_changed
 
     def _record_llm_proxy_requester_unlocked(
         self,
@@ -1169,6 +1262,83 @@ class DashboardHistory:
             now_epoch_s=self._time_fn() if now_epoch_s is None else now_epoch_s,
         )
 
+    async def _restore_llm_proxy_checkpoint(self) -> None:
+        if self.history_store is None:
+            return
+        loader = getattr(self.history_store, "load_llm_proxy_checkpoint", None)
+        if not callable(loader):
+            return
+        try:
+            raw_checkpoint = await asyncio.to_thread(loader)
+            if raw_checkpoint is not None:
+                self._restored_llm_proxy_checkpoint = _coerce_llm_proxy_checkpoint(raw_checkpoint)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Failed to restore LLM proxy history checkpoint: %s", exc)
+
+    def _apply_restored_llm_proxy_checkpoint_unlocked(self) -> None:
+        checkpoint = self._restored_llm_proxy_checkpoint
+        if checkpoint is None:
+            return
+        self._llm_proxy_baselines = copy.deepcopy(checkpoint["baselines"])
+        bucket_start_s = int(checkpoint["bucket_start_s"])
+        min_allowed_bucket = _bucket_start_epoch_s(self._time_fn(), 1) - (self.retention_minutes - 1) * 60
+        if bucket_start_s >= min_allowed_bucket:
+            bucket = self._history.get(bucket_start_s)
+            if bucket is None:
+                bucket = SwarmHistoryBucket(bucket_start_s=bucket_start_s)
+                self._history[bucket_start_s] = bucket
+                self._history = OrderedDict(sorted(self._history.items()))
+            bucket.llm_proxy_requests = int(checkpoint["requests"])
+            bucket.llm_proxy_accepted = int(checkpoint["accepted"])
+            bucket.llm_proxy_rejected = int(checkpoint["rejected"])
+            for actor_id, source_record in dict(checkpoint["requester_usage"]).items():
+                record = bucket.requester_usage.get(actor_id)
+                if record is None:
+                    record = _new_requester_usage_record(source_record)
+                    bucket.requester_usage[actor_id] = record
+                _merge_requester_identity(record, source_record)
+                for field_name in ("llm_proxy_requests", "llm_proxy_accepted", "llm_proxy_rejected"):
+                    record[field_name] = int(source_record[field_name])
+            self._recount_requester_records_unlocked()
+            self._enforce_requester_record_limit_unlocked()
+        self._llm_proxy_checkpoint_bucket_start_s = bucket_start_s
+        self._restored_llm_proxy_checkpoint = None
+
+    def _llm_proxy_checkpoint_unlocked(self) -> Optional[dict[str, object]]:
+        if not self._llm_proxy_checkpoint_dirty or self._llm_proxy_checkpoint_bucket_start_s is None:
+            return None
+        bucket = self._history.get(self._llm_proxy_checkpoint_bucket_start_s)
+        if bucket is None:
+            return None
+        requester_usage = {
+            actor_id: {
+                key: record.get(key)
+                for key in (
+                    "label",
+                    "kind",
+                    "verification",
+                    "fingerprint",
+                    "account_name",
+                    "llm_proxy_requests",
+                    "llm_proxy_accepted",
+                    "llm_proxy_rejected",
+                )
+            }
+            for actor_id, record in bucket.requester_usage.items()
+            if int(record.get("llm_proxy_requests", 0)) > 0
+        }
+        return {
+            "version": 1,
+            "bucket_start_s": bucket.bucket_start_s,
+            "requests": bucket.llm_proxy_requests,
+            "accepted": bucket.llm_proxy_accepted,
+            "rejected": bucket.llm_proxy_rejected,
+            "requester_usage": requester_usage,
+            "baselines": copy.deepcopy(self._llm_proxy_baselines),
+        }
+
     async def _merge_persisted_history_buckets(self, buckets: list[SwarmHistoryBucket]) -> int:
         merge_candidates: list[tuple[SwarmHistoryBucket, Optional[SwarmHistoryBucket]]] = []
         sorted_buckets = sorted(buckets, key=lambda item: item.bucket_start_s)
@@ -1227,7 +1397,9 @@ class DashboardHistory:
             while True:
                 async with self._lock:
                     buckets = self._collect_dirty_buckets_unlocked(include_open_bucket=include_open_bucket)
-                if not buckets:
+                    llm_proxy_checkpoint = self._llm_proxy_checkpoint_unlocked()
+                    checkpoint_generation = self._llm_proxy_checkpoint_generation
+                if not buckets and llm_proxy_checkpoint is None:
                     if flush_started:
                         self._last_flush_finished_at_s = self._time_fn()
                     return
@@ -1241,7 +1413,10 @@ class DashboardHistory:
                     self._last_flush_error = None
                     self._flush_started_at_monotonic_s = time.monotonic()
 
-                if not await self._write_bucket_batch(buckets):
+                if not await self._write_bucket_batch(
+                    buckets,
+                    llm_proxy_checkpoint=llm_proxy_checkpoint,
+                ):
                     return
 
                 async with self._lock:
@@ -1249,6 +1424,11 @@ class DashboardHistory:
                         current_bucket = self._history.get(bucket.bucket_start_s)
                         if current_bucket is None or current_bucket.to_dict() == bucket.to_dict():
                             self._dirty_bucket_starts.discard(bucket.bucket_start_s)
+                    if (
+                        llm_proxy_checkpoint is not None
+                        and self._llm_proxy_checkpoint_generation == checkpoint_generation
+                    ):
+                        self._llm_proxy_checkpoint_dirty = False
         finally:
             self._flush_started_at_monotonic_s = None
 
@@ -1269,11 +1449,22 @@ class DashboardHistory:
                 self._flush_stalled_started_at_s = None
                 self._flush_stalled_started_at_monotonic_s = None
 
-    async def _write_bucket_batch(self, buckets: list[SwarmHistoryBucket]) -> bool:
+    async def _write_bucket_batch(
+        self,
+        buckets: list[SwarmHistoryBucket],
+        *,
+        llm_proxy_checkpoint: Optional[dict[str, object]],
+    ) -> bool:
         if self.history_store is None:
             return False
 
-        write_task = asyncio.create_task(asyncio.to_thread(self.history_store.write_buckets, buckets))
+        write_task = asyncio.create_task(
+            asyncio.to_thread(
+                self.history_store.write_buckets,
+                buckets,
+                llm_proxy_checkpoint=llm_proxy_checkpoint,
+            )
+        )
         self._flush_write_task = write_task
         timed_out = False
         try:

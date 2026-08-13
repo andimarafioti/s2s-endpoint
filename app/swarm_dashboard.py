@@ -251,8 +251,8 @@ class SwarmDashboard:
         self._sample_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
-        await self.capture_sample()
         await self.history.start()
+        await self.capture_sample()
         self._sample_task = asyncio.create_task(self._sample_loop())
 
     async def stop(self) -> None:

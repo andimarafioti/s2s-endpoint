@@ -35,6 +35,7 @@ class FakeSnapshotProvider:
 class FakeHistoryStore:
     def __init__(self, initial_buckets=None):
         self.saved = {bucket.bucket_start_s: bucket.to_dict() for bucket in (initial_buckets or [])}
+        self.llm_proxy_checkpoint = None
         self.write_calls = []
         self.load_calls = 0
         self.load_requests = []
@@ -49,10 +50,15 @@ class FakeHistoryStore:
             if bucket_start_s >= min_bucket
         ]
 
-    def write_buckets(self, buckets):
+    def load_llm_proxy_checkpoint(self):
+        return self.llm_proxy_checkpoint
+
+    def write_buckets(self, buckets, *, llm_proxy_checkpoint=None):
         self.write_calls.append([bucket.bucket_start_s for bucket in buckets])
         for bucket in buckets:
             self.saved[bucket.bucket_start_s] = bucket.to_dict()
+        if llm_proxy_checkpoint is not None:
+            self.llm_proxy_checkpoint = json.loads(json.dumps(llm_proxy_checkpoint))
 
 
 class DayRolloverHistoryStore(FakeHistoryStore):
@@ -99,12 +105,12 @@ class BlockingFirstWriteHistoryStore(FakeHistoryStore):
         self.release_first_write = threading.Event()
         self.write_attempts = 0
 
-    def write_buckets(self, buckets):
+    def write_buckets(self, buckets, *, llm_proxy_checkpoint=None):
         self.write_attempts += 1
         if self.write_attempts == 1:
             self.first_write_started.set()
             self.release_first_write.wait()
-        super().write_buckets(buckets)
+        super().write_buckets(buckets, llm_proxy_checkpoint=llm_proxy_checkpoint)
 
 
 class FlakyWriteHistoryStore(FakeHistoryStore):
@@ -114,12 +120,12 @@ class FlakyWriteHistoryStore(FakeHistoryStore):
         self.write_attempts = 0
         self.write_attempt_started_at = []
 
-    def write_buckets(self, buckets):
+    def write_buckets(self, buckets, *, llm_proxy_checkpoint=None):
         self.write_attempts += 1
         self.write_attempt_started_at.append(time.monotonic())
         if self.write_attempts in self.fail_on_write_attempts:
             raise RuntimeError(f"write failure {self.write_attempts}")
-        super().write_buckets(buckets)
+        super().write_buckets(buckets, llm_proxy_checkpoint=llm_proxy_checkpoint)
 
 
 class BlockingFailingFirstWriteHistoryStore(FakeHistoryStore):
@@ -130,14 +136,14 @@ class BlockingFailingFirstWriteHistoryStore(FakeHistoryStore):
         self.write_attempts = 0
         self.write_attempt_started_at = []
 
-    def write_buckets(self, buckets):
+    def write_buckets(self, buckets, *, llm_proxy_checkpoint=None):
         self.write_attempts += 1
         self.write_attempt_started_at.append(time.monotonic())
         if self.write_attempts == 1:
             self.first_write_started.set()
             self.release_first_write.wait()
             raise RuntimeError("blocked write failed")
-        super().write_buckets(buckets)
+        super().write_buckets(buckets, llm_proxy_checkpoint=llm_proxy_checkpoint)
 
 
 class FakeBucketItem:
@@ -438,6 +444,76 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requester_row["llm_proxy_requests"], 7)
         self.assertEqual(requester_row["llm_proxy_accepted"], 6)
         self.assertEqual(requester_row["llm_proxy_rejected"], 1)
+
+    async def test_lb_restart_recovers_unseen_delta_from_persisted_checkpoint(self):
+        clock = FakeClock(2 * 3600)
+        store = FakeHistoryStore()
+
+        def snapshot(requests: int, accepted: int):
+            rejected = requests - accepted
+            return _health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+                llm_proxy_usages=[
+                    {
+                        "instance_id": "process-a",
+                        "requests": requests,
+                        "accepted": accepted,
+                        "rejected": rejected,
+                        "requesters": {
+                            "anonymous:ip123": {
+                                "metadata": {
+                                    "label": "Anonymous IP •ip123",
+                                    "kind": "anonymous",
+                                    "verification": "not_provided",
+                                    "fingerprint": "ip123",
+                                },
+                                "requests": requests,
+                                "accepted": accepted,
+                                "rejected": rejected,
+                            }
+                        },
+                    }
+                ],
+            )
+
+        first_provider = FakeSnapshotProvider(snapshot(0, 0))
+        first = SwarmDashboard(
+            snapshot_provider=first_provider,
+            sample_interval_s=3600,
+            history_store=store,
+            time_fn=clock.now,
+        )
+        await first.capture_sample()
+        first_provider.payload = snapshot(6, 4)
+        await first.capture_sample()
+        await first.history._flush_dirty_buckets(include_open_bucket=False)
+        self.assertEqual(store.saved, {})
+        self.assertIsNotNone(store.llm_proxy_checkpoint)
+
+        second = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(snapshot(7, 4)),
+            sample_interval_s=3600,
+            history_store=store,
+            time_fn=clock.now,
+        )
+        await second.start()
+        try:
+            payload = await second.data(window="60m", resolution="minute")
+        finally:
+            await second.stop()
+
+        self.assertEqual(payload["summary"]["llm_proxy_requests_window"], 7)
+        self.assertEqual(payload["summary"]["llm_proxy_accepted_window"], 4)
+        self.assertEqual(payload["summary"]["llm_proxy_rejected_window"], 3)
+        requester = next(row for row in payload["requesters"]["leaderboard"] if row["actor_id"] == "anonymous:ip123")
+        self.assertEqual(requester["llm_proxy_requests"], 7)
+        self.assertEqual(requester["llm_proxy_accepted"], 4)
+        self.assertEqual(requester["llm_proxy_rejected"], 3)
 
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
@@ -2030,6 +2106,43 @@ class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
         store.write_buckets([bucket])
 
         self.assertEqual(api.batch_adds[0][1], f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json")
+
+    def test_write_and_load_llm_proxy_checkpoint_with_bucket_batch(self):
+        day_start = _day_start(2026, 5, 18)
+        bucket = SwarmHistoryBucket(bucket_start_s=day_start)
+        checkpoint = {
+            "version": 1,
+            "bucket_start_s": day_start,
+            "requests": 2,
+            "accepted": 1,
+            "rejected": 1,
+            "requester_usage": {},
+            "baselines": {},
+        }
+        api = FakeBucketApi({})
+        store = _bucket_store(api)
+
+        store.write_buckets([bucket], llm_proxy_checkpoint=checkpoint)
+
+        self.assertEqual(len(api.batch_calls), 1)
+        self.assertEqual(
+            [path for _, path in api.batch_calls[0]],
+            [
+                f"reachy-s2s-lb/minutes/2026-05-18/{day_start}.json",
+                "reachy-s2s-lb/llm-proxy-checkpoint.json",
+            ],
+        )
+        self.assertEqual(store.load_llm_proxy_checkpoint(), checkpoint)
+        self.assertEqual(
+            [remote_path for remote_path, _ in api.downloads],
+            ["reachy-s2s-lb/llm-proxy-checkpoint.json"],
+        )
+
+    def test_load_llm_proxy_checkpoint_returns_none_when_missing(self):
+        api = FakeBucketApi({})
+        store = _bucket_store(api)
+
+        self.assertIsNone(store.load_llm_proxy_checkpoint())
 
     def test_write_day_buckets_uses_day_path(self):
         day_start = _day_start(2026, 5, 18)

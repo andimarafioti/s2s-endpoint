@@ -948,8 +948,31 @@ class HuggingFaceBucketHistoryStore:
             "read_only": self.read_only,
         }
 
-    def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
-        if not buckets:
+    def load_llm_proxy_checkpoint(self) -> Optional[dict[str, object]]:
+        remote_path = self._llm_proxy_checkpoint_path()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = Path(tmpdir) / "llm-proxy-checkpoint.json"
+            self._download_bucket_files(
+                self.bucket_id,
+                files=[(remote_path, local_path)],
+                raise_on_missing_files=False,
+                token=self.token,
+            )
+            if not local_path.exists():
+                return None
+            payload = json.loads(local_path.read_text())
+        checkpoint = payload.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            raise ValueError("dashboard LLM proxy checkpoint payload is missing its checkpoint object")
+        return checkpoint
+
+    def write_buckets(
+        self,
+        buckets: list[SwarmHistoryBucket],
+        *,
+        llm_proxy_checkpoint: Optional[dict[str, object]] = None,
+    ) -> None:
+        if not buckets and llm_proxy_checkpoint is None:
             return
 
         add = []
@@ -962,6 +985,15 @@ class HuggingFaceBucketHistoryStore:
                 sort_keys=True,
             ).encode("utf-8")
             add.append((payload, self._bucket_path(bucket.bucket_start_s)))
+        if llm_proxy_checkpoint is not None:
+            payload = json.dumps(
+                {
+                    "version": 1,
+                    "checkpoint": llm_proxy_checkpoint,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            add.append((payload, self._llm_proxy_checkpoint_path()))
 
         self._batch_bucket_files(
             self.bucket_id,
@@ -990,6 +1022,11 @@ class HuggingFaceBucketHistoryStore:
 
     def _day_path(self, day_start_s: int) -> str:
         return f"{self._days_prefix()}/{_day_key(day_start_s)}.json"
+
+    def _llm_proxy_checkpoint_path(self) -> str:
+        if self.prefix:
+            return f"{self.prefix}/llm-proxy-checkpoint.json"
+        return "llm-proxy-checkpoint.json"
 
     def _bucket_start_from_path(self, path: object) -> Optional[int]:
         if path is None:
@@ -1037,8 +1074,17 @@ class ReadOnlyDashboardHistoryStore:
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list[SwarmHistoryBucket]:
         return self.wrapped.load_recent(retention_minutes=retention_minutes, now_epoch_s=now_epoch_s)
 
-    def write_buckets(self, buckets: list[SwarmHistoryBucket]) -> None:
-        if buckets:
+    def load_llm_proxy_checkpoint(self) -> Optional[dict[str, object]]:
+        loader = getattr(self.wrapped, "load_llm_proxy_checkpoint", None)
+        return loader() if callable(loader) else None
+
+    def write_buckets(
+        self,
+        buckets: list[SwarmHistoryBucket],
+        *,
+        llm_proxy_checkpoint: Optional[dict[str, object]] = None,
+    ) -> None:
+        if buckets or llm_proxy_checkpoint is not None:
             logger.debug("Skipping dashboard history write because history store is read-only")
 
     def write_day_buckets(self, *, day_start_s: int, buckets: list[SwarmHistoryBucket]) -> Optional[str]:
