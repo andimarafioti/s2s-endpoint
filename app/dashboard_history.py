@@ -19,6 +19,7 @@ PERSISTENCE_WORKER_RETRY_DELAY_S = 1.0
 FLUSH_RETRY_INITIAL_DELAY_S = 15.0
 FLUSH_RETRY_MAX_DELAY_S = 300.0
 STARTUP_MERGE_PASS_COUNT = 2
+MIN_LLM_USAGE_RECONCILIATION_MINUTES = 5
 
 
 def _normalize_status(status: object) -> str:
@@ -173,6 +174,7 @@ class SwarmHistoryBucket:
     completed_conversation_duration_samples_s: list[float] = field(default_factory=list)
     requester_usage: dict[str, dict[str, object]] = field(default_factory=dict)
     llm_proxy_events: dict[str, dict[int, str]] = field(default_factory=dict)
+    llm_proxy_sequences: dict[str, int] = field(default_factory=dict)
 
     def record_sample(self, sample: SwarmStateSample) -> None:
         self.sample_count += 1
@@ -332,6 +334,15 @@ def _coerce_history_bucket_field(name: str, payload: dict[str, object]) -> objec
                 if str(actor_id)
             }
         return events
+    if name == "llm_proxy_sequences":
+        value = payload.get(name)
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(instance_id)[:64]: max(int(sequence), 0)
+            for instance_id, sequence in value.items()
+            if isinstance(instance_id, str) and instance_id
+        }
     raise KeyError(f"Unknown SwarmHistoryBucket field: {name}")
 
 
@@ -476,6 +487,14 @@ def _remove_duplicate_llm_proxy_events(buckets: list[SwarmHistoryBucket]) -> set
     return changed
 
 
+def _merge_llm_proxy_sequences(target: SwarmHistoryBucket, source: SwarmHistoryBucket) -> None:
+    for instance_id, sequence in source.llm_proxy_sequences.items():
+        target.llm_proxy_sequences[instance_id] = max(
+            target.llm_proxy_sequences.get(instance_id, 0),
+            sequence,
+        )
+
+
 def _merge_requester_identity(record: dict[str, object], metadata: dict[str, object]) -> None:
     current_verification = str(record.get("verification") or "unknown")
     new_verification = str(metadata.get("verification") or "unknown")
@@ -556,11 +575,16 @@ class DashboardHistory:
         self.startup_merge_delay_s = startup_merge_delay_s
         self.max_requesters_per_bucket = max_requesters_per_bucket
         self.max_requester_records = max_requester_records
+        self.llm_usage_reconciliation_minutes = max(
+            MIN_LLM_USAGE_RECONCILIATION_MINUTES,
+            int(startup_merge_delay_s * STARTUP_MERGE_PASS_COUNT // 60) + 1,
+        )
         self._time_fn = time_fn
         self._lock = asyncio.Lock()
         self._persistence_lock = asyncio.Lock()
         self._history: "OrderedDict[int, SwarmHistoryBucket]" = OrderedDict()
         self._llm_proxy_event_ids: set[tuple[str, int]] = set()
+        self._compacted_llm_proxy_sequences: dict[str, int] = {}
         self._requester_record_count = 0
         self._restore_task: Optional[asyncio.Task] = None
         self._startup_merge_task: Optional[asyncio.Task] = None
@@ -840,8 +864,11 @@ class DashboardHistory:
         now = self._time_fn()
         counted = False
         async with self._lock:
+            self._prune_unlocked(now)
             event_id = (instance_id, sequence)
-            if event_id in self._llm_proxy_event_ids:
+            if event_id in self._llm_proxy_event_ids or sequence <= self._compacted_llm_proxy_sequences.get(
+                instance_id, 0
+            ):
                 bucket_start_s = next(
                     (
                         bucket.bucket_start_s
@@ -868,6 +895,10 @@ class DashboardHistory:
                         "verification": "not_applicable",
                     }
                 bucket.llm_proxy_events.setdefault(instance_id, {})[sequence] = resolved_actor_id
+                bucket.llm_proxy_sequences[instance_id] = max(
+                    bucket.llm_proxy_sequences.get(instance_id, 0),
+                    sequence,
+                )
                 record = bucket.requester_usage.get(resolved_actor_id)
                 if record is None:
                     self._make_requester_record_capacity_unlocked()
@@ -877,7 +908,6 @@ class DashboardHistory:
                 _merge_requester_identity(record, resolved_metadata)
                 record["llm_proxy_requests"] = int(record.get("llm_proxy_requests", 0)) + 1
                 self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
-                self._prune_unlocked(now)
                 self._wake_persistence_unlocked()
                 counted = True
 
@@ -907,6 +937,7 @@ class DashboardHistory:
 
         now = self._time_fn()
         async with self._lock:
+            self._prune_unlocked(now)
             bucket = self._get_bucket_unlocked(now)
             global_field, requester_field = counter_fields[event]
             if global_field is not None:
@@ -973,6 +1004,7 @@ class DashboardHistory:
     async def record_completed_conversation(self, duration_s: float) -> None:
         now = self._time_fn()
         async with self._lock:
+            self._prune_unlocked(now)
             bucket = self._get_bucket_unlocked(now)
             bucket.completed_conversations += 1
             bucket.completed_conversation_duration_total_s += duration_s
@@ -982,7 +1014,6 @@ class DashboardHistory:
             )
             bucket.completed_conversation_duration_samples_s.append(duration_s)
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
-            self._prune_unlocked(now)
             self._wake_persistence_unlocked()
 
     def _get_bucket_unlocked(self, epoch_s: float) -> SwarmHistoryBucket:
@@ -1021,6 +1052,24 @@ class DashboardHistory:
                 break
 
     def _prune_unlocked(self, epoch_s: float) -> None:
+        compact_before = _bucket_start_epoch_s(epoch_s, 1) - self.llm_usage_reconciliation_minutes * 60
+        for bucket in self._history.values():
+            if bucket.bucket_start_s > compact_before or not bucket.llm_proxy_events:
+                continue
+            for instance_id, sequences in bucket.llm_proxy_events.items():
+                high_water = max(sequences, default=0)
+                bucket.llm_proxy_sequences[instance_id] = max(
+                    bucket.llm_proxy_sequences.get(instance_id, 0),
+                    high_water,
+                )
+                self._compacted_llm_proxy_sequences[instance_id] = max(
+                    self._compacted_llm_proxy_sequences.get(instance_id, 0),
+                    high_water,
+                )
+            self._llm_proxy_event_ids.difference_update(_llm_proxy_event_ids(bucket))
+            bucket.llm_proxy_events.clear()
+            self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
+
         min_allowed_bucket = _bucket_start_epoch_s(epoch_s, 1) - (self.retention_minutes - 1) * 60
         while self._history:
             oldest_key = next(iter(self._history))
@@ -1193,6 +1242,7 @@ class DashboardHistory:
                 if new_event_ids:
                     for instance_id, sequences in bucket.llm_proxy_events.items():
                         current_bucket.llm_proxy_events.setdefault(instance_id, {}).update(sequences)
+                    _merge_llm_proxy_sequences(current_bucket, bucket)
                     for actor_id, record in bucket.requester_usage.items():
                         current_record = current_bucket.requester_usage.get(actor_id)
                         if current_record is not None:
@@ -1203,6 +1253,8 @@ class DashboardHistory:
                         for actor_id, record in source.items()
                     }
                     _normalize_llm_proxy_usage(current_bucket, metadata)
+                elif bucket.llm_proxy_sequences:
+                    _merge_llm_proxy_sequences(current_bucket, bucket)
                 if new_event_ids or missing_event_ids:
                     self._mark_bucket_dirty_unlocked(current_bucket.bucket_start_s)
                     updated_bucket_count += 1
@@ -1229,6 +1281,13 @@ class DashboardHistory:
             self._llm_proxy_event_ids = {
                 event_id for bucket in self._history.values() for event_id in _llm_proxy_event_ids(bucket)
             }
+            self._compacted_llm_proxy_sequences = {}
+            for bucket in self._history.values():
+                for instance_id, sequence in bucket.llm_proxy_sequences.items():
+                    self._compacted_llm_proxy_sequences[instance_id] = max(
+                        self._compacted_llm_proxy_sequences.get(instance_id, 0),
+                        sequence,
+                    )
         return updated_bucket_count
 
     def _wake_persistence_unlocked(self) -> None:

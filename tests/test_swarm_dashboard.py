@@ -696,6 +696,34 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot[1].llm_proxy_events, {})
         self.assertEqual(snapshot[1].requester_usage["hf:alice"]["llm_proxy_requests"], 0)
 
+    async def test_request_identities_are_compacted_after_reconciliation_window(self):
+        clock = FakeClock(2 * 3600)
+        history = DashboardHistory(retention_minutes=60, time_fn=clock.now, startup_merge_delay_s=60)
+        await history.record_llm_proxy_request("compute-a", 1, "hf:alice", {"label": "@alice"})
+
+        clock.set(clock.now() + history.llm_usage_reconciliation_minutes * 60)
+        await history.record_sample(
+            SwarmStateSample.from_health_snapshot(
+                healthy=True,
+                detail=None,
+                snapshot=_health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )[2],
+                captured_at_s=clock.now(),
+            )
+        )
+
+        first = (await history.snapshot())[0]
+        self.assertEqual(first.llm_proxy_events, {})
+        self.assertEqual(first.llm_proxy_sequences, {"compute-a": 1})
+        self.assertEqual(history._llm_proxy_event_ids, set())
+        self.assertFalse(await history.record_llm_proxy_request("compute-a", 1, "hf:alice", {"label": "@alice"}))
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(
