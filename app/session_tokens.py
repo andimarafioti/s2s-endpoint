@@ -15,7 +15,6 @@ def create_session_token(
     callback_url: str,
     ttl_s: float,
     llm_fingerprint: str | None = None,
-    llm_requester: dict[str, object] | None = None,
 ) -> str:
     expires_at = int(time.time() + ttl_s)
     payload = {
@@ -30,19 +29,12 @@ def create_session_token(
         # paths to api keys matching this claim while the session's
         # websocket is connected. Never a raw token.
         payload["llmf"] = llm_fingerprint
-        if llm_requester:
-            payload["llmr"] = llm_requester
     encoded_payload = _b64encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     signature = _sign(secret, encoded_payload)
     return f"{encoded_payload}.{signature}"
 
 
-def verify_session_token(
-    token: str,
-    secret: str,
-    *,
-    check_expiration: bool = True,
-) -> dict[str, Any]:
+def verify_session_token(token: str, secret: str) -> dict[str, Any]:
     try:
         encoded_payload, signature = token.split(".", 1)
     except ValueError as exc:
@@ -57,7 +49,7 @@ def verify_session_token(
     except Exception as exc:
         raise ValueError("invalid session token payload") from exc
 
-    if check_expiration and int(payload.get("exp", 0)) < int(time.time()):
+    if int(payload.get("exp", 0)) < int(time.time()):
         raise ValueError("session token expired")
 
     return payload

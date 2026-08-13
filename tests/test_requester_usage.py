@@ -557,4 +557,6 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertIn("LLM proxy requests", html)
         self.assertIn("row.llm_proxy_accepted", html)
         self.assertIn("row.llm_proxy_rejected", html)
+        self.assertIn("requesterProxyReasonSummary", html)
+        self.assertIn("row.llm_proxy_rejection_reasons", html)
         self.assertIn("function renderRequesterUsage(requesters, summary)", html)

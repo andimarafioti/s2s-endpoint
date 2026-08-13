@@ -116,12 +116,30 @@ class RequesterIdentityResolver:
         hardware_id: object = None,
         schedule_validation: bool = True,
     ) -> RequesterIdentity:
-        network_id = self._network_id(request)
-        reported_robot_id = self._reported_robot_id(hardware_id)
-        client_kind = _client_kind(_header(request, "user-agent"))
         token = bearer_token(_header(request, "x-reachy-mini-authorization"))
         if token is None:
             token = bearer_token(_header(request, "authorization"))
+
+        return self.identify_values(
+            token=token,
+            address=client_address(request, trust_proxy_headers=self._trust_proxy_headers),
+            hardware_id=hardware_id,
+            client_kind=_client_kind(_header(request, "user-agent")),
+            schedule_validation=schedule_validation,
+        )
+
+    def identify_values(
+        self,
+        *,
+        token: str | None,
+        address: str | None,
+        hardware_id: object = None,
+        client_kind: str = "unknown",
+        schedule_validation: bool = True,
+    ) -> RequesterIdentity:
+        """Resolve identity from trusted values supplied by another service."""
+        network_id = self._network_id_from_address(address)
+        reported_robot_id = self._reported_robot_id(hardware_id)
 
         if token is None:
             fingerprint = network_id.removeprefix("net:") if network_id else "unknown"
@@ -278,11 +296,10 @@ class RequesterIdentityResolver:
             "trust_proxy_headers": self._trust_proxy_headers,
         }
 
-    def _network_id(self, request: object) -> Optional[str]:
-        address = client_address(request, trust_proxy_headers=self._trust_proxy_headers)
+    def _network_id_from_address(self, address: str | None) -> Optional[str]:
         if not address:
             return None
-        return f"net:{self._fingerprint('network', address)}"
+        return f"net:{self._fingerprint('network', _normalize_address(address))}"
 
     def _reported_robot_id(self, hardware_id: object) -> Optional[str]:
         normalized = normalize_hardware_id(hardware_id)

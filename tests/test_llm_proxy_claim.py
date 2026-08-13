@@ -27,19 +27,6 @@ from tests.helpers import load_balancer_fixture
 
 SECRET = "shared-secret"
 HF_TOKEN = "hf_faketesttoken1234"
-REQUESTER_CONTEXT = {
-    "actor_id": "token:abcdef0123456789",
-    "metadata": {
-        "label": "@reachy-user · token •abcdef01",
-        "kind": "authenticated",
-        "verification": "verified",
-        "fingerprint": "abcdef0123456789",
-        "account_name": "reachy-user",
-        "network_id": "net:network123",
-        "reported_robot_id": "robot:robot123",
-        "client_kind": "robot:httpx",
-    },
-}
 
 
 class LlmTokenFingerprintTests(unittest.TestCase):
@@ -80,13 +67,8 @@ class SessionTokenClaimTests(unittest.TestCase):
 
     def test_claim_survives_the_signed_round_trip(self):
         fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
-        payload = verify_session_token(
-            self._mint(llm_fingerprint=fingerprint, llm_requester=REQUESTER_CONTEXT),
-            SECRET,
-        )
+        payload = verify_session_token(self._mint(llm_fingerprint=fingerprint), SECRET)
         self.assertEqual(payload["llmf"], fingerprint)
-        self.assertEqual(payload["llmr"], REQUESTER_CONTEXT)
-        self.assertNotIn(HF_TOKEN, str(payload))
 
     def test_token_without_claim_has_no_llmf_key(self):
         payload = verify_session_token(self._mint(), SECRET)
@@ -141,23 +123,6 @@ class GrantEmbedsClaimTests(unittest.IsolatedAsyncioTestCase):
         payload = verify_session_token(str(allocation["session_token"]), SECRET)
         self.assertEqual(payload["llmf"], fingerprint)
 
-    async def test_fast_path_grant_embeds_the_requester_context(self):
-        manager = DirectSessionManager(
-            endpoint_router=_SingleLeaseRouter(),
-            session_shared_secret=SECRET,
-            queue_enabled=False,
-        )
-        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
-
-        allocation = await manager.allocate(
-            "https://lb.example",
-            llm_fingerprint=fingerprint,
-            llm_requester=REQUESTER_CONTEXT,
-        )
-
-        payload = verify_session_token(str(allocation["session_token"]), SECRET)
-        self.assertEqual(payload["llmr"], REQUESTER_CONTEXT)
-
     async def test_grant_without_fingerprint_carries_no_claim(self):
         manager = DirectSessionManager(
             endpoint_router=_SingleLeaseRouter(),
@@ -182,11 +147,7 @@ class GrantEmbedsClaimTests(unittest.IsolatedAsyncioTestCase):
         )
         fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
         try:
-            ticket = await manager.allocate(
-                "https://lb.example",
-                llm_fingerprint=fingerprint,
-                llm_requester=REQUESTER_CONTEXT,
-            )
+            ticket = await manager.allocate("https://lb.example", llm_fingerprint=fingerprint)
             self.assertEqual(ticket["state"], "queued")
 
             router.has_capacity = True
@@ -195,7 +156,6 @@ class GrantEmbedsClaimTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(grant["state"], "granted")
             payload = verify_session_token(str(grant["session_token"]), SECRET)
             self.assertEqual(payload["llmf"], fingerprint)
-            self.assertEqual(payload["llmr"], REQUESTER_CONTEXT)
         finally:
             await manager.stop()
 

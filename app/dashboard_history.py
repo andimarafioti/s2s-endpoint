@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Callable, Optional, Protocol
 
 from app.app_utils import cancel_and_await
+from app.llm_proxy_usage import LLM_PROXY_ACCEPTED_REASON, LLM_PROXY_REJECTION_REASONS
 
 logger = logging.getLogger("s2s-endpoint")
 DAY_MINUTES = 24 * 60
@@ -167,6 +168,7 @@ class SwarmHistoryBucket:
     llm_proxy_requests: int = 0
     llm_proxy_accepted: int = 0
     llm_proxy_rejected: int = 0
+    llm_proxy_rejection_reasons: dict[str, int] = field(default_factory=dict)
     session_connected_events: int = 0
     session_disconnected_events: int = 0
     completed_conversations: int = 0
@@ -223,6 +225,7 @@ class SwarmHistoryBucket:
             "llm_proxy_requests": self.llm_proxy_requests,
             "llm_proxy_accepted": self.llm_proxy_accepted,
             "llm_proxy_rejected": self.llm_proxy_rejected,
+            "llm_proxy_rejection_reasons": dict(self.llm_proxy_rejection_reasons),
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
@@ -321,6 +324,8 @@ def _coerce_history_bucket_field(name: str, payload: dict[str, object]) -> objec
         return bool(payload.get(name, False))
     if name == "completed_conversation_duration_samples_s":
         return [max(float(value), 0.0) for value in list(payload.get(name) or [])]
+    if name == "llm_proxy_rejection_reasons":
+        return _coerce_llm_proxy_rejection_reasons(payload.get(name))
     if name == "requester_usage":
         return _coerce_requester_usage(payload.get(name))
     raise KeyError(f"Unknown SwarmHistoryBucket field: {name}")
@@ -359,6 +364,9 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "llm_proxy_requests": max(int(raw_record.get("llm_proxy_requests", 0)), 0),
             "llm_proxy_accepted": max(int(raw_record.get("llm_proxy_accepted", 0)), 0),
             "llm_proxy_rejected": max(int(raw_record.get("llm_proxy_rejected", 0)), 0),
+            "llm_proxy_rejection_reasons": _coerce_llm_proxy_rejection_reasons(
+                raw_record.get("llm_proxy_rejection_reasons")
+            ),
             "abandoned": max(int(raw_record.get("abandoned", 0)), 0),
             "connections": max(int(raw_record.get("connections", 0)), 0),
             "completed_sessions": max(int(raw_record.get("completed_sessions", 0)), 0),
@@ -382,6 +390,16 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "client_kinds": client_kinds,
         }
     return usage
+
+
+def _coerce_llm_proxy_rejection_reasons(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        reason: max(int(value.get(reason, 0)), 0)
+        for reason in LLM_PROXY_REJECTION_REASONS
+        if int(value.get(reason, 0)) > 0
+    }
 
 
 _VERIFICATION_RANK = {
@@ -411,6 +429,7 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
         "llm_proxy_requests": 0,
         "llm_proxy_accepted": 0,
         "llm_proxy_rejected": 0,
+        "llm_proxy_rejection_reasons": {},
         "abandoned": 0,
         "connections": 0,
         "completed_sessions": 0,
@@ -761,6 +780,7 @@ class DashboardHistory:
         metadata: dict[str, object] | None,
         duration_s: float | None = None,
         short_session: bool = False,
+        reason: str | None = None,
     ) -> None:
         counter_fields = {
             "request": (("session_requests",), ("requests",)),
@@ -782,6 +802,10 @@ class DashboardHistory:
         }
         if event not in counter_fields:
             raise ValueError(f"Unknown requester event: {event}")
+        if event == "llm_proxy_accepted" and reason != LLM_PROXY_ACCEPTED_REASON:
+            raise ValueError("accepted LLM proxy events require the accepted reason")
+        if event == "llm_proxy_rejected" and reason not in LLM_PROXY_REJECTION_REASONS:
+            raise ValueError("rejected LLM proxy events require a supported rejection reason")
 
         now = self._time_fn()
         async with self._lock:
@@ -789,6 +813,8 @@ class DashboardHistory:
             global_fields, requester_fields = counter_fields[event]
             for global_field in global_fields:
                 setattr(bucket, global_field, getattr(bucket, global_field) + 1)
+            if event == "llm_proxy_rejected" and reason is not None:
+                bucket.llm_proxy_rejection_reasons[reason] = bucket.llm_proxy_rejection_reasons.get(reason, 0) + 1
             if actor_id and metadata is not None:
                 resolved_actor_id = actor_id
                 resolved_metadata = metadata
@@ -812,6 +838,10 @@ class DashboardHistory:
                 _merge_requester_identity(record, resolved_metadata)
                 for requester_field in requester_fields:
                     record[requester_field] = int(record.get(requester_field, 0)) + 1
+                if event == "llm_proxy_rejected" and reason is not None:
+                    rejection_reasons = record.setdefault("llm_proxy_rejection_reasons", {})
+                    if isinstance(rejection_reasons, dict):
+                        rejection_reasons[reason] = int(rejection_reasons.get(reason, 0)) + 1
                 if event == "disconnected":
                     resolved_duration_s = max(float(duration_s or 0.0), 0.0)
                     record["connected_duration_total_s"] = (
@@ -823,7 +853,7 @@ class DashboardHistory:
                     )
                     if short_session:
                         record["short_sessions"] = int(record.get("short_sessions", 0)) + 1
-                if event == "request" and resolved_actor_id != "overflow":
+                if event in {"request", "llm_proxy_accepted", "llm_proxy_rejected"} and resolved_actor_id != "overflow":
                     _record_request_context(record, resolved_metadata)
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(now)

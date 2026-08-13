@@ -15,13 +15,7 @@ class SessionManager(Protocol):
 
     async def stop(self) -> None: ...
 
-    async def allocate(
-        self,
-        lb_base_url: str,
-        *,
-        llm_fingerprint: Optional[str] = None,
-        llm_requester: Optional[dict[str, object]] = None,
-    ) -> dict[str, object]: ...
+    async def allocate(self, lb_base_url: str, *, llm_fingerprint: Optional[str] = None) -> dict[str, object]: ...
 
     async def poll(self, ticket_id: str, lb_base_url: str) -> dict[str, object]: ...
 

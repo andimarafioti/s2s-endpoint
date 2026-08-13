@@ -61,6 +61,7 @@ def _dependencies(router, notify):
         llm_rate_limiter=compute_main._FingerprintRateLimiter(100),
         http_get_json=lambda url: {},
         notify_lb_session_event=notify,
+        notify_lb_llm_proxy_usage=notify,
         proxy_websocket=proxy_websocket,
     )
 
@@ -292,23 +293,20 @@ class NotifyLbRetryTests(unittest.IsolatedAsyncioTestCase):
         calls = []
 
         def post(url, payload):
-            calls.append(payload["event"])
+            calls.append(payload["outcome"])
             time.sleep(0.2)
 
         started = time.monotonic()
         with self.assertRaises(TimeoutError):
-            await compute_main._notify_lb_session_event(
-                "https://lb.example/internal/sessions/abc/event",
-                "token-abc",
-                "llm_proxy_request",
+            await compute_main._notify_lb_llm_proxy_usage(
+                "https://lb.example/internal/llm-proxy-usage",
+                {"outcome": "rejected"},
                 post_json=post,
-                default_backoff_s=1.0,
-                attempts=1,
                 timeout_s=0.01,
             )
 
         self.assertLess(time.monotonic() - started, 0.1)
-        self.assertEqual(calls, ["llm_proxy_request"])
+        self.assertEqual(calls, ["rejected"])
 
     async def test_retries_until_success(self):
         calls = []

@@ -41,6 +41,7 @@ class _ActorUsageAccumulator:
     llm_proxy_requests: int = 0
     llm_proxy_accepted: int = 0
     llm_proxy_rejected: int = 0
+    llm_proxy_rejection_reasons: Counter[str] = field(default_factory=Counter)
     abandoned: int = 0
     connections: int = 0
     completed_sessions: int = 0
@@ -117,6 +118,8 @@ class _ActorUsageAccumulator:
         self.llm_proxy_requests += max(int(record.get("llm_proxy_requests", 0)), 0)
         self.llm_proxy_accepted += max(int(record.get("llm_proxy_accepted", 0)), 0)
         self.llm_proxy_rejected += max(int(record.get("llm_proxy_rejected", 0)), 0)
+        for reason, count in dict(record.get("llm_proxy_rejection_reasons") or {}).items():
+            self.llm_proxy_rejection_reasons[str(reason)] += max(int(count), 0)
         self.abandoned += max(int(record.get("abandoned", 0)), 0)
         connections = max(int(record.get("connections", 0)), 0)
         self.connections += connections
@@ -226,6 +229,7 @@ class _ActorUsageAccumulator:
             "llm_proxy_requests": self.llm_proxy_requests,
             "llm_proxy_accepted": self.llm_proxy_accepted,
             "llm_proxy_rejected": self.llm_proxy_rejected,
+            "llm_proxy_rejection_reasons": dict(self.llm_proxy_rejection_reasons),
             "abandoned": self.abandoned,
             "connections": self.connections,
             "completed_sessions": self.completed_sessions,

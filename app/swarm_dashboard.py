@@ -67,6 +67,7 @@ class SwarmBucketAggregate:
     llm_proxy_requests: int = 0
     llm_proxy_accepted: int = 0
     llm_proxy_rejected: int = 0
+    llm_proxy_rejection_reasons: dict[str, int] = field(default_factory=dict)
     session_connected_events: int = 0
     session_disconnected_events: int = 0
     completed_conversations: int = 0
@@ -101,6 +102,10 @@ class SwarmBucketAggregate:
             aggregate.llm_proxy_requests += bucket.llm_proxy_requests
             aggregate.llm_proxy_accepted += bucket.llm_proxy_accepted
             aggregate.llm_proxy_rejected += bucket.llm_proxy_rejected
+            for reason, count in bucket.llm_proxy_rejection_reasons.items():
+                aggregate.llm_proxy_rejection_reasons[reason] = (
+                    aggregate.llm_proxy_rejection_reasons.get(reason, 0) + count
+                )
             aggregate.session_connected_events += bucket.session_connected_events
             aggregate.session_disconnected_events += bucket.session_disconnected_events
             aggregate.completed_conversations += bucket.completed_conversations
@@ -140,6 +145,7 @@ class SwarmBucketAggregate:
             "llm_proxy_requests": self.llm_proxy_requests,
             "llm_proxy_accepted": self.llm_proxy_accepted,
             "llm_proxy_rejected": self.llm_proxy_rejected,
+            "llm_proxy_rejection_reasons": dict(self.llm_proxy_rejection_reasons),
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
@@ -174,6 +180,7 @@ class SwarmBucketAggregate:
             "llm_proxy_requests": self.llm_proxy_requests,
             "llm_proxy_accepted": self.llm_proxy_accepted,
             "llm_proxy_rejected": self.llm_proxy_rejected,
+            "llm_proxy_rejection_reasons": dict(self.llm_proxy_rejection_reasons),
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
@@ -297,6 +304,7 @@ class SwarmDashboard:
         self,
         outcome: str,
         *,
+        reason: str,
         actor_id: str | None,
         metadata: dict[str, object] | None,
     ) -> None:
@@ -306,6 +314,7 @@ class SwarmDashboard:
             f"llm_proxy_{outcome}",
             actor_id=actor_id,
             metadata=metadata,
+            reason=reason,
         )
 
     async def record_requester_session_connected(self, requester: RequesterIdentity) -> None:
@@ -391,6 +400,7 @@ class SwarmDashboard:
             "llm_proxy_requests_window": selected["llm_proxy_requests"],
             "llm_proxy_accepted_window": selected["llm_proxy_accepted"],
             "llm_proxy_rejected_window": selected["llm_proxy_rejected"],
+            "llm_proxy_rejection_reasons_window": selected["llm_proxy_rejection_reasons"],
             "session_connects_window": selected["session_connected_events"],
             "session_disconnects_window": selected["session_disconnected_events"],
             "conversations_started_window": selected["session_connected_events"],

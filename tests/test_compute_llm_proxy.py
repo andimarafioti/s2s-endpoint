@@ -34,23 +34,19 @@ from app.session_tokens import create_session_token, llm_token_fingerprint
 SECRET = "compute-test-secret"
 HF_TOKEN = "hf_faketesttoken1234"
 OTHER_HF_TOKEN = "hf_otherfaketoken5678"
-REQUESTER_CONTEXT = {
-    "actor_id": "token:abc123",
-    "metadata": {
-        "label": "@reachy-user · token •abc123",
-        "kind": "authenticated",
-        "verification": "verified",
-        "fingerprint": "abc123",
-        "account_name": "reachy-user",
-        "network_id": "net:network123",
-        "reported_robot_id": "robot:robot123",
-        "client_kind": "robot:httpx",
-    },
-}
+CLIENT_IP = "203.0.113.42"
 
 
 def _auth(token: str = HF_TOKEN) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Forwarded-For": CLIENT_IP,
+    }
+
+
+def _anonymous_headers() -> dict[str, str]:
+    return {"Content-Type": "application/json", "X-Forwarded-For": CLIENT_IP}
 
 
 class StubInternalPipeline:
@@ -160,7 +156,6 @@ def _mint_session_token(
         callback_url=f"http://lb.internal/internal/sessions/{session_id}/event",
         ttl_s=600.0,
         llm_fingerprint=llm_token_fingerprint(secret, hf_token) if hf_token else None,
-        llm_requester=REQUESTER_CONTEXT if hf_token else None,
     )
 
 
@@ -193,7 +188,7 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         enable_llm_proxy: bool = True,
         secret: str = SECRET,
         time_fn: Callable[[], float] = time.monotonic,
-        notify: Callable[..., Any] | None = None,
+        notify_usage: Callable[..., Any] | None = None,
     ) -> TestClient:
         async def _fake_acquire():
             return SimpleNamespace(slot_id=0, ws_url="ws://127.0.0.1:1/v1/realtime")
@@ -204,6 +199,9 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         async def _no_lb_callback(*args: Any, **kwargs: Any) -> None:
             pass
 
+        async def _no_usage_callback(*args: Any, **kwargs: Any) -> None:
+            pass
+
         self.enterContext(patch("app.ws_proxy.websockets.connect", _FakeUpstreamConnect))
         stub_url = urlsplit(self.stub.base_url)
         settings = compute_main.ComputeSettings(
@@ -211,14 +209,15 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
             internal_ws_base_port=int(stub_url.port),
             enable_llm_proxy=enable_llm_proxy,
             session_shared_secret=secret,
-            llm_proxy_accounting_callback_url="http://lb.internal/internal/llm-proxy-usage",
+            llm_proxy_accounting_callback_url="https://lb.internal/internal/llm-proxy-usage",
         )
         dependencies = compute_main.ComputeDependencies(
             session_router=SimpleNamespace(acquire=_fake_acquire, release=_fake_release),
             connected_llm_fingerprints=compute_main._ConnectedFingerprintRegistry(),
             llm_rate_limiter=compute_main._FingerprintRateLimiter(rate_limit_rpm, time_fn=time_fn),
             http_get_json=compute_main._http_get_json,
-            notify_lb_session_event=notify or _no_lb_callback,
+            notify_lb_session_event=_no_lb_callback,
+            notify_lb_llm_proxy_usage=notify_usage or _no_usage_callback,
             proxy_websocket=compute_main.proxy_websocket,
         )
         return TestClient(compute_main.create_app(settings, dependencies))
@@ -241,28 +240,36 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
 
 
 class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
-    def test_both_proxy_routes_report_one_accepted_attempt_with_requester(self) -> None:
+    def test_both_proxy_routes_report_one_accepted_attempt(self) -> None:
         callbacks = []
 
-        async def notify(callback_url, session_token, event, **kwargs):
-            if event == "llm_proxy_request":
-                callbacks.append((callback_url, session_token, kwargs))
+        async def notify(callback_url, payload, **kwargs):
+            callbacks.append((callback_url, payload, kwargs))
 
-        client = self.gated_client(notify=notify)
+        client = self.gated_client(notify_usage=notify)
         with _connected_session(client):
             for path in ("/v1/chat/completions", "/v1/responses"):
                 response = client.post(path, content=b"{}", headers=_auth())
                 self.assertEqual(response.status_code, 200)
 
         self.assertEqual(len(callbacks), 2)
-        for callback_url, _session_token, kwargs in callbacks:
+        for callback_url, payload, kwargs in callbacks:
             self.assertEqual(
                 callback_url,
-                "http://lb.internal/internal/sessions/session-under-test/event",
+                "https://lb.internal/internal/llm-proxy-usage",
             )
-            self.assertEqual(kwargs["payload_fields"]["outcome"], "accepted")
-            self.assertEqual(kwargs["payload_fields"]["requester"], REQUESTER_CONTEXT)
-            self.assertEqual(kwargs["attempts"], 1)
+            self.assertEqual(
+                payload,
+                {
+                    "outcome": "accepted",
+                    "reason": "accepted",
+                    "session_matched": True,
+                    "credential_present": True,
+                    "token": HF_TOKEN,
+                    "client_ip": CLIENT_IP,
+                },
+            )
+            self.assertEqual(kwargs["timeout_s"], 1.0)
 
     def test_chat_completions_reaches_internal_pipeline_verbatim(self) -> None:
         self.stub.responder = lambda path: (
@@ -349,12 +356,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.stub.responder = lambda path: (200, "text/event-stream", frames)
         configured_client = self.gated_client()
         registry = configured_client.app.state.dependencies.connected_llm_fingerprints
-        registry.add(
-            llm_token_fingerprint(SECRET, HF_TOKEN),
-            "http://lb.internal/internal/sessions/session-under-test/event",
-            _mint_session_token(),
-            REQUESTER_CONTEXT,
-        )
+        registry.add(llm_token_fingerprint(SECRET, HF_TOKEN))
         live = LiveApp(configured_client.app)
         self.addCleanup(live.close)
 
@@ -378,18 +380,19 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
     def test_unreachable_internal_pipeline_answers_502(self) -> None:
         callbacks = []
 
-        async def notify(_callback_url, _session_token, event, **kwargs):
-            if event == "llm_proxy_request":
-                callbacks.append(kwargs["payload_fields"])
+        async def notify(_callback_url, payload, **_kwargs):
+            callbacks.append(payload)
 
         self.stub.close()  # a port that was just bound and freed: connection refused
-        client = self.gated_client(notify=notify)
+        client = self.gated_client(notify_usage=notify)
         with _connected_session(client):
             response = self.post_chat(client)
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"]["type"], "upstream_unreachable")
-        self.assertEqual(callbacks, [{"outcome": "accepted", "requester": REQUESTER_CONTEXT}])
+        self.assertEqual(callbacks[0]["outcome"], "accepted")
+        self.assertEqual(callbacks[0]["reason"], "accepted")
+        self.assertTrue(callbacks[0]["session_matched"])
 
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()
@@ -403,11 +406,10 @@ class HfTokenGateTests(ComputeLlmProxyTestCase):
     def test_rejected_attempt_after_disconnect_uses_replica_accounting_callback(self) -> None:
         callbacks = []
 
-        async def notify(callback_url, session_token, event, **kwargs):
-            if event == "llm_proxy_request":
-                callbacks.append((callback_url, session_token, kwargs))
+        async def notify(callback_url, payload, **kwargs):
+            callbacks.append((callback_url, payload, kwargs))
 
-        client = self.gated_client(notify=notify)
+        client = self.gated_client(notify_usage=notify)
         with _connected_session(client):
             pass
 
@@ -417,21 +419,27 @@ class HfTokenGateTests(ComputeLlmProxyTestCase):
         self.assertEqual(
             callbacks[-1],
             (
-                "http://lb.internal/internal/llm-proxy-usage",
-                "",
-                {"attempts": 1, "payload_fields": {"outcome": "rejected"}, "timeout_s": 1.0},
+                "https://lb.internal/internal/llm-proxy-usage",
+                {
+                    "outcome": "rejected",
+                    "reason": "no_active_session_match",
+                    "session_matched": False,
+                    "credential_present": True,
+                    "token": HF_TOKEN,
+                    "client_ip": CLIENT_IP,
+                },
+                {"timeout_s": 1.0},
             ),
         )
 
     def test_cold_registry_unknown_credentials_report_rejected_without_requester(self) -> None:
         callbacks = []
 
-        async def notify(callback_url, session_token, event, **kwargs):
-            if event == "llm_proxy_request":
-                callbacks.append((callback_url, session_token, kwargs))
+        async def notify(callback_url, payload, **kwargs):
+            callbacks.append((callback_url, payload, kwargs))
 
-        client = self.gated_client(notify=notify)
-        missing = self.post_chat(client, headers={"Content-Type": "application/json"})
+        client = self.gated_client(notify_usage=notify)
+        missing = self.post_chat(client, headers=_anonymous_headers())
         unknown = self.post_chat(client, headers=_auth("hf_not_the_sessions_token"))
 
         self.assertEqual(missing.status_code, 401)
@@ -440,14 +448,27 @@ class HfTokenGateTests(ComputeLlmProxyTestCase):
             callbacks,
             [
                 (
-                    "http://lb.internal/internal/llm-proxy-usage",
-                    "",
-                    {"attempts": 1, "payload_fields": {"outcome": "rejected"}, "timeout_s": 1.0},
+                    "https://lb.internal/internal/llm-proxy-usage",
+                    {
+                        "outcome": "rejected",
+                        "reason": "missing_token",
+                        "session_matched": False,
+                        "credential_present": False,
+                        "client_ip": CLIENT_IP,
+                    },
+                    {"timeout_s": 1.0},
                 ),
                 (
-                    "http://lb.internal/internal/llm-proxy-usage",
-                    "",
-                    {"attempts": 1, "payload_fields": {"outcome": "rejected"}, "timeout_s": 1.0},
+                    "https://lb.internal/internal/llm-proxy-usage",
+                    {
+                        "outcome": "rejected",
+                        "reason": "no_active_session_match",
+                        "session_matched": False,
+                        "credential_present": True,
+                        "token": "hf_not_the_sessions_token",
+                        "client_ip": CLIENT_IP,
+                    },
+                    {"timeout_s": 1.0},
                 ),
             ],
         )
@@ -554,11 +575,10 @@ class DisabledLlmProxyTests(ComputeLlmProxyTestCase):
     def test_cold_disabled_proxy_reports_rejected_to_replica_callback(self) -> None:
         callbacks = []
 
-        async def notify(callback_url, session_token, event, **kwargs):
-            if event == "llm_proxy_request":
-                callbacks.append((callback_url, session_token, kwargs))
+        async def notify(callback_url, payload, **kwargs):
+            callbacks.append((callback_url, payload, kwargs))
 
-        client = self.gated_client(enable_llm_proxy=False, notify=notify)
+        client = self.gated_client(enable_llm_proxy=False, notify_usage=notify)
         response = self.post_chat(client)
 
         self.assertEqual(response.status_code, 404)
@@ -566,9 +586,16 @@ class DisabledLlmProxyTests(ComputeLlmProxyTestCase):
             callbacks,
             [
                 (
-                    "http://lb.internal/internal/llm-proxy-usage",
-                    "",
-                    {"attempts": 1, "payload_fields": {"outcome": "rejected"}, "timeout_s": 1.0},
+                    "https://lb.internal/internal/llm-proxy-usage",
+                    {
+                        "outcome": "rejected",
+                        "reason": "proxy_disabled",
+                        "session_matched": False,
+                        "credential_present": True,
+                        "token": HF_TOKEN,
+                        "client_ip": CLIENT_IP,
+                    },
+                    {"timeout_s": 1.0},
                 )
             ],
         )
@@ -576,16 +603,17 @@ class DisabledLlmProxyTests(ComputeLlmProxyTestCase):
     def test_disabled_proxy_reports_known_session_token_as_rejected(self) -> None:
         callbacks = []
 
-        async def notify(_callback_url, _session_token, event, **kwargs):
-            if event == "llm_proxy_request":
-                callbacks.append(kwargs["payload_fields"])
+        async def notify(_callback_url, payload, **_kwargs):
+            callbacks.append(payload)
 
-        client = self.gated_client(enable_llm_proxy=False, notify=notify)
+        client = self.gated_client(enable_llm_proxy=False, notify_usage=notify)
         with _connected_session(client):
             response = self.post_chat(client)
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(callbacks, [{"outcome": "rejected", "requester": REQUESTER_CONTEXT}])
+        self.assertEqual(callbacks[0]["outcome"], "rejected")
+        self.assertEqual(callbacks[0]["reason"], "proxy_disabled")
+        self.assertTrue(callbacks[0]["session_matched"])
 
     def test_disabled_proxy_answers_404_even_for_a_connected_session(self) -> None:
         # An authorized key changes nothing: the check runs before auth, so a
@@ -612,34 +640,28 @@ class FingerprintRateLimitTests(ComputeLlmProxyTestCase):
     def test_rate_limited_request_reports_rejected_with_requester(self) -> None:
         callbacks = []
 
-        async def notify(_callback_url, _session_token, event, **kwargs):
-            if event == "llm_proxy_request":
-                callbacks.append(kwargs["payload_fields"])
+        async def notify(_callback_url, payload, **_kwargs):
+            callbacks.append(payload)
 
-        client = self.gated_client(rate_limit_rpm=1, notify=notify)
+        client = self.gated_client(rate_limit_rpm=1, notify_usage=notify)
         with _connected_session(client):
             accepted = self.post_chat(client)
             rejected = self.post_chat(client)
 
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(rejected.status_code, 429)
-        self.assertEqual(
-            callbacks,
-            [
-                {"outcome": "accepted", "requester": REQUESTER_CONTEXT},
-                {"outcome": "rejected", "requester": REQUESTER_CONTEXT},
-            ],
-        )
+        self.assertEqual([callback["outcome"] for callback in callbacks], ["accepted", "rejected"])
+        self.assertEqual([callback["reason"] for callback in callbacks], ["accepted", "rate_limited"])
+        self.assertTrue(all(callback["session_matched"] for callback in callbacks))
 
     def test_callback_failure_is_attempted_once_without_changing_proxy_response(self) -> None:
         attempts = []
 
-        async def notify(_callback_url, _session_token, event, **kwargs):
-            if event == "llm_proxy_request":
-                attempts.append(kwargs)
-                raise RuntimeError("load balancer unavailable")
+        async def notify(_callback_url, _payload, **kwargs):
+            attempts.append(kwargs)
+            raise RuntimeError("load balancer unavailable")
 
-        client = self.gated_client(rate_limit_rpm=1, notify=notify)
+        client = self.gated_client(rate_limit_rpm=1, notify_usage=notify)
         with _connected_session(client):
             accepted = self.post_chat(client)
             rejected = self.post_chat(client)
@@ -647,7 +669,7 @@ class FingerprintRateLimitTests(ComputeLlmProxyTestCase):
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(rejected.status_code, 429)
         self.assertEqual(len(attempts), 2)
-        self.assertTrue(all(attempt["attempts"] == 1 for attempt in attempts))
+        self.assertTrue(all(attempt["timeout_s"] == 1.0 for attempt in attempts))
 
     def test_rate_limit_answers_429_and_other_users_are_unaffected(self) -> None:
         client = self.gated_client(rate_limit_rpm=2)
