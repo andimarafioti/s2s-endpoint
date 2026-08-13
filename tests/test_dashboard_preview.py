@@ -494,6 +494,14 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
             ).status_code,
             403,
         )
+        self.assertEqual(
+            client.post(
+                "/internal/llm-proxy-usage",
+                headers={"Authorization": "Bearer callback-secret"},
+                json={"padding": "x" * 8192},
+            ).status_code,
+            413,
+        )
 
     def _import_load_balancer(self, env):
         return load_balancer_fixture({"LB_ADMIN_AUTH_TOKEN": "", **env})
@@ -1132,11 +1140,9 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         fake_dashboard = FakeDashboard()
         module.dependencies.dashboard = fake_dashboard
         module.dependencies.requester_identity_resolver._whoami_fn = lambda _token: {"name": "reachy-user"}
-        callback_request = SimpleNamespace(headers={"authorization": "Bearer callback-secret"})
         for outcome, reason in (("accepted", "accepted"), ("rejected", "no_active_session_match")):
             await llm_proxy_usage(
                 module.runtime,
-                callback_request,
                 _llm_usage_payload(outcome, reason, token="hf_valid_token"),
             )
 
@@ -1154,15 +1160,13 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer({"LB_CALLBACK_AUTH_TOKEN": "callback-secret"})
         fake_dashboard = FakeDashboard()
         module.dependencies.dashboard = fake_dashboard
-        request = SimpleNamespace(headers={"authorization": "Bearer callback-secret"})
-        await llm_proxy_usage(module.runtime, request, _llm_usage_payload("rejected", "missing_token"))
+        await llm_proxy_usage(module.runtime, _llm_usage_payload("rejected", "missing_token"))
 
         invalid = RuntimeError("invalid")
         invalid.response = SimpleNamespace(status_code=401)
         module.dependencies.requester_identity_resolver._whoami_fn = lambda _token: (_ for _ in ()).throw(invalid)
         await llm_proxy_usage(
             module.runtime,
-            request,
             _llm_usage_payload("rejected", "no_active_session_match", token="hf_invalid_token"),
         )
 

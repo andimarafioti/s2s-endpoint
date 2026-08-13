@@ -1,3 +1,4 @@
+import json
 import logging
 import secrets
 from dataclasses import dataclass, replace
@@ -29,6 +30,7 @@ from app.endpoint_pool_router import (
     fetch_compute_usage,
 )
 from app.llm_proxy_usage import (
+    LLM_PROXY_CALLBACK_BODY_MAX_BYTES,
     LLM_PROXY_CLIENT_IP_MAX_LENGTH,
     LLM_PROXY_REJECTION_REASONS,
 )
@@ -1262,12 +1264,9 @@ async def session_event(
 
 async def llm_proxy_usage(
     runtime: LoadBalancerRuntime,
-    request: Request,
     payload: dict[str, Any],
 ):
     """Record one compute-reported LLM proxy gate decision."""
-    require_callback_auth(runtime, request)
-
     outcome = str(payload.get("outcome", "")).strip()
     if outcome not in {"accepted", "rejected"}:
         raise HTTPException(status_code=400, detail="outcome must be 'accepted' or 'rejected'")
@@ -1279,6 +1278,9 @@ async def llm_proxy_usage(
     session_matched = payload.get("session_matched")
     if type(session_matched) is not bool:
         raise HTTPException(status_code=400, detail="session_matched must be a boolean")
+    credential_present = payload.get("credential_present")
+    if type(credential_present) is not bool:
+        raise HTTPException(status_code=400, detail="credential_present must be a boolean")
 
     token = payload.get("token")
     if token is not None and (not isinstance(token, str) or not is_validatable_hf_token(token)):
@@ -1292,7 +1294,7 @@ async def llm_proxy_usage(
     requester = await _llm_proxy_usage_requester(
         runtime,
         token=token,
-        credential_present=bool(payload.get("credential_present")),
+        credential_present=credential_present,
         client_ip=client_ip,
     )
 
@@ -1303,6 +1305,21 @@ async def llm_proxy_usage(
         metadata=requester.history_metadata(),
     )
     return JSONResponse({"status": "ok", "state": "recorded"})
+
+
+async def _llm_proxy_usage_payload(request: Request) -> dict[str, Any]:
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > LLM_PROXY_CALLBACK_BODY_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="callback payload is too large")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="callback payload must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="callback payload must be an object")
+    return payload
 
 
 async def _llm_proxy_usage_requester(
@@ -1502,8 +1519,9 @@ def create_app(
     async def session_event_route(session_id: str, payload: dict[str, Any]):
         return await session_event(runtime, session_id, payload)
 
-    async def llm_proxy_usage_route(request: Request, payload: dict[str, Any]):
-        return await llm_proxy_usage(runtime, request, payload)
+    async def llm_proxy_usage_route(request: Request):
+        require_callback_auth(runtime, request)
+        return await llm_proxy_usage(runtime, await _llm_proxy_usage_payload(request))
 
     async def endpoint_status_route(endpoint_name: str, request: Request):
         return await endpoint_status(runtime, endpoint_name, request)
