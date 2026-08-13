@@ -385,6 +385,7 @@ class _LLMProxyUsage:
     def __post_init__(self) -> None:
         if not self.outbox_path:
             return
+        outbox: Optional[sqlite3.Connection] = None
         try:
             path = Path(self.outbox_path)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -411,7 +412,7 @@ class _LLMProxyUsage:
             self._outbox = outbox
         except Exception:
             logger.exception("Failed to open the LLM usage outbox; continuing with in-memory delivery")
-            if "outbox" in locals():
+            if outbox is not None:
                 outbox.close()
 
     async def start(self) -> None:
