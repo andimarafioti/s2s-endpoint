@@ -645,7 +645,7 @@ class DashboardHistory:
                 self._restore_task = asyncio.create_task(self._restore_history())
             else:
                 await self._restore_history()
-            if self._startup_merge_scheduled_passes > 0:
+            if self.startup_merge_delay_s > 0:
                 self._startup_merge_status = "waiting"
                 self._startup_merge_attempted_passes = 0
                 self._startup_merge_completed_passes = 0
@@ -671,6 +671,12 @@ class DashboardHistory:
 
         if not self._history_store_is_writable():
             return
+
+        if self.startup_merge_delay_s > 0:
+            try:
+                await self._reconcile_persisted_history()
+            except Exception as exc:
+                logger.warning("Final dashboard history reconciliation failed: %s", exc)
 
         self._persistence_stop_requested = True
         self._persistence_wakeup.set()
@@ -784,10 +790,7 @@ class DashboardHistory:
             "attempted_passes": self._startup_merge_attempted_passes,
             "completed_passes": self._startup_merge_completed_passes,
             "failed_passes": self._startup_merge_failed_passes,
-            "all_passes_completed": (
-                self._startup_merge_scheduled_passes > 0
-                and self._startup_merge_completed_passes == self._startup_merge_scheduled_passes
-            ),
+            "all_passes_completed": False,
             "bucket_count": self._startup_merge_bucket_count,
             "updated_bucket_count": self._startup_merge_updated_bucket_count,
             "last_error": self._startup_merge_last_error,
@@ -1148,7 +1151,9 @@ class DashboardHistory:
                 self._startup_merge_status = "disabled"
                 return
 
-            for pass_number in range(1, self._startup_merge_scheduled_passes + 1):
+            pass_number = 0
+            while True:
+                pass_number += 1
                 self._startup_merge_status = "waiting"
                 await asyncio.sleep(self.startup_merge_delay_s)
                 if (
@@ -1163,24 +1168,16 @@ class DashboardHistory:
                 self._startup_merge_status = "running"
                 self._startup_merge_attempted_passes += 1
                 try:
-                    now_epoch_s = self._time_fn()
-                    buckets = await self._load_persisted_history(
-                        retention_minutes=min(
-                            self.retention_minutes,
-                            _startup_merge_retention_minutes(now_epoch_s),
-                        ),
-                        now_epoch_s=now_epoch_s,
-                    )
-                    updated_bucket_count = await self._merge_persisted_history_buckets(buckets)
+                    buckets, updated_bucket_count = await self._reconcile_persisted_history()
+                    await self._flush_dirty_buckets(include_open_bucket=True)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     self._startup_merge_failed_passes += 1
                     self._startup_merge_last_error = str(exc)
                     logger.warning(
-                        "Dashboard startup history merge pass %s/%s failed: %s",
+                        "Dashboard history reconciliation pass %s failed: %s",
                         pass_number,
-                        self._startup_merge_scheduled_passes,
                         exc,
                     )
                     continue
@@ -1189,9 +1186,8 @@ class DashboardHistory:
                 self._startup_merge_bucket_count += len(buckets)
                 self._startup_merge_updated_bucket_count += updated_bucket_count
                 logger.info(
-                    "Completed dashboard startup history merge pass %s/%s: loaded %s buckets, updated %s in %.2fs",
+                    "Completed dashboard history reconciliation pass %s: loaded %s buckets, updated %s in %.2fs",
                     pass_number,
-                    self._startup_merge_scheduled_passes,
                     len(buckets),
                     updated_bucket_count,
                     time.monotonic() - started_s,
@@ -1200,12 +1196,16 @@ class DashboardHistory:
             self._startup_merge_status = "cancelled"
             raise
 
-        if self._startup_merge_completed_passes == self._startup_merge_scheduled_passes:
-            self._startup_merge_status = "complete"
-        elif self._startup_merge_completed_passes > 0:
-            self._startup_merge_status = "partial"
-        else:
-            self._startup_merge_status = "failed"
+    async def _reconcile_persisted_history(self) -> tuple[list[SwarmHistoryBucket], int]:
+        now_epoch_s = self._time_fn()
+        buckets = await self._load_persisted_history(
+            retention_minutes=min(
+                self.retention_minutes,
+                _startup_merge_retention_minutes(now_epoch_s),
+            ),
+            now_epoch_s=now_epoch_s,
+        )
+        return buckets, await self._merge_persisted_history_buckets(buckets)
 
     async def _load_persisted_history(
         self,

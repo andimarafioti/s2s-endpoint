@@ -1758,7 +1758,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await dashboard.stop()
 
-        self.assertEqual(store.load_calls, 1)
+        self.assertEqual(store.load_calls, 2)
         self.assertEqual(series[0]["running_endpoints"], 2)
 
     async def test_live_day_rollover_writes_complete_past_day_from_memory(self):
@@ -1913,16 +1913,17 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             store.saved[previous_day_bucket.bucket_start_s] = previous_day_bucket.to_dict()
             store.saved[late_bucket.bucket_start_s] = late_bucket.to_dict()
             store.saved[stale_live_bucket.bucket_start_s] = stale_live_bucket.to_dict()
-            await dashboard.history._startup_merge_task
+            while dashboard.history.startup_merge_status()["completed_passes"] < 2:
+                await asyncio.sleep(0.005)
             series = await dashboard.series(window_minutes=2, resolution="minute")
             snapshot = await dashboard.history.snapshot()
             status = dashboard.startup_merge_status()
         finally:
             await dashboard.stop()
 
-        self.assertEqual(store.load_calls, 3)
+        self.assertGreaterEqual(store.load_calls, 4)
         self.assertEqual(
-            store.load_requests,
+            store.load_requests[:3],
             [
                 (28 * 24 * 60, now_epoch_s),
                 (24 * 60 + 4 * 60 + 2, now_epoch_s),
@@ -1931,12 +1932,12 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(previous_day_bucket.bucket_start_s, {bucket.bucket_start_s for bucket in snapshot})
         self.assertEqual([point["running_endpoints"] for point in series], [3, 1])
-        self.assertEqual(status["status"], "complete")
+        self.assertIn(status["status"], {"waiting", "running"})
         self.assertEqual(status["scheduled_passes"], 2)
         self.assertEqual(status["attempted_passes"], 2)
         self.assertEqual(status["completed_passes"], 2)
         self.assertEqual(status["failed_passes"], 0)
-        self.assertTrue(status["all_passes_completed"])
+        self.assertFalse(status["all_passes_completed"])
         self.assertEqual(status["bucket_count"], 6)
         self.assertEqual(status["updated_bucket_count"], 2)
         self.assertIsNone(status["last_error"])
@@ -1969,7 +1970,8 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             await history._restore_task
             await asyncio.wait_for(wait_for_first_pass(), timeout=1)
             store.saved[late_bucket.bucket_start_s] = late_bucket.to_dict()
-            await history._startup_merge_task
+            while history.startup_merge_status()["completed_passes"] < 2:
+                await asyncio.sleep(0.005)
             snapshot = await history.snapshot()
             status = history.startup_merge_status()
         finally:
@@ -1977,18 +1979,53 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(late_bucket.bucket_start_s, {bucket.bucket_start_s for bucket in snapshot})
         self.assertEqual(
-            store.load_requests,
+            store.load_requests[:3],
             [
                 (28 * 24 * 60, now_epoch_s),
                 (24 * 60 + 4 * 60 + 2, now_epoch_s),
                 (24 * 60 + 4 * 60 + 2, now_epoch_s),
             ],
         )
-        self.assertEqual(status["status"], "complete")
+        self.assertIn(status["status"], {"waiting", "running"})
         self.assertEqual(status["scheduled_passes"], 2)
         self.assertEqual(status["completed_passes"], 2)
-        self.assertTrue(status["all_passes_completed"])
+        self.assertFalse(status["all_passes_completed"])
         self.assertEqual(status["updated_bucket_count"], 1)
+
+    async def test_continuous_reconciliation_converges_overlapping_load_balancers(self):
+        clock = FakeClock(2 * 3600)
+        store = FakeHistoryStore()
+        histories = [
+            DashboardHistory(
+                retention_minutes=60,
+                history_store=store,
+                restore_history_in_background=True,
+                startup_merge_delay_s=0.01,
+                time_fn=clock.now,
+            )
+            for _ in range(2)
+        ]
+        for history in histories:
+            await history.start()
+        try:
+            while any(history.startup_merge_status()["completed_passes"] < 2 for history in histories):
+                await asyncio.sleep(0.005)
+            await histories[0].record_llm_proxy_request("compute-a", 1, "hf:alice", {"label": "@alice"})
+            await histories[1].record_llm_proxy_request("compute-b", 1, "hf:bob", {"label": "@bob"})
+            while store.saved[2 * 3600]["llm_proxy_requests"] < 2:
+                await asyncio.sleep(0.005)
+        finally:
+            for history in histories:
+                await history.stop()
+
+        restored = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
+        await restored.start()
+        try:
+            bucket = (await restored.snapshot())[0]
+        finally:
+            await restored.stop()
+        self.assertEqual(bucket.llm_proxy_requests, 2)
+        self.assertEqual(bucket.llm_proxy_events, {"compute-a": {1: "hf:alice"}, "compute-b": {1: "hf:bob"}})
 
     async def test_startup_merge_schedule_continues_after_a_failed_pass(self):
         clock = FakeClock(_day_start(2026, 5, 19) + 60)
@@ -2003,13 +2040,14 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         await history.start()
         try:
-            await history._startup_merge_task
+            while history.startup_merge_status()["completed_passes"] < 1:
+                await asyncio.sleep(0.005)
             status = history.startup_merge_status()
         finally:
             await history.stop()
 
-        self.assertEqual(store.load_calls, 3)
-        self.assertEqual(status["status"], "partial")
+        self.assertGreaterEqual(store.load_calls, 4)
+        self.assertIn(status["status"], {"waiting", "running"})
         self.assertEqual(status["scheduled_passes"], 2)
         self.assertEqual(status["attempted_passes"], 2)
         self.assertEqual(status["completed_passes"], 1)

@@ -251,12 +251,12 @@ Persisted history is restored in the background during load-balancer startup, so
 the endpoint can become ready before older dashboard buckets finish loading. The
 `/dashboard/data` response includes a `history_restore` object with the restore
 status, elapsed time, and restored bucket count. After the initial restore, the
-load balancer performs two delayed reconciliation passes by default so it also
-sees files that the previous replica writes during a slow shutdown. Each pass is
-limited to the previous UTC day through the current minute, and bucket
+load balancer continuously reconciles persisted history so overlapping replicas
+converge on usage written during rolling replacement. Each pass is limited to
+the previous UTC day through the current minute, and bucket
 comparisons release the dashboard lock between bounded chunks. The
 `startup_merge` persistence status reports the scheduled, attempted, completed,
-and failed pass counts and whether the full schedule completed.
+and failed pass counts.
 
 The dashboard store keeps minute files under `minutes/YYYY-MM-DD/` and also
 uses `days/YYYY-MM-DD.json` files as a compact cache for UTC days. On restore it
@@ -419,14 +419,11 @@ load-balancer variable is ignored and can be removed from existing deployments.
   delay.
 - `DASHBOARD_DIRTY_BUCKET_WARNING_AGE_S`: age at which the load balancer warns
   that dashboard minute persistence is falling behind (defaults to 300 seconds)
-- `DASHBOARD_STARTUP_MERGE_DELAY_S`: interval before each of two startup history
-  reconciliation reads that merge files written late by the previous LB replica
-  (defaults to 60 seconds, so passes run at roughly 60 and 120 seconds; set to 0
-  to disable). Each read covers only the previous UTC day through the current
-  minute, independently of the full dashboard retention setting. Choose an
-  interval whose two-pass window covers the old replica's worst-case shutdown
-  drain; a longer interval improves late-write coverage but delays final
-  reconciliation status.
+- `DASHBOARD_STARTUP_MERGE_DELAY_S`: interval between history reconciliation
+  reads that merge files written by overlapping LB replicas (defaults to 60
+  seconds; set to 0 to disable). Each read covers only the previous UTC day
+  through the current minute, independently of the full dashboard retention
+  setting.
 - `DASHBOARD_PREVIEW_MODE`: set to `true` to serve the dashboard with synthetic
   endpoint/session data instead of connecting to real compute endpoints. You can
   also set `COMPUTE_ENDPOINT_NAMES=TEST` for the same local preview behavior.
