@@ -64,7 +64,6 @@ class SwarmBucketAggregate:
     session_allocation_failures: int = 0
     session_auth_rejections: int = 0
     session_rate_limited: int = 0
-    llm_proxy_requests: int = 0
     llm_proxy_accepted: int = 0
     llm_proxy_rejected: int = 0
     llm_proxy_rejection_reasons: dict[str, int] = field(default_factory=dict)
@@ -99,7 +98,6 @@ class SwarmBucketAggregate:
             aggregate.session_allocation_failures += bucket.session_allocation_failures
             aggregate.session_auth_rejections += bucket.session_auth_rejections
             aggregate.session_rate_limited += bucket.session_rate_limited
-            aggregate.llm_proxy_requests += bucket.llm_proxy_requests
             aggregate.llm_proxy_accepted += bucket.llm_proxy_accepted
             aggregate.llm_proxy_rejected += bucket.llm_proxy_rejected
             for reason, count in bucket.llm_proxy_rejection_reasons.items():
@@ -142,7 +140,7 @@ class SwarmBucketAggregate:
             "session_allocation_failures": self.session_allocation_failures,
             "session_auth_rejections": self.session_auth_rejections,
             "session_rate_limited": self.session_rate_limited,
-            "llm_proxy_requests": self.llm_proxy_requests,
+            "llm_proxy_requests": self.llm_proxy_accepted + self.llm_proxy_rejected,
             "llm_proxy_accepted": self.llm_proxy_accepted,
             "llm_proxy_rejected": self.llm_proxy_rejected,
             "llm_proxy_rejection_reasons": dict(self.llm_proxy_rejection_reasons),
@@ -177,7 +175,7 @@ class SwarmBucketAggregate:
             "session_allocation_failures": self.session_allocation_failures,
             "session_auth_rejections": self.session_auth_rejections,
             "session_rate_limited": self.session_rate_limited,
-            "llm_proxy_requests": self.llm_proxy_requests,
+            "llm_proxy_requests": self.llm_proxy_accepted + self.llm_proxy_rejected,
             "llm_proxy_accepted": self.llm_proxy_accepted,
             "llm_proxy_rejected": self.llm_proxy_rejected,
             "llm_proxy_rejection_reasons": dict(self.llm_proxy_rejection_reasons),

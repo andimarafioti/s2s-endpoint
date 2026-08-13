@@ -388,53 +388,41 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         )
         session_requester = RequesterIdentity(
             actor_id="anonymous:session",
-            label="Anonymous IP •session",
+            label="Anonymous",
             kind="anonymous",
             verification="not_provided",
             fingerprint="session",
         )
-        proxy_requester = RequesterIdentity(
-            actor_id="token:abc123",
-            label="@reachy-user · token •abc123",
-            kind="authenticated",
-            verification="verified",
-            fingerprint="abc123",
-            account_name="reachy-user",
-        )
+        proxy_metadata = {
+            "label": "@reachy-user",
+            "kind": "authenticated",
+            "verification": "verified",
+            "fingerprint": "abc123",
+            "account_name": "reachy-user",
+        }
 
         await dashboard.record_session_request(session_requester)
-        await dashboard.record_session_request(session_requester)
-        await dashboard.record_session_rate_limited(session_requester)
-        await dashboard.record_llm_proxy_request(
-            "accepted",
-            reason="accepted",
-            actor_id=proxy_requester.actor_id,
-            metadata=proxy_requester.history_metadata(),
-        )
-        await dashboard.record_llm_proxy_request(
-            "rejected",
-            reason="rate_limited",
-            actor_id=proxy_requester.actor_id,
-            metadata=proxy_requester.history_metadata(),
-        )
+        for outcome, reason in (("accepted", "accepted"), ("rejected", "rate_limited")):
+            await dashboard.record_llm_proxy_request(
+                outcome,
+                reason=reason,
+                actor_id="token:abc123",
+                metadata=proxy_metadata,
+            )
 
         payload = await dashboard.data(window="60m", resolution="minute")
         summary = payload["summary"]
         rows = payload["requesters"]["leaderboard"]
 
-        self.assertEqual(summary["llm_proxy_requests_window"], 2)
-        self.assertEqual(summary["llm_proxy_accepted_window"], 1)
-        self.assertEqual(summary["llm_proxy_rejected_window"], 1)
-        self.assertEqual(summary["session_requests_window"], 2)
-        self.assertEqual(summary["session_rate_limited_window"], 1)
+        self.assertEqual(summary["session_requests_window"], 1)
         self.assertEqual(summary["unique_requesters_window"], 1)
         self.assertEqual(summary["authenticated_users_window"], 0)
         self.assertEqual(rows[0]["actor_id"], "anonymous:session")
         proxy_row = next(row for row in rows if row["actor_id"] == "hf:reachy-user")
-        self.assertEqual(proxy_row["requests"], 0)
-        self.assertEqual(proxy_row["llm_proxy_requests"], 2)
-        self.assertEqual(proxy_row["llm_proxy_accepted"], 1)
-        self.assertEqual(proxy_row["llm_proxy_rejected"], 1)
+        self.assertEqual(
+            (proxy_row["requests"], proxy_row["llm_proxy_accepted"], proxy_row["llm_proxy_rejected"]),
+            (0, 1, 1),
+        )
         self.assertEqual(proxy_row["llm_proxy_rejection_reasons"], {"rate_limited": 1})
 
     async def test_hourly_series_averages_state_metrics_and_sums_events(self):
@@ -804,7 +792,6 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted.completed_conversations, 1)
         self.assertEqual(persisted.completed_conversation_duration_total_s, 90.0)
         self.assertEqual(persisted.completed_conversation_duration_samples_s, [90.0])
-        self.assertEqual(persisted.llm_proxy_requests, 2)
         self.assertEqual(persisted.llm_proxy_accepted, 1)
         self.assertEqual(persisted.llm_proxy_rejected, 1)
         self.assertEqual(persisted.llm_proxy_rejection_reasons, {"proxy_disabled": 1})

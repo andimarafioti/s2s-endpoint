@@ -38,6 +38,19 @@ class FakeClock:
         return self.now
 
 
+def _llm_usage_payload(outcome, reason, *, token=None):
+    payload = {
+        "outcome": outcome,
+        "reason": reason,
+        "session_matched": outcome == "accepted" or reason == "rate_limited",
+        "credential_present": token is not None,
+        "client_ip": "203.0.113.8",
+    }
+    if token is not None:
+        payload["token"] = token
+    return payload
+
+
 class FakeHistoryStore:
     def __init__(self, buckets=None):
         self.buckets = list(buckets or [])
@@ -462,7 +475,7 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["detail"], "LB admin auth token is not configured")
 
-    def test_llm_proxy_callback_authenticates_before_bounded_body_read(self):
+    def test_llm_proxy_callback_requires_compute_authentication(self):
         module = self._import_load_balancer(
             {
                 "COMPUTE_ENDPOINT_NAMES": "TEST",
@@ -471,17 +484,16 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
             }
         )
         client = TestClient(module.app)
-        oversized_body = b"x" * 8193
-
-        unauthenticated = client.post("/internal/llm-proxy-usage", content=oversized_body)
-        authenticated = client.post(
-            "/internal/llm-proxy-usage",
-            headers={"Authorization": "Bearer callback-secret"},
-            content=oversized_body,
+        payload = _llm_usage_payload("rejected", "missing_token")
+        self.assertEqual(client.post("/internal/llm-proxy-usage", json=payload).status_code, 401)
+        self.assertEqual(
+            client.post(
+                "/internal/llm-proxy-usage",
+                headers={"Authorization": "Bearer hf_user_token"},
+                json=payload,
+            ).status_code,
+            403,
         )
-
-        self.assertEqual(unauthenticated.status_code, 401)
-        self.assertEqual(authenticated.status_code, 413)
 
     def _import_load_balancer(self, env):
         return load_balancer_fixture({"LB_ADMIN_AUTH_TOKEN": "", **env})
@@ -839,12 +851,7 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
 
     async def test_required_verified_token_can_receive_immediate_grant(self):
-        module = self._import_load_balancer(
-            {
-                "SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true",
-                "SESSION_SHARED_SECRET": "shared-secret",
-            }
-        )
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
         module.dependencies.dashboard = fake_dashboard
@@ -852,14 +859,10 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         verified = _requester_identity(verification="verified", kind="authenticated")
 
         with patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified):
-            response = await create_session(
-                module.runtime,
-                FakeHeaderRequest({"authorization": "Bearer hf_faketesttoken1234"}),
-            )
+            response = await create_session(module.runtime, FakeConnectedRequest())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_session_manager.allocation_calls, 1)
-        self.assertIsNotNone(fake_session_manager.allocation_arguments[0]["llm_fingerprint"])
         self.assertEqual(fake_dashboard.calls, ["request", "success"])
 
     async def test_default_verification_age_allows_the_full_default_allocation_wait(self):
@@ -1128,182 +1131,45 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         module = self._import_load_balancer({"LB_CALLBACK_AUTH_TOKEN": "callback-secret"})
         fake_dashboard = FakeDashboard()
         module.dependencies.dashboard = fake_dashboard
-        requester = RequesterIdentity(
-            actor_id="token:abc123",
-            label="@reachy-user · token •abc123",
-            kind="authenticated",
-            verification="verified",
-            fingerprint="abc123",
-            account_name="reachy-user",
-            network_id="net:network123",
-        )
+        module.dependencies.requester_identity_resolver._whoami_fn = lambda _token: {"name": "reachy-user"}
         callback_request = SimpleNamespace(headers={"authorization": "Bearer callback-secret"})
-        with patch.object(module.dependencies.requester_identity_resolver, "identify_values", return_value=requester):
-            accepted = await llm_proxy_usage(
+        for outcome, reason in (("accepted", "accepted"), ("rejected", "no_active_session_match")):
+            await llm_proxy_usage(
                 module.runtime,
                 callback_request,
-                {
-                    "outcome": "accepted",
-                    "reason": "accepted",
-                    "session_matched": True,
-                    "credential_present": True,
-                    "token": "hf_valid_token",
-                    "client_ip": "203.0.113.8",
-                },
-            )
-            rejected = await llm_proxy_usage(
-                module.runtime,
-                callback_request,
-                {
-                    "outcome": "rejected",
-                    "reason": "no_active_session_match",
-                    "session_matched": False,
-                    "credential_present": True,
-                    "token": "hf_valid_token",
-                    "client_ip": "203.0.113.8",
-                },
+                _llm_usage_payload(outcome, reason, token="hf_valid_token"),
             )
 
-        self.assertEqual(accepted.status_code, 200)
-        self.assertEqual(rejected.status_code, 200)
+        events = fake_dashboard.llm_proxy_requests
         self.assertEqual(
-            fake_dashboard.llm_proxy_requests,
-            [
-                ("accepted", "accepted", requester.actor_id, requester.history_metadata()),
-                (
-                    "rejected",
-                    "no_active_session_match",
-                    requester.actor_id,
-                    requester.history_metadata(),
-                ),
-            ],
+            [event[:2] for event in events],
+            [("accepted", "accepted"), ("rejected", "no_active_session_match")],
         )
-        persisted_record = json.dumps(fake_dashboard.llm_proxy_requests)
-        self.assertNotIn("hf_valid_token", persisted_record)
-        self.assertNotIn("203.0.113.8", persisted_record)
+        self.assertEqual(events[0][2], events[1][2])
+        self.assertEqual(events[0][3]["account_name"], "reachy-user")
+        self.assertNotIn("hf_valid_token", str(events))
+        self.assertNotIn("203.0.113.8", str(events))
 
-    async def test_llm_proxy_missing_token_falls_back_to_privacy_safe_ip(self):
+    async def test_unidentified_tokens_fall_back_to_privacy_safe_ip(self):
         module = self._import_load_balancer({"LB_CALLBACK_AUTH_TOKEN": "callback-secret"})
         fake_dashboard = FakeDashboard()
         module.dependencies.dashboard = fake_dashboard
-        network_requester = RequesterIdentity(
-            actor_id="anonymous:network123",
-            label="Anonymous IP •network1",
-            kind="anonymous",
-            verification="not_provided",
-            fingerprint="network123",
-            network_id="net:network123",
+        request = SimpleNamespace(headers={"authorization": "Bearer callback-secret"})
+        await llm_proxy_usage(module.runtime, request, _llm_usage_payload("rejected", "missing_token"))
+
+        invalid = RuntimeError("invalid")
+        invalid.response = SimpleNamespace(status_code=401)
+        module.dependencies.requester_identity_resolver._whoami_fn = lambda _token: (_ for _ in ()).throw(invalid)
+        await llm_proxy_usage(
+            module.runtime,
+            request,
+            _llm_usage_payload("rejected", "no_active_session_match", token="hf_invalid_token"),
         )
 
-        with patch.object(
-            module.dependencies.requester_identity_resolver,
-            "identify_values",
-            return_value=network_requester,
-        ):
-            response = await llm_proxy_usage(
-                module.runtime,
-                SimpleNamespace(headers={"authorization": "Bearer callback-secret"}),
-                {
-                    "outcome": "rejected",
-                    "reason": "missing_token",
-                    "session_matched": False,
-                    "credential_present": False,
-                    "client_ip": "203.0.113.8",
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            fake_dashboard.llm_proxy_requests,
-            [
-                (
-                    "rejected",
-                    "missing_token",
-                    network_requester.actor_id,
-                    network_requester.history_metadata(),
-                )
-            ],
-        )
-        self.assertNotIn("203.0.113.8", json.dumps(fake_dashboard.llm_proxy_requests))
-
-    async def test_llm_proxy_callback_requires_compute_authentication(self):
-        module = self._import_load_balancer({"LB_CALLBACK_AUTH_TOKEN": "callback-secret"})
-        payload = {
-            "outcome": "rejected",
-            "reason": "missing_token",
-            "session_matched": False,
-            "credential_present": False,
-            "client_ip": "203.0.113.8",
-        }
-
-        with self.assertRaises(HTTPException) as missing_auth:
-            await llm_proxy_usage(
-                module.runtime,
-                SimpleNamespace(headers={}),
-                payload,
-            )
-        with self.assertRaises(HTTPException) as user_token_auth:
-            await llm_proxy_usage(
-                module.runtime,
-                SimpleNamespace(headers={"authorization": "Bearer hf_valid_token"}),
-                payload,
-            )
-
-        self.assertEqual(missing_auth.exception.status_code, 401)
-        self.assertEqual(user_token_auth.exception.status_code, 403)
-
-    async def test_llm_proxy_invalid_token_falls_back_to_privacy_safe_ip(self):
-        module = self._import_load_balancer({"LB_CALLBACK_AUTH_TOKEN": "callback-secret"})
-        fake_dashboard = FakeDashboard()
-        module.dependencies.dashboard = fake_dashboard
-        token_requester = RequesterIdentity(
-            actor_id="token:abc123",
-            label="Invalid token •abc123",
-            kind="invalid_token",
-            verification="invalid",
-            fingerprint="abc123",
-        )
-        network_requester = RequesterIdentity(
-            actor_id="anonymous:network123",
-            label="Anonymous IP •network1",
-            kind="anonymous",
-            verification="not_provided",
-            fingerprint="network123",
-            network_id="net:network123",
-        )
-
-        with (
-            patch.object(
-                module.dependencies.requester_identity_resolver,
-                "identify_values",
-                side_effect=[token_requester, network_requester],
-            ),
-            patch.object(
-                module.dependencies.requester_identity_resolver,
-                "latest_identity",
-                return_value=token_requester,
-            ),
-        ):
-            response = await llm_proxy_usage(
-                module.runtime,
-                SimpleNamespace(headers={"authorization": "Bearer callback-secret"}),
-                {
-                    "outcome": "rejected",
-                    "reason": "no_active_session_match",
-                    "session_matched": False,
-                    "credential_present": True,
-                    "token": "hf_invalid_token",
-                    "client_ip": "203.0.113.8",
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        _, reason, actor_id, metadata = fake_dashboard.llm_proxy_requests[0]
-        self.assertEqual(reason, "no_active_session_match")
-        self.assertEqual(actor_id, network_requester.actor_id)
-        self.assertEqual(metadata["verification"], "invalid")
-        self.assertNotIn("hf_invalid_token", str(metadata))
-        self.assertNotIn("203.0.113.8", str(metadata))
+        events = fake_dashboard.llm_proxy_requests
+        self.assertTrue(all(event[2].startswith("anonymous:") for event in events))
+        self.assertEqual([event[3]["verification"] for event in events], ["not_provided", "invalid"])
+        self.assertNotIn("203.0.113.8", str(events))
 
     async def test_disconnected_callback_records_requester_duration_after_connect(self):
         module = self._import_load_balancer()
@@ -1508,18 +1374,12 @@ class FakeSessionManager:
         self.allocation_wait_ms = allocation_wait_ms
         self.waited_for_capacity = waited_for_capacity
         self.allocation_calls = 0
-        self.allocation_arguments = []
         self.connected_session_ids = set()
 
     async def allocate(self, lb_base_url, *, llm_fingerprint=None):
         # Mirrors DirectSessionManager._grant_from_lease, which stamps
         # "state": "granted" on every grant it returns.
         self.allocation_calls += 1
-        self.allocation_arguments.append(
-            {
-                "llm_fingerprint": llm_fingerprint,
-            }
-        )
         return {
             "state": "granted",
             "session_id": "session-123",

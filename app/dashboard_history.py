@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Callable, Optional, Protocol
 
 from app.app_utils import cancel_and_await
-from app.llm_proxy_usage import LLM_PROXY_ACCEPTED_REASON, LLM_PROXY_REJECTION_REASONS
+from app.llm_proxy_usage import LLM_PROXY_REJECTION_REASONS
 
 logger = logging.getLogger("s2s-endpoint")
 DAY_MINUTES = 24 * 60
@@ -165,7 +165,6 @@ class SwarmHistoryBucket:
     session_allocation_failures: int = 0
     session_auth_rejections: int = 0
     session_rate_limited: int = 0
-    llm_proxy_requests: int = 0
     llm_proxy_accepted: int = 0
     llm_proxy_rejected: int = 0
     llm_proxy_rejection_reasons: dict[str, int] = field(default_factory=dict)
@@ -222,7 +221,7 @@ class SwarmHistoryBucket:
             "session_allocation_failures": self.session_allocation_failures,
             "session_auth_rejections": self.session_auth_rejections,
             "session_rate_limited": self.session_rate_limited,
-            "llm_proxy_requests": self.llm_proxy_requests,
+            "llm_proxy_requests": self.llm_proxy_accepted + self.llm_proxy_rejected,
             "llm_proxy_accepted": self.llm_proxy_accepted,
             "llm_proxy_rejected": self.llm_proxy_rejected,
             "llm_proxy_rejection_reasons": dict(self.llm_proxy_rejection_reasons),
@@ -287,7 +286,6 @@ _HISTORY_BUCKET_INT_FIELDS = {
     "session_allocation_failures",
     "session_auth_rejections",
     "session_rate_limited",
-    "llm_proxy_requests",
     "llm_proxy_accepted",
     "llm_proxy_rejected",
     "session_connected_events",
@@ -361,7 +359,6 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "failures": max(int(raw_record.get("failures", 0)), 0),
             "auth_rejected": max(int(raw_record.get("auth_rejected", 0)), 0),
             "rate_limited": max(int(raw_record.get("rate_limited", 0)), 0),
-            "llm_proxy_requests": max(int(raw_record.get("llm_proxy_requests", 0)), 0),
             "llm_proxy_accepted": max(int(raw_record.get("llm_proxy_accepted", 0)), 0),
             "llm_proxy_rejected": max(int(raw_record.get("llm_proxy_rejected", 0)), 0),
             "llm_proxy_rejection_reasons": _coerce_llm_proxy_rejection_reasons(
@@ -426,7 +423,6 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
         "failures": 0,
         "auth_rejected": 0,
         "rate_limited": 0,
-        "llm_proxy_requests": 0,
         "llm_proxy_accepted": 0,
         "llm_proxy_rejected": 0,
         "llm_proxy_rejection_reasons": {},
@@ -783,26 +779,20 @@ class DashboardHistory:
         reason: str | None = None,
     ) -> None:
         counter_fields = {
-            "request": (("session_requests",), ("requests",)),
-            "success": (("session_allocation_successes",), ("successes",)),
-            "failure": (("session_allocation_failures",), ("failures",)),
-            "auth_rejected": (("session_auth_rejections",), ("auth_rejected",)),
-            "rate_limited": (("session_rate_limited",), ("rate_limited",)),
-            "llm_proxy_accepted": (
-                ("llm_proxy_requests", "llm_proxy_accepted"),
-                ("llm_proxy_requests", "llm_proxy_accepted"),
-            ),
-            "llm_proxy_rejected": (
-                ("llm_proxy_requests", "llm_proxy_rejected"),
-                ("llm_proxy_requests", "llm_proxy_rejected"),
-            ),
-            "abandoned": ((), ("abandoned",)),
-            "connected": ((), ("connections",)),
-            "disconnected": ((), ("completed_sessions",)),
+            "request": ("session_requests", "requests"),
+            "success": ("session_allocation_successes", "successes"),
+            "failure": ("session_allocation_failures", "failures"),
+            "auth_rejected": ("session_auth_rejections", "auth_rejected"),
+            "rate_limited": ("session_rate_limited", "rate_limited"),
+            "llm_proxy_accepted": ("llm_proxy_accepted", "llm_proxy_accepted"),
+            "llm_proxy_rejected": ("llm_proxy_rejected", "llm_proxy_rejected"),
+            "abandoned": (None, "abandoned"),
+            "connected": (None, "connections"),
+            "disconnected": (None, "completed_sessions"),
         }
         if event not in counter_fields:
             raise ValueError(f"Unknown requester event: {event}")
-        if event == "llm_proxy_accepted" and reason != LLM_PROXY_ACCEPTED_REASON:
+        if event == "llm_proxy_accepted" and reason != "accepted":
             raise ValueError("accepted LLM proxy events require the accepted reason")
         if event == "llm_proxy_rejected" and reason not in LLM_PROXY_REJECTION_REASONS:
             raise ValueError("rejected LLM proxy events require a supported rejection reason")
@@ -810,8 +800,8 @@ class DashboardHistory:
         now = self._time_fn()
         async with self._lock:
             bucket = self._get_bucket_unlocked(now)
-            global_fields, requester_fields = counter_fields[event]
-            for global_field in global_fields:
+            global_field, requester_field = counter_fields[event]
+            if global_field is not None:
                 setattr(bucket, global_field, getattr(bucket, global_field) + 1)
             if event == "llm_proxy_rejected" and reason is not None:
                 bucket.llm_proxy_rejection_reasons[reason] = bucket.llm_proxy_rejection_reasons.get(reason, 0) + 1
@@ -836,8 +826,7 @@ class DashboardHistory:
                     bucket.requester_usage[resolved_actor_id] = record
                     self._requester_record_count += 1
                 _merge_requester_identity(record, resolved_metadata)
-                for requester_field in requester_fields:
-                    record[requester_field] = int(record.get(requester_field, 0)) + 1
+                record[requester_field] = int(record.get(requester_field, 0)) + 1
                 if event == "llm_proxy_rejected" and reason is not None:
                     rejection_reasons = record.setdefault("llm_proxy_rejection_reasons", {})
                     if isinstance(rejection_reasons, dict):

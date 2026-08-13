@@ -355,11 +355,6 @@ load-balancer variable is ignored and can be removed from existing deployments.
   first-seen HF token's `whoami` validation before minting the session's LLM
   proxy claim (defaults to 5 seconds). On timeout the session is created
   normally but without LLM proxy access.
-- `LLM_PROXY_USAGE_VERIFY_TIMEOUT_S`: maximum time the accounting callback waits
-  for first-seen HF token validation before recording the attempt under its
-  privacy-safe network identity (defaults to 5 seconds). Compute waits at most
-  one second for the callback response, so a slow first lookup does not extend
-  the proxy request beyond that reporting bound.
 - `SESSION_PENDING_TIMEOUT_S`: how long an unused reservation stays alive
 - `SESSION_TOKEN_TTL_S`: lifetime of the signed session token
 - `SESSION_REAP_INTERVAL_S`: how often the LB reaps unused reservations

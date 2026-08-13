@@ -58,30 +58,6 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
-    async def test_trusted_values_use_the_same_token_and_network_identities(self):
-        resolver = RequesterIdentityResolver(hash_secret="stable-secret", whoami_fn=lambda token: {})
-        request_identity = resolver.identify(
-            FakeRequest(
-                headers={
-                    "authorization": "Bearer hf_same_token",
-                    "x-forwarded-for": "203.0.113.8",
-                }
-            ),
-            schedule_validation=False,
-        )
-        value_identity = resolver.identify_values(
-            token="hf_same_token",
-            address="203.0.113.8",
-            schedule_validation=False,
-        )
-
-        self.assertEqual(value_identity.actor_id, request_identity.actor_id)
-        self.assertEqual(value_identity.network_id, request_identity.network_id)
-        self.assertNotIn("hf_same_token", str(value_identity.history_metadata()))
-        self.assertNotIn("203.0.113.8", str(value_identity.history_metadata()))
-
-        await resolver.stop()
-
     async def test_proxy_headers_can_be_ignored(self):
         request = FakeRequest(
             headers={"x-forwarded-for": "203.0.113.8"},

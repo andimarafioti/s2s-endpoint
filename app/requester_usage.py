@@ -38,7 +38,6 @@ class _ActorUsageAccumulator:
     failures: int = 0
     auth_rejected: int = 0
     rate_limited: int = 0
-    llm_proxy_requests: int = 0
     llm_proxy_accepted: int = 0
     llm_proxy_rejected: int = 0
     llm_proxy_rejection_reasons: Counter[str] = field(default_factory=Counter)
@@ -115,7 +114,6 @@ class _ActorUsageAccumulator:
         self.failures += max(int(record.get("failures", 0)), 0)
         self.auth_rejected += max(int(record.get("auth_rejected", 0)), 0)
         self.rate_limited += max(int(record.get("rate_limited", 0)), 0)
-        self.llm_proxy_requests += max(int(record.get("llm_proxy_requests", 0)), 0)
         self.llm_proxy_accepted += max(int(record.get("llm_proxy_accepted", 0)), 0)
         self.llm_proxy_rejected += max(int(record.get("llm_proxy_rejected", 0)), 0)
         for reason, count in dict(record.get("llm_proxy_rejection_reasons") or {}).items():
@@ -226,7 +224,7 @@ class _ActorUsageAccumulator:
             "failures": self.failures,
             "auth_rejected": self.auth_rejected,
             "rate_limited": self.rate_limited,
-            "llm_proxy_requests": self.llm_proxy_requests,
+            "llm_proxy_requests": self.llm_proxy_accepted + self.llm_proxy_rejected,
             "llm_proxy_accepted": self.llm_proxy_accepted,
             "llm_proxy_rejected": self.llm_proxy_rejected,
             "llm_proxy_rejection_reasons": dict(self.llm_proxy_rejection_reasons),

@@ -14,7 +14,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app.app_utils import build_lifespan, env_bool, env_text, setup_logging
-from app.llm_proxy_usage import LLM_PROXY_ACCEPTED_REASON
 from app.requester_identity import bearer_token, client_address, is_validatable_hf_token
 from app.session_router import SessionRouter
 from app.session_tokens import llm_token_fingerprint, verify_session_token, websocket_host_matches
@@ -308,11 +307,11 @@ class _ConnectedFingerprintRegistry:
         self._counts[fingerprint] = self._counts.get(fingerprint, 0) + 1
 
     def remove(self, fingerprint: str) -> None:
-        count = self._counts.get(fingerprint, 0)
-        if count <= 1:
+        count = self._counts.get(fingerprint, 0) - 1
+        if count > 0:
+            self._counts[fingerprint] = count
+        else:
             self._counts.pop(fingerprint, None)
-            return
-        self._counts[fingerprint] = count - 1
 
     def __contains__(self, fingerprint: str) -> bool:
         return fingerprint in self._counts
@@ -360,18 +359,6 @@ def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONRes
     return JSONResponse({"error": {"message": message, "type": error_type}}, status_code=status_code)
 
 
-def _llm_proxy_match(
-    token: Optional[str],
-    settings: ComputeSettings,
-    dependencies: "ComputeDependencies",
-) -> Optional[str]:
-    """Return the fingerprint when the presented token has an active session."""
-    if not settings.session_shared_secret or token is None:
-        return None
-    fingerprint = llm_token_fingerprint(settings.session_shared_secret, token)
-    return fingerprint if fingerprint in dependencies.connected_llm_fingerprints else None
-
-
 def _llm_proxy_token(request: Request) -> Optional[str]:
     token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
     if token is None:
@@ -379,41 +366,43 @@ def _llm_proxy_token(request: Request) -> Optional[str]:
     return token
 
 
-def _llm_proxy_denial(
+def _llm_proxy_gate(
     token: Optional[str],
-    matched_fingerprint: Optional[str],
+    settings: ComputeSettings,
     dependencies: "ComputeDependencies",
-) -> tuple[Optional[JSONResponse], str]:
-    """Access check for the LLM proxy paths; None means forward the request.
+) -> tuple[Optional[JSONResponse], str, bool]:
+    """Return the local gate response, accounting reason, and session match.
 
     The api key must be the HF token the session was created with, checked by
     fingerprint against the sessions whose websocket is currently connected.
     Without a shared secret the replica cannot verify anything, so the paths
-    fail closed. The credential match was resolved once at request start, so
-    an answer already streaming when its session disconnects finishes
-    undisturbed.
+    fail closed. Checked once at request start: an answer already streaming
+    when its session disconnects finishes undisturbed.
     """
-    if matched_fingerprint is not None:
-        if dependencies.llm_rate_limiter.allow(matched_fingerprint):
-            return None, LLM_PROXY_ACCEPTED_REASON
-        return (
-            _llm_proxy_error(
-                429,
-                f"Rate limit exceeded: {dependencies.llm_rate_limiter.limit_rpm} requests per minute "
-                "per user. Back off and retry.",
-                "rate_limit_exceeded",
-            ),
-            "rate_limited",
-        )
-    return (
-        _llm_proxy_error(
+    fingerprint = None
+    if settings.session_shared_secret and token is not None:
+        candidate = llm_token_fingerprint(settings.session_shared_secret, token)
+        if candidate in dependencies.connected_llm_fingerprints:
+            fingerprint = candidate
+    if not settings.enable_llm_proxy:
+        return None, "proxy_disabled", fingerprint is not None
+    if fingerprint is None:
+        denial = _llm_proxy_error(
             401,
             "Invalid API key: pass the HF token this session was created with, "
             "while the session's realtime websocket is connected.",
             "invalid_api_key",
-        ),
-        "missing_token" if token is None else "no_active_session_match",
-    )
+        )
+        return denial, "missing_token" if token is None else "no_active_session_match", False
+    if not dependencies.llm_rate_limiter.allow(fingerprint):
+        denial = _llm_proxy_error(
+            429,
+            f"Rate limit exceeded: {dependencies.llm_rate_limiter.limit_rpm} requests per minute "
+            "per user. Back off and retry.",
+            "rate_limit_exceeded",
+        )
+        return denial, "rate_limited", True
+    return None, "accepted", True
 
 
 async def _report_llm_proxy_request(
@@ -495,45 +484,20 @@ async def _proxy_llm_request(
     unreachable).
     """
     token = _llm_proxy_token(request)
-    matched_fingerprint = _llm_proxy_match(token, settings, dependencies)
-    session_matched = matched_fingerprint is not None
-
-    if not settings.enable_llm_proxy:
-        # Returned before admission or rate limiting: a disabled replica
-        # answers exactly like an app where these routes were never registered.
-        await _report_llm_proxy_request(
-            request,
-            settings,
-            dependencies,
-            outcome="rejected",
-            reason="proxy_disabled",
-            token=token,
-            session_matched=session_matched,
-        )
-        raise HTTPException(status_code=404)
-
-    denial, reason = _llm_proxy_denial(token, matched_fingerprint, dependencies)
-    if denial is not None:
-        await _report_llm_proxy_request(
-            request,
-            settings,
-            dependencies,
-            outcome="rejected",
-            reason=reason,
-            token=token,
-            session_matched=session_matched,
-        )
-        return denial
-
+    denial, reason, session_matched = _llm_proxy_gate(token, settings, dependencies)
     await _report_llm_proxy_request(
         request,
         settings,
         dependencies,
-        outcome="accepted",
-        reason=LLM_PROXY_ACCEPTED_REASON,
+        outcome="accepted" if reason == "accepted" else "rejected",
+        reason=reason,
         token=token,
-        session_matched=True,
+        session_matched=session_matched,
     )
+    if reason == "proxy_disabled":
+        raise HTTPException(status_code=404)
+    if denial is not None:
+        return denial
 
     headers = {}
     content_type = request.headers.get("content-type")
@@ -716,12 +680,10 @@ async def _notify_lb_session_event(
     session_token: str,
     event: str,
     *,
-    post_json: Callable[[str, dict[str, object]], None],
+    post_json: Callable[[str, dict[str, str]], None],
     default_backoff_s: float,
     attempts: int = 1,
     backoff_s: Optional[float] = None,
-    payload_fields: Optional[Mapping[str, object]] = None,
-    timeout_s: Optional[float] = None,
 ) -> None:
     """Post a session lifecycle event to the LB callback URL.
 
@@ -734,19 +696,13 @@ async def _notify_lb_session_event(
         "session_token": session_token,
         "event": event,
     }
-    if payload_fields:
-        payload.update(payload_fields)
     if backoff_s is None:
         backoff_s = default_backoff_s
     attempts = max(attempts, 1)
     delay = backoff_s
     for attempt in range(1, attempts + 1):
         try:
-            operation = asyncio.to_thread(post_json, callback_url, payload)
-            if timeout_s is None:
-                await operation
-            else:
-                await asyncio.wait_for(operation, timeout=max(timeout_s, 0.0))
+            await asyncio.to_thread(post_json, callback_url, payload)
             return
         except Exception as exc:
             if attempt >= attempts:
@@ -761,17 +717,6 @@ async def _notify_lb_session_event(
             )
             await asyncio.sleep(delay)
             delay *= 3
-
-
-async def _notify_lb_llm_proxy_usage(
-    callback_url: str,
-    payload: dict[str, object],
-    *,
-    post_json: Callable[[str, dict[str, object]], None],
-    timeout_s: float,
-) -> None:
-    operation = asyncio.to_thread(post_json, callback_url, payload)
-    await asyncio.wait_for(operation, timeout=max(timeout_s, 0.0))
 
 
 def _http_get_json(url: str) -> dict[str, object]:
@@ -856,14 +801,6 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
             callback_auth_token=settings.lb_callback_auth_token,
         )
 
-    def post_llm_proxy_usage(url: str, payload: dict[str, object]) -> None:
-        _post_json(
-            url,
-            payload,
-            callback_auth_token=settings.lb_callback_auth_token,
-            timeout_s=LLM_PROXY_ACCOUNTING_TIMEOUT_S,
-        )
-
     async def notify_lb_session_event(
         callback_url: str,
         session_token: str,
@@ -871,8 +808,6 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
         *,
         attempts: int = 1,
         backoff_s: Optional[float] = None,
-        payload_fields: Optional[Mapping[str, object]] = None,
-        timeout_s: Optional[float] = None,
     ) -> None:
         await _notify_lb_session_event(
             callback_url,
@@ -882,8 +817,6 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
             default_backoff_s=settings.lb_callback_retry_backoff_s,
             attempts=attempts,
             backoff_s=backoff_s,
-            payload_fields=payload_fields,
-            timeout_s=timeout_s,
         )
 
     async def notify_lb_llm_proxy_usage(
@@ -892,11 +825,15 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
         *,
         timeout_s: float,
     ) -> None:
-        await _notify_lb_llm_proxy_usage(
-            callback_url,
-            payload,
-            post_json=post_llm_proxy_usage,
-            timeout_s=timeout_s,
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                _post_json,
+                callback_url,
+                payload,
+                callback_auth_token=settings.lb_callback_auth_token,
+                timeout_s=timeout_s,
+            ),
+            timeout=timeout_s,
         )
 
     router = SessionRouter(

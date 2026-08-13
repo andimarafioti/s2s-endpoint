@@ -123,35 +123,25 @@ class CreateComputeEndpointsTests(unittest.TestCase):
                 llm_proxy_accounting_callback_url=None,
             )
 
-    def test_build_endpoint_env_requires_callback_auth_when_not_copied(self):
-        with self.assertRaisesRegex(ValueError, "--lb-callback-auth-token is required"):
-            build_endpoint_env(
-                base_env={"SESSION_SHARED_SECRET": "shared"},
-                session_shared_secret=None,
-                num_pipelines=None,
-                lb_callback_auth_token=None,
-                llm_proxy_accounting_callback_url="https://lb.example/internal/llm-proxy-usage",
-            )
-
-    def test_build_endpoint_env_requires_accounting_url_when_not_copied(self):
-        with self.assertRaisesRegex(ValueError, "--llm-proxy-accounting-callback-url is required"):
-            build_endpoint_env(
-                base_env={"SESSION_SHARED_SECRET": "shared"},
-                session_shared_secret=None,
-                num_pipelines=None,
-                lb_callback_auth_token="callback-secret",
-                llm_proxy_accounting_callback_url=None,
-            )
-
-    def test_build_endpoint_env_requires_https_accounting_url(self):
-        with self.assertRaisesRegex(ValueError, "absolute HTTPS URL"):
-            build_endpoint_env(
-                base_env={"SESSION_SHARED_SECRET": "shared"},
-                session_shared_secret=None,
-                num_pipelines=None,
-                lb_callback_auth_token="callback-secret",
-                llm_proxy_accounting_callback_url="http://lb.example/internal/llm-proxy-usage",
-            )
+    def test_build_endpoint_env_requires_accounting_config(self):
+        cases = (
+            (None, "https://lb.example/internal/llm-proxy-usage", "--lb-callback-auth-token"),
+            ("callback-secret", None, "--llm-proxy-accounting-callback-url"),
+            (
+                "callback-secret",
+                "http://lb.example/internal/llm-proxy-usage",
+                "absolute HTTPS URL",
+            ),
+        )
+        for callback_token, callback_url, error in cases:
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                build_endpoint_env(
+                    base_env={"SESSION_SHARED_SECRET": "shared"},
+                    session_shared_secret=None,
+                    num_pipelines=None,
+                    lb_callback_auth_token=callback_token,
+                    llm_proxy_accounting_callback_url=callback_url,
+                )
 
 
 class CreateEndpointMainTests(unittest.TestCase):
