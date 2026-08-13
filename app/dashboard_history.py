@@ -451,8 +451,9 @@ def _llm_proxy_event_ids(bucket: SwarmHistoryBucket) -> set[tuple[str, int]]:
 def _normalize_llm_proxy_usage(
     bucket: SwarmHistoryBucket,
     metadata: dict[str, dict[str, object]] | None = None,
+    compacted_counts: dict[str, int] | None = None,
 ) -> None:
-    requester_counts: dict[str, int] = {}
+    requester_counts = dict(compacted_counts or {})
     for sequences in bucket.llm_proxy_events.values():
         for actor_id in sequences.values():
             requester_counts[actor_id] = requester_counts.get(actor_id, 0) + 1
@@ -465,11 +466,24 @@ def _normalize_llm_proxy_usage(
         bucket.requester_usage[actor_id] = record
 
 
+def _llm_proxy_compacted_counts(bucket: SwarmHistoryBucket) -> dict[str, int]:
+    exact_counts: dict[str, int] = {}
+    for sequences in bucket.llm_proxy_events.values():
+        for actor_id in sequences.values():
+            exact_counts[actor_id] = exact_counts.get(actor_id, 0) + 1
+    return {
+        actor_id: max(int(record.get("llm_proxy_requests", 0)) - exact_counts.get(actor_id, 0), 0)
+        for actor_id, record in bucket.requester_usage.items()
+        if int(record.get("llm_proxy_requests", 0)) > exact_counts.get(actor_id, 0)
+    }
+
+
 def _remove_duplicate_llm_proxy_events(buckets: list[SwarmHistoryBucket]) -> set[int]:
     """Keep each event in its earliest minute when callbacks straddle a rollover."""
     seen: set[tuple[str, int]] = set()
     changed: set[int] = set()
     for bucket in sorted(buckets, key=lambda item: item.bucket_start_s):
+        compacted_counts = _llm_proxy_compacted_counts(bucket)
         for instance_id, sequences in list(bucket.llm_proxy_events.items()):
             unique = {
                 sequence: actor_id for sequence, actor_id in sequences.items() if (instance_id, sequence) not in seen
@@ -483,7 +497,7 @@ def _remove_duplicate_llm_proxy_events(buckets: list[SwarmHistoryBucket]) -> set
             else:
                 bucket.llm_proxy_events.pop(instance_id)
         if bucket.bucket_start_s in changed:
-            _normalize_llm_proxy_usage(bucket)
+            _normalize_llm_proxy_usage(bucket, compacted_counts=compacted_counts)
     return changed
 
 
@@ -895,10 +909,6 @@ class DashboardHistory:
                         "verification": "not_applicable",
                     }
                 bucket.llm_proxy_events.setdefault(instance_id, {})[sequence] = resolved_actor_id
-                bucket.llm_proxy_sequences[instance_id] = max(
-                    bucket.llm_proxy_sequences.get(instance_id, 0),
-                    sequence,
-                )
                 record = bucket.requester_usage.get(resolved_actor_id)
                 if record is None:
                     self._make_requester_record_capacity_unlocked()
@@ -1237,11 +1247,22 @@ class DashboardHistory:
                     continue
                 current_event_ids = _llm_proxy_event_ids(current_bucket)
                 incoming_event_ids = _llm_proxy_event_ids(bucket)
-                new_event_ids = incoming_event_ids - current_event_ids
+                new_event_ids = {
+                    (instance_id, sequence)
+                    for instance_id, sequence in incoming_event_ids - current_event_ids
+                    if sequence > current_bucket.llm_proxy_sequences.get(instance_id, 0)
+                }
                 missing_event_ids = current_event_ids - incoming_event_ids
                 if new_event_ids:
+                    compacted_counts = _llm_proxy_compacted_counts(current_bucket)
                     for instance_id, sequences in bucket.llm_proxy_events.items():
-                        current_bucket.llm_proxy_events.setdefault(instance_id, {}).update(sequences)
+                        current_bucket.llm_proxy_events.setdefault(instance_id, {}).update(
+                            {
+                                sequence: actor_id
+                                for sequence, actor_id in sequences.items()
+                                if (instance_id, sequence) in new_event_ids
+                            }
+                        )
                     _merge_llm_proxy_sequences(current_bucket, bucket)
                     for actor_id, record in bucket.requester_usage.items():
                         current_record = current_bucket.requester_usage.get(actor_id)
@@ -1252,7 +1273,11 @@ class DashboardHistory:
                         for source in (current_bucket.requester_usage, bucket.requester_usage)
                         for actor_id, record in source.items()
                     }
-                    _normalize_llm_proxy_usage(current_bucket, metadata)
+                    _normalize_llm_proxy_usage(
+                        current_bucket,
+                        metadata,
+                        compacted_counts,
+                    )
                 elif bucket.llm_proxy_sequences:
                     _merge_llm_proxy_sequences(current_bucket, bucket)
                 if new_event_ids or missing_event_ids:
