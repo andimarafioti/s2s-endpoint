@@ -48,22 +48,25 @@ def _isoformat(epoch_s: int | float) -> str:
     return datetime.fromtimestamp(epoch_s, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _cumulative_delta(
+def _cumulative_deltas(
     current: dict[str, object],
     previous: Optional[dict[str, object]],
-    field_name: str,
-    same_instance: bool,
+    *,
     count_current: bool,
-) -> int:
-    current_value = max(int(current.get(field_name, 0)), 0)
+) -> tuple[dict[str, int], bool]:
+    fields = ("requests", "accepted", "rejected")
+    current_values = {field: max(int(current.get(field, 0)), 0) for field in fields}
     if count_current:
-        return current_value
-    if not same_instance or previous is None:
-        return 0
-    previous_value = max(int(previous.get(field_name, 0)), 0)
-    # A decrease without an instance-id change is still a reset. Establish the
-    # lower baseline without interpreting old cumulative traffic as new.
-    return max(current_value - previous_value, 0)
+        return current_values, False
+    if previous is None:
+        return dict.fromkeys(fields, 0), False
+    previous_values = {field: max(int(previous.get(field, 0)), 0) for field in fields}
+    reset = any(current_values[field] < previous_values[field] for field in fields)
+    if reset:
+        # Reset the triple atomically. Independent clamping could otherwise
+        # manufacture accepted or rejected traffic while the total decreases.
+        return dict.fromkeys(fields, 0), True
+    return ({field: current_values[field] - previous_values[field] for field in fields}, False)
 
 
 class DashboardHistoryStore(Protocol):
@@ -661,9 +664,14 @@ class DashboardHistory:
             same_instance = previous is not None and previous.get("instance_id") == instance_id
             count_current = previous is not None and not same_instance
 
-            requests = _cumulative_delta(current, previous, "requests", same_instance, count_current)
-            accepted = _cumulative_delta(current, previous, "accepted", same_instance, count_current)
-            rejected = _cumulative_delta(current, previous, "rejected", same_instance, count_current)
+            deltas, replica_reset = _cumulative_deltas(
+                current,
+                previous if same_instance else None,
+                count_current=count_current,
+            )
+            requests = deltas["requests"]
+            accepted = deltas["accepted"]
+            rejected = deltas["rejected"]
             if requests or accepted or rejected:
                 bucket.llm_proxy_requests += requests
                 bucket.llm_proxy_accepted += accepted
@@ -680,28 +688,19 @@ class DashboardHistory:
                     previous_record = previous_requesters.get(raw_actor_id)
                     if not isinstance(previous_record, dict):
                         previous_record = None
+                    raw_deltas, _ = _cumulative_deltas(
+                        raw_record,
+                        previous_record,
+                        count_current=(
+                            not replica_reset and (count_current or (same_instance and previous_record is None))
+                        ),
+                    )
+                    if replica_reset:
+                        raw_deltas = dict.fromkeys(raw_deltas, 0)
                     requester_deltas = {
-                        "llm_proxy_requests": _cumulative_delta(
-                            raw_record,
-                            previous_record,
-                            "requests",
-                            same_instance,
-                            count_current or (same_instance and previous_record is None),
-                        ),
-                        "llm_proxy_accepted": _cumulative_delta(
-                            raw_record,
-                            previous_record,
-                            "accepted",
-                            same_instance,
-                            count_current or (same_instance and previous_record is None),
-                        ),
-                        "llm_proxy_rejected": _cumulative_delta(
-                            raw_record,
-                            previous_record,
-                            "rejected",
-                            same_instance,
-                            count_current or (same_instance and previous_record is None),
-                        ),
+                        "llm_proxy_requests": raw_deltas["requests"],
+                        "llm_proxy_accepted": raw_deltas["accepted"],
+                        "llm_proxy_rejected": raw_deltas["rejected"],
                     }
                     if not any(requester_deltas.values()):
                         continue

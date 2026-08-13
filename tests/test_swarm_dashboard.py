@@ -377,7 +377,17 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
     async def test_replica_restart_and_counter_reset_count_only_new_traffic(self):
         clock = FakeClock(2 * 3600)
 
-        def snapshot(instance_id: str, requests: int):
+        requester_metadata = {
+            "label": "@reachy-user · token •abc123",
+            "kind": "authenticated",
+            "verification": "verified",
+            "fingerprint": "abc123",
+            "account_name": "reachy-user",
+        }
+
+        def snapshot(instance_id: str, requests: int, *, accepted: int | None = None):
+            accepted = requests if accepted is None else accepted
+            rejected = requests - accepted
             return _health_snapshot(
                 connected=0,
                 pending=0,
@@ -389,9 +399,16 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "instance_id": instance_id,
                         "requests": requests,
-                        "accepted": requests,
-                        "rejected": 0,
-                        "requesters": {},
+                        "accepted": accepted,
+                        "rejected": rejected,
+                        "requesters": {
+                            "token:abc123": {
+                                "metadata": requester_metadata,
+                                "requests": requests,
+                                "accepted": accepted,
+                                "rejected": rejected,
+                            }
+                        },
                     }
                 ],
             )
@@ -405,16 +422,22 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         await dashboard.capture_sample()
         provider.payload = snapshot("process-b", 3)
         await dashboard.capture_sample()
-        provider.payload = snapshot("process-b", 0)  # Defensive reset with a stale instance id.
+        # The total and accepted counters fall, but rejected rises. Treat the
+        # whole triple as a reset rather than manufacturing one rejection.
+        provider.payload = snapshot("process-b", 2, accepted=1)
         await dashboard.capture_sample()
-        provider.payload = snapshot("process-b", 2)
+        provider.payload = snapshot("process-b", 4, accepted=2)
         await dashboard.capture_sample()
 
         payload = await dashboard.data(window="60m", resolution="minute")
 
         self.assertEqual(payload["summary"]["llm_proxy_requests_window"], 7)
-        self.assertEqual(payload["summary"]["llm_proxy_accepted_window"], 7)
-        self.assertEqual(payload["summary"]["llm_proxy_rejected_window"], 0)
+        self.assertEqual(payload["summary"]["llm_proxy_accepted_window"], 6)
+        self.assertEqual(payload["summary"]["llm_proxy_rejected_window"], 1)
+        requester_row = payload["requesters"]["leaderboard"][0]
+        self.assertEqual(requester_row["llm_proxy_requests"], 7)
+        self.assertEqual(requester_row["llm_proxy_accepted"], 6)
+        self.assertEqual(requester_row["llm_proxy_rejected"], 1)
 
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
