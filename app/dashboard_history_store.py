@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.dashboard_history import DashboardHistoryStore, SwarmHistoryBucket, _bucket_start_epoch_s
+from app.dashboard_history import DashboardHistoryStore, LLMProxyUsageEvent, SwarmHistoryBucket, _bucket_start_epoch_s
 
 logger = logging.getLogger("s2s-endpoint")
 
@@ -969,6 +969,67 @@ class HuggingFaceBucketHistoryStore:
             token=self.token,
         )
 
+    def write_llm_proxy_event(self, event: LLMProxyUsageEvent) -> None:
+        payload = json.dumps(
+            {
+                "bucket_start_s": event.bucket_start_s,
+                "instance_id": event.instance_id,
+                "sequence": event.sequence,
+                "actor_id": event.actor_id,
+                "metadata": event.metadata,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        self._batch_bucket_files(
+            self.bucket_id,
+            add=[(payload, self._llm_proxy_event_path(event))],
+            token=self.token,
+        )
+
+    def load_llm_proxy_events(self, *, min_bucket_start_s: int) -> list[LLMProxyUsageEvent]:
+        prefix = f"{self.prefix}/llm-proxy-events" if self.prefix else "llm-proxy-events"
+        paths = [
+            str(item.path)
+            for item in self._list_bucket_tree(self.bucket_id, prefix=prefix, recursive=True, token=self.token)
+            if getattr(item, "path", None)
+        ]
+        events: list[LLMProxyUsageEvent] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = [(path, Path(tmpdir) / f"{index}.json") for index, path in enumerate(paths)]
+            self._download_bucket_files(
+                self.bucket_id,
+                files=files,
+                raise_on_missing_files=False,
+                token=self.token,
+            )
+            for _, local_path in files:
+                if not local_path.exists():
+                    continue
+                payload = json.loads(local_path.read_text())
+                bucket_start_s = int(payload["bucket_start_s"])
+                if bucket_start_s >= min_bucket_start_s:
+                    events.append(
+                        LLMProxyUsageEvent(
+                            bucket_start_s=bucket_start_s,
+                            instance_id=str(payload["instance_id"]),
+                            sequence=int(payload["sequence"]),
+                            actor_id=str(payload["actor_id"]),
+                            metadata=dict(payload.get("metadata") or {}),
+                        )
+                    )
+        return events
+
+    def delete_llm_proxy_events_before(self, bucket_start_s: int) -> None:
+        prefix = f"{self.prefix}/llm-proxy-events" if self.prefix else "llm-proxy-events"
+        delete = []
+        for item in self._list_bucket_tree(self.bucket_id, prefix=prefix, recursive=True, token=self.token):
+            path = str(getattr(item, "path", ""))
+            match = re.search(r"/(\d+)/[^/]+\.json$", f"/{path}")
+            if match and int(match.group(1)) < bucket_start_s:
+                delete.append(path)
+        if delete:
+            self._batch_bucket_files(self.bucket_id, delete=delete, token=self.token)
+
     def _minutes_prefix(self) -> str:
         if self.prefix:
             return f"{self.prefix}/minutes"
@@ -984,6 +1045,10 @@ class HuggingFaceBucketHistoryStore:
 
     def _bucket_path(self, bucket_start_s: int) -> str:
         return f"{self._day_minutes_prefix(_day_start_epoch_s(bucket_start_s))}/{bucket_start_s}.json"
+
+    def _llm_proxy_event_path(self, event: LLMProxyUsageEvent) -> str:
+        prefix = f"{self.prefix}/llm-proxy-events" if self.prefix else "llm-proxy-events"
+        return f"{prefix}/{event.bucket_start_s}/{event.instance_id}-{event.sequence}.json"
 
     def _legacy_bucket_path(self, bucket_start_s: int) -> str:
         return f"{self._minutes_prefix()}/{bucket_start_s}.json"
@@ -1044,4 +1109,13 @@ class ReadOnlyDashboardHistoryStore:
     def write_day_buckets(self, *, day_start_s: int, buckets: list[SwarmHistoryBucket]) -> Optional[str]:
         if buckets:
             logger.debug("Skipping dashboard day history write because history store is read-only")
+        return None
+
+    def write_llm_proxy_event(self, event: LLMProxyUsageEvent) -> None:
+        logger.debug("Skipping LLM proxy event write because history store is read-only")
+
+    def load_llm_proxy_events(self, *, min_bucket_start_s: int) -> list[LLMProxyUsageEvent]:
+        return self.wrapped.load_llm_proxy_events(min_bucket_start_s=min_bucket_start_s)
+
+    def delete_llm_proxy_events_before(self, bucket_start_s: int) -> None:
         return None

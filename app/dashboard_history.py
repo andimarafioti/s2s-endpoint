@@ -56,6 +56,21 @@ class DashboardHistoryStore(Protocol):
 
     def write_day_buckets(self, *, day_start_s: int, buckets: list["SwarmHistoryBucket"]) -> Optional[str]: ...
 
+    def write_llm_proxy_event(self, event: "LLMProxyUsageEvent") -> None: ...
+
+    def load_llm_proxy_events(self, *, min_bucket_start_s: int) -> list["LLMProxyUsageEvent"]: ...
+
+    def delete_llm_proxy_events_before(self, bucket_start_s: int) -> None: ...
+
+
+@dataclass(frozen=True)
+class LLMProxyUsageEvent:
+    bucket_start_s: int
+    instance_id: str
+    sequence: int
+    actor_id: str
+    metadata: dict[str, object]
+
 
 @dataclass
 class SwarmStateSample:
@@ -859,6 +874,18 @@ class DashboardHistory:
         if self._history_store_is_writable():
             async with self._persistence_lock:
                 await self._ensure_history_restored_before_persisting()
+                now_bucket_start_s = _bucket_start_epoch_s(self._time_fn(), 1)
+                if hasattr(self.history_store, "write_llm_proxy_event"):
+                    await asyncio.to_thread(
+                        self.history_store.write_llm_proxy_event,
+                        LLMProxyUsageEvent(
+                            bucket_start_s=now_bucket_start_s,
+                            instance_id=instance_id,
+                            sequence=sequence,
+                            actor_id=actor_id,
+                            metadata=metadata,
+                        ),
+                    )
                 counted, bucket_start_s = await self._record_llm_proxy_request_in_memory(
                     instance_id,
                     sequence,
@@ -877,8 +904,10 @@ class DashboardHistory:
         sequence: int,
         actor_id: str,
         metadata: dict[str, object],
+        *,
+        now: float | None = None,
     ) -> tuple[bool, int | None]:
-        now = self._time_fn()
+        now = self._time_fn() if now is None else now
         counted = False
         async with self._lock:
             self._prune_unlocked(now)
@@ -1205,7 +1234,30 @@ class DashboardHistory:
             ),
             now_epoch_s=now_epoch_s,
         )
-        return buckets, await self._merge_persisted_history_buckets(buckets)
+        updated_bucket_count = await self._merge_persisted_history_buckets(buckets)
+        if hasattr(self.history_store, "load_llm_proxy_events"):
+            min_bucket_start_s = _bucket_start_epoch_s(now_epoch_s, 1) - self.llm_usage_reconciliation_minutes * 60
+            events = await asyncio.to_thread(
+                self.history_store.load_llm_proxy_events,
+                min_bucket_start_s=min_bucket_start_s,
+            )
+            for event in events:
+                await self._record_llm_proxy_request_at(event)
+            if hasattr(self.history_store, "delete_llm_proxy_events_before"):
+                await asyncio.to_thread(
+                    self.history_store.delete_llm_proxy_events_before,
+                    min_bucket_start_s,
+                )
+        return buckets, updated_bucket_count
+
+    async def _record_llm_proxy_request_at(self, event: LLMProxyUsageEvent) -> None:
+        await self._record_llm_proxy_request_in_memory(
+            event.instance_id,
+            event.sequence,
+            event.actor_id,
+            event.metadata,
+            now=float(event.bucket_start_s),
+        )
 
     async def _load_persisted_history(
         self,

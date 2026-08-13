@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from app.dashboard_history import DashboardHistory, SwarmHistoryBucket, SwarmStateSample
+from app.dashboard_history import DashboardHistory, LLMProxyUsageEvent, SwarmHistoryBucket, SwarmStateSample
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
 from app.requester_identity import RequesterIdentity
 from app.swarm_dashboard import SwarmDashboard
@@ -39,6 +39,7 @@ class FakeHistoryStore:
         self.write_calls = []
         self.load_calls = 0
         self.load_requests = []
+        self.llm_proxy_events = {}
 
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float):
         self.load_calls += 1
@@ -54,6 +55,19 @@ class FakeHistoryStore:
         self.write_calls.append([bucket.bucket_start_s for bucket in buckets])
         for bucket in buckets:
             self.saved[bucket.bucket_start_s] = bucket.to_dict()
+
+    def write_llm_proxy_event(self, event: LLMProxyUsageEvent):
+        self.llm_proxy_events[(event.instance_id, event.sequence)] = event
+
+    def load_llm_proxy_events(self, *, min_bucket_start_s: int):
+        return [event for event in self.llm_proxy_events.values() if event.bucket_start_s >= min_bucket_start_s]
+
+    def delete_llm_proxy_events_before(self, bucket_start_s: int):
+        self.llm_proxy_events = {
+            event_id: event
+            for event_id, event in self.llm_proxy_events.items()
+            if event.bucket_start_s >= bucket_start_s
+        }
 
 
 class DayRolloverHistoryStore(FakeHistoryStore):
@@ -2007,16 +2021,11 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         ]
         for history in histories:
             await history.start()
-        try:
-            while any(history.startup_merge_status()["completed_passes"] < 2 for history in histories):
-                await asyncio.sleep(0.005)
-            await histories[0].record_llm_proxy_request("compute-a", 1, "hf:alice", {"label": "@alice"})
-            await histories[1].record_llm_proxy_request("compute-b", 1, "hf:bob", {"label": "@bob"})
-            while store.saved[2 * 3600]["llm_proxy_requests"] < 2:
-                await asyncio.sleep(0.005)
-        finally:
-            for history in histories:
-                await history.stop()
+        while any(history.startup_merge_status()["completed_passes"] < 2 for history in histories):
+            await asyncio.sleep(0.005)
+        await histories[0].record_llm_proxy_request("compute-a", 1, "hf:alice", {"label": "@alice"})
+        await histories[1].record_llm_proxy_request("compute-b", 1, "hf:bob", {"label": "@bob"})
+        await asyncio.gather(*(history.stop() for history in histories))
 
         restored = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
         await restored.start()
@@ -2057,6 +2066,34 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HuggingFaceBucketHistoryStoreTests(unittest.TestCase):
+    def test_llm_proxy_event_ledger_is_idempotent_and_loadable(self):
+        api = FakeBucketApi({})
+        store = _bucket_store(api)
+        event = LLMProxyUsageEvent(7200, "compute-a", 1, "hf:alice", {"label": "@alice"})
+
+        store.write_llm_proxy_event(event)
+        store.write_llm_proxy_event(event)
+        loaded = store.load_llm_proxy_events(min_bucket_start_s=7200)
+
+        self.assertEqual(loaded, [event])
+        self.assertEqual(
+            api.batch_adds[-1][1],
+            "reachy-s2s-lb/llm-proxy-events/7200/compute-a-1.json",
+        )
+
+    def test_llm_proxy_event_ledger_deletes_only_expired_minutes(self):
+        first = LLMProxyUsageEvent(7200, "compute-a", 1, "hf:alice", {})
+        second = LLMProxyUsageEvent(7260, "compute-a", 2, "hf:alice", {})
+        api = FakeBucketApi({})
+        store = _bucket_store(api)
+        store.write_llm_proxy_event(first)
+        store.write_llm_proxy_event(second)
+
+        store.delete_llm_proxy_events_before(7260)
+
+        self.assertNotIn("reachy-s2s-lb/llm-proxy-events/7200/compute-a-1.json", api.files)
+        self.assertIn("reachy-s2s-lb/llm-proxy-events/7260/compute-a-2.json", api.files)
+
     def test_configures_real_worker_thread_huggingface_session_timeout(self):
         from huggingface_hub import get_session
 
