@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import subprocess
 import time
 import urllib.error
@@ -7,6 +8,7 @@ import urllib.request
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Optional
 
 import httpx
@@ -34,6 +36,7 @@ INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_POOL_PATH = "/v1/pool"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
 LLM_USAGE_SHUTDOWN_TIMEOUT_S = 10.0
+DEFAULT_LLM_USAGE_OUTBOX_PATH = "/tmp/s2s-endpoint-llm-usage.sqlite3"
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,7 @@ class ComputeSettings:
     lb_callback_retry_attempts: int = 5
     lb_callback_retry_backoff_s: float = 1.0
     llm_proxy_requests_per_minute: int = 20
+    llm_usage_outbox_path: str = DEFAULT_LLM_USAGE_OUTBOX_PATH
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "ComputeSettings":
@@ -103,6 +107,11 @@ class ComputeSettings:
                 0.0,
             ),
             llm_proxy_requests_per_minute=int(env_text("LLM_PROXY_REQUESTS_PER_MINUTE", "20", environ=environ)),
+            llm_usage_outbox_path=env_text(
+                "LLM_USAGE_OUTBOX_PATH",
+                DEFAULT_LLM_USAGE_OUTBOX_PATH,
+                environ=environ,
+            ),
         )
 
     @property
@@ -366,11 +375,47 @@ class _LLMProxyUsage:
 
     instance_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     requests: int = 0
-    _queue: asyncio.Queue[tuple[str, str, Callable[..., Awaitable[None]], int, dict[str, object]]] = field(
-        default_factory=asyncio.Queue
-    )
+    notify: Optional[Callable[..., Awaitable[None]]] = field(default=None, repr=False)
+    outbox_path: str = ""
+    _pending: deque[tuple[int, str, str, int, dict[str, object]]] = field(default_factory=deque)
     _worker: Optional[asyncio.Task[None]] = None
     _delivering: bool = False
+    _outbox: Optional[sqlite3.Connection] = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.outbox_path:
+            return
+        try:
+            path = Path(self.outbox_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            outbox = sqlite3.connect(path, timeout=0.1)
+            path.chmod(0o600)
+            outbox.execute("PRAGMA synchronous=FULL")
+            outbox.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            outbox.execute(
+                "CREATE TABLE IF NOT EXISTS events ("
+                "sequence INTEGER PRIMARY KEY, callback_url TEXT NOT NULL, session_token TEXT NOT NULL, "
+                "attempts INTEGER NOT NULL, payload TEXT NOT NULL)"
+            )
+            stored_instance = outbox.execute("SELECT value FROM metadata WHERE key = 'instance_id'").fetchone()
+            if stored_instance is None:
+                outbox.execute(
+                    "INSERT INTO metadata(key, value) VALUES ('instance_id', ?)",
+                    (self.instance_id,),
+                )
+            else:
+                self.instance_id = str(stored_instance[0])
+            stored_requests = outbox.execute("SELECT value FROM metadata WHERE key = 'requests'").fetchone()
+            self.requests = int(stored_requests[0]) if stored_requests is not None else 0
+            outbox.commit()
+            self._outbox = outbox
+        except Exception:
+            logger.exception("Failed to open the LLM usage outbox; continuing with in-memory delivery")
+            if "outbox" in locals():
+                outbox.close()
+
+    async def start(self) -> None:
+        self._start_delivery()
 
     def record(
         self,
@@ -382,40 +427,99 @@ class _LLMProxyUsage:
         *,
         attempts: int,
     ) -> None:
+        self.notify = notify
         self.requests += 1
-        self._queue.put_nowait(
-            (
-                callback_url,
-                session_token,
-                notify,
-                attempts,
-                {
-                    "instance_id": self.instance_id,
-                    "sequence": self.requests,
-                    "signature": llm_usage_event_signature(
-                        shared_secret,
-                        session_id,
-                        self.instance_id,
-                        self.requests,
-                    ),
-                },
-            )
+        event = (
+            self.requests,
+            callback_url,
+            session_token,
+            attempts,
+            {
+                "instance_id": self.instance_id,
+                "sequence": self.requests,
+                "signature": llm_usage_event_signature(
+                    shared_secret,
+                    session_id,
+                    self.instance_id,
+                    self.requests,
+                ),
+            },
         )
+        self._persist_event(event)
+        self._start_delivery()
+
+    def _start_delivery(self) -> None:
+        if self.notify is None:
+            return
         if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(self._deliver())
+            if self._next_event() is not None:
+                self._worker = asyncio.create_task(self._deliver())
+
+    def _persist_event(self, event: tuple[int, str, str, int, dict[str, object]]) -> None:
+        if self._outbox is None:
+            self._pending.append(event)
+            return
+        sequence, callback_url, session_token, attempts, extra_payload = event
+        try:
+            with self._outbox:
+                self._outbox.execute(
+                    "INSERT INTO events(sequence, callback_url, session_token, attempts, payload) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (sequence, callback_url, session_token, attempts, json.dumps(extra_payload)),
+                )
+                self._outbox.execute(
+                    "INSERT INTO metadata(key, value) VALUES ('requests', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(sequence),),
+                )
+        except Exception:
+            logger.exception("Failed to persist an LLM usage event; continuing with in-memory delivery")
+            self._pending.append(event)
+
+    def _next_event(self) -> Optional[tuple[int, str, str, int, dict[str, object]]]:
+        pending = self._pending[0] if self._pending else None
+        row = (
+            self._outbox.execute(
+                "SELECT sequence, callback_url, session_token, attempts, payload FROM events ORDER BY sequence LIMIT 1"
+            ).fetchone()
+            if self._outbox is not None
+            else None
+        )
+        if row is None:
+            return pending
+        sequence, callback_url, session_token, attempts, payload = row
+        persisted = int(sequence), str(callback_url), str(session_token), int(attempts), json.loads(str(payload))
+        if pending is not None and pending[0] < persisted[0]:
+            return pending
+        return persisted
+
+    def _acknowledge_event(self, sequence: int) -> bool:
+        if self._pending and self._pending[0][0] == sequence:
+            self._pending.popleft()
+            return True
+        if self._outbox is None:
+            return True
+        try:
+            with self._outbox:
+                self._outbox.execute("DELETE FROM events WHERE sequence = ?", (sequence,))
+        except Exception:
+            logger.exception("Failed to remove an acknowledged LLM usage event from the outbox")
+            return False
+        return True
 
     async def _deliver(self) -> None:
         while True:
-            try:
-                callback_url, session_token, notify, attempts, extra_payload = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
+            event = self._next_event()
+            if event is None:
                 self._worker = None
                 return
+            sequence, callback_url, session_token, attempts, extra_payload = event
             self._delivering = True
             try:
                 while True:
                     try:
-                        await notify(
+                        assert self.notify is not None
+                        await self.notify(
                             callback_url,
                             session_token,
                             "llm_proxy_request",
@@ -428,20 +532,31 @@ class _LLMProxyUsage:
                     except Exception:
                         logger.exception("Failed to record LLM proxy usage; retrying in background")
                         await asyncio.sleep(1.0)
+                if not self._acknowledge_event(sequence):
+                    return
             finally:
                 self._delivering = False
-                self._queue.task_done()
 
     async def stop(self, *, timeout_s: float = LLM_USAGE_SHUTDOWN_TIMEOUT_S) -> None:
-        try:
-            await asyncio.wait_for(self._queue.join(), timeout=max(timeout_s, 0.0))
-        except asyncio.TimeoutError:
-            pending = self._queue.qsize() + int(self._delivering)
-            logger.error("Discarding %d undelivered LLM usage events during shutdown", pending)
+        self._start_delivery()
         if self._worker is not None:
-            self._worker.cancel()
-            await asyncio.gather(self._worker, return_exceptions=True)
+            try:
+                await asyncio.wait_for(asyncio.shield(self._worker), timeout=max(timeout_s, 0.0))
+            except asyncio.TimeoutError:
+                logger.error("Retaining %d undelivered LLM usage events for restart", self._pending_count())
+                self._worker.cancel()
+                await asyncio.gather(self._worker, return_exceptions=True)
         self._worker = None
+        if self._outbox is not None:
+            self._outbox.close()
+            self._outbox = None
+
+    def _pending_count(self) -> int:
+        persisted = 0
+        if self._outbox is not None:
+            row = self._outbox.execute("SELECT COUNT(*) FROM events").fetchone()
+            persisted = int(row[0]) if row is not None else 0
+        return len(self._pending) + persisted
 
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
@@ -843,6 +958,7 @@ class ComputeRuntime:
     dependencies: ComputeDependencies
 
     async def start(self) -> None:
+        await self.dependencies.llm_proxy_usage.start()
         await self.dependencies.session_router.start()
 
     async def stop(self) -> None:
@@ -908,7 +1024,10 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
         http_get_json=_http_get_json,
         notify_lb_session_event=notify_lb_session_event,
         proxy_websocket=proxy_websocket,
-        llm_proxy_usage=_LLMProxyUsage(),
+        llm_proxy_usage=_LLMProxyUsage(
+            notify=notify_lb_session_event,
+            outbox_path=settings.llm_usage_outbox_path,
+        ),
     )
 
 

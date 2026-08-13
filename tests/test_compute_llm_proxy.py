@@ -15,10 +15,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 from unittest.mock import patch
@@ -421,7 +423,8 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
                 notify,
                 attempts=1,
             )
-            await usage._queue.join()
+            assert usage._worker is not None
+            await usage._worker
             usage.record(
                 "https://lb.example/event",
                 "session-token",
@@ -448,12 +451,14 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertLess(elapsed, 1.0)
         self.assertEqual(len(self.stub.requests), 1)
 
-    def test_shutdown_bounds_an_unavailable_usage_callback(self) -> None:
+    def test_shutdown_retains_unavailable_usage_for_restart(self) -> None:
         async def exercise() -> None:
+            outbox_path = str(temporary_directory / "usage.sqlite3")
+
             async def notify(*args: Any, **kwargs: Any) -> None:
                 raise RuntimeError("LB unavailable")
 
-            usage = compute_main._LLMProxyUsage()
+            usage = compute_main._LLMProxyUsage(outbox_path=outbox_path)
             usage.record(
                 "https://lb.example/event",
                 "session-token",
@@ -464,9 +469,34 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
             )
             with self.assertLogs("s2s-endpoint", level="ERROR") as logs:
                 await usage.stop(timeout_s=0.01)
-            self.assertIn("undelivered LLM usage events", logs.output[-1])
+            self.assertIn("Retaining 1 undelivered LLM usage events", logs.output[-1])
 
-        asyncio.run(exercise())
+            delivered: list[int] = []
+
+            async def recovered_notify(*args: Any, **kwargs: Any) -> None:
+                delivered.append(kwargs["extra_payload"]["sequence"])
+
+            recovered = compute_main._LLMProxyUsage(
+                notify=recovered_notify,
+                outbox_path=outbox_path,
+            )
+            instance_id = recovered.instance_id
+            await recovered.start()
+            recovered.record(
+                "https://lb.example/event",
+                "session-token",
+                "session-1",
+                SECRET,
+                recovered_notify,
+                attempts=1,
+            )
+            await recovered.stop()
+            self.assertEqual(delivered, [1, 2])
+            self.assertEqual(recovered.instance_id, instance_id)
+
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_directory = Path(directory)
+            asyncio.run(exercise())
 
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()

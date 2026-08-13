@@ -126,12 +126,14 @@ class ComputeSettingsTests(unittest.TestCase):
                 "ENABLE_SMART_TURN": "0",
                 "RESPONSES_API_API_KEY": " explicit-key ",
                 "HF_TOKEN": "fallback-key",
+                "LLM_USAGE_OUTBOX_PATH": " /var/run/usage.sqlite3 ",
             }
         )
 
         self.assertTrue(settings.enable_llm_proxy)
         self.assertFalse(settings.enable_smart_turn)
         self.assertEqual(settings.responses_api_api_key, "explicit-key")
+        self.assertEqual(settings.llm_usage_outbox_path, "/var/run/usage.sqlite3")
 
     def test_settings_are_frozen(self):
         settings = compute_app.ComputeSettings()
