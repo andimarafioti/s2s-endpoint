@@ -412,6 +412,67 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved.llm_proxy_requests, 6)
         self.assertEqual(saved.llm_proxy_sequences, {"old-process": 5, "new-process": 1})
 
+    async def test_failed_restore_is_recovered_before_normal_flush(self):
+        clock = FakeClock(2 * 3600)
+        persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)
+        persisted.llm_proxy_requests = 5
+        persisted.llm_proxy_sequences = {"old-process": 5}
+        store = FailingLoadHistoryStore(fail_on_load_calls={1}, initial_buckets=[persisted])
+        history = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
+        await history._restore_history()
+        await history.record_sample(
+            SwarmStateSample.from_health_snapshot(
+                healthy=True,
+                detail=None,
+                snapshot=_health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )[2],
+                captured_at_s=clock.now(),
+            )
+        )
+
+        clock.set(clock.now() + 60)
+        await history._flush_dirty_buckets(include_open_bucket=False)
+        await history.record_llm_proxy_request("new-process", 1, "hf:alice", {"label": "@alice"})
+
+        self.assertEqual(sum(bucket["llm_proxy_requests"] for bucket in store.saved.values()), 6)
+
+    async def test_delayed_merge_uses_initial_restore_as_its_baseline(self):
+        clock = FakeClock(2 * 3600)
+        initial = SwarmHistoryBucket(bucket_start_s=2 * 3600)
+        initial.llm_proxy_requests = 5
+        initial.llm_proxy_sequences = {"process-a": 5}
+        history = DashboardHistory(retention_minutes=60, time_fn=clock.now)
+
+        await history._merge_persisted_history_buckets([initial])
+        await history.record_sample(
+            SwarmStateSample.from_health_snapshot(
+                healthy=True,
+                detail=None,
+                snapshot=_health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=1,
+                    effective_free_slots=1,
+                )[2],
+                captured_at_s=clock.now(),
+            )
+        )
+        updated = SwarmHistoryBucket.from_dict(initial.to_dict())
+        updated.llm_proxy_requests = 6
+        updated.llm_proxy_sequences = {"process-a": 6}
+        await history._merge_persisted_history_buckets([updated])
+
+        current = next(bucket for bucket in await history.snapshot() if bucket.bucket_start_s == 2 * 3600)
+        self.assertEqual(current.llm_proxy_requests, 6)
+
     async def test_restore_merges_current_minute_usage_into_startup_sample(self):
         clock = FakeClock(2 * 3600)
         persisted = SwarmHistoryBucket(bucket_start_s=2 * 3600)

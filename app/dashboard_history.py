@@ -426,6 +426,13 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
     }
 
 
+def _llm_proxy_usage_checkpoint(bucket: SwarmHistoryBucket) -> tuple[int, dict[str, int]]:
+    return (
+        bucket.llm_proxy_requests,
+        {actor_id: int(record.get("llm_proxy_requests", 0)) for actor_id, record in bucket.requester_usage.items()},
+    )
+
+
 def _merge_requester_identity(record: dict[str, object], metadata: dict[str, object]) -> None:
     current_verification = str(record.get("verification") or "unknown")
     new_verification = str(metadata.get("verification") or "unknown")
@@ -766,12 +773,28 @@ class DashboardHistory:
         restore_task = self._restore_task
         if restore_task is not None and restore_task is not asyncio.current_task() and not restore_task.done():
             await restore_task
-        if self._history_restore_status == "failed":
+        if self._history_store_is_writable():
             async with self._persistence_lock:
-                if self._history_restore_status == "failed":
-                    await self._restore_history()
-                    if self._history_restore_status == "failed":
-                        raise RuntimeError(self._history_restore_detail or "Failed to restore dashboard history")
+                await self._ensure_history_restored_before_persisting()
+                counted, bucket_start_s = await self._record_llm_proxy_request_in_memory(
+                    instance_id,
+                    sequence,
+                    actor_id,
+                    metadata,
+                )
+                if bucket_start_s is not None:
+                    await self._persist_bucket_locked(bucket_start_s)
+                return counted
+        counted, _ = await self._record_llm_proxy_request_in_memory(instance_id, sequence, actor_id, metadata)
+        return counted
+
+    async def _record_llm_proxy_request_in_memory(
+        self,
+        instance_id: str,
+        sequence: int,
+        actor_id: str,
+        metadata: dict[str, object],
+    ) -> tuple[bool, int | None]:
         now = self._time_fn()
         counted = False
         async with self._lock:
@@ -815,9 +838,7 @@ class DashboardHistory:
                 self._wake_persistence_unlocked()
                 counted = True
 
-        if bucket_start_s is not None:
-            await self._persist_bucket(bucket_start_s)
-        return counted
+        return counted, bucket_start_s
 
     async def record_requester_event(
         self,
@@ -969,6 +990,7 @@ class DashboardHistory:
             )
             self._dirty_bucket_starts.discard(oldest_key)
             self._locally_sampled_bucket_starts.discard(oldest_key)
+            self._merged_llm_proxy_usage.pop(oldest_key, None)
 
     async def _restore_history(self) -> None:
         if self.history_store is None:
@@ -1168,6 +1190,7 @@ class DashboardHistory:
                     if current_bucket is not None and current_bucket.to_dict() == bucket.to_dict():
                         continue
                 self._history[bucket.bucket_start_s] = bucket
+                self._merged_llm_proxy_usage[bucket.bucket_start_s] = _llm_proxy_usage_checkpoint(bucket)
                 updated_bucket_count += 1
             self._history = OrderedDict(sorted(self._history.items()))
             self._prune_unlocked(self._time_fn())
@@ -1189,7 +1212,18 @@ class DashboardHistory:
 
     async def _flush_dirty_buckets(self, *, include_open_bucket: bool) -> None:
         async with self._persistence_lock:
+            await self._ensure_history_restored_before_persisting()
             await self._flush_dirty_buckets_locked(include_open_bucket=include_open_bucket)
+
+    async def _ensure_history_restored_before_persisting(self) -> None:
+        restore_task = self._restore_task
+        if restore_task is not None and restore_task is not asyncio.current_task() and not restore_task.done():
+            await restore_task
+        if self._history_restore_status not in {"pending", "failed"}:
+            return
+        await self._restore_history()
+        if self._history_restore_status == "failed":
+            raise RuntimeError(self._history_restore_detail or "Failed to restore dashboard history")
 
     async def _flush_dirty_buckets_locked(self, *, include_open_bucket: bool) -> None:
         if self.history_store is None:
@@ -1230,18 +1264,15 @@ class DashboardHistory:
         finally:
             self._flush_started_at_monotonic_s = None
 
-    async def _persist_bucket(self, bucket_start_s: int) -> None:
-        if not self._history_store_is_writable():
-            return
-        async with self._persistence_lock:
-            await self._wait_for_inflight_write()
-            async with self._lock:
-                bucket = self._history.get(bucket_start_s)
-                if bucket is None:
-                    return
-                snapshot = SwarmHistoryBucket.from_dict(bucket.to_dict())
-            if not await self._write_bucket_batch([snapshot]):
-                raise RuntimeError(self._last_flush_error or "Failed to persist LLM proxy usage")
+    async def _persist_bucket_locked(self, bucket_start_s: int) -> None:
+        await self._wait_for_inflight_write()
+        async with self._lock:
+            bucket = self._history.get(bucket_start_s)
+            if bucket is None:
+                return
+            snapshot = SwarmHistoryBucket.from_dict(bucket.to_dict())
+        if not await self._write_bucket_batch([snapshot]):
+            raise RuntimeError(self._last_flush_error or "Failed to persist LLM proxy usage")
 
     async def _wait_for_inflight_write(self) -> None:
         write_task = self._flush_write_task
