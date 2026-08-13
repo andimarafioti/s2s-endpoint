@@ -70,6 +70,23 @@ class SessionTokenClaimTests(unittest.TestCase):
         payload = verify_session_token(self._mint(llm_fingerprint=fingerprint), SECRET)
         self.assertEqual(payload["llmf"], fingerprint)
 
+    def test_privacy_safe_requester_survives_without_raw_token(self):
+        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
+        requester = {
+            "actor_id": "token:abcdef0123456789",
+            "label": "@reachy-user · token •abcdef01",
+            "kind": "authenticated",
+            "verification": "verified",
+            "fingerprint": "abcdef0123456789",
+            "account_name": "reachy-user",
+        }
+
+        token = self._mint(llm_fingerprint=fingerprint, llm_requester=requester)
+        payload = verify_session_token(token, SECRET)
+
+        self.assertEqual(payload["llmr"], requester)
+        self.assertNotIn(HF_TOKEN, token)
+
     def test_token_without_claim_has_no_llmf_key(self):
         payload = verify_session_token(self._mint(), SECRET)
         self.assertNotIn("llmf", payload)
@@ -123,6 +140,31 @@ class GrantEmbedsClaimTests(unittest.IsolatedAsyncioTestCase):
         payload = verify_session_token(str(allocation["session_token"]), SECRET)
         self.assertEqual(payload["llmf"], fingerprint)
 
+    async def test_fast_path_grant_embeds_the_privacy_safe_requester(self):
+        manager = DirectSessionManager(
+            endpoint_router=_SingleLeaseRouter(),
+            session_shared_secret=SECRET,
+            queue_enabled=False,
+        )
+        fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
+        requester = {
+            "actor_id": "token:abcdef0123456789",
+            "label": "@reachy-user · token •abcdef01",
+            "kind": "authenticated",
+            "verification": "verified",
+            "fingerprint": "abcdef0123456789",
+            "account_name": "reachy-user",
+        }
+
+        allocation = await manager.allocate(
+            "https://lb.example",
+            llm_fingerprint=fingerprint,
+            llm_requester=requester,
+        )
+
+        payload = verify_session_token(str(allocation["session_token"]), SECRET)
+        self.assertEqual(payload["llmr"], requester)
+
     async def test_grant_without_fingerprint_carries_no_claim(self):
         manager = DirectSessionManager(
             endpoint_router=_SingleLeaseRouter(),
@@ -146,8 +188,20 @@ class GrantEmbedsClaimTests(unittest.IsolatedAsyncioTestCase):
             queue_reap_interval_s=3600,
         )
         fingerprint = llm_token_fingerprint(SECRET, HF_TOKEN)
+        requester = {
+            "actor_id": "token:abcdef0123456789",
+            "label": "@reachy-user · token •abcdef01",
+            "kind": "authenticated",
+            "verification": "verified",
+            "fingerprint": "abcdef0123456789",
+            "account_name": "reachy-user",
+        }
         try:
-            ticket = await manager.allocate("https://lb.example", llm_fingerprint=fingerprint)
+            ticket = await manager.allocate(
+                "https://lb.example",
+                llm_fingerprint=fingerprint,
+                llm_requester=requester,
+            )
             self.assertEqual(ticket["state"], "queued")
 
             router.has_capacity = True
@@ -156,6 +210,7 @@ class GrantEmbedsClaimTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(grant["state"], "granted")
             payload = verify_session_token(str(grant["session_token"]), SECRET)
             self.assertEqual(payload["llmf"], fingerprint)
+            self.assertEqual(payload["llmr"], requester)
         finally:
             await manager.stop()
 

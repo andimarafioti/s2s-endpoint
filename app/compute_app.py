@@ -4,8 +4,9 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Mapping, Optional
 
 import httpx
@@ -248,6 +249,7 @@ async def health(settings: ComputeSettings, dependencies: "ComputeDependencies")
             "llm": settings.llm,
             "tts": settings.tts,
             "router": snapshot,
+            "llm_proxy_usage": dependencies.llm_proxy_usage.snapshot(),
         }
     )
 
@@ -284,25 +286,93 @@ class _ConnectedFingerprintRegistry:
 
     Membership is the LLM proxy access window: a fingerprint is added when
     its session's websocket connects and removed when it disconnects.
-    Refcounted because one token may hold several concurrent sessions.
+    Refcounted because one token may hold several concurrent sessions. The
+    optional value is the privacy-safe requester identity signed into the
+    session token by the load balancer.
     Single event loop, so no locking.
     """
 
     def __init__(self) -> None:
-        self._counts: dict[str, int] = {}
+        self._entries: dict[str, tuple[int, Optional[dict[str, object]]]] = {}
 
-    def add(self, fingerprint: str) -> None:
-        self._counts[fingerprint] = self._counts.get(fingerprint, 0) + 1
+    def add(self, fingerprint: str, requester: Optional[dict[str, object]] = None) -> None:
+        count, current_requester = self._entries.get(fingerprint, (0, None))
+        self._entries[fingerprint] = (count + 1, requester or current_requester)
 
     def remove(self, fingerprint: str) -> None:
-        count = self._counts.get(fingerprint, 0) - 1
+        count, requester = self._entries.get(fingerprint, (0, None))
+        count -= 1
         if count > 0:
-            self._counts[fingerprint] = count
+            self._entries[fingerprint] = (count, requester)
         else:
-            self._counts.pop(fingerprint, None)
+            self._entries.pop(fingerprint, None)
 
     def __contains__(self, fingerprint: str) -> bool:
-        return fingerprint in self._counts
+        return fingerprint in self._entries
+
+    def requester(self, fingerprint: str) -> Optional[dict[str, object]]:
+        entry = self._entries.get(fingerprint)
+        return entry[1] if entry is not None else None
+
+
+_LLM_REQUESTER_METADATA_FIELDS = (
+    "label",
+    "kind",
+    "verification",
+    "fingerprint",
+    "account_name",
+)
+
+
+class _LLMProxyUsage:
+    """Replica-process cumulative counters sampled by the load balancer."""
+
+    def __init__(self, *, instance_id: Optional[str] = None) -> None:
+        self.instance_id = instance_id or uuid.uuid4().hex
+        self.requests = 0
+        self.accepted = 0
+        self.rejected = 0
+        self.requesters: dict[str, dict[str, object]] = {}
+
+    def record(self, *, accepted: bool, requester: Optional[dict[str, object]]) -> None:
+        self.requests += 1
+        self.accepted += int(accepted)
+        self.rejected += int(not accepted)
+        if requester is None:
+            return
+        actor_id = str(requester.get("actor_id") or "")[:128]
+        if not actor_id:
+            return
+        record = self.requesters.get(actor_id)
+        if record is None:
+            metadata = {key: requester[key] for key in _LLM_REQUESTER_METADATA_FIELDS if requester.get(key) is not None}
+            record = {
+                "metadata": metadata,
+                "requests": 0,
+                "accepted": 0,
+                "rejected": 0,
+            }
+            self.requesters[actor_id] = record
+        record["requests"] = int(record["requests"]) + 1
+        counter = "accepted" if accepted else "rejected"
+        record[counter] = int(record[counter]) + 1
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "instance_id": self.instance_id,
+            "requests": self.requests,
+            "accepted": self.accepted,
+            "rejected": self.rejected,
+            "requesters": {
+                actor_id: {
+                    "metadata": dict(record["metadata"]),
+                    "requests": int(record["requests"]),
+                    "accepted": int(record["accepted"]),
+                    "rejected": int(record["rejected"]),
+                }
+                for actor_id, record in self.requesters.items()
+            },
+        }
 
 
 def _now() -> float:
@@ -351,8 +421,11 @@ def _llm_proxy_denial(
     request: Request,
     settings: ComputeSettings,
     dependencies: "ComputeDependencies",
-) -> Optional[JSONResponse]:
-    """Access check for the LLM proxy paths; None means forward the request.
+) -> tuple[Optional[JSONResponse], Optional[dict[str, object]]]:
+    """Return a denial and privacy-safe requester identity for proxy accounting.
+
+    A ``None`` denial means the request passed the compute gate and should be
+    forwarded.
 
     The api key must be the HF token the session was created with, checked by
     fingerprint against the sessions whose websocket is currently connected.
@@ -374,19 +447,26 @@ def _llm_proxy_denial(
         if token is not None:
             fingerprint = llm_token_fingerprint(settings.session_shared_secret, token)
             if fingerprint in dependencies.connected_llm_fingerprints:
+                requester = dependencies.connected_llm_fingerprints.requester(fingerprint)
                 if dependencies.llm_rate_limiter.allow(fingerprint):
-                    return None
-                return _llm_proxy_error(
-                    429,
-                    f"Rate limit exceeded: {dependencies.llm_rate_limiter.limit_rpm} requests per minute "
-                    "per user. Back off and retry.",
-                    "rate_limit_exceeded",
+                    return None, requester
+                return (
+                    _llm_proxy_error(
+                        429,
+                        f"Rate limit exceeded: {dependencies.llm_rate_limiter.limit_rpm} requests per minute "
+                        "per user. Back off and retry.",
+                        "rate_limit_exceeded",
+                    ),
+                    requester,
                 )
-    return _llm_proxy_error(
-        401,
-        "Invalid API key: pass the HF token this session was created with, "
-        "while the session's realtime websocket is connected.",
-        "invalid_api_key",
+    return (
+        _llm_proxy_error(
+            401,
+            "Invalid API key: pass the HF token this session was created with, "
+            "while the session's realtime websocket is connected.",
+            "invalid_api_key",
+        ),
+        None,
     )
 
 
@@ -436,9 +516,11 @@ async def _proxy_llm_request(
     if not settings.enable_llm_proxy:
         # Checked before auth: a disabled replica reveals nothing, answering
         # exactly like an app where these routes were never registered.
+        dependencies.llm_proxy_usage.record(accepted=False, requester=None)
         raise HTTPException(status_code=404)
 
-    denial = _llm_proxy_denial(request, settings, dependencies)
+    denial, requester = _llm_proxy_denial(request, settings, dependencies)
+    dependencies.llm_proxy_usage.record(accepted=denial is None, requester=requester)
     if denial is not None:
         return denial
 
@@ -519,10 +601,14 @@ async def websocket_proxy(
         return
 
     llm_fingerprint: Optional[str] = None
+    llm_requester: Optional[dict[str, object]] = None
     if session_payload is not None:
         claim = session_payload.get("llmf")
         if isinstance(claim, str) and claim:
             llm_fingerprint = claim
+        requester_claim = session_payload.get("llmr")
+        if isinstance(requester_claim, dict):
+            llm_requester = requester_claim
     llm_fingerprint_registered = False
 
     async def _notify_connected() -> None:
@@ -541,7 +627,7 @@ async def websocket_proxy(
         # the finally below, alongside the disconnected notification.
         nonlocal llm_fingerprint_registered
         if llm_fingerprint is not None:
-            dependencies.connected_llm_fingerprints.add(llm_fingerprint)
+            dependencies.connected_llm_fingerprints.add(llm_fingerprint, llm_requester)
             llm_fingerprint_registered = True
 
     try:
@@ -712,6 +798,7 @@ class ComputeDependencies:
     http_get_json: Callable[[str], dict[str, object]]
     notify_lb_session_event: Callable[..., Awaitable[None]]
     proxy_websocket: Callable[..., Awaitable[None]]
+    llm_proxy_usage: _LLMProxyUsage = field(default_factory=_LLMProxyUsage)
 
 
 @dataclass(frozen=True)

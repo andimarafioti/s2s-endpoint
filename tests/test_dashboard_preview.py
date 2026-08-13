@@ -831,6 +831,28 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_session_manager.allocation_calls, 1)
         self.assertEqual(fake_dashboard.calls, ["request", "success"])
 
+    async def test_verified_proxy_claim_carries_privacy_safe_requester_metadata(self):
+        module = self._import_load_balancer({"SESSION_SHARED_SECRET": "shared-secret"})
+        fake_dashboard = FakeDashboard()
+        fake_session_manager = FakeSessionManager()
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = fake_session_manager
+        verified = _requester_identity(verification="verified", kind="authenticated")
+        raw_token = "hf_verified_test_token_1234"
+
+        with patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified):
+            response = await create_session(
+                module.runtime,
+                FakeHeaderRequest({"authorization": f"Bearer {raw_token}"}),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(fake_session_manager.last_llm_fingerprint)
+        self.assertEqual(fake_session_manager.last_llm_requester["actor_id"], "token:abc123")
+        self.assertEqual(fake_session_manager.last_llm_requester["account_name"], "reachy-user")
+        self.assertEqual(fake_session_manager.last_llm_requester["verification"], "verified")
+        self.assertNotIn(raw_token, str(fake_session_manager.last_llm_requester))
+
     async def test_default_verification_age_allows_the_full_default_allocation_wait(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
         fake_dashboard = FakeDashboard()
@@ -1293,11 +1315,15 @@ class FakeSessionManager:
         self.waited_for_capacity = waited_for_capacity
         self.allocation_calls = 0
         self.connected_session_ids = set()
+        self.last_llm_fingerprint = None
+        self.last_llm_requester = None
 
-    async def allocate(self, lb_base_url, *, llm_fingerprint=None):
+    async def allocate(self, lb_base_url, *, llm_fingerprint=None, llm_requester=None):
         # Mirrors DirectSessionManager._grant_from_lease, which stamps
         # "state": "granted" on every grant it returns.
         self.allocation_calls += 1
+        self.last_llm_fingerprint = llm_fingerprint
+        self.last_llm_requester = llm_requester
         return {
             "state": "granted",
             "session_id": "session-123",
@@ -1334,7 +1360,7 @@ class FakeFailingSessionManager:
     def __init__(self, exc=None):
         self.exc = exc or RuntimeError("no capacity")
 
-    async def allocate(self, lb_base_url, *, llm_fingerprint=None):
+    async def allocate(self, lb_base_url, *, llm_fingerprint=None, llm_requester=None):
         raise self.exc
 
 
@@ -1344,7 +1370,7 @@ class FakeQueuedSessionManager:
     def __init__(self):
         self.left = False
 
-    async def allocate(self, lb_base_url, *, llm_fingerprint=None):
+    async def allocate(self, lb_base_url, *, llm_fingerprint=None, llm_requester=None):
         return {
             "state": "queued",
             "queue_id": "queue-123",

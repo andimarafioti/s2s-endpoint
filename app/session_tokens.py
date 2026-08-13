@@ -15,6 +15,7 @@ def create_session_token(
     callback_url: str,
     ttl_s: float,
     llm_fingerprint: str | None = None,
+    llm_requester: dict[str, object] | None = None,
 ) -> str:
     expires_at = int(time.time() + ttl_s)
     payload = {
@@ -29,6 +30,11 @@ def create_session_token(
         # paths to api keys matching this claim while the session's
         # websocket is connected. Never a raw token.
         payload["llmf"] = llm_fingerprint
+        if llm_requester:
+            # Privacy-safe requester metadata already used by dashboard
+            # history. The signed claim lets the compute replica attribute
+            # proxy counters without receiving or retaining the raw HF token.
+            payload["llmr"] = llm_requester
     encoded_payload = _b64encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     signature = _sign(secret, encoded_payload)
     return f"{encoded_payload}.{signature}"

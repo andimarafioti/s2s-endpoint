@@ -146,6 +146,53 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("rate limited: 1 request", leaderboard[0]["signals"])
         self.assertFalse(any(signal.startswith("mostly short sessions") for signal in leaderboard[0]["signals"]))
 
+    async def test_proxy_only_requester_is_included_in_the_leaderboard(self):
+        service = self._service(FakeClock(2 * 3600))
+        await service.history.record_llm_proxy_usage(
+            {
+                "reachy-s2s-01": {
+                    "instance_id": "process-a",
+                    "requests": 0,
+                    "accepted": 0,
+                    "rejected": 0,
+                    "requesters": {},
+                }
+            }
+        )
+        await service.history.record_llm_proxy_usage(
+            {
+                "reachy-s2s-01": {
+                    "instance_id": "process-a",
+                    "requests": 2,
+                    "accepted": 1,
+                    "rejected": 1,
+                    "requesters": {
+                        "token:abc123": {
+                            "metadata": {
+                                "label": "@reachy-user · token •abc123",
+                                "kind": "authenticated",
+                                "verification": "verified",
+                                "fingerprint": "abc123",
+                                "account_name": "reachy-user",
+                            },
+                            "requests": 2,
+                            "accepted": 1,
+                            "rejected": 1,
+                        }
+                    },
+                }
+            }
+        )
+
+        payload = await service.data(window_minutes=60)
+
+        self.assertEqual(payload["summary"]["authenticated_users_window"], 1)
+        self.assertEqual(payload["tracked_llm_proxy_requests"], 2)
+        self.assertEqual(payload["leaderboard"][0]["actor_id"], "hf:reachy-user")
+        self.assertEqual(payload["leaderboard"][0]["llm_proxy_requests"], 2)
+        self.assertEqual(payload["leaderboard"][0]["llm_proxy_accepted"], 1)
+        self.assertEqual(payload["leaderboard"][0]["llm_proxy_rejected"], 1)
+
     async def test_empty_usage_has_zero_median(self):
         service = self._service(FakeClock(2 * 3600))
 
@@ -549,6 +596,7 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertIn("function requesterCredentialSummary(row)", html)
         self.assertIn("row.token_fingerprints", html)
         self.assertIn("<th>Rejected</th>", html)
+        self.assertIn("<th>LLM proxy</th>", html)
         self.assertNotIn("<th>Limited</th>", html)
         self.assertIn("function requesterRejectedCount(row)", html)
         self.assertIn("Number(row.auth_rejected || 0) + Number(row.rate_limited || 0)", html)

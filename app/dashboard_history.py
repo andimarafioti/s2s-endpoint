@@ -48,6 +48,24 @@ def _isoformat(epoch_s: int | float) -> str:
     return datetime.fromtimestamp(epoch_s, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _cumulative_delta(
+    current: dict[str, object],
+    previous: Optional[dict[str, object]],
+    field_name: str,
+    same_instance: bool,
+    count_current: bool,
+) -> int:
+    current_value = max(int(current.get(field_name, 0)), 0)
+    if count_current:
+        return current_value
+    if not same_instance or previous is None:
+        return 0
+    previous_value = max(int(previous.get(field_name, 0)), 0)
+    # A decrease without an instance-id change is still a reset. Establish the
+    # lower baseline without interpreting old cumulative traffic as new.
+    return max(current_value - previous_value, 0)
+
+
 class DashboardHistoryStore(Protocol):
     def load_recent(self, *, retention_minutes: int, now_epoch_s: float) -> list["SwarmHistoryBucket"]: ...
 
@@ -166,6 +184,9 @@ class SwarmHistoryBucket:
     session_rate_limited: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
+    llm_proxy_requests: int = 0
+    llm_proxy_accepted: int = 0
+    llm_proxy_rejected: int = 0
     completed_conversations: int = 0
     completed_conversation_duration_total_s: float = 0.0
     completed_conversation_duration_max_s: float = 0.0
@@ -219,6 +240,9 @@ class SwarmHistoryBucket:
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
+            "llm_proxy_requests": self.llm_proxy_requests,
+            "llm_proxy_accepted": self.llm_proxy_accepted,
+            "llm_proxy_rejected": self.llm_proxy_rejected,
             "completed_conversations": self.completed_conversations,
             "avg_conversation_duration_s": (
                 round(self.completed_conversation_duration_total_s / self.completed_conversations, 2)
@@ -280,6 +304,9 @@ _HISTORY_BUCKET_INT_FIELDS = {
     "session_rate_limited",
     "session_connected_events",
     "session_disconnected_events",
+    "llm_proxy_requests",
+    "llm_proxy_accepted",
+    "llm_proxy_rejected",
     "completed_conversations",
 }
 _HISTORY_BUCKET_FLOAT_FIELDS = {
@@ -347,6 +374,9 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "failures": max(int(raw_record.get("failures", 0)), 0),
             "auth_rejected": max(int(raw_record.get("auth_rejected", 0)), 0),
             "rate_limited": max(int(raw_record.get("rate_limited", 0)), 0),
+            "llm_proxy_requests": max(int(raw_record.get("llm_proxy_requests", 0)), 0),
+            "llm_proxy_accepted": max(int(raw_record.get("llm_proxy_accepted", 0)), 0),
+            "llm_proxy_rejected": max(int(raw_record.get("llm_proxy_rejected", 0)), 0),
             "abandoned": max(int(raw_record.get("abandoned", 0)), 0),
             "connections": max(int(raw_record.get("connections", 0)), 0),
             "completed_sessions": max(int(raw_record.get("completed_sessions", 0)), 0),
@@ -396,6 +426,9 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
         "failures": 0,
         "auth_rejected": 0,
         "rate_limited": 0,
+        "llm_proxy_requests": 0,
+        "llm_proxy_accepted": 0,
+        "llm_proxy_rejected": 0,
         "abandoned": 0,
         "connections": 0,
         "completed_sessions": 0,
@@ -515,6 +548,7 @@ class DashboardHistory:
         self._flush_retry_not_before_monotonic_s: Optional[float] = None
         self._last_dirty_bucket_warning_at_monotonic_s: Optional[float] = None
         self._day_rollover_cursor_s: Optional[int] = None
+        self._llm_proxy_baselines: dict[str, dict[str, object]] = {}
         self._history_restore_status = "disabled" if history_store is None else "pending"
         self._history_restore_detail: Optional[str] = None
         self._history_restore_started_at_s: Optional[float] = None
@@ -590,9 +624,129 @@ class DashboardHistory:
         async with self._lock:
             bucket = self._get_bucket_unlocked(sample.captured_at_s)
             bucket.record_sample(sample)
+            self._record_llm_proxy_usage_unlocked(
+                bucket,
+                {
+                    str(endpoint.get("name")): endpoint["llm_proxy_usage"]
+                    for endpoint in sample.endpoints
+                    if endpoint.get("name") and isinstance(endpoint.get("llm_proxy_usage"), dict)
+                },
+            )
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(sample.captured_at_s)
             self._wake_persistence_unlocked()
+
+    async def record_llm_proxy_usage(self, usage_by_endpoint: dict[str, dict[str, object]]) -> None:
+        """Ingest cumulative compute counters, recording only unseen deltas."""
+        now = self._time_fn()
+        async with self._lock:
+            bucket = self._get_bucket_unlocked(now)
+            changed = self._record_llm_proxy_usage_unlocked(bucket, usage_by_endpoint)
+            if changed:
+                self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
+                self._wake_persistence_unlocked()
+            self._prune_unlocked(now)
+
+    def _record_llm_proxy_usage_unlocked(
+        self,
+        bucket: SwarmHistoryBucket,
+        usage_by_endpoint: dict[str, dict[str, object]],
+    ) -> bool:
+        changed = False
+        for endpoint_name, current in usage_by_endpoint.items():
+            instance_id = str(current.get("instance_id") or "")
+            if not instance_id:
+                continue
+            previous = self._llm_proxy_baselines.get(endpoint_name)
+            same_instance = previous is not None and previous.get("instance_id") == instance_id
+            count_current = previous is not None and not same_instance
+
+            requests = _cumulative_delta(current, previous, "requests", same_instance, count_current)
+            accepted = _cumulative_delta(current, previous, "accepted", same_instance, count_current)
+            rejected = _cumulative_delta(current, previous, "rejected", same_instance, count_current)
+            if requests or accepted or rejected:
+                bucket.llm_proxy_requests += requests
+                bucket.llm_proxy_accepted += accepted
+                bucket.llm_proxy_rejected += rejected
+                changed = True
+
+            raw_requesters = current.get("requesters") or {}
+            previous_requesters = (previous.get("requesters") or {}) if same_instance and previous is not None else {}
+            if isinstance(raw_requesters, dict) and isinstance(previous_requesters, dict):
+                for raw_actor_id, raw_record in raw_requesters.items():
+                    if not isinstance(raw_record, dict):
+                        continue
+                    actor_id = str(raw_actor_id)[:128]
+                    previous_record = previous_requesters.get(raw_actor_id)
+                    if not isinstance(previous_record, dict):
+                        previous_record = None
+                    requester_deltas = {
+                        "llm_proxy_requests": _cumulative_delta(
+                            raw_record,
+                            previous_record,
+                            "requests",
+                            same_instance,
+                            count_current or (same_instance and previous_record is None),
+                        ),
+                        "llm_proxy_accepted": _cumulative_delta(
+                            raw_record,
+                            previous_record,
+                            "accepted",
+                            same_instance,
+                            count_current or (same_instance and previous_record is None),
+                        ),
+                        "llm_proxy_rejected": _cumulative_delta(
+                            raw_record,
+                            previous_record,
+                            "rejected",
+                            same_instance,
+                            count_current or (same_instance and previous_record is None),
+                        ),
+                    }
+                    if not any(requester_deltas.values()):
+                        continue
+                    metadata = raw_record.get("metadata")
+                    self._record_llm_proxy_requester_unlocked(
+                        bucket,
+                        actor_id=actor_id,
+                        metadata=metadata if isinstance(metadata, dict) else {},
+                        deltas=requester_deltas,
+                    )
+                    changed = True
+
+            self._llm_proxy_baselines[endpoint_name] = copy.deepcopy(current)
+        return changed
+
+    def _record_llm_proxy_requester_unlocked(
+        self,
+        bucket: SwarmHistoryBucket,
+        *,
+        actor_id: str,
+        metadata: dict[str, object],
+        deltas: dict[str, int],
+    ) -> None:
+        resolved_actor_id = actor_id
+        resolved_metadata = metadata
+        if (
+            resolved_actor_id not in bucket.requester_usage
+            and len(bucket.requester_usage) >= self.max_requesters_per_bucket
+        ):
+            resolved_actor_id = "overflow"
+            resolved_metadata = {
+                "label": "Other requesters (cardinality limit)",
+                "kind": "overflow",
+                "verification": "not_applicable",
+                "fingerprint": "",
+            }
+        record = bucket.requester_usage.get(resolved_actor_id)
+        if record is None:
+            self._make_requester_record_capacity_unlocked()
+            record = _new_requester_usage_record(resolved_metadata)
+            bucket.requester_usage[resolved_actor_id] = record
+            self._requester_record_count += 1
+        _merge_requester_identity(record, resolved_metadata)
+        for field_name, delta in deltas.items():
+            record[field_name] = int(record.get(field_name, 0)) + delta
 
     async def snapshot(self) -> list[SwarmHistoryBucket]:
         async with self._lock:

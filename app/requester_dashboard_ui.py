@@ -23,6 +23,7 @@ REQUESTER_DASHBOARD_MARKUP = """
                 <th>Requester</th>
                 <th>Status</th>
                 <th>Requests</th>
+                <th>LLM proxy</th>
                 <th>Allocated</th>
                 <th>Connected</th>
                 <th>Duration</th>
@@ -44,6 +45,7 @@ REQUESTER_DASHBOARD_MARKUP = """
 
 
 REQUESTER_DASHBOARD_KPI_CARDS = """
+        kpiCard(`LLM proxy / ${windowLabel}`, prettyNumber(summary.llm_proxy_requests_window || 0), `${prettyNumber(summary.llm_proxy_accepted_window || 0)} accepted · ${prettyNumber(summary.llm_proxy_rejected_window || 0)} rejected at the compute gate`),
         kpiCard(`HF users / ${windowLabel}`, prettyNumber(summary.authenticated_users_window || 0), `Distinct verified Hugging Face accounts in the last ${windowLabel}`),
         kpiCard(`Connected requesters / ${windowLabel}`, prettyNumber(summary.connected_requesters_window || 0), `Distinct requesters whose allocated session reached the compute websocket`),
         kpiCard(`Auth rejected / ${windowLabel}`, prettyNumber(summary.session_auth_rejections_window || 0), `POST /session and queued grants denied by verified-token enforcement`),
@@ -113,6 +115,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
       document.getElementById('requester-summary').innerHTML = [
         `<span class="status-pill good">${htmlEscape(prettyNumber(summary.authenticated_users_window || 0))} HF users</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.tokens_window || 0))} tokens</span>`,
+        `<span class="status-pill ${summary.llm_proxy_rejected_window ? 'warm' : 'good'}">${htmlEscape(prettyNumber(summary.llm_proxy_requests_window || 0))} LLM proxy · ${htmlEscape(prettyNumber(summary.llm_proxy_rejected_window || 0))} rejected</span>`,
         `<span class="status-pill">${htmlEscape(prettyNumber(summary.allocated_requesters_window || 0))} allocated · ${htmlEscape(prettyNumber(summary.connected_requesters_window || 0))} connected</span>`,
         `<span class="status-pill ${summary.session_auth_rejections_window ? 'bad' : 'good'}">${htmlEscape(prettyNumber(summary.session_auth_rejections_window || 0))} auth rejected</span>`,
         `<span class="status-pill ${summary.session_rate_limited_window ? 'bad' : 'good'}">${htmlEscape(prettyNumber(summary.session_rate_limited_window || 0))} limited</span>`,
@@ -138,6 +141,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
               <div style="margin-top:6px;"><span class="tiny-pill risk-pill ${htmlEscape(row.risk || 'normal')}">${htmlEscape(row.risk || 'normal')}</span></div>
             </td>
             <td><strong>${htmlEscape(prettyNumber(row.requests || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.requests_per_hour || 0))}/h</div></td>
+            <td><strong>${htmlEscape(prettyNumber(row.llm_proxy_requests || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.llm_proxy_accepted || 0))} accepted · ${htmlEscape(prettyNumber(row.llm_proxy_rejected || 0))} rejected</div></td>
             <td>${htmlEscape(prettyNumber(row.successes || 0))}<div class="muted">${htmlEscape(row.success_rate_pct || 0)}%</div></td>
             <td><strong>${htmlEscape(prettyNumber(row.connections || 0))}</strong><div class="muted">websocket joins</div></td>
             <td><strong>${htmlEscape(formatDuration(row.avg_connected_duration_s || 0))} avg</strong><div class="muted">${htmlEscape(prettyNumber(row.short_sessions || 0))} short · ${htmlEscape(formatDuration(row.max_connected_duration_s || 0))} max</div></td>
@@ -150,13 +154,17 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td class="requester-signals">${htmlEscape(signals)}</td>
           </tr>
         `;
-      }).join('') : '<tr><td colspan="13" class="muted">No attributed session requests in this window yet.</td></tr>';
+      }).join('') : '<tr><td colspan="14" class="muted">No attributed session or LLM proxy requests in this window yet.</td></tr>';
 
       const unattributed = Number(requesters?.unattributed_requests || 0);
+      const unattributedLlmProxy = Number(requesters?.unattributed_llm_proxy_requests || 0);
       const attributionDetail = unattributed
         ? `${prettyNumber(unattributed)} request(s) in the last ${windowLabel} predate attribution or could not be attributed.`
         : `All recorded session requests in the last ${windowLabel} have requester attribution.`;
-      document.getElementById('requester-detail').textContent = `${attributionDetail} Connected counts the first compute websocket callback for an allocated session. Duration uses attributed completed sessions; system-forced disconnects are excluded from the short-session count. Allocated, Connected, and completed duration are independent events in the selected window, not a cohort conversion rate.`;
+      const llmAttributionDetail = unattributedLlmProxy
+        ? ` ${prettyNumber(unattributedLlmProxy)} LLM proxy request(s) could not be attributed to a connected requester.`
+        : '';
+      document.getElementById('requester-detail').textContent = `${attributionDetail}${llmAttributionDetail} Connected counts the first compute websocket callback for an allocated session. Duration uses attributed completed sessions; system-forced disconnects are excluded from the short-session count. Allocated, Connected, and completed duration are independent events in the selected window, not a cohort conversion rate.`;
     }
 """
 

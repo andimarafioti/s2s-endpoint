@@ -147,6 +147,18 @@ def _mint_session_token(
         callback_url=f"http://lb.internal/internal/sessions/{session_id}/event",
         ttl_s=600.0,
         llm_fingerprint=llm_token_fingerprint(secret, hf_token) if hf_token else None,
+        llm_requester=(
+            {
+                "actor_id": "token:abc123",
+                "label": "@reachy-user · token •abc123",
+                "kind": "authenticated",
+                "verification": "verified",
+                "fingerprint": "abc123",
+                "account_name": "reachy-user",
+            }
+            if hf_token == HF_TOKEN
+            else None
+        ),
     )
 
 
@@ -186,6 +198,9 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         async def _fake_release(slot_id) -> None:
             pass
 
+        async def _fake_healthcheck():
+            return True, None, {}
+
         async def _no_lb_callback(*args: Any, **kwargs: Any) -> None:
             pass
 
@@ -198,7 +213,11 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
             session_shared_secret=secret,
         )
         dependencies = compute_main.ComputeDependencies(
-            session_router=SimpleNamespace(acquire=_fake_acquire, release=_fake_release),
+            session_router=SimpleNamespace(
+                acquire=_fake_acquire,
+                release=_fake_release,
+                healthcheck=_fake_healthcheck,
+            ),
             connected_llm_fingerprints=compute_main._ConnectedFingerprintRegistry(),
             llm_rate_limiter=compute_main._FingerprintRateLimiter(rate_limit_rpm, time_fn=time_fn),
             http_get_json=compute_main._http_get_json,
@@ -225,6 +244,36 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
 
 
 class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
+    def test_counts_both_proxy_paths_as_accepted_for_the_requester(self) -> None:
+        client = self.gated_client()
+        with _connected_session(client):
+            self.assertEqual(self.post_chat(client).status_code, 200)
+            self.assertEqual(
+                client.post("/v1/responses", content=b"{}", headers=_auth()).status_code,
+                200,
+            )
+
+        usage = client.get("/health").json()["llm_proxy_usage"]
+        self.assertEqual(usage["requests"], 2)
+        self.assertEqual(usage["accepted"], 2)
+        self.assertEqual(usage["rejected"], 0)
+        self.assertEqual(
+            usage["requesters"]["token:abc123"],
+            {
+                "metadata": {
+                    "label": "@reachy-user · token •abc123",
+                    "kind": "authenticated",
+                    "verification": "verified",
+                    "fingerprint": "abc123",
+                    "account_name": "reachy-user",
+                },
+                "requests": 2,
+                "accepted": 2,
+                "rejected": 0,
+            },
+        )
+        self.assertNotIn(HF_TOKEN, json.dumps(usage))
+
     def test_chat_completions_reaches_internal_pipeline_verbatim(self) -> None:
         self.stub.responder = lambda path: (
             200,
@@ -339,6 +388,10 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"]["type"], "upstream_unreachable")
+        usage = client.get("/health").json()["llm_proxy_usage"]
+        self.assertEqual(usage["requests"], 1)
+        self.assertEqual(usage["accepted"], 1)
+        self.assertEqual(usage["rejected"], 0)
 
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()
@@ -365,6 +418,11 @@ class HfTokenGateTests(ComputeLlmProxyTestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(self.stub.requests, [])
+        usage = client.get("/health").json()["llm_proxy_usage"]
+        self.assertEqual(usage["requests"], 1)
+        self.assertEqual(usage["accepted"], 0)
+        self.assertEqual(usage["rejected"], 1)
+        self.assertEqual(usage["requesters"], {})
 
     def test_api_key_in_reachy_authorization_header_opens_the_gate(self) -> None:
         """The HF Inference Endpoints ingress consumes the standard
@@ -458,6 +516,10 @@ class DisabledLlmProxyTests(ComputeLlmProxyTestCase):
                 self.assertEqual(response.status_code, 404)
 
         self.assertEqual(self.stub.requests, [])
+        usage = client.get("/health").json()["llm_proxy_usage"]
+        self.assertEqual(usage["requests"], 2)
+        self.assertEqual(usage["accepted"], 0)
+        self.assertEqual(usage["rejected"], 2)
 
     def test_disabled_proxy_404_is_indistinguishable_from_an_unknown_route(self) -> None:
         client = self.gated_client(enable_llm_proxy=False)
@@ -484,6 +546,11 @@ class FingerprintRateLimitTests(ComputeLlmProxyTestCase):
 
         # The throttled request never reached the pipeline.
         self.assertEqual(len(self.stub.requests), 3)
+        usage = client.get("/health").json()["llm_proxy_usage"]
+        self.assertEqual(usage["requests"], 4)
+        self.assertEqual(usage["accepted"], 3)
+        self.assertEqual(usage["rejected"], 1)
+        self.assertEqual(usage["requesters"]["token:abc123"]["rejected"], 1)
 
     def test_rate_limit_window_slides_and_recovers(self) -> None:
         clock = {"now": 1000.0}

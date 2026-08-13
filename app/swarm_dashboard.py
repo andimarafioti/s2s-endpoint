@@ -66,6 +66,9 @@ class SwarmBucketAggregate:
     session_rate_limited: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
+    llm_proxy_requests: int = 0
+    llm_proxy_accepted: int = 0
+    llm_proxy_rejected: int = 0
     completed_conversations: int = 0
     completed_conversation_duration_total_s: float = 0.0
     completed_conversation_duration_max_s: float = 0.0
@@ -97,6 +100,9 @@ class SwarmBucketAggregate:
             aggregate.session_rate_limited += bucket.session_rate_limited
             aggregate.session_connected_events += bucket.session_connected_events
             aggregate.session_disconnected_events += bucket.session_disconnected_events
+            aggregate.llm_proxy_requests += bucket.llm_proxy_requests
+            aggregate.llm_proxy_accepted += bucket.llm_proxy_accepted
+            aggregate.llm_proxy_rejected += bucket.llm_proxy_rejected
             aggregate.completed_conversations += bucket.completed_conversations
             aggregate.completed_conversation_duration_total_s += bucket.completed_conversation_duration_total_s
             aggregate.completed_conversation_duration_max_s = max(
@@ -133,6 +139,9 @@ class SwarmBucketAggregate:
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
+            "llm_proxy_requests": self.llm_proxy_requests,
+            "llm_proxy_accepted": self.llm_proxy_accepted,
+            "llm_proxy_rejected": self.llm_proxy_rejected,
             "completed_conversations": self.completed_conversations,
             "active_conversation_minutes": round(self.active_conversation_minutes, 2),
             "active_conversation_hours": round(self.active_conversation_minutes / 60.0, 2),
@@ -164,6 +173,9 @@ class SwarmBucketAggregate:
             "session_rate_limited": self.session_rate_limited,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
+            "llm_proxy_requests": self.llm_proxy_requests,
+            "llm_proxy_accepted": self.llm_proxy_accepted,
+            "llm_proxy_rejected": self.llm_proxy_rejected,
             "completed_conversations": self.completed_conversations,
             "avg_conversation_duration_s": self.avg_conversation_duration_s,
             "avg_conversation_duration_min": round(self.avg_conversation_duration_s / 60.0, 2),
@@ -363,6 +375,9 @@ class SwarmDashboard:
             "session_rate_limited_window": selected["session_rate_limited"],
             "session_connects_window": selected["session_connected_events"],
             "session_disconnects_window": selected["session_disconnected_events"],
+            "llm_proxy_requests_window": selected["llm_proxy_requests"],
+            "llm_proxy_accepted_window": selected["llm_proxy_accepted"],
+            "llm_proxy_rejected_window": selected["llm_proxy_rejected"],
             "conversations_started_window": selected["session_connected_events"],
             "conversations_completed_window": selected["completed_conversations"],
             "active_conversation_minutes_window": selected["active_conversation_minutes"],

@@ -7,6 +7,7 @@ import urllib.error
 from unittest.mock import patch
 
 from app.endpoint_pool_router import (
+    ComputeLLMProxyUsage,
     ComputeUnhealthyError,
     ComputeUsage,
     ComputeUsageSchemaError,
@@ -145,6 +146,65 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
             usage = fetch_compute_usage("https://compute.example")
 
         self.assertEqual(usage, ComputeUsage(active_sessions=2, max_sessions=4))
+
+    def test_fetch_compute_usage_reads_llm_proxy_counters(self):
+        payload = {
+            "router": {"active_sessions": 1, "max_sessions": 2},
+            "llm_proxy_usage": {
+                "instance_id": "process-a",
+                "requests": 4,
+                "accepted": 3,
+                "rejected": 1,
+                "requesters": {
+                    "token:abc123": {
+                        "metadata": {
+                            "label": "@reachy-user",
+                            "kind": "authenticated",
+                            "verification": "verified",
+                            "fingerprint": "abc123",
+                            "account_name": "reachy-user",
+                        },
+                        "requests": 3,
+                        "accepted": 2,
+                        "rejected": 1,
+                    }
+                },
+            },
+        }
+        with patch(
+            "app.endpoint_pool_router.urllib.request.urlopen",
+            return_value=FakeUrlopenResponse(payload),
+        ):
+            usage = fetch_compute_usage("https://compute.example")
+
+        self.assertEqual(
+            usage.llm_proxy,
+            ComputeLLMProxyUsage(
+                instance_id="process-a",
+                requests=4,
+                accepted=3,
+                rejected=1,
+                requesters=payload["llm_proxy_usage"]["requesters"],
+            ),
+        )
+
+    def test_fetch_compute_usage_rejects_inconsistent_llm_proxy_counters(self):
+        payload = {
+            "router": {"active_sessions": 1, "max_sessions": 2},
+            "llm_proxy_usage": {
+                "instance_id": "process-a",
+                "requests": 4,
+                "accepted": 4,
+                "rejected": 1,
+                "requesters": {},
+            },
+        }
+        with patch(
+            "app.endpoint_pool_router.urllib.request.urlopen",
+            return_value=FakeUrlopenResponse(payload),
+        ):
+            with self.assertRaisesRegex(ComputeUsageSchemaError, "accepted plus rejected"):
+                fetch_compute_usage("https://compute.example")
 
     def test_huggingface_controller_uses_an_isolated_bounded_http_client(self):
         from huggingface_hub import get_session

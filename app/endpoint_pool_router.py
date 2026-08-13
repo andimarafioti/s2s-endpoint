@@ -17,9 +17,28 @@ logger = logging.getLogger("s2s-endpoint")
 
 
 @dataclass(frozen=True)
+class ComputeLLMProxyUsage:
+    instance_id: str
+    requests: int
+    accepted: int
+    rejected: int
+    requesters: dict[str, dict[str, object]]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "instance_id": self.instance_id,
+            "requests": self.requests,
+            "accepted": self.accepted,
+            "rejected": self.rejected,
+            "requesters": self.requesters,
+        }
+
+
+@dataclass(frozen=True)
 class ComputeUsage:
     active_sessions: int
     max_sessions: int
+    llm_proxy: Optional[ComputeLLMProxyUsage] = None
 
 
 ComputeUsageFetcher = Callable[[str], ComputeUsage]
@@ -128,7 +147,76 @@ def fetch_compute_usage(base_url: str) -> ComputeUsage:
     return ComputeUsage(
         active_sessions=active_sessions,
         max_sessions=max_sessions,
+        llm_proxy=_parse_llm_proxy_usage(payload.get("llm_proxy_usage")),
     )
+
+
+def _parse_llm_proxy_usage(value: object) -> Optional[ComputeLLMProxyUsage]:
+    # Missing during a rolling deploy means "not available", not zero: zero
+    # would establish a false baseline and inflate the first upgraded poll.
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ComputeUsageSchemaError("compute health llm_proxy_usage must be an object")
+
+    instance_id = str(value.get("instance_id") or "")[:128]
+    if not instance_id:
+        raise ComputeUsageSchemaError("compute health llm_proxy_usage did not include instance_id")
+    requests = _llm_proxy_counter(value, "requests")
+    accepted = _llm_proxy_counter(value, "accepted")
+    rejected = _llm_proxy_counter(value, "rejected")
+    if accepted + rejected != requests:
+        raise ComputeUsageSchemaError("compute health llm_proxy_usage accepted plus rejected must equal requests")
+
+    raw_requesters = value.get("requesters") or {}
+    if not isinstance(raw_requesters, dict):
+        raise ComputeUsageSchemaError("compute health llm_proxy_usage requesters must be an object")
+    requesters: dict[str, dict[str, object]] = {}
+    for raw_actor_id, raw_record in raw_requesters.items():
+        if not isinstance(raw_record, dict):
+            raise ComputeUsageSchemaError("compute health llm_proxy_usage requester record must be an object")
+        actor_id = str(raw_actor_id)[:128]
+        if not actor_id:
+            raise ComputeUsageSchemaError("compute health llm_proxy_usage requester id must not be empty")
+        requester_requests = _llm_proxy_counter(raw_record, "requests")
+        requester_accepted = _llm_proxy_counter(raw_record, "accepted")
+        requester_rejected = _llm_proxy_counter(raw_record, "rejected")
+        if requester_accepted + requester_rejected != requester_requests:
+            raise ComputeUsageSchemaError(
+                "compute health llm_proxy_usage requester accepted plus rejected must equal requests"
+            )
+        raw_metadata = raw_record.get("metadata") or {}
+        if not isinstance(raw_metadata, dict):
+            raise ComputeUsageSchemaError("compute health llm_proxy_usage requester metadata must be an object")
+        metadata = {
+            key: raw_metadata[key]
+            for key in ("label", "kind", "verification", "fingerprint", "account_name")
+            if raw_metadata.get(key) is not None
+        }
+        requesters[actor_id] = {
+            "metadata": metadata,
+            "requests": requester_requests,
+            "accepted": requester_accepted,
+            "rejected": requester_rejected,
+        }
+
+    return ComputeLLMProxyUsage(
+        instance_id=instance_id,
+        requests=requests,
+        accepted=accepted,
+        rejected=rejected,
+        requesters=requesters,
+    )
+
+
+def _llm_proxy_counter(record: dict[object, object], name: str) -> int:
+    try:
+        value = int(record.get(name, 0))
+    except (TypeError, ValueError) as exc:
+        raise ComputeUsageSchemaError(f"compute health llm_proxy_usage {name} must be an integer") from exc
+    if value < 0:
+        raise ComputeUsageSchemaError(f"compute health llm_proxy_usage {name} must not be negative")
+    return value
 
 
 def _is_running_status(status: str) -> bool:
@@ -413,6 +501,7 @@ class ManagedEndpoint:
     drain_lease_id: Optional[str] = None
     last_drain_warning_at: Optional[float] = None
     last_sync_failure_log_at: Optional[float] = None
+    llm_proxy_usage: Optional[ComputeLLMProxyUsage] = None
 
     def apply_snapshot(self, snapshot: EndpointSnapshot) -> None:
         self.status = snapshot.status
@@ -428,6 +517,7 @@ class ManagedEndpoint:
     def reset_usage_after_fresh_process(self) -> None:
         self.observed_active_sessions = 0
         self.invalidate_usage_sync(forget_last_success=True)
+        self.llm_proxy_usage = None
 
     def reset_usage_after_process_stop(self, *, clear_local_sessions: bool) -> None:
         if clear_local_sessions:
@@ -436,6 +526,7 @@ class ManagedEndpoint:
         self.observed_active_sessions = 0
         self.unobserved_connected_sessions = 0
         self.invalidate_usage_sync(forget_last_success=True)
+        self.llm_proxy_usage = None
 
     def apply_usage_sync(
         self,
@@ -452,6 +543,7 @@ class ManagedEndpoint:
         self.usage_sync_drain_generation = drain_generation
         self.last_sync_failure_log_at = None
         self.last_error = None
+        self.llm_proxy_usage = usage.llm_proxy
         if observed_increase:
             self.unobserved_connected_sessions = max(
                 self.unobserved_connected_sessions - observed_increase,
@@ -988,6 +1080,9 @@ class EndpointPoolRouter:
                     "warming_capacity_counted": self._counts_as_warming_capacity(endpoint, now),
                     "url": endpoint.url,
                     "last_error": endpoint.last_error,
+                    "llm_proxy_usage": (
+                        endpoint.llm_proxy_usage.to_dict() if endpoint.llm_proxy_usage is not None else None
+                    ),
                 }
                 for endpoint in sorted(endpoints, key=lambda item: item.name)
             ],

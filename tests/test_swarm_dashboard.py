@@ -197,7 +197,14 @@ class FakeBucketApi:
 
 
 def _health_snapshot(
-    *, connected: int, pending: int, running: int, waking: int, free_slots: int, effective_free_slots: int
+    *,
+    connected: int,
+    pending: int,
+    running: int,
+    waking: int,
+    free_slots: int,
+    effective_free_slots: int,
+    llm_proxy_usages: list[dict[str, object] | None] | None = None,
 ):
     endpoints = [
         {
@@ -241,6 +248,8 @@ def _health_snapshot(
             "last_error": None,
         },
     ]
+    for endpoint, usage in zip(endpoints, llm_proxy_usages or []):
+        endpoint["llm_proxy_usage"] = usage
     return (
         True,
         None,
@@ -273,6 +282,140 @@ def _bucket_store(api: FakeBucketApi) -> HuggingFaceBucketHistoryStore:
 
 
 class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_aggregates_llm_proxy_usage_across_replicas_and_requesters(self):
+        clock = FakeClock(2 * 3600)
+        provider = FakeSnapshotProvider(
+            _health_snapshot(
+                connected=0,
+                pending=0,
+                running=2,
+                waking=0,
+                free_slots=2,
+                effective_free_slots=2,
+                llm_proxy_usages=[
+                    {
+                        "instance_id": "process-a",
+                        "requests": 0,
+                        "accepted": 0,
+                        "rejected": 0,
+                        "requesters": {},
+                    },
+                    {
+                        "instance_id": "process-b",
+                        "requests": 0,
+                        "accepted": 0,
+                        "rejected": 0,
+                        "requesters": {},
+                    },
+                ],
+            )
+        )
+        dashboard = SwarmDashboard(snapshot_provider=provider, time_fn=clock.now)
+        await dashboard.capture_sample()
+        requester = {
+            "metadata": {
+                "label": "@reachy-user · token •abc123",
+                "kind": "authenticated",
+                "verification": "verified",
+                "fingerprint": "abc123",
+                "account_name": "reachy-user",
+            },
+            "requests": 0,
+            "accepted": 0,
+            "rejected": 0,
+        }
+        provider.payload = _health_snapshot(
+            connected=0,
+            pending=0,
+            running=2,
+            waking=0,
+            free_slots=2,
+            effective_free_slots=2,
+            llm_proxy_usages=[
+                {
+                    "instance_id": "process-a",
+                    "requests": 3,
+                    "accepted": 2,
+                    "rejected": 1,
+                    "requesters": {
+                        "token:abc123": {
+                            **requester,
+                            "requests": 3,
+                            "accepted": 2,
+                            "rejected": 1,
+                        }
+                    },
+                },
+                {
+                    "instance_id": "process-b",
+                    "requests": 2,
+                    "accepted": 2,
+                    "rejected": 0,
+                    "requesters": {
+                        "token:abc123": {
+                            **requester,
+                            "requests": 2,
+                            "accepted": 2,
+                        }
+                    },
+                },
+            ],
+        )
+
+        await dashboard.capture_sample()
+        payload = await dashboard.data(window="60m", resolution="minute")
+
+        self.assertEqual(payload["summary"]["llm_proxy_requests_window"], 5)
+        self.assertEqual(payload["summary"]["llm_proxy_accepted_window"], 4)
+        self.assertEqual(payload["summary"]["llm_proxy_rejected_window"], 1)
+        self.assertEqual(payload["series"][-1]["llm_proxy_requests"], 5)
+        requester_row = next(row for row in payload["requesters"]["leaderboard"] if row["actor_id"] == "hf:reachy-user")
+        self.assertEqual(requester_row["llm_proxy_requests"], 5)
+        self.assertEqual(requester_row["llm_proxy_accepted"], 4)
+        self.assertEqual(requester_row["llm_proxy_rejected"], 1)
+
+    async def test_replica_restart_and_counter_reset_count_only_new_traffic(self):
+        clock = FakeClock(2 * 3600)
+
+        def snapshot(instance_id: str, requests: int):
+            return _health_snapshot(
+                connected=0,
+                pending=0,
+                running=1,
+                waking=0,
+                free_slots=1,
+                effective_free_slots=1,
+                llm_proxy_usages=[
+                    {
+                        "instance_id": instance_id,
+                        "requests": requests,
+                        "accepted": requests,
+                        "rejected": 0,
+                        "requesters": {},
+                    }
+                ],
+            )
+
+        provider = FakeSnapshotProvider(snapshot("process-a", 10))
+        dashboard = SwarmDashboard(snapshot_provider=provider, time_fn=clock.now)
+        await dashboard.capture_sample()  # Establish the initial cumulative baseline.
+        provider.payload = snapshot("process-a", 12)
+        await dashboard.capture_sample()
+        provider.payload = snapshot("process-b", 1)
+        await dashboard.capture_sample()
+        provider.payload = snapshot("process-b", 3)
+        await dashboard.capture_sample()
+        provider.payload = snapshot("process-b", 0)  # Defensive reset with a stale instance id.
+        await dashboard.capture_sample()
+        provider.payload = snapshot("process-b", 2)
+        await dashboard.capture_sample()
+
+        payload = await dashboard.data(window="60m", resolution="minute")
+
+        self.assertEqual(payload["summary"]["llm_proxy_requests_window"], 7)
+        self.assertEqual(payload["summary"]["llm_proxy_accepted_window"], 7)
+        self.assertEqual(payload["summary"]["llm_proxy_rejected_window"], 0)
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(
@@ -684,6 +827,28 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             conversation_duration_s=90.0,
             conversation_counted=True,
         )
+        await dashboard.history.record_llm_proxy_usage(
+            {
+                "compute-01": {
+                    "instance_id": "process-a",
+                    "requests": 4,
+                    "accepted": 3,
+                    "rejected": 1,
+                    "requesters": {},
+                }
+            }
+        )
+        await dashboard.history.record_llm_proxy_usage(
+            {
+                "compute-01": {
+                    "instance_id": "process-a",
+                    "requests": 6,
+                    "accepted": 4,
+                    "rejected": 2,
+                    "requesters": {},
+                }
+            }
+        )
         clock.set(clock.now() + 60)
         await dashboard.record_sample(
             SwarmStateSample(
@@ -713,6 +878,9 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted.completed_conversations, 1)
         self.assertEqual(persisted.completed_conversation_duration_total_s, 90.0)
         self.assertEqual(persisted.completed_conversation_duration_samples_s, [90.0])
+        self.assertEqual(persisted.llm_proxy_requests, 2)
+        self.assertEqual(persisted.llm_proxy_accepted, 1)
+        self.assertEqual(persisted.llm_proxy_rejected, 1)
 
     async def test_flushes_dirty_buckets_in_bounded_batches(self):
         clock = FakeClock(5 * 60)

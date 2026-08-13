@@ -38,6 +38,9 @@ class _ActorUsageAccumulator:
     failures: int = 0
     auth_rejected: int = 0
     rate_limited: int = 0
+    llm_proxy_requests: int = 0
+    llm_proxy_accepted: int = 0
+    llm_proxy_rejected: int = 0
     abandoned: int = 0
     connections: int = 0
     completed_sessions: int = 0
@@ -111,6 +114,9 @@ class _ActorUsageAccumulator:
         self.failures += max(int(record.get("failures", 0)), 0)
         self.auth_rejected += max(int(record.get("auth_rejected", 0)), 0)
         self.rate_limited += max(int(record.get("rate_limited", 0)), 0)
+        self.llm_proxy_requests += max(int(record.get("llm_proxy_requests", 0)), 0)
+        self.llm_proxy_accepted += max(int(record.get("llm_proxy_accepted", 0)), 0)
+        self.llm_proxy_rejected += max(int(record.get("llm_proxy_rejected", 0)), 0)
         self.abandoned += max(int(record.get("abandoned", 0)), 0)
         connections = max(int(record.get("connections", 0)), 0)
         self.connections += connections
@@ -217,6 +223,9 @@ class _ActorUsageAccumulator:
             "failures": self.failures,
             "auth_rejected": self.auth_rejected,
             "rate_limited": self.rate_limited,
+            "llm_proxy_requests": self.llm_proxy_requests,
+            "llm_proxy_accepted": self.llm_proxy_accepted,
+            "llm_proxy_rejected": self.llm_proxy_rejected,
             "abandoned": self.abandoned,
             "connections": self.connections,
             "completed_sessions": self.completed_sessions,
@@ -304,8 +313,11 @@ def aggregate_requester_usage(
     total_session_requests: int,
     thresholds: RequesterUsageThresholds,
 ) -> dict[str, object]:
-    actors = _collect_actors(buckets)
+    bucket_list = list(buckets)
+    actors = _collect_actors(bucket_list)
     tracked_requests = sum(actor.requests for actor in actors.values())
+    tracked_llm_proxy_requests = sum(actor.llm_proxy_requests for actor in actors.values())
+    total_llm_proxy_requests = sum(bucket.llm_proxy_requests for bucket in bucket_list)
     peer_request_counts = [
         actor.requests for actor_id, actor in actors.items() if actor_id != "overflow" and actor.requests > 0
     ]
@@ -328,7 +340,7 @@ def aggregate_requester_usage(
     attributed_connections = 0
 
     for actor_id, actor in actors.items():
-        if actor.requests > 0 and actor_id != "overflow":
+        if (actor.requests > 0 or actor.llm_proxy_requests > 0) and actor_id != "overflow":
             token_actors.update(actor.requesting_token_actor_ids)
             authenticated_accounts.update(actor.authenticated_account_names)
             if actor.kind == "authenticated" and actor.verification == "verified":
@@ -361,11 +373,18 @@ def aggregate_requester_usage(
             )
         )
 
-    rows.sort(key=lambda row: (-int(row["requests"]), str(row["label"])))
+    rows.sort(
+        key=lambda row: (
+            -(int(row["requests"]) + int(row["llm_proxy_requests"])),
+            str(row["label"]),
+        )
+    )
     unattributed_requests = max(total_session_requests - tracked_requests, 0)
     summary = {
         "unique_requesters_window": sum(
-            1 for row in rows if row["actor_id"] != "overflow" and int(row["requests"]) > 0
+            1
+            for row in rows
+            if row["actor_id"] != "overflow" and (int(row["requests"]) > 0 or int(row["llm_proxy_requests"]) > 0)
         ),
         "authenticated_users_window": len(authenticated_accounts),
         "tokens_window": len(token_actors),
@@ -389,6 +408,8 @@ def aggregate_requester_usage(
         "summary": summary,
         "tracked_requests": tracked_requests,
         "unattributed_requests": unattributed_requests,
+        "tracked_llm_proxy_requests": tracked_llm_proxy_requests,
+        "unattributed_llm_proxy_requests": max(total_llm_proxy_requests - tracked_llm_proxy_requests, 0),
         "median_requests_per_requester": median_peer_requests,
         "thresholds": {
             "high_volume_requests": thresholds.high_volume_requests,
