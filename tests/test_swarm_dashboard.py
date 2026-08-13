@@ -626,6 +626,26 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         current = next(bucket for bucket in await history.snapshot() if bucket.bucket_start_s == 2 * 3600)
         self.assertEqual(current.llm_proxy_requests, 2)
 
+    async def test_delayed_merge_repairs_a_stale_usage_overwrite(self):
+        clock = FakeClock(2 * 3600)
+        stale = SwarmHistoryBucket(bucket_start_s=2 * 3600)
+        stale.llm_proxy_requests = 1
+        stale.llm_proxy_sequences = {"old-process": 1}
+        store = FakeHistoryStore(initial_buckets=[stale])
+        history = DashboardHistory(retention_minutes=60, history_store=store, time_fn=clock.now)
+
+        await history._restore_history()
+        await history.record_llm_proxy_request("new-process", 1, "hf:alice", {"label": "@alice"})
+        self.assertEqual(store.saved[2 * 3600]["llm_proxy_requests"], 2)
+
+        store.saved[2 * 3600] = stale.to_dict()
+        await history._merge_persisted_history_buckets([stale])
+        self.assertIn(2 * 3600, history._dirty_bucket_starts)
+        await history._flush_dirty_buckets(include_open_bucket=True)
+
+        self.assertEqual(store.saved[2 * 3600]["llm_proxy_requests"], 2)
+        self.assertEqual(store.saved[2 * 3600]["llm_proxy_sequences"], {"old-process": 1, "new-process": 1})
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(

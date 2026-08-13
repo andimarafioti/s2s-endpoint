@@ -1151,6 +1151,10 @@ class DashboardHistory:
                     sequence > current_bucket.llm_proxy_sequences.get(instance_id, 0)
                     for instance_id, sequence in bucket.llm_proxy_sequences.items()
                 ):
+                    current_usage = _llm_proxy_usage_checkpoint(current_bucket)
+                    if current_usage != _llm_proxy_usage_checkpoint(bucket):
+                        self._mark_bucket_dirty_unlocked(current_bucket.bucket_start_s)
+                        updated_bucket_count += 1
                     continue
                 total_delta = max(bucket.llm_proxy_requests - previous_total, 0)
                 current_bucket.llm_proxy_requests += total_delta
