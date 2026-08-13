@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -450,6 +451,36 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertLess(elapsed, 1.0)
         self.assertEqual(len(self.stub.requests), 1)
+
+    def test_locked_outbox_does_not_block_accounting(self) -> None:
+        async def exercise(outbox_path: str) -> list[int]:
+            delivered: list[int] = []
+
+            async def notify(*args: Any, **kwargs: Any) -> None:
+                delivered.append(kwargs["extra_payload"]["sequence"])
+
+            usage = compute_main._LLMProxyUsage(outbox_path=outbox_path)
+            blocker = sqlite3.connect(outbox_path)
+            blocker.execute("BEGIN EXCLUSIVE")
+            try:
+                with self.assertLogs("s2s-endpoint", level="ERROR"):
+                    usage.record(
+                        "https://lb.example/event",
+                        "session-token",
+                        "session-1",
+                        SECRET,
+                        notify,
+                        attempts=1,
+                    )
+            finally:
+                blocker.rollback()
+                blocker.close()
+            await usage.stop()
+            return delivered
+
+        with tempfile.TemporaryDirectory() as directory:
+            outbox_path = str(Path(directory) / "usage.sqlite3")
+            self.assertEqual(asyncio.run(exercise(outbox_path)), [1])
 
     def test_shutdown_retains_unavailable_usage_for_restart(self) -> None:
         async def exercise() -> None:

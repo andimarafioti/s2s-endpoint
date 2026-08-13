@@ -453,7 +453,7 @@ class _LLMProxyUsage:
         if self.notify is None:
             return
         if self._worker is None or self._worker.done():
-            if self._next_event() is not None:
+            if self._pending or self._outbox is not None:
                 self._worker = asyncio.create_task(self._deliver())
 
     def _persist_event(self, event: tuple[int, str, str, int, dict[str, object]]) -> None:
@@ -510,7 +510,14 @@ class _LLMProxyUsage:
 
     async def _deliver(self) -> None:
         while True:
-            event = self._next_event()
+            try:
+                event = self._next_event()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Failed to read the LLM usage outbox; retrying in background")
+                await asyncio.sleep(1.0)
+                continue
             if event is None:
                 self._worker = None
                 return
