@@ -1,3 +1,4 @@
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -287,6 +288,28 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NotifyLbRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_single_usage_attempt_has_a_bounded_wait(self):
+        calls = []
+
+        def post(url, payload):
+            calls.append(payload["event"])
+            time.sleep(0.2)
+
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            await compute_main._notify_lb_session_event(
+                "https://lb.example/internal/sessions/abc/event",
+                "token-abc",
+                "llm_proxy_request",
+                post_json=post,
+                default_backoff_s=1.0,
+                attempts=1,
+                timeout_s=0.01,
+            )
+
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.assertEqual(calls, ["llm_proxy_request"])
+
     async def test_retries_until_success(self):
         calls = []
 

@@ -27,6 +27,7 @@ REQUESTER_DASHBOARD_MARKUP = """
                 <th>Connected</th>
                 <th>Duration</th>
                 <th>Rejected</th>
+                <th>LLM proxy</th>
                 <th>Traffic</th>
                 <th>Peak</th>
                 <th>Networks</th>
@@ -48,6 +49,9 @@ REQUESTER_DASHBOARD_KPI_CARDS = """
         kpiCard(`Connected requesters / ${windowLabel}`, prettyNumber(summary.connected_requesters_window || 0), `Distinct requesters whose allocated session reached the compute websocket`),
         kpiCard(`Auth rejected / ${windowLabel}`, prettyNumber(summary.session_auth_rejections_window || 0), `POST /session and queued grants denied by verified-token enforcement`),
         kpiCard(`Rate limited / ${windowLabel}`, prettyNumber(summary.session_rate_limited_window || 0), `POST /session requests rejected before compute allocation`),
+        kpiCard(`LLM proxy requests / ${windowLabel}`, prettyNumber(summary.llm_proxy_requests_window || 0), `Proxy gate attempts in the last ${windowLabel}`),
+        kpiCard(`LLM proxy accepted / ${windowLabel}`, prettyNumber(summary.llm_proxy_accepted_window || 0), `Proxy requests admitted for forwarding in the last ${windowLabel}`),
+        kpiCard(`LLM proxy rejected / ${windowLabel}`, prettyNumber(summary.llm_proxy_rejected_window || 0), `Proxy requests rejected with 404, 401, or 429 in the last ${windowLabel}`),
         kpiCard(`Anonymous IPs / ${windowLabel}`, prettyNumber(summary.anonymous_ips_window || 0), `Distinct privacy-safe network fingerprints without tokens`),
         kpiCard(`Reported robots / ${windowLabel}`, prettyNumber(summary.reported_robots_window || 0), `Distinct privacy-safe robot fingerprints reported by clients; not verified hardware`),
         kpiCard(`Flagged / ${windowLabel}`, prettyNumber(summary.unusual_requesters_window || 0), `Requesters with rejection, volume, burst, network, token, or automation signals`),
@@ -142,6 +146,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td><strong>${htmlEscape(prettyNumber(row.connections || 0))}</strong><div class="muted">websocket joins</div></td>
             <td><strong>${htmlEscape(formatDuration(row.avg_connected_duration_s || 0))} avg</strong><div class="muted">${htmlEscape(prettyNumber(row.short_sessions || 0))} short · ${htmlEscape(formatDuration(row.max_connected_duration_s || 0))} max</div></td>
             <td><strong>${htmlEscape(prettyNumber(requesterRejectedCount(row)))}</strong><div class="muted">${htmlEscape(prettyNumber(row.auth_rejected || 0))} auth rejected · ${htmlEscape(prettyNumber(row.rate_limited || 0))} limited</div></td>
+            <td><strong>${htmlEscape(prettyNumber(row.llm_proxy_requests || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.llm_proxy_accepted || 0))} accepted · ${htmlEscape(prettyNumber(row.llm_proxy_rejected || 0))} rejected</div></td>
             <td>${htmlEscape(row.traffic_share_pct || 0)}%</td>
             <td>${htmlEscape(prettyNumber(row.peak_requests_per_minute || 0))}/min</td>
             <td>${htmlEscape(networks)}</td>
@@ -150,7 +155,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td class="requester-signals">${htmlEscape(signals)}</td>
           </tr>
         `;
-      }).join('') : '<tr><td colspan="13" class="muted">No attributed session requests in this window yet.</td></tr>';
+      }).join('') : '<tr><td colspan="14" class="muted">No attributed session or LLM proxy requests in this window yet.</td></tr>';
 
       const unattributed = Number(requesters?.unattributed_requests || 0);
       const attributionDetail = unattributed

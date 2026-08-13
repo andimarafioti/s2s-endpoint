@@ -22,6 +22,7 @@ from app.load_balancer_app import (
 from app.requester_identity import RequesterIdentity
 from app.requester_rate_limiter import RequesterRateLimitConfig, RequesterRateLimiter
 from app.session_requester_tracker import SessionRequesterTracker
+from app.session_tokens import create_session_token
 from app.verification_admission_limiter import (
     VerificationAdmissionConfig,
     VerificationAdmissionLimiter,
@@ -817,7 +818,12 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_dashboard.calls, ["request", "auth_rejected"])
 
     async def test_required_verified_token_can_receive_immediate_grant(self):
-        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        module = self._import_load_balancer(
+            {
+                "SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true",
+                "SESSION_SHARED_SECRET": "shared-secret",
+            }
+        )
         fake_dashboard = FakeDashboard()
         fake_session_manager = FakeSessionManager()
         module.dependencies.dashboard = fake_dashboard
@@ -825,10 +831,20 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         verified = _requester_identity(verification="verified", kind="authenticated")
 
         with patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified):
-            response = await create_session(module.runtime, FakeConnectedRequest())
+            response = await create_session(
+                module.runtime,
+                FakeHeaderRequest({"authorization": "Bearer hf_faketesttoken1234"}),
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(fake_session_manager.allocation_calls, 1)
+        self.assertEqual(
+            fake_session_manager.allocation_arguments[0]["llm_requester"],
+            {
+                "actor_id": verified.actor_id,
+                "metadata": verified.history_metadata(),
+            },
+        )
         self.assertEqual(fake_dashboard.calls, ["request", "success"])
 
     async def test_default_verification_age_allows_the_full_default_allocation_wait(self):
@@ -1093,6 +1109,97 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_dashboard.session_events, ["connected", "connected"])
         self.assertEqual(fake_dashboard.connected_requesters, [fake_dashboard.requesters[0]])
 
+    async def test_llm_proxy_callback_records_signed_requester_and_unattributed_attempts(self):
+        module = self._import_load_balancer({"SESSION_SHARED_SECRET": "shared-secret"})
+        fake_dashboard = FakeDashboard()
+        module.dependencies.dashboard = fake_dashboard
+        requester = {
+            "actor_id": "token:abc123",
+            "metadata": {
+                "label": "@reachy-user · token •abc123",
+                "kind": "authenticated",
+                "verification": "verified",
+                "fingerprint": "abc123",
+                "account_name": "reachy-user",
+            },
+        }
+        token = create_session_token(
+            "shared-secret",
+            session_id="session-123",
+            websocket_url="wss://compute.example/v1/realtime",
+            callback_url="https://lb.example/internal/sessions/session-123/event",
+            ttl_s=60,
+            llm_fingerprint="fingerprint",
+            llm_requester=requester,
+        )
+
+        accepted = await session_event(
+            module.runtime,
+            "session-123",
+            {
+                "session_token": token,
+                "event": "llm_proxy_request",
+                "outcome": "accepted",
+                "requester": requester,
+            },
+        )
+        rejected = await session_event(
+            module.runtime,
+            "session-123",
+            {
+                "session_token": token,
+                "event": "llm_proxy_request",
+                "outcome": "rejected",
+            },
+        )
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(rejected.status_code, 200)
+        self.assertEqual(
+            fake_dashboard.llm_proxy_requests,
+            [
+                ("accepted", requester["actor_id"], requester["metadata"]),
+                ("rejected", None, None),
+            ],
+        )
+        self.assertEqual(fake_dashboard.session_events, [])
+
+    async def test_llm_proxy_callback_rejects_requester_not_in_signed_context(self):
+        module = self._import_load_balancer({"SESSION_SHARED_SECRET": "shared-secret"})
+        requester = {
+            "actor_id": "token:abc123",
+            "metadata": {
+                "label": "@reachy-user · token •abc123",
+                "kind": "authenticated",
+                "verification": "verified",
+                "fingerprint": "abc123",
+                "account_name": "reachy-user",
+            },
+        }
+        token = create_session_token(
+            "shared-secret",
+            session_id="session-123",
+            websocket_url="wss://compute.example/v1/realtime",
+            callback_url="https://lb.example/internal/sessions/session-123/event",
+            ttl_s=60,
+            llm_fingerprint="fingerprint",
+            llm_requester=requester,
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            await session_event(
+                module.runtime,
+                "session-123",
+                {
+                    "session_token": token,
+                    "event": "llm_proxy_request",
+                    "outcome": "accepted",
+                    "requester": {**requester, "actor_id": "token:forged"},
+                },
+            )
+
+        self.assertEqual(raised.exception.status_code, 403)
+
     async def test_disconnected_callback_records_requester_duration_after_connect(self):
         module = self._import_load_balancer()
         fake_dashboard = FakeDashboard()
@@ -1247,6 +1354,7 @@ class FakeDashboard:
         self.connected_requesters = []
         self.disconnected_requesters = []
         self.identity_updates = []
+        self.llm_proxy_requests = []
 
     async def record_session_request(self, requester=None):
         self.calls.append("request")
@@ -1285,6 +1393,9 @@ class FakeDashboard:
     async def update_requester_identity(self, requester):
         self.identity_updates.append(requester)
 
+    async def record_llm_proxy_request(self, outcome, *, actor_id, metadata):
+        self.llm_proxy_requests.append((outcome, actor_id, metadata))
+
 
 class FakeSessionManager:
     def __init__(self, *, allocation_wait_ms: int = 1200, waited_for_capacity: bool = True):
@@ -1292,12 +1403,19 @@ class FakeSessionManager:
         self.allocation_wait_ms = allocation_wait_ms
         self.waited_for_capacity = waited_for_capacity
         self.allocation_calls = 0
+        self.allocation_arguments = []
         self.connected_session_ids = set()
 
-    async def allocate(self, lb_base_url, *, llm_fingerprint=None):
+    async def allocate(self, lb_base_url, *, llm_fingerprint=None, llm_requester=None):
         # Mirrors DirectSessionManager._grant_from_lease, which stamps
         # "state": "granted" on every grant it returns.
         self.allocation_calls += 1
+        self.allocation_arguments.append(
+            {
+                "llm_fingerprint": llm_fingerprint,
+                "llm_requester": llm_requester,
+            }
+        )
         return {
             "state": "granted",
             "session_id": "session-123",
@@ -1334,7 +1452,7 @@ class FakeFailingSessionManager:
     def __init__(self, exc=None):
         self.exc = exc or RuntimeError("no capacity")
 
-    async def allocate(self, lb_base_url, *, llm_fingerprint=None):
+    async def allocate(self, lb_base_url, *, llm_fingerprint=None, llm_requester=None):
         raise self.exc
 
 
@@ -1344,7 +1462,7 @@ class FakeQueuedSessionManager:
     def __init__(self):
         self.left = False
 
-    async def allocate(self, lb_base_url, *, llm_fingerprint=None):
+    async def allocate(self, lb_base_url, *, llm_fingerprint=None, llm_requester=None):
         return {
             "state": "queued",
             "queue_id": "queue-123",

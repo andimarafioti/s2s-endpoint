@@ -164,6 +164,9 @@ class SwarmHistoryBucket:
     session_allocation_failures: int = 0
     session_auth_rejections: int = 0
     session_rate_limited: int = 0
+    llm_proxy_requests: int = 0
+    llm_proxy_accepted: int = 0
+    llm_proxy_rejected: int = 0
     session_connected_events: int = 0
     session_disconnected_events: int = 0
     completed_conversations: int = 0
@@ -217,6 +220,9 @@ class SwarmHistoryBucket:
             "session_allocation_failures": self.session_allocation_failures,
             "session_auth_rejections": self.session_auth_rejections,
             "session_rate_limited": self.session_rate_limited,
+            "llm_proxy_requests": self.llm_proxy_requests,
+            "llm_proxy_accepted": self.llm_proxy_accepted,
+            "llm_proxy_rejected": self.llm_proxy_rejected,
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
@@ -278,6 +284,9 @@ _HISTORY_BUCKET_INT_FIELDS = {
     "session_allocation_failures",
     "session_auth_rejections",
     "session_rate_limited",
+    "llm_proxy_requests",
+    "llm_proxy_accepted",
+    "llm_proxy_rejected",
     "session_connected_events",
     "session_disconnected_events",
     "completed_conversations",
@@ -347,6 +356,9 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "failures": max(int(raw_record.get("failures", 0)), 0),
             "auth_rejected": max(int(raw_record.get("auth_rejected", 0)), 0),
             "rate_limited": max(int(raw_record.get("rate_limited", 0)), 0),
+            "llm_proxy_requests": max(int(raw_record.get("llm_proxy_requests", 0)), 0),
+            "llm_proxy_accepted": max(int(raw_record.get("llm_proxy_accepted", 0)), 0),
+            "llm_proxy_rejected": max(int(raw_record.get("llm_proxy_rejected", 0)), 0),
             "abandoned": max(int(raw_record.get("abandoned", 0)), 0),
             "connections": max(int(raw_record.get("connections", 0)), 0),
             "completed_sessions": max(int(raw_record.get("completed_sessions", 0)), 0),
@@ -396,6 +408,9 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
         "failures": 0,
         "auth_rejected": 0,
         "rate_limited": 0,
+        "llm_proxy_requests": 0,
+        "llm_proxy_accepted": 0,
+        "llm_proxy_rejected": 0,
         "abandoned": 0,
         "connections": 0,
         "completed_sessions": 0,
@@ -748,14 +763,22 @@ class DashboardHistory:
         short_session: bool = False,
     ) -> None:
         counter_fields = {
-            "request": ("session_requests", "requests"),
-            "success": ("session_allocation_successes", "successes"),
-            "failure": ("session_allocation_failures", "failures"),
-            "auth_rejected": ("session_auth_rejections", "auth_rejected"),
-            "rate_limited": ("session_rate_limited", "rate_limited"),
-            "abandoned": (None, "abandoned"),
-            "connected": (None, "connections"),
-            "disconnected": (None, "completed_sessions"),
+            "request": (("session_requests",), ("requests",)),
+            "success": (("session_allocation_successes",), ("successes",)),
+            "failure": (("session_allocation_failures",), ("failures",)),
+            "auth_rejected": (("session_auth_rejections",), ("auth_rejected",)),
+            "rate_limited": (("session_rate_limited",), ("rate_limited",)),
+            "llm_proxy_accepted": (
+                ("llm_proxy_requests", "llm_proxy_accepted"),
+                ("llm_proxy_requests", "llm_proxy_accepted"),
+            ),
+            "llm_proxy_rejected": (
+                ("llm_proxy_requests", "llm_proxy_rejected"),
+                ("llm_proxy_requests", "llm_proxy_rejected"),
+            ),
+            "abandoned": ((), ("abandoned",)),
+            "connected": ((), ("connections",)),
+            "disconnected": ((), ("completed_sessions",)),
         }
         if event not in counter_fields:
             raise ValueError(f"Unknown requester event: {event}")
@@ -763,8 +786,8 @@ class DashboardHistory:
         now = self._time_fn()
         async with self._lock:
             bucket = self._get_bucket_unlocked(now)
-            global_field, requester_field = counter_fields[event]
-            if global_field is not None:
+            global_fields, requester_fields = counter_fields[event]
+            for global_field in global_fields:
                 setattr(bucket, global_field, getattr(bucket, global_field) + 1)
             if actor_id and metadata is not None:
                 resolved_actor_id = actor_id
@@ -787,7 +810,8 @@ class DashboardHistory:
                     bucket.requester_usage[resolved_actor_id] = record
                     self._requester_record_count += 1
                 _merge_requester_identity(record, resolved_metadata)
-                record[requester_field] = int(record.get(requester_field, 0)) + 1
+                for requester_field in requester_fields:
+                    record[requester_field] = int(record.get(requester_field, 0)) + 1
                 if event == "disconnected":
                     resolved_duration_s = max(float(duration_s or 0.0), 0.0)
                     record["connected_duration_total_s"] = (

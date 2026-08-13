@@ -27,6 +27,7 @@ PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_POOL_PATH = "/v1/pool"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
+LLM_PROXY_ACCOUNTING_TIMEOUT_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -279,30 +280,59 @@ def _redact_pool_payload(data: dict[str, object]) -> dict[str, object]:
     return data
 
 
+@dataclass(frozen=True)
+class _LLMProxySessionContext:
+    callback_url: str
+    session_token: str
+    requester: Optional[dict[str, object]] = None
+
+
 class _ConnectedFingerprintRegistry:
     """HF token fingerprints with a currently connected realtime session.
 
     Membership is the LLM proxy access window: a fingerprint is added when
     its session's websocket connects and removed when it disconnects.
-    Refcounted because one token may hold several concurrent sessions.
-    Single event loop, so no locking.
+    One token may hold several concurrent sessions, so each fingerprint maps
+    its signed session tokens to their callback context. The most recently
+    observed context is retained as the reporting transport for an
+    unattributed request after all sessions disconnect. Single event loop, so
+    no locking.
     """
 
     def __init__(self) -> None:
-        self._counts: dict[str, int] = {}
+        self._sessions: dict[str, dict[str, _LLMProxySessionContext]] = {}
+        self._last_reporter: Optional[_LLMProxySessionContext] = None
 
-    def add(self, fingerprint: str) -> None:
-        self._counts[fingerprint] = self._counts.get(fingerprint, 0) + 1
+    def add(
+        self,
+        fingerprint: str,
+        callback_url: str,
+        session_token: str,
+        requester: Optional[dict[str, object]],
+    ) -> None:
+        context = _LLMProxySessionContext(callback_url, session_token, requester)
+        self._sessions.setdefault(fingerprint, {})[session_token] = context
+        self._last_reporter = context
 
-    def remove(self, fingerprint: str) -> None:
-        count = self._counts.get(fingerprint, 0) - 1
-        if count > 0:
-            self._counts[fingerprint] = count
-        else:
-            self._counts.pop(fingerprint, None)
+    def remove(self, fingerprint: str, session_token: str) -> None:
+        sessions = self._sessions.get(fingerprint)
+        if sessions is None:
+            return
+        sessions.pop(session_token, None)
+        if not sessions:
+            self._sessions.pop(fingerprint, None)
 
     def __contains__(self, fingerprint: str) -> bool:
-        return fingerprint in self._counts
+        return fingerprint in self._sessions
+
+    def context(self, fingerprint: str) -> Optional[_LLMProxySessionContext]:
+        sessions = self._sessions.get(fingerprint)
+        if not sessions:
+            return None
+        return next(reversed(sessions.values()))
+
+    def reporter(self) -> Optional[_LLMProxySessionContext]:
+        return self._last_reporter
 
 
 def _now() -> float:
@@ -347,9 +377,28 @@ def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONRes
     return JSONResponse({"error": {"message": message, "type": error_type}}, status_code=status_code)
 
 
-def _llm_proxy_denial(
+def _llm_proxy_match(
     request: Request,
     settings: ComputeSettings,
+    dependencies: "ComputeDependencies",
+) -> Optional[tuple[str, _LLMProxySessionContext]]:
+    """Resolve the presented credential to an active signed session context."""
+    if not settings.session_shared_secret:
+        return None
+    token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
+    if token is None:
+        token = bearer_token(request.headers.get("authorization"))
+    if token is None:
+        return None
+    fingerprint = llm_token_fingerprint(settings.session_shared_secret, token)
+    context = dependencies.connected_llm_fingerprints.context(fingerprint)
+    if context is None:
+        return None
+    return fingerprint, context
+
+
+def _llm_proxy_denial(
+    match: Optional[tuple[str, _LLMProxySessionContext]],
     dependencies: "ComputeDependencies",
 ) -> Optional[JSONResponse]:
     """Access check for the LLM proxy paths; None means forward the request.
@@ -357,37 +406,53 @@ def _llm_proxy_denial(
     The api key must be the HF token the session was created with, checked by
     fingerprint against the sessions whose websocket is currently connected.
     Without a shared secret the replica cannot verify anything, so the paths
-    fail closed. Checked once at request start: an answer already streaming
-    when its session disconnects finishes undisturbed.
-
-    The key is read from ``x-reachy-mini-authorization`` first, then from
-    ``Authorization`` — the same precedence the load balancer uses at session
-    creation, and for the same reason: the HF Inference Endpoints ingress
-    consumes the standard Authorization header before it reaches the app, so
-    SDK clients on that infrastructure carry the token in the custom header
-    (``default_headers``) alongside their normal ``api_key``.
+    fail closed. The credential match was resolved once at request start, so
+    an answer already streaming when its session disconnects finishes
+    undisturbed.
     """
-    if settings.session_shared_secret:
-        token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
-        if token is None:
-            token = bearer_token(request.headers.get("authorization"))
-        if token is not None:
-            fingerprint = llm_token_fingerprint(settings.session_shared_secret, token)
-            if fingerprint in dependencies.connected_llm_fingerprints:
-                if dependencies.llm_rate_limiter.allow(fingerprint):
-                    return None
-                return _llm_proxy_error(
-                    429,
-                    f"Rate limit exceeded: {dependencies.llm_rate_limiter.limit_rpm} requests per minute "
-                    "per user. Back off and retry.",
-                    "rate_limit_exceeded",
-                )
+    if match is not None:
+        fingerprint, _context = match
+        if dependencies.llm_rate_limiter.allow(fingerprint):
+            return None
+        return _llm_proxy_error(
+            429,
+            f"Rate limit exceeded: {dependencies.llm_rate_limiter.limit_rpm} requests per minute "
+            "per user. Back off and retry.",
+            "rate_limit_exceeded",
+        )
     return _llm_proxy_error(
         401,
         "Invalid API key: pass the HF token this session was created with, "
         "while the session's realtime websocket is connected.",
         "invalid_api_key",
     )
+
+
+async def _report_llm_proxy_request(
+    dependencies: "ComputeDependencies",
+    *,
+    outcome: str,
+    context: Optional[_LLMProxySessionContext],
+) -> None:
+    reporter = context or dependencies.connected_llm_fingerprints.reporter()
+    if reporter is None:
+        logger.warning("LLM proxy accounting skipped: no load-balancer callback context is available")
+        return
+
+    payload_fields: dict[str, object] = {"outcome": outcome}
+    if context is not None and context.requester is not None:
+        payload_fields["requester"] = context.requester
+    try:
+        await dependencies.notify_lb_session_event(
+            reporter.callback_url,
+            reporter.session_token,
+            "llm_proxy_request",
+            attempts=1,
+            payload_fields=payload_fields,
+            timeout_s=LLM_PROXY_ACCOUNTING_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("Failed to record LLM proxy %s request: %s", outcome, exc)
 
 
 async def llm_proxy_chat_completions(
@@ -433,14 +498,21 @@ async def _proxy_llm_request(
     (feature disabled), 401 and 429 (denials), and 502 (internal pipeline
     unreachable).
     """
+    match = _llm_proxy_match(request, settings, dependencies)
+    context = match[1] if match is not None else None
+
     if not settings.enable_llm_proxy:
-        # Checked before auth: a disabled replica reveals nothing, answering
-        # exactly like an app where these routes were never registered.
+        # Returned before admission or rate limiting: a disabled replica
+        # answers exactly like an app where these routes were never registered.
+        await _report_llm_proxy_request(dependencies, outcome="rejected", context=context)
         raise HTTPException(status_code=404)
 
-    denial = _llm_proxy_denial(request, settings, dependencies)
+    denial = _llm_proxy_denial(match, dependencies)
     if denial is not None:
+        await _report_llm_proxy_request(dependencies, outcome="rejected", context=context)
         return denial
+
+    await _report_llm_proxy_request(dependencies, outcome="accepted", context=context)
 
     headers = {}
     content_type = request.headers.get("content-type")
@@ -519,10 +591,14 @@ async def websocket_proxy(
         return
 
     llm_fingerprint: Optional[str] = None
+    llm_requester: Optional[dict[str, object]] = None
     if session_payload is not None:
         claim = session_payload.get("llmf")
         if isinstance(claim, str) and claim:
             llm_fingerprint = claim
+        requester_claim = session_payload.get("llmr")
+        if isinstance(requester_claim, dict):
+            llm_requester = requester_claim
     llm_fingerprint_registered = False
 
     async def _notify_connected() -> None:
@@ -541,7 +617,12 @@ async def websocket_proxy(
         # the finally below, alongside the disconnected notification.
         nonlocal llm_fingerprint_registered
         if llm_fingerprint is not None:
-            dependencies.connected_llm_fingerprints.add(llm_fingerprint)
+            dependencies.connected_llm_fingerprints.add(
+                llm_fingerprint,
+                str(session_payload["callback_url"]),
+                str(session_payload["session_token"]),
+                llm_requester,
+            )
             llm_fingerprint_registered = True
 
     try:
@@ -562,7 +643,10 @@ async def websocket_proxy(
             pass
     finally:
         if llm_fingerprint_registered and llm_fingerprint is not None:
-            dependencies.connected_llm_fingerprints.remove(llm_fingerprint)
+            dependencies.connected_llm_fingerprints.remove(
+                llm_fingerprint,
+                str(session_payload["session_token"]),
+            )
         if session_payload is not None:
             # Always tell the LB the session is over. For a normal session this
             # completes the conversation; for a capacity rejection it releases
@@ -583,7 +667,7 @@ async def websocket_proxy(
 def _get_session_payload(
     client_ws: WebSocket,
     settings: ComputeSettings,
-) -> Optional[dict[str, str]]:
+) -> Optional[dict[str, object]]:
     if not settings.session_shared_secret:
         return None
 
@@ -623,10 +707,12 @@ async def _notify_lb_session_event(
     session_token: str,
     event: str,
     *,
-    post_json: Callable[[str, dict[str, str]], None],
+    post_json: Callable[[str, dict[str, object]], None],
     default_backoff_s: float,
     attempts: int = 1,
     backoff_s: Optional[float] = None,
+    payload_fields: Optional[Mapping[str, object]] = None,
+    timeout_s: Optional[float] = None,
 ) -> None:
     """Post a session lifecycle event to the LB callback URL.
 
@@ -639,13 +725,19 @@ async def _notify_lb_session_event(
         "session_token": session_token,
         "event": event,
     }
+    if payload_fields:
+        payload.update(payload_fields)
     if backoff_s is None:
         backoff_s = default_backoff_s
     attempts = max(attempts, 1)
     delay = backoff_s
     for attempt in range(1, attempts + 1):
         try:
-            await asyncio.to_thread(post_json, callback_url, payload)
+            operation = asyncio.to_thread(post_json, callback_url, payload)
+            if timeout_s is None:
+                await operation
+            else:
+                await asyncio.wait_for(operation, timeout=max(timeout_s, 0.0))
             return
         except Exception as exc:
             if attempt >= attempts:
@@ -683,7 +775,7 @@ def _http_get_json(url: str) -> dict[str, object]:
 
 def _post_json(
     url: str,
-    payload: dict[str, str],
+    payload: dict[str, object],
     *,
     callback_auth_token: str,
 ) -> None:
@@ -735,7 +827,7 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
             http_get_json=_http_get_json,
         )
 
-    def post_json(url: str, payload: dict[str, str]) -> None:
+    def post_json(url: str, payload: dict[str, object]) -> None:
         _post_json(
             url,
             payload,
@@ -749,6 +841,8 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
         *,
         attempts: int = 1,
         backoff_s: Optional[float] = None,
+        payload_fields: Optional[Mapping[str, object]] = None,
+        timeout_s: Optional[float] = None,
     ) -> None:
         await _notify_lb_session_event(
             callback_url,
@@ -758,6 +852,8 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
             default_backoff_s=settings.lb_callback_retry_backoff_s,
             attempts=attempts,
             backoff_s=backoff_s,
+            payload_fields=payload_fields,
+            timeout_s=timeout_s,
         )
 
     router = SessionRouter(

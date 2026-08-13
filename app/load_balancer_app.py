@@ -42,7 +42,7 @@ from app.requester_rate_limiter import (
 from app.session_manager import SessionManager
 from app.session_request_metadata import reported_hardware_id
 from app.session_requester_tracker import SessionRequesterTracker
-from app.session_tokens import llm_token_fingerprint
+from app.session_tokens import llm_token_fingerprint, verify_session_token
 from app.swarm_dashboard import SwarmDashboard
 from app.verification_admission_limiter import (
     VerificationAdmissionConfig,
@@ -964,9 +964,18 @@ async def create_session(runtime: LoadBalancerRuntime, request: Request):
         )
     allocation_started_at = monotonic()
     try:
+        llm_fingerprint = await _llm_proxy_fingerprint(runtime, request, requester)
+        llm_requester = None
+        if llm_fingerprint is not None:
+            requester = await _refresh_requester_identity(runtime, requester)
+            llm_requester = {
+                "actor_id": requester.actor_id,
+                "metadata": requester.history_metadata(),
+            }
         allocation = await dependencies.session_manager.allocate(
             public_base_url(request),
-            llm_fingerprint=await _llm_proxy_fingerprint(runtime, request, requester),
+            llm_fingerprint=llm_fingerprint,
+            llm_requester=llm_requester,
         )
     except QueueAtCapacityError as exc:
         dependencies.requester_rate_limiter.record_allocation_failure(requester)
@@ -1213,6 +1222,10 @@ async def session_event(
     if not event:
         raise HTTPException(status_code=400, detail="event is required")
 
+    if event == "llm_proxy_request":
+        await _record_llm_proxy_request(runtime, session_id, session_token, payload)
+        return JSONResponse({"status": "ok", "session_id": session_id, "state": "recorded"})
+
     try:
         result = await dependencies.session_manager.handle_event(session_id, session_token, event)
     except KeyError:
@@ -1252,6 +1265,43 @@ async def session_event(
             )
         dependencies.session_requester_tracker.discard(session_id)
     return JSONResponse(result)
+
+
+async def _record_llm_proxy_request(
+    runtime: LoadBalancerRuntime,
+    session_id: str,
+    session_token: str,
+    payload: dict[str, Any],
+) -> None:
+    outcome = str(payload.get("outcome", "")).strip()
+    if outcome not in {"accepted", "rejected"}:
+        raise HTTPException(status_code=400, detail="outcome must be 'accepted' or 'rejected'")
+
+    try:
+        claims = verify_session_token(session_token, runtime.settings.session_shared_secret)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if claims.get("sid") != session_id:
+        raise HTTPException(status_code=403, detail="session token does not match session id")
+
+    requester = payload.get("requester")
+    actor_id = None
+    metadata = None
+    if requester is not None:
+        if not isinstance(requester, dict) or requester != claims.get("llmr"):
+            raise HTTPException(status_code=403, detail="requester does not match signed session context")
+        raw_actor_id = requester.get("actor_id")
+        raw_metadata = requester.get("metadata")
+        if not isinstance(raw_actor_id, str) or not raw_actor_id or not isinstance(raw_metadata, dict):
+            raise HTTPException(status_code=403, detail="signed requester context is invalid")
+        actor_id = raw_actor_id
+        metadata = raw_metadata
+
+    await runtime.dependencies.dashboard.record_llm_proxy_request(
+        outcome,
+        actor_id=actor_id,
+        metadata=metadata,
+    )
 
 
 async def endpoint_status(runtime: LoadBalancerRuntime, endpoint_name: str, request: Request):
