@@ -92,17 +92,22 @@ class CreateComputeEndpointsTests(unittest.TestCase):
         env = build_endpoint_env(
             base_env={
                 "SESSION_SHARED_SECRET": "shared",
+                "LB_CALLBACK_AUTH_TOKEN": "callback-secret",
+                "LLM_PROXY_ACCOUNTING_CALLBACK_URL": "https://lb.example/internal/llm-proxy-usage",
                 "OPEN_API_MODEL_NAME": "template-model",
             },
             session_shared_secret=None,
             num_pipelines=None,
             lb_callback_auth_token=None,
+            llm_proxy_accounting_callback_url=None,
         )
 
         self.assertEqual(
             env,
             {
                 "SESSION_SHARED_SECRET": "shared",
+                "LB_CALLBACK_AUTH_TOKEN": "callback-secret",
+                "LLM_PROXY_ACCOUNTING_CALLBACK_URL": "https://lb.example/internal/llm-proxy-usage",
                 "NUM_PIPELINES": "1",
                 "OPEN_API_MODEL_NAME": "template-model",
             },
@@ -115,6 +120,37 @@ class CreateComputeEndpointsTests(unittest.TestCase):
                 session_shared_secret=None,
                 num_pipelines=None,
                 lb_callback_auth_token=None,
+                llm_proxy_accounting_callback_url=None,
+            )
+
+    def test_build_endpoint_env_requires_callback_auth_when_not_copied(self):
+        with self.assertRaisesRegex(ValueError, "--lb-callback-auth-token is required"):
+            build_endpoint_env(
+                base_env={"SESSION_SHARED_SECRET": "shared"},
+                session_shared_secret=None,
+                num_pipelines=None,
+                lb_callback_auth_token=None,
+                llm_proxy_accounting_callback_url="https://lb.example/internal/llm-proxy-usage",
+            )
+
+    def test_build_endpoint_env_requires_accounting_url_when_not_copied(self):
+        with self.assertRaisesRegex(ValueError, "--llm-proxy-accounting-callback-url is required"):
+            build_endpoint_env(
+                base_env={"SESSION_SHARED_SECRET": "shared"},
+                session_shared_secret=None,
+                num_pipelines=None,
+                lb_callback_auth_token="callback-secret",
+                llm_proxy_accounting_callback_url=None,
+            )
+
+    def test_build_endpoint_env_requires_https_accounting_url(self):
+        with self.assertRaisesRegex(ValueError, "absolute HTTPS URL"):
+            build_endpoint_env(
+                base_env={"SESSION_SHARED_SECRET": "shared"},
+                session_shared_secret=None,
+                num_pipelines=None,
+                lb_callback_auth_token="callback-secret",
+                llm_proxy_accounting_callback_url="http://lb.example/internal/llm-proxy-usage",
             )
 
 
@@ -146,6 +182,10 @@ class CreateEndpointMainTests(unittest.TestCase):
             "4",
             "--session-shared-secret",
             "my-secret",
+            "--lb-callback-auth-token",
+            "callback-secret",
+            "--llm-proxy-accounting-callback-url",
+            "https://lb.example/internal/llm-proxy-usage",
         ]
 
         with (
@@ -160,6 +200,11 @@ class CreateEndpointMainTests(unittest.TestCase):
         env = mock_api.create_inference_endpoint.call_args.kwargs["env"]
         self.assertEqual(env["NUM_PIPELINES"], "4")
         self.assertEqual(env["SESSION_SHARED_SECRET"], "my-secret")
+        self.assertEqual(env["LB_CALLBACK_AUTH_TOKEN"], "callback-secret")
+        self.assertEqual(
+            env["LLM_PROXY_ACCOUNTING_CALLBACK_URL"],
+            "https://lb.example/internal/llm-proxy-usage",
+        )
 
 
 if __name__ == "__main__":

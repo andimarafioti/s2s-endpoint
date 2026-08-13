@@ -3,6 +3,7 @@ import argparse
 import concurrent.futures
 import json
 import sys
+from urllib.parse import urlsplit
 
 from _endpoint_helpers import (
     DEFAULT_FRAMEWORK,
@@ -102,6 +103,7 @@ def build_endpoint_env(
     session_shared_secret: str | None,
     num_pipelines: int | None,
     lb_callback_auth_token: str | None,
+    llm_proxy_accounting_callback_url: str | None,
 ) -> dict[str, str]:
     endpoint_env = dict(base_env)
 
@@ -118,8 +120,26 @@ def build_endpoint_env(
     elif "NUM_PIPELINES" not in endpoint_env:
         endpoint_env["NUM_PIPELINES"] = "1"
 
-    if lb_callback_auth_token:
+    if lb_callback_auth_token is not None:
+        lb_callback_auth_token = lb_callback_auth_token.strip()
+        if not lb_callback_auth_token:
+            raise ValueError("--lb-callback-auth-token must be a non-empty string")
         endpoint_env["LB_CALLBACK_AUTH_TOKEN"] = lb_callback_auth_token
+    elif not endpoint_env.get("LB_CALLBACK_AUTH_TOKEN", "").strip():
+        raise ValueError("--lb-callback-auth-token is required unless copied from --copy-env-from")
+
+    if llm_proxy_accounting_callback_url is not None:
+        llm_proxy_accounting_callback_url = llm_proxy_accounting_callback_url.strip()
+        if not llm_proxy_accounting_callback_url:
+            raise ValueError("--llm-proxy-accounting-callback-url must be a non-empty string")
+        endpoint_env["LLM_PROXY_ACCOUNTING_CALLBACK_URL"] = llm_proxy_accounting_callback_url
+    elif not endpoint_env.get("LLM_PROXY_ACCOUNTING_CALLBACK_URL", "").strip():
+        raise ValueError("--llm-proxy-accounting-callback-url is required unless copied from --copy-env-from")
+    callback_url = endpoint_env["LLM_PROXY_ACCOUNTING_CALLBACK_URL"].strip()
+    parsed_callback_url = urlsplit(callback_url)
+    if parsed_callback_url.scheme != "https" or not parsed_callback_url.netloc:
+        raise ValueError("--llm-proxy-accounting-callback-url must be an absolute HTTPS URL")
+    endpoint_env["LLM_PROXY_ACCOUNTING_CALLBACK_URL"] = callback_url
 
     return endpoint_env
 
@@ -150,7 +170,11 @@ def main() -> None:
     )
     parser.add_argument("--session-shared-secret", help="Shared secret used to validate LB-issued session tokens")
     parser.add_argument(
-        "--lb-callback-auth-token", help="Optional bearer token used by compute endpoints when notifying the LB"
+        "--lb-callback-auth-token", help="Bearer credential used by compute endpoints when notifying the LB"
+    )
+    parser.add_argument(
+        "--llm-proxy-accounting-callback-url",
+        help="Full load-balancer /internal/llm-proxy-usage callback URL",
     )
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY, help=argparse.SUPPRESS)
     parser.add_argument("--account-id", help="Optional account id")
@@ -219,6 +243,7 @@ def main() -> None:
         session_shared_secret=args.session_shared_secret,
         num_pipelines=args.num_pipelines,
         lb_callback_auth_token=args.lb_callback_auth_token,
+        llm_proxy_accounting_callback_url=args.llm_proxy_accounting_callback_url,
     )
 
     for name in names:

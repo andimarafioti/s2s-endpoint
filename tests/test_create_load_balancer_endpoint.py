@@ -6,7 +6,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from create_load_balancer_endpoint import resolve_compute_endpoint_names  # noqa: E402
+from create_load_balancer_endpoint import require_callback_auth_config, resolve_compute_endpoint_names  # noqa: E402
 
 
 class CreateLoadBalancerEndpointTests(unittest.TestCase):
@@ -29,6 +29,12 @@ class CreateLoadBalancerEndpointTests(unittest.TestCase):
             ),
             ["reachy-s2s-01", "reachy-s2s-02"],
         )
+
+    def test_requires_callback_auth_config(self):
+        with self.assertRaisesRegex(ValueError, "LB_CALLBACK_AUTH_TOKEN is required"):
+            require_callback_auth_config(env={}, secrets={})
+
+        require_callback_auth_config(env={}, secrets={"LB_CALLBACK_AUTH_TOKEN": "callback-secret"})
 
 
 if __name__ == "__main__":
