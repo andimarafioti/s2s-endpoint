@@ -181,6 +181,7 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         time_fn: Callable[[], float] = time.monotonic,
     ) -> TestClient:
         self.lb_events: list[tuple[str, dict[str, Any]]] = []
+        self.fail_usage_callback = False
 
         async def _fake_acquire():
             return SimpleNamespace(slot_id=0, ws_url="ws://127.0.0.1:1/v1/realtime")
@@ -192,6 +193,8 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
             return True, None, {"active_sessions": 1, "max_sessions": 1}
 
         async def _no_lb_callback(callback_url, session_token, event, **kwargs: Any) -> None:
+            if event == "llm_proxy_request" and self.fail_usage_callback:
+                raise RuntimeError("LB unavailable")
             self.lb_events.append((event, kwargs.get("extra_payload") or {}))
 
         self.enterContext(patch("app.ws_proxy.websockets.connect", _FakeUpstreamConnect))
@@ -231,6 +234,14 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
             if response.status_code == 401 or time.monotonic() > deadline:
                 return response
             time.sleep(0.05)
+
+    def wait_for_usage_events(self, count: int = 1, deadline_s: float = 5.0) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + deadline_s
+        while True:
+            events = [payload for event, payload in self.lb_events if event == "llm_proxy_request"]
+            if len(events) >= count or time.monotonic() > deadline:
+                return events
+            time.sleep(0.01)
 
 
 class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
@@ -354,7 +365,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"]["type"], "upstream_unreachable")
 
-        usage_events = [event for event in self.lb_events if event[0] == "llm_proxy_request"]
+        usage_events = self.wait_for_usage_events()
         self.assertEqual(len(usage_events), 1)
 
     def test_authorized_alternate_route_is_counted(self) -> None:
@@ -363,7 +374,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
             response = client.post("/v1/responses", content=b"{}", headers=_auth())
 
         self.assertEqual(response.status_code, 200)
-        usage_events = [event for event in self.lb_events if event[0] == "llm_proxy_request"]
+        usage_events = self.wait_for_usage_events()
         self.assertEqual(len(usage_events), 1)
 
     def test_accounting_retries_until_acknowledged(self) -> None:
@@ -381,7 +392,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
 
             usage = compute_main._LLMProxyUsage()
             with patch("app.compute_app.asyncio.sleep", new=no_sleep):
-                await usage.record(
+                usage.record(
                     "https://lb.example/event",
                     "session-token",
                     "session-1",
@@ -389,9 +400,43 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
                     notify,
                     attempts=1,
                 )
+                await usage.stop()
             return calls
 
         self.assertEqual(asyncio.run(exercise()), 2)
+
+    def test_accounting_failure_does_not_block_proxying(self) -> None:
+        client = self.gated_client()
+        self.fail_usage_callback = True
+        with _connected_session(client):
+            started = time.monotonic()
+            response = self.post_chat(client)
+            elapsed = time.monotonic() - started
+            self.fail_usage_callback = False
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(self.stub.requests), 1)
+
+    def test_shutdown_bounds_an_unavailable_usage_callback(self) -> None:
+        async def exercise() -> None:
+            async def notify(*args: Any, **kwargs: Any) -> None:
+                raise RuntimeError("LB unavailable")
+
+            usage = compute_main._LLMProxyUsage()
+            usage.record(
+                "https://lb.example/event",
+                "session-token",
+                "session-1",
+                SECRET,
+                notify,
+                attempts=1,
+            )
+            with self.assertLogs("s2s-endpoint", level="ERROR") as logs:
+                await usage.stop(timeout_s=0.01)
+            self.assertIn("undelivered LLM usage events", logs.output[-1])
+
+        asyncio.run(exercise())
 
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()

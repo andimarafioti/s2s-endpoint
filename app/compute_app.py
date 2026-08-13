@@ -33,6 +33,7 @@ PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_POOL_PATH = "/v1/pool"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
+LLM_USAGE_SHUTDOWN_TIMEOUT_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -361,13 +362,16 @@ class _FingerprintRateLimiter:
 
 @dataclass
 class _LLMProxyUsage:
-    """Serialize idempotent usage callbacks from this compute process."""
+    """Deliver idempotent usage callbacks without delaying inference."""
 
     instance_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     requests: int = 0
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _queue: asyncio.Queue[tuple[str, str, Callable[..., Awaitable[None]], int, dict[str, object]]] = field(
+        default_factory=asyncio.Queue
+    )
+    _worker: Optional[asyncio.Task[None]] = None
 
-    async def record(
+    def record(
         self,
         callback_url: str,
         session_token: str,
@@ -377,18 +381,31 @@ class _LLMProxyUsage:
         *,
         attempts: int,
     ) -> None:
-        async with self._lock:
-            self.requests += 1
-            extra_payload = {
-                "instance_id": self.instance_id,
-                "sequence": self.requests,
-                "signature": llm_usage_event_signature(
-                    shared_secret,
-                    session_id,
-                    self.instance_id,
-                    self.requests,
-                ),
-            }
+        self.requests += 1
+        self._queue.put_nowait(
+            (
+                callback_url,
+                session_token,
+                notify,
+                attempts,
+                {
+                    "instance_id": self.instance_id,
+                    "sequence": self.requests,
+                    "signature": llm_usage_event_signature(
+                        shared_secret,
+                        session_id,
+                        self.instance_id,
+                        self.requests,
+                    ),
+                },
+            )
+        )
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._deliver())
+
+    async def _deliver(self) -> None:
+        while not self._queue.empty():
+            callback_url, session_token, notify, attempts, extra_payload = await self._queue.get()
             while True:
                 try:
                     await notify(
@@ -398,12 +415,26 @@ class _LLMProxyUsage:
                         attempts=attempts,
                         extra_payload=extra_payload,
                     )
-                    return
+                    break
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.exception("Failed to record LLM proxy usage; retrying before forwarding")
+                    logger.exception("Failed to record LLM proxy usage; retrying in background")
                     await asyncio.sleep(1.0)
+            self._queue.task_done()
+
+    async def stop(self, *, timeout_s: float = LLM_USAGE_SHUTDOWN_TIMEOUT_S) -> None:
+        try:
+            await asyncio.wait_for(self._queue.join(), timeout=max(timeout_s, 0.0))
+        except asyncio.TimeoutError:
+            logger.error("Discarding %d undelivered LLM usage events during shutdown", self._queue.qsize() + 1)
+            if self._worker is not None:
+                self._worker.cancel()
+                await asyncio.gather(self._worker, return_exceptions=True)
+        else:
+            if self._worker is not None:
+                await self._worker
+        self._worker = None
 
 
 def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONResponse:
@@ -512,14 +543,12 @@ async def _proxy_llm_request(
     fingerprint = llm_token_fingerprint(settings.session_shared_secret, token)
     callback = dependencies.connected_llm_fingerprints.callback(fingerprint)
     assert callback is not None
-    await dependencies.llm_proxy_usage.record(
+    dependencies.llm_proxy_usage.record(
         *callback,
         settings.session_shared_secret,
         dependencies.notify_lb_session_event,
         attempts=settings.lb_callback_retry_attempts,
     )
-    await asyncio.sleep(0)
-
     headers = {}
     content_type = request.headers.get("content-type")
     if content_type:
@@ -806,6 +835,13 @@ class ComputeRuntime:
     settings: ComputeSettings
     dependencies: ComputeDependencies
 
+    async def start(self) -> None:
+        await self.dependencies.session_router.start()
+
+    async def stop(self) -> None:
+        await self.dependencies.llm_proxy_usage.stop()
+        await self.dependencies.session_router.stop()
+
 
 def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies:
     async def wait_for_ready(
@@ -880,7 +916,7 @@ def create_app(
             "SESSION_SHARED_SECRET is unset; the LLM proxy paths fail closed and answer 401 for every request"
         )
     runtime = ComputeRuntime(settings, resolved_dependencies)
-    application = FastAPI(lifespan=build_lifespan(resolved_dependencies.session_router))
+    application = FastAPI(lifespan=build_lifespan(runtime))
     application.state.runtime = runtime
     application.state.settings = settings
     application.state.dependencies = resolved_dependencies
