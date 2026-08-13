@@ -211,6 +211,7 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
             internal_ws_base_port=int(stub_url.port),
             enable_llm_proxy=enable_llm_proxy,
             session_shared_secret=secret,
+            llm_proxy_accounting_callback_url="http://lb.internal/internal/llm-proxy-usage",
         )
         dependencies = compute_main.ComputeDependencies(
             session_router=SimpleNamespace(acquire=_fake_acquire, release=_fake_release),
@@ -399,12 +400,12 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
 
 
 class HfTokenGateTests(ComputeLlmProxyTestCase):
-    def test_rejected_attempt_after_disconnect_uses_retained_callback_context(self) -> None:
+    def test_rejected_attempt_after_disconnect_uses_replica_accounting_callback(self) -> None:
         callbacks = []
 
-        async def notify(_callback_url, _session_token, event, **kwargs):
+        async def notify(callback_url, session_token, event, **kwargs):
             if event == "llm_proxy_request":
-                callbacks.append(kwargs["payload_fields"])
+                callbacks.append((callback_url, session_token, kwargs))
 
         client = self.gated_client(notify=notify)
         with _connected_session(client):
@@ -413,23 +414,43 @@ class HfTokenGateTests(ComputeLlmProxyTestCase):
         response = self.post_until_401(client)
 
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(callbacks[-1], {"outcome": "rejected"})
+        self.assertEqual(
+            callbacks[-1],
+            (
+                "http://lb.internal/internal/llm-proxy-usage",
+                "",
+                {"attempts": 1, "payload_fields": {"outcome": "rejected"}, "timeout_s": 1.0},
+            ),
+        )
 
-    def test_unknown_credentials_report_rejected_without_requester(self) -> None:
+    def test_cold_registry_unknown_credentials_report_rejected_without_requester(self) -> None:
         callbacks = []
 
-        async def notify(_callback_url, _session_token, event, **kwargs):
+        async def notify(callback_url, session_token, event, **kwargs):
             if event == "llm_proxy_request":
-                callbacks.append(kwargs["payload_fields"])
+                callbacks.append((callback_url, session_token, kwargs))
 
         client = self.gated_client(notify=notify)
-        with _connected_session(client):
-            missing = self.post_chat(client, headers={"Content-Type": "application/json"})
-            unknown = self.post_chat(client, headers=_auth("hf_not_the_sessions_token"))
+        missing = self.post_chat(client, headers={"Content-Type": "application/json"})
+        unknown = self.post_chat(client, headers=_auth("hf_not_the_sessions_token"))
 
         self.assertEqual(missing.status_code, 401)
         self.assertEqual(unknown.status_code, 401)
-        self.assertEqual(callbacks, [{"outcome": "rejected"}, {"outcome": "rejected"}])
+        self.assertEqual(
+            callbacks,
+            [
+                (
+                    "http://lb.internal/internal/llm-proxy-usage",
+                    "",
+                    {"attempts": 1, "payload_fields": {"outcome": "rejected"}, "timeout_s": 1.0},
+                ),
+                (
+                    "http://lb.internal/internal/llm-proxy-usage",
+                    "",
+                    {"attempts": 1, "payload_fields": {"outcome": "rejected"}, "timeout_s": 1.0},
+                ),
+            ],
+        )
 
     def test_missing_api_key_is_401(self) -> None:
         client = self.gated_client()
@@ -530,6 +551,28 @@ class HfTokenGateTests(ComputeLlmProxyTestCase):
 
 
 class DisabledLlmProxyTests(ComputeLlmProxyTestCase):
+    def test_cold_disabled_proxy_reports_rejected_to_replica_callback(self) -> None:
+        callbacks = []
+
+        async def notify(callback_url, session_token, event, **kwargs):
+            if event == "llm_proxy_request":
+                callbacks.append((callback_url, session_token, kwargs))
+
+        client = self.gated_client(enable_llm_proxy=False, notify=notify)
+        response = self.post_chat(client)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            callbacks,
+            [
+                (
+                    "http://lb.internal/internal/llm-proxy-usage",
+                    "",
+                    {"attempts": 1, "payload_fields": {"outcome": "rejected"}, "timeout_s": 1.0},
+                )
+            ],
+        )
+
     def test_disabled_proxy_reports_known_session_token_as_rejected(self) -> None:
         callbacks = []
 

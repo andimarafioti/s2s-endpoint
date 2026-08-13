@@ -57,6 +57,7 @@ class ComputeSettings:
     lb_callback_auth_token: str = ""
     lb_callback_retry_attempts: int = 5
     lb_callback_retry_backoff_s: float = 1.0
+    llm_proxy_accounting_callback_url: str = ""
     llm_proxy_requests_per_minute: int = 20
 
     @classmethod
@@ -95,6 +96,10 @@ class ComputeSettings:
             lb_callback_retry_backoff_s=max(
                 float(env_text("LB_CALLBACK_RETRY_BACKOFF_S", "1.0", environ=environ)),
                 0.0,
+            ),
+            llm_proxy_accounting_callback_url=env_text(
+                "LLM_PROXY_ACCOUNTING_CALLBACK_URL",
+                environ=environ,
             ),
             llm_proxy_requests_per_minute=int(env_text("LLM_PROXY_REQUESTS_PER_MINUTE", "20", environ=environ)),
         )
@@ -293,15 +298,12 @@ class _ConnectedFingerprintRegistry:
     Membership is the LLM proxy access window: a fingerprint is added when
     its session's websocket connects and removed when it disconnects.
     One token may hold several concurrent sessions, so each fingerprint maps
-    its signed session tokens to their callback context. The most recently
-    observed context is retained as the reporting transport for an
-    unattributed request after all sessions disconnect. Single event loop, so
-    no locking.
+    its signed session tokens to their callback context. Single event loop,
+    so no locking.
     """
 
     def __init__(self) -> None:
         self._sessions: dict[str, dict[str, _LLMProxySessionContext]] = {}
-        self._last_reporter: Optional[_LLMProxySessionContext] = None
 
     def add(
         self,
@@ -312,7 +314,6 @@ class _ConnectedFingerprintRegistry:
     ) -> None:
         context = _LLMProxySessionContext(callback_url, session_token, requester)
         self._sessions.setdefault(fingerprint, {})[session_token] = context
-        self._last_reporter = context
 
     def remove(self, fingerprint: str, session_token: str) -> None:
         sessions = self._sessions.get(fingerprint)
@@ -330,9 +331,6 @@ class _ConnectedFingerprintRegistry:
         if not sessions:
             return None
         return next(reversed(sessions.values()))
-
-    def reporter(self) -> Optional[_LLMProxySessionContext]:
-        return self._last_reporter
 
 
 def _now() -> float:
@@ -429,13 +427,14 @@ def _llm_proxy_denial(
 
 
 async def _report_llm_proxy_request(
+    settings: ComputeSettings,
     dependencies: "ComputeDependencies",
     *,
     outcome: str,
     context: Optional[_LLMProxySessionContext],
 ) -> None:
-    reporter = context or dependencies.connected_llm_fingerprints.reporter()
-    if reporter is None:
+    callback_url = context.callback_url if context is not None else settings.llm_proxy_accounting_callback_url
+    if not callback_url:
         logger.warning("LLM proxy accounting skipped: no load-balancer callback context is available")
         return
 
@@ -444,8 +443,8 @@ async def _report_llm_proxy_request(
         payload_fields["requester"] = context.requester
     try:
         await dependencies.notify_lb_session_event(
-            reporter.callback_url,
-            reporter.session_token,
+            callback_url,
+            context.session_token if context is not None else "",
             "llm_proxy_request",
             attempts=1,
             payload_fields=payload_fields,
@@ -504,15 +503,15 @@ async def _proxy_llm_request(
     if not settings.enable_llm_proxy:
         # Returned before admission or rate limiting: a disabled replica
         # answers exactly like an app where these routes were never registered.
-        await _report_llm_proxy_request(dependencies, outcome="rejected", context=context)
+        await _report_llm_proxy_request(settings, dependencies, outcome="rejected", context=context)
         raise HTTPException(status_code=404)
 
     denial = _llm_proxy_denial(match, dependencies)
     if denial is not None:
-        await _report_llm_proxy_request(dependencies, outcome="rejected", context=context)
+        await _report_llm_proxy_request(settings, dependencies, outcome="rejected", context=context)
         return denial
 
-    await _report_llm_proxy_request(dependencies, outcome="accepted", context=context)
+    await _report_llm_proxy_request(settings, dependencies, outcome="accepted", context=context)
 
     headers = {}
     content_type = request.headers.get("content-type")

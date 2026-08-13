@@ -1304,6 +1304,23 @@ async def _record_llm_proxy_request(
     )
 
 
+async def llm_proxy_usage(
+    runtime: LoadBalancerRuntime,
+    payload: dict[str, Any],
+):
+    """Record a proxy attempt that cannot be tied to a signed session."""
+    outcome = str(payload.get("outcome", "")).strip()
+    if outcome not in {"accepted", "rejected"}:
+        raise HTTPException(status_code=400, detail="outcome must be 'accepted' or 'rejected'")
+
+    await runtime.dependencies.dashboard.record_llm_proxy_request(
+        outcome,
+        actor_id=None,
+        metadata=None,
+    )
+    return JSONResponse({"status": "ok", "state": "recorded"})
+
+
 async def endpoint_status(runtime: LoadBalancerRuntime, endpoint_name: str, request: Request):
     require_admin_auth(runtime, request)
 
@@ -1470,6 +1487,9 @@ def create_app(
     async def session_event_route(session_id: str, payload: dict[str, Any]):
         return await session_event(runtime, session_id, payload)
 
+    async def llm_proxy_usage_route(payload: dict[str, Any]):
+        return await llm_proxy_usage(runtime, payload)
+
     async def endpoint_status_route(endpoint_name: str, request: Request):
         return await endpoint_status(runtime, endpoint_name, request)
 
@@ -1515,6 +1535,12 @@ def create_app(
         session_event_route,
         methods=["POST"],
         name="session_event",
+    )
+    application.add_api_route(
+        "/internal/llm-proxy-usage",
+        llm_proxy_usage_route,
+        methods=["POST"],
+        name="llm_proxy_usage",
     )
     application.add_api_route(
         "/internal/endpoints/{endpoint_name}",

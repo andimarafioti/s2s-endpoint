@@ -14,6 +14,7 @@ from app.dashboard_preview import DashboardPreviewSessionManager
 from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointTransitionConflictError
 from app.load_balancer_app import (
     create_session,
+    llm_proxy_usage,
     queue_leave,
     queue_status,
     record_expired_queue_ticket,
@@ -1143,12 +1144,9 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
                 "requester": requester,
             },
         )
-        rejected = await session_event(
+        rejected = await llm_proxy_usage(
             module.runtime,
-            "session-123",
             {
-                "session_token": token,
-                "event": "llm_proxy_request",
                 "outcome": "rejected",
             },
         )

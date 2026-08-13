@@ -442,6 +442,11 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `NUM_PIPELINES`: concurrent realtime sessions the `speech-to-speech` process handles internally (default `1`)
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
 - `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
+- `LLM_PROXY_ACCOUNTING_CALLBACK_URL`: full load-balancer
+  `/internal/llm-proxy-usage` URL used to count rejected proxy attempts that
+  cannot be tied to an active session, including cold-start 401 and 404
+  responses. Protect this callback with `LB_CALLBACK_AUTH_TOKEN` in the same
+  way as the session-event API.
 - `ENABLE_SMART_TURN`: enables Smart Turn endpointing (default `1`); set it to
   `0` to disable it.
 - `SMART_TURN_MODEL_PATH`: optional Smart Turn ONNX checkpoint path. The
