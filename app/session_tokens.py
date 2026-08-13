@@ -37,7 +37,12 @@ def create_session_token(
     return f"{encoded_payload}.{signature}"
 
 
-def verify_session_token(token: str, secret: str) -> dict[str, Any]:
+def verify_session_token(
+    token: str,
+    secret: str,
+    *,
+    check_expiration: bool = True,
+) -> dict[str, Any]:
     try:
         encoded_payload, signature = token.split(".", 1)
     except ValueError as exc:
@@ -52,7 +57,7 @@ def verify_session_token(token: str, secret: str) -> dict[str, Any]:
     except Exception as exc:
         raise ValueError("invalid session token payload") from exc
 
-    if int(payload.get("exp", 0)) < int(time.time()):
+    if check_expiration and int(payload.get("exp", 0)) < int(time.time()):
         raise ValueError("session token expired")
 
     return payload

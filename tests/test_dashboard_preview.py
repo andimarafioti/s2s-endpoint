@@ -23,7 +23,7 @@ from app.load_balancer_app import (
 from app.requester_identity import RequesterIdentity
 from app.requester_rate_limiter import RequesterRateLimitConfig, RequesterRateLimiter
 from app.session_requester_tracker import SessionRequesterTracker
-from app.session_tokens import create_session_token
+from app.session_tokens import create_session_token, verify_session_token
 from app.verification_admission_limiter import (
     VerificationAdmissionConfig,
     VerificationAdmissionLimiter,
@@ -1197,6 +1197,49 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(raised.exception.status_code, 403)
+
+    async def test_llm_proxy_callback_accepts_expired_context_for_still_active_session(self):
+        module = self._import_load_balancer({"SESSION_SHARED_SECRET": "shared-secret"})
+        fake_dashboard = FakeDashboard()
+        module.dependencies.dashboard = fake_dashboard
+        requester = {
+            "actor_id": "token:abc123",
+            "metadata": {
+                "label": "@reachy-user · token •abc123",
+                "kind": "authenticated",
+                "verification": "verified",
+                "fingerprint": "abc123",
+                "account_name": "reachy-user",
+            },
+        }
+        token = create_session_token(
+            "shared-secret",
+            session_id="session-123",
+            websocket_url="wss://compute.example/v1/realtime",
+            callback_url="https://lb.example/internal/sessions/session-123/event",
+            ttl_s=-1,
+            llm_fingerprint="fingerprint",
+            llm_requester=requester,
+        )
+        with self.assertRaisesRegex(ValueError, "session token expired"):
+            verify_session_token(token, "shared-secret")
+
+        response = await session_event(
+            module.runtime,
+            "session-123",
+            {
+                "session_token": token,
+                "event": "llm_proxy_request",
+                "outcome": "accepted",
+                "requester": requester,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            fake_dashboard.llm_proxy_requests,
+            [("accepted", requester["actor_id"], requester["metadata"])],
+        )
 
     async def test_disconnected_callback_records_requester_duration_after_connect(self):
         module = self._import_load_balancer()

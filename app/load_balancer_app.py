@@ -1278,7 +1278,15 @@ async def _record_llm_proxy_request(
         raise HTTPException(status_code=400, detail="outcome must be 'accepted' or 'rejected'")
 
     try:
-        claims = verify_session_token(session_token, runtime.settings.session_shared_secret)
+        # Compute validated expiry before accepting the websocket and keeps
+        # this signed context only while that websocket remains connected.
+        # An open session can outlive the token TTL, so accounting rechecks
+        # the signature and claims without treating expiry as a disconnect.
+        claims = verify_session_token(
+            session_token,
+            runtime.settings.session_shared_secret,
+            check_expiration=False,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     if claims.get("sid") != session_id:
