@@ -1219,7 +1219,7 @@ class DashboardHistory:
         restore_task = self._restore_task
         if restore_task is not None and restore_task is not asyncio.current_task() and not restore_task.done():
             await restore_task
-        if self._history_restore_status not in {"pending", "failed"}:
+        if self._history_restore_status not in {"pending", "failed", "cancelled"}:
             return
         await self._restore_history()
         if self._history_restore_status == "failed":
