@@ -406,7 +406,11 @@ class _LLMProxyUsage:
 
     async def _deliver(self) -> None:
         while True:
-            callback_url, session_token, notify, attempts, extra_payload = await self._queue.get()
+            try:
+                callback_url, session_token, notify, attempts, extra_payload = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                self._worker = None
+                return
             self._delivering = True
             try:
                 while True:
