@@ -30,6 +30,7 @@ from app.endpoint_pool_router import (
     fetch_compute_usage,
 )
 from app.llm_proxy_usage import (
+    LLM_PROXY_CALLBACK_AUTH_HEADER,
     LLM_PROXY_CALLBACK_BODY_MAX_BYTES,
     LLM_PROXY_CLIENT_IP_MAX_LENGTH,
     LLM_PROXY_REASONS,
@@ -1411,17 +1412,20 @@ async def get_endpoint_snapshot(
 
 
 def require_callback_auth(runtime: LoadBalancerRuntime, request: Request) -> None:
-    _require_bearer_auth(request, runtime.settings.lb_callback_auth_token, "callback")
+    authorization = request.headers.get(LLM_PROXY_CALLBACK_AUTH_HEADER)
+    if authorization is None:
+        authorization = request.headers.get("authorization")
+    _require_bearer_auth(authorization, runtime.settings.lb_callback_auth_token, "callback")
 
 
 def require_admin_auth(runtime: LoadBalancerRuntime, request: Request) -> None:
-    _require_bearer_auth(request, runtime.settings.lb_admin_auth_token, "admin")
+    _require_bearer_auth(request.headers.get("authorization"), runtime.settings.lb_admin_auth_token, "admin")
 
 
-def _require_bearer_auth(request: Request, expected_token: str | None, label: str) -> None:
+def _require_bearer_auth(authorization: str | None, expected_token: str | None, label: str) -> None:
     if not expected_token:
         raise HTTPException(status_code=503, detail=f"LB {label} auth token is not configured")
-    token = _bearer_token(request.headers.get("authorization"))
+    token = _bearer_token(authorization)
     if token is None:
         raise HTTPException(
             status_code=401,

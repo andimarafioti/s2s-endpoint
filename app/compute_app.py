@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app.app_utils import build_lifespan, env_bool, env_text, setup_logging
+from app.llm_proxy_usage import LLM_PROXY_CALLBACK_AUTH_HEADER
 from app.requester_identity import bearer_token, client_address, is_validatable_hf_token
 from app.session_router import SessionRouter
 from app.session_tokens import llm_token_fingerprint, verify_session_token, websocket_host_matches
@@ -745,7 +746,9 @@ def _post_json(
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if callback_auth_token:
-        headers["Authorization"] = f"Bearer {callback_auth_token}"
+        # HF Inference Endpoints consumes the standard Authorization header
+        # before forwarding public requests to the application.
+        headers[LLM_PROXY_CALLBACK_AUTH_HEADER] = f"Bearer {callback_auth_token}"
 
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:

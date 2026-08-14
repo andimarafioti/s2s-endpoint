@@ -330,7 +330,10 @@ load-balancer variable is ignored and can be removed from existing deployments.
   status and drain routes; do not reuse `HF_CONTROL_TOKEN`
 - `LB_CALLBACK_AUTH_TOKEN`: dedicated bearer credential required from compute
   endpoints at `/internal/llm-proxy-usage`. Use the same value on the LB and
-  every compute endpoint; do not reuse a requester's HF token.
+  every compute endpoint; do not reuse a requester's HF token. Compute sends
+  it in `X-Reachy-Mini-Callback-Authorization` because HF Inference Endpoints
+  consumes the standard `Authorization` header; the LB retains the standard
+  header as a fallback for non-HF deployments.
 - `COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S`: default allocator-drain lease lifetime
   for admin clients that do not request one explicitly (defaults to 3,600 seconds)
 - `COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S`: age at which the LB starts warning

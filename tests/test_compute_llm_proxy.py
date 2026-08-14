@@ -45,6 +45,25 @@ def _auth(token: str = HF_TOKEN) -> dict[str, str]:
     }
 
 
+class CallbackTransportTests(unittest.TestCase):
+    def test_callback_uses_ingress_safe_auth_header(self) -> None:
+        response = contextlib.nullcontext(SimpleNamespace(status=200))
+        with patch("app.compute_app.urllib.request.urlopen", return_value=response) as urlopen:
+            compute_main._post_json(
+                "https://lb.example/internal/llm-proxy-usage",
+                {"reason": "accepted"},
+                callback_auth_token="callback-secret",
+            )
+
+        request = urlopen.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(
+            headers["x-reachy-mini-callback-authorization"],
+            "Bearer callback-secret",
+        )
+        self.assertNotIn("authorization", headers)
+
+
 class StubInternalPipeline:
     """Stand-in for the internal speech-to-speech HTTP listener.
 

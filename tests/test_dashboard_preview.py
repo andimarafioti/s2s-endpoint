@@ -487,11 +487,34 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertEqual(
             client.post(
                 url,
+                headers={"X-Reachy-Mini-Callback-Authorization": "Bearer callback-secret"},
+                json={"padding": "x" * 8192},
+            ).status_code,
+            413,
+        )
+        self.assertEqual(
+            client.post(
+                url,
                 headers={"Authorization": "Bearer callback-secret"},
                 json={"padding": "x" * 8192},
             ).status_code,
             413,
         )
+
+    def test_llm_proxy_callback_custom_auth_takes_precedence(self):
+        module = self._import_load_balancer({"LB_CALLBACK_AUTH_TOKEN": "callback-secret"})
+        client = TestClient(module.app)
+
+        response = client.post(
+            "/internal/llm-proxy-usage",
+            headers={
+                "X-Reachy-Mini-Callback-Authorization": "Bearer wrong-secret",
+                "Authorization": "Bearer callback-secret",
+            },
+            json=_llm_usage_payload("missing_token"),
+        )
+
+        self.assertEqual(response.status_code, 403)
 
     def _import_load_balancer(self, env):
         return load_balancer_fixture({"LB_ADMIN_AUTH_TOKEN": "", **env})

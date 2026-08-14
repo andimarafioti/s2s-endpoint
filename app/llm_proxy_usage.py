@@ -10,6 +10,7 @@ LLM_PROXY_REASONS = (
 LLM_PROXY_REJECTION_REASONS = LLM_PROXY_REASONS[1:]
 LLM_PROXY_CLIENT_IP_MAX_LENGTH = 128
 LLM_PROXY_CALLBACK_BODY_MAX_BYTES = 8192
+LLM_PROXY_CALLBACK_AUTH_HEADER = "X-Reachy-Mini-Callback-Authorization"
 
 
 def llm_proxy_counts(reasons: Mapping[str, int]) -> dict[str, object]:
