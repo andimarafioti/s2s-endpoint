@@ -600,5 +600,6 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertIn("row.llm_proxy_accepted", html)
         self.assertIn("row.llm_proxy_rejected", html)
         self.assertIn("requesterProxyReasonSummary", html)
+        self.assertNotIn("No proxy gate rejections in this window", html)
         self.assertIn("row.llm_proxy_rejection_reasons", html)
         self.assertIn("function renderRequesterUsage(requesters, summary)", html)

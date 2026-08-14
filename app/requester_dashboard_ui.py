@@ -119,7 +119,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
         rate_limited: 'rate limited',
       };
       const entries = Object.entries(reasons || {}).filter(([, count]) => Number(count) > 0);
-      if (!entries.length) return 'No proxy gate rejections in this window';
+      if (!entries.length) return '';
       return entries.map(([reason, count]) => `${prettyNumber(count)} ${labels[reason] || reason}`).join(' · ');
     }
 
