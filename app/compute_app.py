@@ -14,7 +14,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app.app_utils import build_lifespan, env_bool, env_text, setup_logging
-from app.requester_identity import bearer_token
+from app.llm_proxy_usage import LLM_PROXY_CALLBACK_AUTH_HEADER
+from app.requester_identity import bearer_token, client_address, is_validatable_hf_token
 from app.session_router import SessionRouter
 from app.session_tokens import llm_token_fingerprint, verify_session_token, websocket_host_matches
 from app.ws_proxy import proxy_websocket
@@ -27,6 +28,7 @@ PUBLIC_WS_PATH = "/v1/realtime"
 INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_POOL_PATH = "/v1/pool"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
+LLM_PROXY_ACCOUNTING_TIMEOUT_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,8 @@ class ComputeSettings:
     lb_callback_auth_token: str = ""
     lb_callback_retry_attempts: int = 5
     lb_callback_retry_backoff_s: float = 1.0
+    llm_proxy_accounting_callback_url: str = ""
+    llm_proxy_trust_proxy_headers: bool = True
     llm_proxy_requests_per_minute: int = 20
 
     @classmethod
@@ -94,6 +98,15 @@ class ComputeSettings:
             lb_callback_retry_backoff_s=max(
                 float(env_text("LB_CALLBACK_RETRY_BACKOFF_S", "1.0", environ=environ)),
                 0.0,
+            ),
+            llm_proxy_accounting_callback_url=env_text(
+                "LLM_PROXY_ACCOUNTING_CALLBACK_URL",
+                environ=environ,
+            ),
+            llm_proxy_trust_proxy_headers=env_bool(
+                "LLM_PROXY_TRUST_PROXY_HEADERS",
+                True,
+                environ=environ,
             ),
             llm_proxy_requests_per_minute=int(env_text("LLM_PROXY_REQUESTS_PER_MINUTE", "20", environ=environ)),
         )
@@ -347,47 +360,84 @@ def _llm_proxy_error(status_code: int, message: str, error_type: str) -> JSONRes
     return JSONResponse({"error": {"message": message, "type": error_type}}, status_code=status_code)
 
 
-def _llm_proxy_denial(
-    request: Request,
+def _llm_proxy_token(request: Request) -> Optional[str]:
+    token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
+    if token is None:
+        token = bearer_token(request.headers.get("authorization"))
+    return token
+
+
+def _llm_proxy_gate(
+    token: Optional[str],
     settings: ComputeSettings,
     dependencies: "ComputeDependencies",
-) -> Optional[JSONResponse]:
-    """Access check for the LLM proxy paths; None means forward the request.
+) -> tuple[Optional[JSONResponse], str]:
+    """Return the local gate response and its canonical accounting reason.
 
     The api key must be the HF token the session was created with, checked by
     fingerprint against the sessions whose websocket is currently connected.
     Without a shared secret the replica cannot verify anything, so the paths
     fail closed. Checked once at request start: an answer already streaming
     when its session disconnects finishes undisturbed.
-
-    The key is read from ``x-reachy-mini-authorization`` first, then from
-    ``Authorization`` — the same precedence the load balancer uses at session
-    creation, and for the same reason: the HF Inference Endpoints ingress
-    consumes the standard Authorization header before it reaches the app, so
-    SDK clients on that infrastructure carry the token in the custom header
-    (``default_headers``) alongside their normal ``api_key``.
     """
-    if settings.session_shared_secret:
-        token = bearer_token(request.headers.get("x-reachy-mini-authorization"))
-        if token is None:
-            token = bearer_token(request.headers.get("authorization"))
-        if token is not None:
-            fingerprint = llm_token_fingerprint(settings.session_shared_secret, token)
-            if fingerprint in dependencies.connected_llm_fingerprints:
-                if dependencies.llm_rate_limiter.allow(fingerprint):
-                    return None
-                return _llm_proxy_error(
-                    429,
-                    f"Rate limit exceeded: {dependencies.llm_rate_limiter.limit_rpm} requests per minute "
-                    "per user. Back off and retry.",
-                    "rate_limit_exceeded",
-                )
-    return _llm_proxy_error(
-        401,
-        "Invalid API key: pass the HF token this session was created with, "
-        "while the session's realtime websocket is connected.",
-        "invalid_api_key",
-    )
+    if not settings.enable_llm_proxy:
+        return None, "proxy_disabled"
+
+    fingerprint = None
+    if settings.session_shared_secret and token is not None:
+        candidate = llm_token_fingerprint(settings.session_shared_secret, token)
+        if candidate in dependencies.connected_llm_fingerprints:
+            fingerprint = candidate
+    if fingerprint is None:
+        denial = _llm_proxy_error(
+            401,
+            "Invalid API key: pass the HF token this session was created with, "
+            "while the session's realtime websocket is connected.",
+            "invalid_api_key",
+        )
+        return denial, "missing_token" if token is None else "no_active_session_match"
+    if not dependencies.llm_rate_limiter.allow(fingerprint):
+        denial = _llm_proxy_error(
+            429,
+            f"Rate limit exceeded: {dependencies.llm_rate_limiter.limit_rpm} requests per minute "
+            "per user. Back off and retry.",
+            "rate_limit_exceeded",
+        )
+        return denial, "rate_limited"
+    return None, "accepted"
+
+
+async def _report_llm_proxy_request(
+    request: Request,
+    settings: ComputeSettings,
+    dependencies: "ComputeDependencies",
+    *,
+    reason: str,
+    token: Optional[str],
+) -> None:
+    if not settings.llm_proxy_accounting_callback_url:
+        logger.warning("LLM proxy accounting skipped: no fleet callback URL is configured")
+        return
+
+    payload: dict[str, object] = {"reason": reason}
+    if token is not None and is_validatable_hf_token(token):
+        payload["token"] = token
+    address = client_address(request, trust_proxy_headers=settings.llm_proxy_trust_proxy_headers)
+    if address is not None:
+        payload["client_ip"] = address
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                _post_json,
+                settings.llm_proxy_accounting_callback_url,
+                payload,
+                callback_auth_token=settings.lb_callback_auth_token,
+                timeout_s=LLM_PROXY_ACCOUNTING_TIMEOUT_S,
+            ),
+            timeout=LLM_PROXY_ACCOUNTING_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning("Failed to record LLM proxy request reason=%s: %s", reason, exc)
 
 
 async def llm_proxy_chat_completions(
@@ -433,12 +483,17 @@ async def _proxy_llm_request(
     (feature disabled), 401 and 429 (denials), and 502 (internal pipeline
     unreachable).
     """
-    if not settings.enable_llm_proxy:
-        # Checked before auth: a disabled replica reveals nothing, answering
-        # exactly like an app where these routes were never registered.
+    token = _llm_proxy_token(request)
+    denial, reason = _llm_proxy_gate(token, settings, dependencies)
+    await _report_llm_proxy_request(
+        request,
+        settings,
+        dependencies,
+        reason=reason,
+        token=token,
+    )
+    if reason == "proxy_disabled":
         raise HTTPException(status_code=404)
-
-    denial = _llm_proxy_denial(request, settings, dependencies)
     if denial is not None:
         return denial
 
@@ -583,7 +638,7 @@ async def websocket_proxy(
 def _get_session_payload(
     client_ws: WebSocket,
     settings: ComputeSettings,
-) -> Optional[dict[str, str]]:
+) -> Optional[dict[str, object]]:
     if not settings.session_shared_secret:
         return None
 
@@ -683,18 +738,21 @@ def _http_get_json(url: str) -> dict[str, object]:
 
 def _post_json(
     url: str,
-    payload: dict[str, str],
+    payload: dict[str, object],
     *,
     callback_auth_token: str,
+    timeout_s: float = 10.0,
 ) -> None:
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if callback_auth_token:
-        headers["Authorization"] = f"Bearer {callback_auth_token}"
+        # HF Inference Endpoints consumes the standard Authorization header
+        # before forwarding public requests to the application.
+        headers[LLM_PROXY_CALLBACK_AUTH_HEADER] = f"Bearer {callback_auth_token}"
 
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
             status_code = getattr(response, "status", 200)
             if status_code >= 400:
                 raise RuntimeError(f"LB callback failed with HTTP {status_code}")
@@ -735,7 +793,7 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
             http_get_json=_http_get_json,
         )
 
-    def post_json(url: str, payload: dict[str, str]) -> None:
+    def post_json(url: str, payload: dict[str, object]) -> None:
         _post_json(
             url,
             payload,

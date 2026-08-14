@@ -14,6 +14,7 @@ from app.dashboard_history import (
     _bucket_start_epoch_s,
     _isoformat,
 )
+from app.llm_proxy_usage import llm_proxy_counts
 from app.requester_dashboard_ui import inject_requester_dashboard
 from app.requester_identity import RequesterIdentity
 from app.requester_usage import RequesterUsageService, RequesterUsageThresholds
@@ -64,6 +65,7 @@ class SwarmBucketAggregate:
     session_allocation_failures: int = 0
     session_auth_rejections: int = 0
     session_rate_limited: int = 0
+    llm_proxy_reasons: dict[str, int] = field(default_factory=dict)
     session_connected_events: int = 0
     session_disconnected_events: int = 0
     completed_conversations: int = 0
@@ -95,6 +97,8 @@ class SwarmBucketAggregate:
             aggregate.session_allocation_failures += bucket.session_allocation_failures
             aggregate.session_auth_rejections += bucket.session_auth_rejections
             aggregate.session_rate_limited += bucket.session_rate_limited
+            for reason, count in bucket.llm_proxy_reasons.items():
+                aggregate.llm_proxy_reasons[reason] = aggregate.llm_proxy_reasons.get(reason, 0) + count
             aggregate.session_connected_events += bucket.session_connected_events
             aggregate.session_disconnected_events += bucket.session_disconnected_events
             aggregate.completed_conversations += bucket.completed_conversations
@@ -131,6 +135,7 @@ class SwarmBucketAggregate:
             "session_allocation_failures": self.session_allocation_failures,
             "session_auth_rejections": self.session_auth_rejections,
             "session_rate_limited": self.session_rate_limited,
+            **llm_proxy_counts(self.llm_proxy_reasons),
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
@@ -162,6 +167,7 @@ class SwarmBucketAggregate:
             "session_allocation_failures": self.session_allocation_failures,
             "session_auth_rejections": self.session_auth_rejections,
             "session_rate_limited": self.session_rate_limited,
+            **llm_proxy_counts(self.llm_proxy_reasons),
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
@@ -281,6 +287,20 @@ class SwarmDashboard:
     async def record_session_request_abandoned(self, requester: RequesterIdentity | None = None) -> None:
         await self.requesters.record("abandoned", requester)
 
+    async def record_llm_proxy_request(
+        self,
+        *,
+        reason: str,
+        actor_id: str | None,
+        metadata: dict[str, object] | None,
+    ) -> None:
+        await self.history.record_requester_event(
+            "llm_proxy",
+            actor_id=actor_id,
+            metadata=metadata,
+            reason=reason,
+        )
+
     async def record_requester_session_connected(self, requester: RequesterIdentity) -> None:
         await self.requesters.record("connected", requester)
 
@@ -361,6 +381,10 @@ class SwarmDashboard:
             "session_successes_window": selected["session_allocation_successes"],
             "session_auth_rejections_window": selected["session_auth_rejections"],
             "session_rate_limited_window": selected["session_rate_limited"],
+            "llm_proxy_requests_window": selected["llm_proxy_requests"],
+            "llm_proxy_accepted_window": selected["llm_proxy_accepted"],
+            "llm_proxy_rejected_window": selected["llm_proxy_rejected"],
+            "llm_proxy_rejection_reasons_window": selected["llm_proxy_rejection_reasons"],
             "session_connects_window": selected["session_connected_events"],
             "session_disconnects_window": selected["session_disconnected_events"],
             "conversations_started_window": selected["session_connected_events"],

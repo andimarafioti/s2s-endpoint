@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app.dashboard_history import DashboardHistory, SwarmHistoryBucket, SwarmStateSample
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
+from app.requester_identity import RequesterIdentity
 from app.swarm_dashboard import SwarmDashboard
 
 
@@ -311,12 +312,32 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             retention_minutes=24 * 60,
             time_fn=clock.now,
         )
+        session_requester = RequesterIdentity(
+            actor_id="anonymous:session",
+            label="Anonymous",
+            kind="anonymous",
+            verification="not_provided",
+            fingerprint="session",
+        )
+        proxy_metadata = {
+            "label": "@reachy-user",
+            "kind": "authenticated",
+            "verification": "verified",
+            "fingerprint": "abc123",
+            "account_name": "reachy-user",
+        }
 
         await dashboard.capture_sample()
-        await dashboard.record_session_request()
+        await dashboard.record_session_request(session_requester)
         await dashboard.record_session_allocation_success()
         await dashboard.record_session_auth_rejected()
         await dashboard.record_session_rate_limited()
+        await dashboard.record_llm_proxy_request(reason="accepted", actor_id="token:abc123", metadata=proxy_metadata)
+        await dashboard.record_llm_proxy_request(
+            reason="rate_limited",
+            actor_id="token:abc123",
+            metadata=proxy_metadata,
+        )
         await dashboard.record_session_event("connected")
         await dashboard.record_session_event(
             "disconnected",
@@ -335,6 +356,9 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(point["session_allocation_successes"], 1)
         self.assertEqual(point["session_auth_rejections"], 1)
         self.assertEqual(point["session_rate_limited"], 1)
+        self.assertEqual(point["llm_proxy_requests"], 2)
+        self.assertEqual(point["llm_proxy_accepted"], 1)
+        self.assertEqual(point["llm_proxy_rejected"], 1)
         self.assertEqual(point["session_connected_events"], 1)
         self.assertEqual(point["completed_conversations"], 1)
         self.assertEqual(point["avg_conversation_duration_s"], 150.0)
@@ -343,13 +367,29 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["summary"]["session_requests_window"], 1)
         self.assertEqual(payload["summary"]["session_auth_rejections_window"], 1)
         self.assertEqual(payload["summary"]["session_rate_limited_window"], 1)
+        self.assertEqual(payload["summary"]["llm_proxy_requests_window"], 2)
+        self.assertEqual(payload["summary"]["llm_proxy_accepted_window"], 1)
+        self.assertEqual(payload["summary"]["llm_proxy_rejected_window"], 1)
+        self.assertEqual(
+            payload["summary"]["llm_proxy_rejection_reasons_window"],
+            {"rate_limited": 1},
+        )
         self.assertEqual(payload["summary"]["conversations_completed_window"], 1)
         self.assertEqual(payload["summary"]["active_conversation_minutes_window"], 2.0)
         self.assertEqual(payload["summary"]["active_conversation_hours_window"], 0.03)
         self.assertEqual(payload["summary"]["active_conversation_days_window"], 0.001)
         self.assertEqual(payload["summary"]["avg_conversation_duration_window_s"], 150.0)
         self.assertEqual(payload["summary"]["peak_connected_sessions_window"], 2)
-        self.assertEqual(payload["summary"]["unattributed_requests_window"], 1)
+        self.assertEqual(payload["summary"]["unique_requesters_window"], 1)
+        self.assertEqual(payload["summary"]["authenticated_users_window"], 0)
+        rows = payload["requesters"]["leaderboard"]
+        self.assertEqual(rows[0]["actor_id"], "anonymous:session")
+        proxy_row = next(row for row in rows if row["actor_id"] == "hf:reachy-user")
+        self.assertEqual(
+            (proxy_row["requests"], proxy_row["llm_proxy_accepted"], proxy_row["llm_proxy_rejected"]),
+            (0, 1, 1),
+        )
+        self.assertEqual(proxy_row["llm_proxy_rejection_reasons"], {"rate_limited": 1})
         self.assertFalse(payload["history_persistence"]["enabled"])
         self.assertEqual(payload["history_persistence"]["dirty_bucket_count"], 0)
 
@@ -684,6 +724,12 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
             conversation_duration_s=90.0,
             conversation_counted=True,
         )
+        await dashboard.record_llm_proxy_request(reason="accepted", actor_id=None, metadata=None)
+        await dashboard.record_llm_proxy_request(
+            reason="proxy_disabled",
+            actor_id=None,
+            metadata=None,
+        )
         clock.set(clock.now() + 60)
         await dashboard.record_sample(
             SwarmStateSample(
@@ -713,6 +759,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted.completed_conversations, 1)
         self.assertEqual(persisted.completed_conversation_duration_total_s, 90.0)
         self.assertEqual(persisted.completed_conversation_duration_samples_s, [90.0])
+        self.assertEqual(persisted.llm_proxy_reasons, {"accepted": 1, "proxy_disabled": 1})
 
     async def test_flushes_dirty_buckets_in_bounded_batches(self):
         clock = FakeClock(5 * 60)

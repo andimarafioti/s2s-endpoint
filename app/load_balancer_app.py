@@ -1,6 +1,7 @@
+import json
 import logging
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from inspect import cleandoc
 from time import monotonic
 from typing import Any, Mapping
@@ -27,6 +28,12 @@ from app.endpoint_pool_router import (
     EndpointTransitionConflictError,
     HuggingFaceEndpointController,
     fetch_compute_usage,
+)
+from app.llm_proxy_usage import (
+    LLM_PROXY_CALLBACK_AUTH_HEADER,
+    LLM_PROXY_CALLBACK_BODY_MAX_BYTES,
+    LLM_PROXY_CLIENT_IP_MAX_LENGTH,
+    LLM_PROXY_REASONS,
 )
 from app.requester_identity import (
     RequesterIdentity,
@@ -82,6 +89,7 @@ class LoadBalancerSettings:
     compute_usage_stale_ttl_s: float = 60.0
     hf_control_token: str | None = None
     lb_admin_auth_token: str | None = None
+    lb_callback_auth_token: str | None = None
     session_shared_secret: str = ""
     session_require_verified_hf_token: bool = False
     session_hf_token_verify_timeout_s: float = 5.0
@@ -235,6 +243,7 @@ class LoadBalancerSettings:
             compute_usage_stale_ttl_s=float(env_text("COMPUTE_USAGE_STALE_TTL_S", "60", environ=environ)),
             hf_control_token=hf_control_token,
             lb_admin_auth_token=env_optional("LB_ADMIN_AUTH_TOKEN", environ=environ),
+            lb_callback_auth_token=env_optional("LB_CALLBACK_AUTH_TOKEN", environ=environ),
             session_shared_secret=session_shared_secret,
             session_require_verified_hf_token=env_bool("SESSION_REQUIRE_VERIFIED_HF_TOKEN", False, environ=environ),
             session_hf_token_verify_timeout_s=float(
@@ -1254,6 +1263,64 @@ async def session_event(
     return JSONResponse(result)
 
 
+async def llm_proxy_usage(
+    runtime: LoadBalancerRuntime,
+    payload: dict[str, Any],
+):
+    """Record one compute-reported LLM proxy gate decision."""
+    if payload.keys() - {"reason", "token", "client_ip"}:
+        raise HTTPException(status_code=400, detail="callback payload contains unknown fields")
+    reason = payload.get("reason")
+    if reason not in LLM_PROXY_REASONS:
+        raise HTTPException(status_code=400, detail="invalid LLM proxy reason")
+
+    token = payload.get("token")
+    if token is not None and (not isinstance(token, str) or not is_validatable_hf_token(token)):
+        raise HTTPException(status_code=400, detail="token is malformed or too long")
+
+    client_ip = payload.get("client_ip")
+    if client_ip is not None:
+        if not isinstance(client_ip, str) or not client_ip.strip() or len(client_ip) > LLM_PROXY_CLIENT_IP_MAX_LENGTH:
+            raise HTTPException(status_code=400, detail="client_ip is malformed or too long")
+
+    resolver = runtime.dependencies.requester_identity_resolver
+    requester = resolver.identify_values(token=None, address=client_ip)
+    if token is not None:
+        token_requester = await resolver.wait_for_verification(
+            resolver.identify_values(token=token, address=client_ip),
+            timeout_s=runtime.settings.llm_proxy_claim_verify_timeout_s,
+        )
+        requester = (
+            token_requester
+            if token_requester.verification == "verified"
+            else replace(requester, verification=token_requester.verification)
+        )
+    elif reason == "no_active_session_match":
+        requester = replace(requester, verification="unrecognized")
+
+    await runtime.dependencies.dashboard.record_llm_proxy_request(
+        reason=reason,
+        actor_id=requester.actor_id,
+        metadata=requester.history_metadata(),
+    )
+    return JSONResponse({"status": "ok", "state": "recorded"})
+
+
+async def _llm_proxy_usage_payload(request: Request) -> dict[str, Any]:
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > LLM_PROXY_CALLBACK_BODY_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="callback payload is too large")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="callback payload must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="callback payload must be an object")
+    return payload
+
+
 async def endpoint_status(runtime: LoadBalancerRuntime, endpoint_name: str, request: Request):
     require_admin_auth(runtime, request)
 
@@ -1344,20 +1411,29 @@ async def get_endpoint_snapshot(
     return endpoint_snapshot
 
 
-def require_admin_auth(runtime: LoadBalancerRuntime, request: Request) -> None:
-    admin_auth_token = runtime.settings.lb_admin_auth_token
-    if not admin_auth_token:
-        raise HTTPException(status_code=503, detail="LB admin auth token is not configured")
+def require_callback_auth(runtime: LoadBalancerRuntime, request: Request) -> None:
+    authorization = request.headers.get(LLM_PROXY_CALLBACK_AUTH_HEADER)
+    if authorization is None:
+        authorization = request.headers.get("authorization")
+    _require_bearer_auth(authorization, runtime.settings.lb_callback_auth_token, "callback")
 
-    token = _bearer_token(request.headers.get("authorization"))
+
+def require_admin_auth(runtime: LoadBalancerRuntime, request: Request) -> None:
+    _require_bearer_auth(request.headers.get("authorization"), runtime.settings.lb_admin_auth_token, "admin")
+
+
+def _require_bearer_auth(authorization: str | None, expected_token: str | None, label: str) -> None:
+    if not expected_token:
+        raise HTTPException(status_code=503, detail=f"LB {label} auth token is not configured")
+    token = _bearer_token(authorization)
     if token is None:
         raise HTTPException(
             status_code=401,
-            detail="Missing admin bearer token",
+            detail=f"Missing {label} bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if not secrets.compare_digest(token, admin_auth_token):
-        raise HTTPException(status_code=403, detail="Invalid admin authorization")
+    if not secrets.compare_digest(token, expected_token):
+        raise HTTPException(status_code=403, detail=f"Invalid {label} authorization")
 
 
 def _bearer_token(authorization: str | None) -> str | None:
@@ -1420,6 +1496,10 @@ def create_app(
     async def session_event_route(session_id: str, payload: dict[str, Any]):
         return await session_event(runtime, session_id, payload)
 
+    async def llm_proxy_usage_route(request: Request):
+        require_callback_auth(runtime, request)
+        return await llm_proxy_usage(runtime, await _llm_proxy_usage_payload(request))
+
     async def endpoint_status_route(endpoint_name: str, request: Request):
         return await endpoint_status(runtime, endpoint_name, request)
 
@@ -1465,6 +1545,12 @@ def create_app(
         session_event_route,
         methods=["POST"],
         name="session_event",
+    )
+    application.add_api_route(
+        "/internal/llm-proxy-usage",
+        llm_proxy_usage_route,
+        methods=["POST"],
+        name="llm_proxy_usage",
     )
     application.add_api_route(
         "/internal/endpoints/{endpoint_name}",

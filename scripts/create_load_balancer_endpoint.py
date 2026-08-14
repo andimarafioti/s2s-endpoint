@@ -27,6 +27,12 @@ def resolve_compute_endpoint_names(
     return build_names(prefix, count, names)
 
 
+def require_callback_auth_config(*, env: dict[str, str], secrets: dict[str, str]) -> None:
+    callback_auth_token = secrets.get("LB_CALLBACK_AUTH_TOKEN") or env.get("LB_CALLBACK_AUTH_TOKEN")
+    if not str(callback_auth_token or "").strip():
+        raise ValueError("LB_CALLBACK_AUTH_TOKEN is required in --secret/--secret-file or --env/--env-file")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create the CPU load-balancer endpoint for the s2s-endpoint app.")
     parser.add_argument("--name", required=True, help="Load-balancer endpoint name")
@@ -146,6 +152,7 @@ def main() -> None:
     secrets = load_json_file(args.secret_file) or {}
     env.update(parse_key_value_pairs(args.env))
     secrets.update(parse_key_value_pairs(args.secret))
+    require_callback_auth_config(env=env, secrets=secrets)
 
     if not (
         secrets.get("HF_CONTROL_TOKEN") or secrets.get("HF_TOKEN") or env.get("HF_CONTROL_TOKEN") or env.get("HF_TOKEN")

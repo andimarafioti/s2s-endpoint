@@ -126,12 +126,17 @@ class ComputeSettingsTests(unittest.TestCase):
                 "ENABLE_SMART_TURN": "0",
                 "RESPONSES_API_API_KEY": " explicit-key ",
                 "HF_TOKEN": "fallback-key",
+                "LLM_PROXY_ACCOUNTING_CALLBACK_URL": " https://lb.example/internal/llm-proxy-usage ",
             }
         )
 
         self.assertTrue(settings.enable_llm_proxy)
         self.assertFalse(settings.enable_smart_turn)
         self.assertEqual(settings.responses_api_api_key, "explicit-key")
+        self.assertEqual(
+            settings.llm_proxy_accounting_callback_url,
+            "https://lb.example/internal/llm-proxy-usage",
+        )
 
     def test_settings_are_frozen(self):
         settings = compute_app.ComputeSettings()
@@ -312,6 +317,10 @@ class LoadBalancerApplicationFactoryTests(unittest.TestCase):
                 ("POST", "/internal/sessions/{session_id}/event"): (
                     "session_event_internal_sessions__session_id__event_post",
                     "Session Event",
+                ),
+                ("POST", "/internal/llm-proxy-usage"): (
+                    "llm_proxy_usage_internal_llm_proxy_usage_post",
+                    "Llm Proxy Usage",
                 ),
                 ("GET", "/internal/endpoints/{endpoint_name}"): (
                     "endpoint_status_internal_endpoints__endpoint_name__get",

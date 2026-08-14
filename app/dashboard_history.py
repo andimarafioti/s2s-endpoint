@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Callable, Optional, Protocol
 
 from app.app_utils import cancel_and_await
+from app.llm_proxy_usage import LLM_PROXY_REASONS, llm_proxy_counts
 
 logger = logging.getLogger("s2s-endpoint")
 DAY_MINUTES = 24 * 60
@@ -164,6 +165,7 @@ class SwarmHistoryBucket:
     session_allocation_failures: int = 0
     session_auth_rejections: int = 0
     session_rate_limited: int = 0
+    llm_proxy_reasons: dict[str, int] = field(default_factory=dict)
     session_connected_events: int = 0
     session_disconnected_events: int = 0
     completed_conversations: int = 0
@@ -217,6 +219,7 @@ class SwarmHistoryBucket:
             "session_allocation_failures": self.session_allocation_failures,
             "session_auth_rejections": self.session_auth_rejections,
             "session_rate_limited": self.session_rate_limited,
+            **llm_proxy_counts(self.llm_proxy_reasons),
             "session_connected_events": self.session_connected_events,
             "session_disconnected_events": self.session_disconnected_events,
             "completed_conversations": self.completed_conversations,
@@ -312,6 +315,8 @@ def _coerce_history_bucket_field(name: str, payload: dict[str, object]) -> objec
         return bool(payload.get(name, False))
     if name == "completed_conversation_duration_samples_s":
         return [max(float(value), 0.0) for value in list(payload.get(name) or [])]
+    if name == "llm_proxy_reasons":
+        return _coerce_llm_proxy_reasons(payload.get(name))
     if name == "requester_usage":
         return _coerce_requester_usage(payload.get(name))
     raise KeyError(f"Unknown SwarmHistoryBucket field: {name}")
@@ -347,6 +352,7 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "failures": max(int(raw_record.get("failures", 0)), 0),
             "auth_rejected": max(int(raw_record.get("auth_rejected", 0)), 0),
             "rate_limited": max(int(raw_record.get("rate_limited", 0)), 0),
+            "llm_proxy_reasons": _coerce_llm_proxy_reasons(raw_record.get("llm_proxy_reasons")),
             "abandoned": max(int(raw_record.get("abandoned", 0)), 0),
             "connections": max(int(raw_record.get("connections", 0)), 0),
             "completed_sessions": max(int(raw_record.get("completed_sessions", 0)), 0),
@@ -370,6 +376,12 @@ def _coerce_requester_usage(value: object) -> dict[str, dict[str, object]]:
             "client_kinds": client_kinds,
         }
     return usage
+
+
+def _coerce_llm_proxy_reasons(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {reason: max(int(value.get(reason, 0)), 0) for reason in LLM_PROXY_REASONS if int(value.get(reason, 0)) > 0}
 
 
 _VERIFICATION_RANK = {
@@ -396,6 +408,7 @@ def _new_requester_usage_record(metadata: dict[str, object]) -> dict[str, object
         "failures": 0,
         "auth_rejected": 0,
         "rate_limited": 0,
+        "llm_proxy_reasons": {},
         "abandoned": 0,
         "connections": 0,
         "completed_sessions": 0,
@@ -746,6 +759,7 @@ class DashboardHistory:
         metadata: dict[str, object] | None,
         duration_s: float | None = None,
         short_session: bool = False,
+        reason: str | None = None,
     ) -> None:
         counter_fields = {
             "request": ("session_requests", "requests"),
@@ -757,15 +771,21 @@ class DashboardHistory:
             "connected": (None, "connections"),
             "disconnected": (None, "completed_sessions"),
         }
-        if event not in counter_fields:
+        if event != "llm_proxy" and event not in counter_fields:
             raise ValueError(f"Unknown requester event: {event}")
+        if event == "llm_proxy" and reason not in LLM_PROXY_REASONS:
+            raise ValueError("LLM proxy events require a supported reason")
 
         now = self._time_fn()
         async with self._lock:
             bucket = self._get_bucket_unlocked(now)
-            global_field, requester_field = counter_fields[event]
-            if global_field is not None:
-                setattr(bucket, global_field, getattr(bucket, global_field) + 1)
+            requester_field = None
+            if event == "llm_proxy":
+                bucket.llm_proxy_reasons[reason] = bucket.llm_proxy_reasons.get(reason, 0) + 1
+            else:
+                global_field, requester_field = counter_fields[event]
+                if global_field is not None:
+                    setattr(bucket, global_field, getattr(bucket, global_field) + 1)
             if actor_id and metadata is not None:
                 resolved_actor_id = actor_id
                 resolved_metadata = metadata
@@ -787,7 +807,12 @@ class DashboardHistory:
                     bucket.requester_usage[resolved_actor_id] = record
                     self._requester_record_count += 1
                 _merge_requester_identity(record, resolved_metadata)
-                record[requester_field] = int(record.get(requester_field, 0)) + 1
+                if event == "llm_proxy":
+                    reasons = record.setdefault("llm_proxy_reasons", {})
+                    if isinstance(reasons, dict):
+                        reasons[reason] = int(reasons.get(reason, 0)) + 1
+                elif requester_field is not None:
+                    record[requester_field] = int(record.get(requester_field, 0)) + 1
                 if event == "disconnected":
                     resolved_duration_s = max(float(duration_s or 0.0), 0.0)
                     record["connected_duration_total_s"] = (

@@ -12,6 +12,7 @@ from app.dashboard_history import (
     _isoformat,
     _merge_requester_identity,
 )
+from app.llm_proxy_usage import llm_proxy_counts
 from app.requester_identity import RequesterIdentity
 
 
@@ -38,6 +39,7 @@ class _ActorUsageAccumulator:
     failures: int = 0
     auth_rejected: int = 0
     rate_limited: int = 0
+    llm_proxy_reasons: Counter[str] = field(default_factory=Counter)
     abandoned: int = 0
     connections: int = 0
     completed_sessions: int = 0
@@ -111,6 +113,8 @@ class _ActorUsageAccumulator:
         self.failures += max(int(record.get("failures", 0)), 0)
         self.auth_rejected += max(int(record.get("auth_rejected", 0)), 0)
         self.rate_limited += max(int(record.get("rate_limited", 0)), 0)
+        for reason, count in dict(record.get("llm_proxy_reasons") or {}).items():
+            self.llm_proxy_reasons[str(reason)] += max(int(count), 0)
         self.abandoned += max(int(record.get("abandoned", 0)), 0)
         connections = max(int(record.get("connections", 0)), 0)
         self.connections += connections
@@ -185,7 +189,6 @@ class _ActorUsageAccumulator:
         )
         signals = _usage_signals(
             requests=self.requests,
-            verification=self.verification,
             traffic_share_pct=traffic_share_pct,
             peak_requests_per_minute=self.peak_requests_per_minute,
             network_count=len(self.network_ids),
@@ -217,6 +220,7 @@ class _ActorUsageAccumulator:
             "failures": self.failures,
             "auth_rejected": self.auth_rejected,
             "rate_limited": self.rate_limited,
+            **llm_proxy_counts(self.llm_proxy_reasons),
             "abandoned": self.abandoned,
             "connections": self.connections,
             "completed_sessions": self.completed_sessions,
@@ -470,7 +474,6 @@ def _normalized_account_name(value: object) -> str | None:
 def _usage_signals(
     *,
     requests: int,
-    verification: str,
     traffic_share_pct: float,
     peak_requests_per_minute: int,
     network_count: int,
@@ -498,7 +501,7 @@ def _usage_signals(
         signals.append(f"many networks: {network_count}{'+' if network_ids_overflow else ''}")
     if requests >= 5 and automated_requests / max(requests, 1) >= 0.8:
         signals.append("mostly automation-like clients")
-    if verification == "invalid" or invalid_token_requests > 0:
+    if invalid_token_requests > 0:
         signals.append("invalid HF token")
     if auth_rejected > 0:
         noun = "request" if auth_rejected == 1 else "requests"

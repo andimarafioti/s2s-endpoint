@@ -525,6 +525,48 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["summary"]["tokens_window"], 3)
         self.assertEqual(payload["summary"]["invalid_token_requests_window"], 1)
 
+    async def test_proxy_events_do_not_change_session_risk_signals(self):
+        service = self._service(FakeClock(2 * 3600))
+        requester = RequesterIdentity(
+            actor_id="token:abc123",
+            label="@reachy-user",
+            kind="authenticated",
+            verification="verified",
+            fingerprint="abc123",
+            account_name="reachy-user",
+            network_id="net:session",
+        )
+        await service.record("request", requester)
+        for index in range(5):
+            await service.history.record_requester_event(
+                "llm_proxy",
+                actor_id=requester.actor_id,
+                metadata={**requester.history_metadata(), "network_id": f"net:proxy-{index}"},
+                reason="accepted",
+            )
+        await service.history.record_requester_event(
+            "llm_proxy",
+            actor_id="anonymous:invalid",
+            metadata={
+                "label": "Anonymous IP •invalid",
+                "kind": "anonymous",
+                "verification": "invalid",
+                "fingerprint": "invalid",
+                "network_id": "net:invalid",
+            },
+            reason="no_active_session_match",
+        )
+
+        payload = await service.data(window_minutes=60)
+        rows = {row["actor_id"]: row for row in payload["leaderboard"]}
+
+        self.assertEqual(payload["summary"]["unique_requesters_window"], 1)
+        self.assertEqual(payload["summary"]["unusual_requesters_window"], 0)
+        self.assertEqual((rows["hf:reachy-user"]["network_count"], rows["hf:reachy-user"]["risk"]), (1, "normal"))
+        self.assertEqual(rows["hf:reachy-user"]["llm_proxy_accepted"], 5)
+        self.assertEqual((rows["anonymous:invalid"]["network_count"], rows["anonymous:invalid"]["risk"]), (0, "normal"))
+        self.assertEqual(rows["anonymous:invalid"]["invalid_token_requests"], 0)
+
 
 class RequesterDashboardUiTests(unittest.TestCase):
     def test_injects_requester_dashboard_fragments(self):
@@ -549,8 +591,19 @@ class RequesterDashboardUiTests(unittest.TestCase):
         self.assertIn("function requesterCredentialSummary(row)", html)
         self.assertIn("row.token_fingerprints", html)
         self.assertIn("<th>Rejected</th>", html)
+        self.assertIn("<th>LLM proxy</th>", html)
         self.assertNotIn("<th>Limited</th>", html)
         self.assertIn("function requesterRejectedCount(row)", html)
         self.assertIn("Number(row.auth_rejected || 0) + Number(row.rate_limited || 0)", html)
         self.assertIn("auth rejected · ${htmlEscape(prettyNumber(row.rate_limited || 0))} limited", html)
+        self.assertIn("LLM proxy requests", html)
+        self.assertIn("row.llm_proxy_accepted", html)
+        self.assertIn("row.llm_proxy_rejected", html)
+        self.assertIn("requesterProxyReasonSummary", html)
+        self.assertIn("function requesterProxyTooltip(row)", html)
+        self.assertIn("No rejected proxy requests", html)
+        self.assertIn('title="${htmlEscape(requesterProxyTooltip(row))}"', html)
+        self.assertIn("/${htmlEscape(prettyNumber(row.llm_proxy_requests || 0))} accepted", html)
+        self.assertNotIn("No proxy gate rejections in this window", html)
+        self.assertIn("row.llm_proxy_rejection_reasons", html)
         self.assertIn("function renderRequesterUsage(requesters, summary)", html)

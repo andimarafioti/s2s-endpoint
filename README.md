@@ -328,6 +328,12 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `HF_CONTROL_TOKEN`: token used to call the Inference Endpoints API
 - `LB_ADMIN_AUTH_TOKEN`: dedicated bearer token required by the internal endpoint
   status and drain routes; do not reuse `HF_CONTROL_TOKEN`
+- `LB_CALLBACK_AUTH_TOKEN`: dedicated bearer credential required from compute
+  endpoints at `/internal/llm-proxy-usage`. Use the same value on the LB and
+  every compute endpoint; do not reuse a requester's HF token. Compute sends
+  it in `X-Reachy-Mini-Callback-Authorization` because HF Inference Endpoints
+  consumes the standard `Authorization` header; the LB retains the standard
+  header as a fallback for non-HF deployments.
 - `COMPUTE_ENDPOINT_DRAIN_LEASE_TTL_S`: default allocator-drain lease lifetime
   for admin clients that do not request one explicitly (defaults to 3,600 seconds)
 - `COMPUTE_ENDPOINT_DRAIN_WARNING_AFTER_S`: age at which the LB starts warning
@@ -441,7 +447,16 @@ load-balancer variable is ignored and can be removed from existing deployments.
 
 - `NUM_PIPELINES`: concurrent realtime sessions the `speech-to-speech` process handles internally (default `1`)
 - `SESSION_SHARED_SECRET`: shared secret used to validate LB-issued session tokens
-- `LB_CALLBACK_AUTH_TOKEN`: optional bearer token used when compute endpoints call the LB session-event API
+- `LB_CALLBACK_AUTH_TOKEN`: dedicated bearer credential used to authenticate
+  compute accounting callbacks to the LB. This is a service credential, not the
+  requester's HF token.
+- `LLM_PROXY_ACCOUNTING_CALLBACK_URL`: full load-balancer
+  `/internal/llm-proxy-usage` URL. Every LLM proxy attempt sends one best-effort,
+  at-most-once callback containing its canonical gate reason and, when
+  available, the presented HF token and trusted client IP.
+- `LLM_PROXY_TRUST_PROXY_HEADERS`: whether proxy accounting trusts the first
+  `X-Forwarded-For`/`X-Real-IP` address (defaults to `true`). Disable this
+  outside a trusted reverse-proxy deployment.
 - `ENABLE_SMART_TURN`: enables Smart Turn endpointing (default `1`); set it to
   `0` to disable it.
 - `SMART_TURN_MODEL_PATH`: optional Smart Turn ONNX checkpoint path. The
@@ -455,6 +470,13 @@ load-balancer variable is ignored and can be removed from existing deployments.
   without the feature.
 - `LLM_PROXY_REQUESTS_PER_MINUTE`: per-token sliding-window rate limit on the
   replica's LLM proxy paths (defaults to 20; zero or negative closes the paths)
+
+The accounting callback must use HTTPS outside local development. It carries
+the presented HF token and trusted client IP in the request body only so the LB
+can resolve token identity first and fall back to its privacy-safe network
+fingerprint. Neither raw value is retained in dashboard history or exposed by
+dashboard APIs/UI, and callback payloads must not be logged by the compute, LB,
+or an upstream proxy.
 
 The compute endpoint serves `/v1/realtime`. The LB now serves `POST /session` for allocation.
 
@@ -470,6 +492,8 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --image-url your-registry/s2s-endpoint-compute:latest \
   --image-port 7860 \
   --session-shared-secret your-shared-secret \
+  --lb-callback-auth-token your-callback-secret \
+  --llm-proxy-accounting-callback-url https://your-lb.example/internal/llm-proxy-usage \
   --secret HF_TOKEN=$HF_TOKEN \
   --instance-size x1 \
   --instance-type nvidia-a10g \
@@ -487,6 +511,8 @@ uv run --with-requirements requirements.txt python scripts/create_compute_endpoi
   --count 3 \
   --image-url your-registry/s2s-endpoint-compute:realtime \
   --session-shared-secret your-shared-secret \
+  --lb-callback-auth-token your-callback-secret \
+  --llm-proxy-accounting-callback-url https://your-lb.example/internal/llm-proxy-usage \
   --secret HF_TOKEN=$HF_TOKEN \
   --instance-size x1 \
   --instance-type nvidia-a10g \
@@ -611,6 +637,7 @@ uv run --with-requirements requirements.txt python scripts/create_load_balancer_
   --session-shared-secret your-shared-secret \
   --secret HF_CONTROL_TOKEN=$HF_TOKEN \
   --secret LB_ADMIN_AUTH_TOKEN=$LB_ADMIN_AUTH_TOKEN \
+  --secret LB_CALLBACK_AUTH_TOKEN=$LB_CALLBACK_AUTH_TOKEN \
   --instance-size x2 \
   --instance-type intel-icl \
   --vendor aws \

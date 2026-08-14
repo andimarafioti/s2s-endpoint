@@ -34,10 +34,34 @@ from app.session_tokens import create_session_token, llm_token_fingerprint
 SECRET = "compute-test-secret"
 HF_TOKEN = "hf_faketesttoken1234"
 OTHER_HF_TOKEN = "hf_otherfaketoken5678"
+CLIENT_IP = "203.0.113.42"
 
 
 def _auth(token: str = HF_TOKEN) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Forwarded-For": CLIENT_IP,
+    }
+
+
+class CallbackTransportTests(unittest.TestCase):
+    def test_callback_uses_ingress_safe_auth_header(self) -> None:
+        response = contextlib.nullcontext(SimpleNamespace(status=200))
+        with patch("app.compute_app.urllib.request.urlopen", return_value=response) as urlopen:
+            compute_main._post_json(
+                "https://lb.example/internal/llm-proxy-usage",
+                {"reason": "accepted"},
+                callback_auth_token="callback-secret",
+            )
+
+        request = urlopen.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(
+            headers["x-reachy-mini-callback-authorization"],
+            "Bearer callback-secret",
+        )
+        self.assertNotIn("authorization", headers)
 
 
 class StubInternalPipeline:
@@ -190,12 +214,14 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
             pass
 
         self.enterContext(patch("app.ws_proxy.websockets.connect", _FakeUpstreamConnect))
+        self.enterContext(patch("app.compute_app._post_json"))
         stub_url = urlsplit(self.stub.base_url)
         settings = compute_main.ComputeSettings(
             internal_ws_host=str(stub_url.hostname),
             internal_ws_base_port=int(stub_url.port),
             enable_llm_proxy=enable_llm_proxy,
             session_shared_secret=secret,
+            llm_proxy_accounting_callback_url="https://lb.internal/internal/llm-proxy-usage",
         )
         dependencies = compute_main.ComputeDependencies(
             session_router=SimpleNamespace(acquire=_fake_acquire, release=_fake_release),
@@ -211,6 +237,16 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
         if headers is None:
             headers = _auth()
         return client.post("/v1/chat/completions", content=b"{}", headers=headers)
+
+    def recording_client(self, **kwargs):
+        callbacks = []
+
+        def notify(url, payload, **options):
+            callbacks.append((url, payload, options))
+
+        client = self.gated_client(**kwargs)
+        self.enterContext(patch("app.compute_app._post_json", side_effect=notify))
+        return client, callbacks
 
     def post_until_401(self, client: TestClient, deadline_s: float = 5.0):
         """Post until the access window closes: the websocket route's teardown
@@ -230,7 +266,7 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
             200,
             {"id": "chatcmpl-1", "choices": [{"message": {"content": "hi"}}]},
         )
-        client = self.gated_client()
+        client, callbacks = self.recording_client()
         with _connected_session(client):
             response = client.post(
                 "/v1/chat/completions",
@@ -245,6 +281,10 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
         self.assertEqual(seen["method"], "POST")
         self.assertEqual(seen["path"], "/v1/chat/completions")
         self.assertEqual(seen["body"], b'{"messages":[{"role":"user","content":"hi"}],"custom_field":1}')
+        callback_url, payload, options = callbacks[0]
+        self.assertEqual(callback_url, "https://lb.internal/internal/llm-proxy-usage")
+        self.assertEqual(options["timeout_s"], 1.0)
+        self.assertEqual(payload, {"reason": "accepted", "token": HF_TOKEN, "client_ip": CLIENT_IP})
 
     def test_api_key_is_never_forwarded_to_the_pipeline(self) -> None:
         """The api key is a user's HF token — a real credential — so it must
@@ -259,13 +299,14 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
 
     def test_responses_path_forwards_to_internal_responses(self) -> None:
         self.stub.responder = lambda path: (200, {"id": "resp_1", "output": []})
-        client = self.gated_client()
+        client, callbacks = self.recording_client()
         with _connected_session(client):
             response = client.post("/v1/responses", content=b'{"input":"hello"}', headers=_auth())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"id": "resp_1", "output": []})
         self.assertEqual(self.stub.requests[0]["path"], "/v1/responses")
+        self.assertEqual(callbacks[0][1]["reason"], "accepted")
 
     def test_pipeline_answers_pass_through_unchanged(self) -> None:
         """Beyond the gate, the contract clients see is the pipeline's own:
@@ -333,12 +374,13 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
 
     def test_unreachable_internal_pipeline_answers_502(self) -> None:
         self.stub.close()  # a port that was just bound and freed: connection refused
-        client = self.gated_client()
+        client, callbacks = self.recording_client()
         with _connected_session(client):
             response = self.post_chat(client)
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["error"]["type"], "upstream_unreachable")
+        self.assertEqual(callbacks[0][1]["reason"], "accepted")
 
     def test_only_post_is_exposed_on_proxy_paths(self) -> None:
         client = self.gated_client()
@@ -350,21 +392,23 @@ class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
 
 class HfTokenGateTests(ComputeLlmProxyTestCase):
     def test_missing_api_key_is_401(self) -> None:
-        client = self.gated_client()
+        client, callbacks = self.recording_client()
         with _connected_session(client):
             response = self.post_chat(client, headers={"Content-Type": "application/json"})
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"]["type"], "invalid_api_key")
         self.assertEqual(self.stub.requests, [])
+        self.assertEqual(callbacks[0][1]["reason"], "missing_token")
 
     def test_wrong_api_key_is_401(self) -> None:
-        client = self.gated_client()
+        client, callbacks = self.recording_client()
         with _connected_session(client):
             response = self.post_chat(client, headers=_auth("hf_not_the_sessions_token"))
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(self.stub.requests, [])
+        self.assertEqual(callbacks[0][1]["reason"], "no_active_session_match")
 
     def test_api_key_in_reachy_authorization_header_opens_the_gate(self) -> None:
         """The HF Inference Endpoints ingress consumes the standard
@@ -451,13 +495,14 @@ class DisabledLlmProxyTests(ComputeLlmProxyTestCase):
     def test_disabled_proxy_answers_404_even_for_a_connected_session(self) -> None:
         # An authorized key changes nothing: the check runs before auth, so a
         # disabled replica never touches the gate or the pipeline.
-        client = self.gated_client(enable_llm_proxy=False)
+        client, callbacks = self.recording_client(enable_llm_proxy=False)
         with _connected_session(client):
             for path in ("/v1/chat/completions", "/v1/responses"):
                 response = client.post(path, content=b"{}", headers=_auth())
                 self.assertEqual(response.status_code, 404)
 
         self.assertEqual(self.stub.requests, [])
+        self.assertEqual([callback[1]["reason"] for callback in callbacks], ["proxy_disabled"] * 2)
 
     def test_disabled_proxy_404_is_indistinguishable_from_an_unknown_route(self) -> None:
         client = self.gated_client(enable_llm_proxy=False)
@@ -470,8 +515,26 @@ class DisabledLlmProxyTests(ComputeLlmProxyTestCase):
 
 
 class FingerprintRateLimitTests(ComputeLlmProxyTestCase):
+    def test_callback_failure_is_attempted_once_without_changing_proxy_response(self) -> None:
+        attempts = 0
+
+        def notify(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("load balancer unavailable")
+
+        client = self.gated_client(rate_limit_rpm=1)
+        with patch("app.compute_app._post_json", side_effect=notify):
+            with _connected_session(client):
+                accepted = self.post_chat(client)
+                rejected = self.post_chat(client)
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(rejected.status_code, 429)
+        self.assertEqual(attempts, 2)
+
     def test_rate_limit_answers_429_and_other_users_are_unaffected(self) -> None:
-        client = self.gated_client(rate_limit_rpm=2)
+        client, callbacks = self.recording_client(rate_limit_rpm=2)
         with _connected_session(client, session_id="session-a"):
             with _connected_session(client, session_id="session-b", hf_token=OTHER_HF_TOKEN):
                 self.assertEqual(self.post_chat(client).status_code, 200)
@@ -484,6 +547,10 @@ class FingerprintRateLimitTests(ComputeLlmProxyTestCase):
 
         # The throttled request never reached the pipeline.
         self.assertEqual(len(self.stub.requests), 3)
+        self.assertEqual(
+            [callback[1]["reason"] for callback in callbacks],
+            ["accepted", "accepted", "rate_limited", "accepted"],
+        )
 
     def test_rate_limit_window_slides_and_recovers(self) -> None:
         clock = {"now": 1000.0}
