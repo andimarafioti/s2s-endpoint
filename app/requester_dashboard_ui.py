@@ -123,6 +123,13 @@ REQUESTER_DASHBOARD_SCRIPT = """
       return entries.map(([reason, count]) => `${prettyNumber(count)} ${labels[reason] || reason}`).join(' · ');
     }
 
+    function requesterProxyTooltip(row) {
+      const rejected = Number(row.llm_proxy_rejected || 0);
+      const reasons = requesterProxyReasonSummary(row.llm_proxy_rejection_reasons);
+      if (!rejected) return 'No rejected proxy requests';
+      return `${prettyNumber(rejected)} rejected${reasons ? ` · ${reasons}` : ''}`;
+    }
+
     function renderRequesterUsage(requesters, summary) {
       const rows = requesters?.leaderboard || [];
       const windowLabel = summary.window_label || '6h';
@@ -158,7 +165,7 @@ REQUESTER_DASHBOARD_SCRIPT = """
             <td><strong>${htmlEscape(prettyNumber(row.connections || 0))}</strong><div class="muted">websocket joins</div></td>
             <td><strong>${htmlEscape(formatDuration(row.avg_connected_duration_s || 0))} avg</strong><div class="muted">${htmlEscape(prettyNumber(row.short_sessions || 0))} short · ${htmlEscape(formatDuration(row.max_connected_duration_s || 0))} max</div></td>
             <td><strong>${htmlEscape(prettyNumber(requesterRejectedCount(row)))}</strong><div class="muted">${htmlEscape(prettyNumber(row.auth_rejected || 0))} auth rejected · ${htmlEscape(prettyNumber(row.rate_limited || 0))} limited</div></td>
-            <td><strong>${htmlEscape(prettyNumber(row.llm_proxy_requests || 0))}</strong><div class="muted">${htmlEscape(prettyNumber(row.llm_proxy_accepted || 0))} accepted · ${htmlEscape(prettyNumber(row.llm_proxy_rejected || 0))} rejected</div><div class="muted">${htmlEscape(requesterProxyReasonSummary(row.llm_proxy_rejection_reasons))}</div></td>
+            <td title="${htmlEscape(requesterProxyTooltip(row))}"><strong>${htmlEscape(prettyNumber(row.llm_proxy_accepted || 0))}/${htmlEscape(prettyNumber(row.llm_proxy_requests || 0))} accepted</strong></td>
             <td>${htmlEscape(row.traffic_share_pct || 0)}%</td>
             <td>${htmlEscape(prettyNumber(row.peak_requests_per_minute || 0))}/min</td>
             <td>${htmlEscape(networks)}</td>
