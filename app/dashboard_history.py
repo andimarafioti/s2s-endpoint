@@ -824,7 +824,7 @@ class DashboardHistory:
                     )
                     if short_session:
                         record["short_sessions"] = int(record.get("short_sessions", 0)) + 1
-                if event in {"request", "llm_proxy"} and resolved_actor_id != "overflow":
+                if event == "request" and resolved_actor_id != "overflow":
                     _record_request_context(record, resolved_metadata)
             self._mark_bucket_dirty_unlocked(bucket.bucket_start_s)
             self._prune_unlocked(now)

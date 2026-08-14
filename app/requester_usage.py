@@ -189,7 +189,6 @@ class _ActorUsageAccumulator:
         )
         signals = _usage_signals(
             requests=self.requests,
-            verification=self.verification,
             traffic_share_pct=traffic_share_pct,
             peak_requests_per_minute=self.peak_requests_per_minute,
             network_count=len(self.network_ids),
@@ -475,7 +474,6 @@ def _normalized_account_name(value: object) -> str | None:
 def _usage_signals(
     *,
     requests: int,
-    verification: str,
     traffic_share_pct: float,
     peak_requests_per_minute: int,
     network_count: int,
@@ -503,7 +501,7 @@ def _usage_signals(
         signals.append(f"many networks: {network_count}{'+' if network_ids_overflow else ''}")
     if requests >= 5 and automated_requests / max(requests, 1) >= 0.8:
         signals.append("mostly automation-like clients")
-    if verification == "invalid" or invalid_token_requests > 0:
+    if invalid_token_requests > 0:
         signals.append("invalid HF token")
     if auth_rejected > 0:
         noun = "request" if auth_rejected == 1 else "requests"

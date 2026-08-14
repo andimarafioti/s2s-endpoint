@@ -525,6 +525,48 @@ class RequesterUsageServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["summary"]["tokens_window"], 3)
         self.assertEqual(payload["summary"]["invalid_token_requests_window"], 1)
 
+    async def test_proxy_events_do_not_change_session_risk_signals(self):
+        service = self._service(FakeClock(2 * 3600))
+        requester = RequesterIdentity(
+            actor_id="token:abc123",
+            label="@reachy-user",
+            kind="authenticated",
+            verification="verified",
+            fingerprint="abc123",
+            account_name="reachy-user",
+            network_id="net:session",
+        )
+        await service.record("request", requester)
+        for index in range(5):
+            await service.history.record_requester_event(
+                "llm_proxy",
+                actor_id=requester.actor_id,
+                metadata={**requester.history_metadata(), "network_id": f"net:proxy-{index}"},
+                reason="accepted",
+            )
+        await service.history.record_requester_event(
+            "llm_proxy",
+            actor_id="anonymous:invalid",
+            metadata={
+                "label": "Anonymous IP •invalid",
+                "kind": "anonymous",
+                "verification": "invalid",
+                "fingerprint": "invalid",
+                "network_id": "net:invalid",
+            },
+            reason="no_active_session_match",
+        )
+
+        payload = await service.data(window_minutes=60)
+        rows = {row["actor_id"]: row for row in payload["leaderboard"]}
+
+        self.assertEqual(payload["summary"]["unique_requesters_window"], 1)
+        self.assertEqual(payload["summary"]["unusual_requesters_window"], 0)
+        self.assertEqual((rows["hf:reachy-user"]["network_count"], rows["hf:reachy-user"]["risk"]), (1, "normal"))
+        self.assertEqual(rows["hf:reachy-user"]["llm_proxy_accepted"], 5)
+        self.assertEqual((rows["anonymous:invalid"]["network_count"], rows["anonymous:invalid"]["risk"]), (0, "normal"))
+        self.assertEqual(rows["anonymous:invalid"]["invalid_token_requests"], 0)
+
 
 class RequesterDashboardUiTests(unittest.TestCase):
     def test_injects_requester_dashboard_fragments(self):
