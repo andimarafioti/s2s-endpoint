@@ -8,6 +8,7 @@ ARG S2S_REF=3986f453012a131632eee4731995474046846794
 ARG SMART_TURN_MODEL_REPO=pipecat-ai/smart-turn-v3
 ARG SMART_TURN_MODEL_REV=f766f81d3cfdf7737ac64aad813d91bbfd56bf93
 ARG SMART_TURN_MODEL_FILENAME=smart-turn-v3.2-cpu.onnx
+ARG SILERO_VAD_REF=867c2aa692646a1f1de3e94a15c9dd9f614c0acb
 
 LABEL org.opencontainers.image.source="https://github.com/andimarafioti/s2s-endpoint"
 
@@ -61,7 +62,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 RUN mkdir -p /opt/models "${TORCH_HOME}" && \
     python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='${SMART_TURN_MODEL_REPO}', filename='${SMART_TURN_MODEL_FILENAME}', revision='${SMART_TURN_MODEL_REV}', local_dir='/opt/models')" && \
     python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')" && \
-    python -c "import torch; torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)"
+    python -c "import torch; torch.hub.load('snakers4/silero-vad:${SILERO_VAD_REF}', 'silero_vad', trust_repo=True)"
 
 COPY pipeline_entrypoint.py /app/pipeline_entrypoint.py
 
