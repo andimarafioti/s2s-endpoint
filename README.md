@@ -28,6 +28,9 @@ GPU service images:
 - TTS image: `Dockerfile.tts`
   Runs Qwen3-TTS CustomVoice through vLLM-Omni on port 8091. Its bundled deploy
   config keeps async chunking and multi-request batching enabled.
+- pipeline image: `Dockerfile.pipeline`
+  Runs only VAD, Smart Turn, and `speech-to-speech serve` on CPU. It sends STT
+  and TTS requests to the dedicated GPU endpoints and LLM requests to OpenAI.
 
 This is intended for a deployment with:
 
@@ -136,6 +139,43 @@ Because the endpoints are protected, pass a Hugging Face token as the
 speech-to-speech pipeline. This deployment does not change
 `stream_batch_sentences`; the experiment should preserve the pipeline's current
 sentence batching while comparing service placement.
+
+Build and deploy the CPU-only pipeline after both speech services are running:
+
+```bash
+docker buildx build --platform linux/amd64 -f Dockerfile.pipeline \
+  -t your-registry/s2s-pipeline:v0.1 --push .
+
+export HF_TOKEN=...
+export OPENAI_API_KEY=...
+uv run --with-requirements requirements.txt python scripts/create_pipeline_endpoint.py \
+  --namespace HuggingFaceM4 \
+  --image-url your-registry/s2s-pipeline:v0.1 \
+  --dry-run
+uv run --with-requirements requirements.txt python scripts/create_pipeline_endpoint.py \
+  --namespace HuggingFaceM4 \
+  --image-url your-registry/s2s-pipeline:v0.1 \
+  --wait
+```
+
+The default endpoint is a protected, always-warm AWS `intel-spr-x4` CPU
+instance in `us-east-1`. It preserves `stream_batch_sentences=3`, disables live
+transcription for the baseline, and keeps conversation transcripts out of
+retained endpoint logs. Secrets are written only to an owner-readable ephemeral
+configuration file inside the container; they are not included in the process
+arguments.
+
+Connect the packaged microphone/speaker client directly to the resulting URL:
+
+```bash
+speech-to-speech talk \
+  --url wss://YOUR-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1/realtime \
+  --api-key "$HF_TOKEN" \
+  --playback-buffer-ms 196
+```
+
+Current upstream uses the command name `talk`; older checkouts may call the
+same client `listen`.
 
 ## Direct Session Flow
 
