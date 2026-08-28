@@ -412,7 +412,7 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "concurrencies": args.concurrencies,
             "waves": args.waves,
             "stt_durations_s": args.stt_durations,
-            "tts_cases": list(TTS_CASES),
+            "tts_cases": args.tts_cases,
             "client_region": args.client_region,
         },
         "tts": [],
@@ -429,7 +429,8 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         }
 
         if "tts" in args.services:
-            for case_name, text in TTS_CASES.items():
+            for case_name in args.tts_cases:
+                text = TTS_CASES[case_name]
                 warmup, _ = await request_tts(client, args, text)
                 if not warmup.ok:
                     raise RuntimeError(f"TTS warmup failed for {case_name}: {warmup.error}")
@@ -509,6 +510,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tts-model", default=DEFAULT_TTS_MODEL)
     parser.add_argument("--voice", default="aiden")
     parser.add_argument("--language", default="English")
+    parser.add_argument(
+        "--tts-cases",
+        nargs="+",
+        choices=tuple(TTS_CASES),
+        default=list(TTS_CASES),
+        help="TTS text cases to benchmark",
+    )
     parser.add_argument("--concurrencies", nargs="+", type=int, default=[1, 2, 4, 8])
     parser.add_argument("--waves", type=int, default=2)
     parser.add_argument("--stt-durations", nargs="+", type=float, default=[2, 5, 15, 30])
