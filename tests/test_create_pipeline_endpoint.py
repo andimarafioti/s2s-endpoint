@@ -9,7 +9,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from create_pipeline_endpoint import deployment_env, main, resolve_secrets  # noqa: E402
+from create_pipeline_endpoint import deployment_env, main, parse_args, resolve_secrets  # noqa: E402
 
 
 class FakeResponse:
@@ -21,6 +21,25 @@ class FakeNotFound(Exception):
 
 
 class CreatePipelineEndpointTests(unittest.TestCase):
+    def test_parse_args_requires_explicit_image(self):
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "create_pipeline_endpoint",
+                    "--stt-base-url",
+                    "https://stt.example/v1",
+                    "--tts-base-url",
+                    "https://tts.example/v1",
+                ],
+            ),
+            patch("sys.stderr", io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            parse_args()
+
+        self.assertEqual(raised.exception.code, 2)
+
     def test_deployment_env_preserves_non_streaming_stt_and_sentence_batching(self):
         args = argparse.Namespace(
             stt_base_url="https://stt.example/v1",
@@ -59,6 +78,8 @@ class CreatePipelineEndpointTests(unittest.TestCase):
                 "sys.argv",
                 [
                     "create_pipeline_endpoint",
+                    "--image-url",
+                    "ghcr.io/example/s2s-pipeline:sha-1234",
                     "--stt-base-url",
                     "https://stt.example/v1",
                     "--tts-base-url",

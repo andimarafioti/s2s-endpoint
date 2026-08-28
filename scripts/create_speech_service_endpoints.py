@@ -18,8 +18,6 @@ DEFAULT_STT_NAME = "reachy-s2s-stt-01"
 DEFAULT_TTS_NAME = "reachy-s2s-tts-01"
 DEFAULT_STT_REPOSITORY = "Qwen/Qwen3-ASR-1.7B"
 DEFAULT_TTS_REPOSITORY = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-DEFAULT_STT_IMAGE = "ghcr.io/andimarafioti/s2s-stt:v0.2"
-DEFAULT_TTS_IMAGE = "ghcr.io/andimarafioti/s2s-tts:v0.2"
 
 
 @dataclass(frozen=True)
@@ -128,8 +126,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tts-repository", default=DEFAULT_TTS_REPOSITORY)
     parser.add_argument("--stt-revision")
     parser.add_argument("--tts-revision")
-    parser.add_argument("--stt-image-url", default=DEFAULT_STT_IMAGE)
-    parser.add_argument("--tts-image-url", default=DEFAULT_TTS_IMAGE)
+    parser.add_argument("--stt-image-url")
+    parser.add_argument("--tts-image-url")
     parser.add_argument("--vendor", default=DEFAULT_VENDOR)
     parser.add_argument("--region", default=DEFAULT_REGION)
     parser.add_argument("--instance-size", default=DEFAULT_INSTANCE_SIZE)
@@ -142,6 +140,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Resolve revisions and print the deployment plan")
     args = parser.parse_args()
 
+    if "stt" in args.services and not args.stt_image_url:
+        parser.error("--stt-image-url is required when deploying STT")
+    if "tts" in args.services and not args.tts_image_url:
+        parser.error("--tts-image-url is required when deploying TTS")
     if args.min_replica < 0:
         parser.error("--min-replica must be >= 0")
     if args.max_replica < 1:

@@ -9,7 +9,6 @@ from huggingface_hub import HfApi
 
 DEFAULT_NAMESPACE = "HuggingFaceM4"
 DEFAULT_NAME = "reachy-s2s-pipeline-01"
-DEFAULT_IMAGE = "ghcr.io/andimarafioti/s2s-pipeline:v0.2"
 DEFAULT_VENDOR = "aws"
 DEFAULT_REGION = "us-east-1"
 DEFAULT_INSTANCE_TYPE = "intel-spr"
@@ -73,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--name", default=DEFAULT_NAME)
-    parser.add_argument("--image-url", default=DEFAULT_IMAGE)
+    parser.add_argument("--image-url", required=True)
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY)
     parser.add_argument("--revision")
     parser.add_argument("--vendor", default=DEFAULT_VENDOR)

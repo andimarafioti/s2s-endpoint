@@ -2,9 +2,14 @@ name: Publish speech service images
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional version alias to publish, such as v0.3
+        required: false
+        type: string
   push:
     branches:
-      - deploy/stt-tts-endpoints
+      - main
     paths:
       - .github/workflows/publish-speech-service-images.yml
       - Dockerfile.stt
@@ -23,6 +28,8 @@ jobs:
         service:
           - stt
           - tts
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/s2s-${{ matrix.service }}
     steps:
       - uses: actions/checkout@v4
 
@@ -34,6 +41,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve immutable and release tags
+        id: tags
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          {
+            echo "value<<EOF"
+            echo "${IMAGE}:sha-${GITHUB_SHA}"
+            if [[ -n "${RELEASE_TAG}" ]]; then
+              if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+                echo "release_tag must look like v0.3 or v0.3.1" >&2
+                exit 1
+              fi
+              echo "${IMAGE}:${RELEASE_TAG}"
+            fi
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
       - uses: docker/build-push-action@v7
         with:
           context: .
@@ -41,6 +67,6 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
-          tags: ghcr.io/${{ github.repository_owner }}/s2s-${{ matrix.service }}:v0.2
+          tags: ${{ steps.tags.outputs.value }}
           cache-from: type=gha,scope=speech-${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=speech-${{ matrix.service }}

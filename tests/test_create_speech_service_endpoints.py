@@ -16,6 +16,7 @@ from create_speech_service_endpoints import (  # noqa: E402
     build_specs,
     ensure_names_available,
     main,
+    parse_args,
 )
 
 
@@ -85,6 +86,32 @@ class SpeechServiceSpecTests(unittest.TestCase):
 
 
 class CreateSpeechServiceEndpointsMainTests(unittest.TestCase):
+    def test_parse_args_requires_image_for_each_selected_service(self):
+        with (
+            patch("sys.argv", ["create_speech_service_endpoints", "--services", "stt"]),
+            patch("sys.stderr", io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            parse_args()
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_parse_args_accepts_only_the_selected_service_image(self):
+        with patch(
+            "sys.argv",
+            [
+                "create_speech_service_endpoints",
+                "--services",
+                "stt",
+                "--stt-image-url",
+                "ghcr.io/example/s2s-stt:sha-1234",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.stt_image_url, "ghcr.io/example/s2s-stt:sha-1234")
+        self.assertIsNone(args.tts_image_url)
+
     def test_main_creates_protected_warm_gpu_endpoints(self):
         api = MagicMock()
         api.model_info.side_effect = [MagicMock(sha="stt-sha"), MagicMock(sha="tts-sha")]
@@ -100,7 +127,16 @@ class CreateSpeechServiceEndpointsMainTests(unittest.TestCase):
         api.create_inference_endpoint.side_effect = [stt_endpoint, tts_endpoint]
 
         with (
-            patch("sys.argv", ["create_speech_service_endpoints"]),
+            patch(
+                "sys.argv",
+                [
+                    "create_speech_service_endpoints",
+                    "--stt-image-url",
+                    "ghcr.io/example/s2s-stt:sha-1234",
+                    "--tts-image-url",
+                    "ghcr.io/example/s2s-tts:sha-1234",
+                ],
+            ),
             patch("sys.stdout", io.StringIO()),
             patch("create_speech_service_endpoints.HfApi", return_value=api),
         ):
