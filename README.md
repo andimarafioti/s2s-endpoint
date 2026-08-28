@@ -107,6 +107,10 @@ docker buildx build --platform linux/amd64 -f Dockerfile.tts \
   -t your-registry/s2s-tts:v0.1 --push .
 ```
 
+The `Publish speech service images` workflow publishes the repository defaults,
+`ghcr.io/andimarafioti/s2s-stt:v0.1` and
+`ghcr.io/andimarafioti/s2s-tts:v0.1`, as Linux AMD64 images.
+
 Create one protected, warm A10G endpoint for each service in the production
 region. The script resolves and pins the current model revisions before it
 creates anything, and refuses to reuse an existing endpoint name:

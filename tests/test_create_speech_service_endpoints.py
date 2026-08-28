@@ -36,8 +36,8 @@ def make_args(**overrides):
         "tts_repository": DEFAULT_TTS_REPOSITORY,
         "stt_revision": None,
         "tts_revision": None,
-        "stt_image_url": "andito/s2s-stt:v0.1",
-        "tts_image_url": "andito/s2s-tts:v0.1",
+        "stt_image_url": "ghcr.io/andimarafioti/s2s-stt:v0.1",
+        "tts_image_url": "ghcr.io/andimarafioti/s2s-tts:v0.1",
     }
     values.update(overrides)
     return argparse.Namespace(**values)

@@ -1,6 +1,8 @@
 ARG VLLM_OMNI_VERSION=0.24.0
 FROM vllm/vllm-omni:v${VLLM_OMNI_VERSION}
 
+LABEL org.opencontainers.image.source="https://github.com/andimarafioti/s2s-endpoint"
+
 EXPOSE 8091
 
 # The bundled deploy config enables async chunking and keeps multi-request

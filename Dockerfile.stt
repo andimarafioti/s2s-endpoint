@@ -1,6 +1,8 @@
 ARG VLLM_VERSION=0.24.0
 FROM vllm/vllm-openai:v${VLLM_VERSION}
 
+LABEL org.opencontainers.image.source="https://github.com/andimarafioti/s2s-endpoint"
+
 ARG VLLM_VERSION
 
 # The official vLLM image intentionally omits optional audio dependencies.

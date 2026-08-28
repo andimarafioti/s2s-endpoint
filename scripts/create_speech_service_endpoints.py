@@ -18,8 +18,8 @@ DEFAULT_STT_NAME = "reachy-s2s-stt-01"
 DEFAULT_TTS_NAME = "reachy-s2s-tts-01"
 DEFAULT_STT_REPOSITORY = "Qwen/Qwen3-ASR-1.7B"
 DEFAULT_TTS_REPOSITORY = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-DEFAULT_STT_IMAGE = "andito/s2s-stt:v0.1"
-DEFAULT_TTS_IMAGE = "andito/s2s-tts:v0.1"
+DEFAULT_STT_IMAGE = "ghcr.io/andimarafioti/s2s-stt:v0.1"
+DEFAULT_TTS_IMAGE = "ghcr.io/andimarafioti/s2s-tts:v0.1"
 
 
 @dataclass(frozen=True)
