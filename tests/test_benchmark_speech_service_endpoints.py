@@ -1,6 +1,8 @@
+import asyncio
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
@@ -13,6 +15,7 @@ from benchmark_speech_service_endpoints import (  # noqa: E402
     percentile,
     prometheus_value,
     repeat_pcm,
+    sample_stt_live_metrics,
     server_metric_summary,
 )
 
@@ -85,6 +88,32 @@ http_request_duration_seconds_count{handler="/health",method="GET"} 10.0
         self.assertEqual(summary["mean_e2e_s"], 0.3)
         self.assertEqual(summary["mean_queue_s"], 0.05)
         self.assertEqual(summary["mean_ttft_s"], 0.05)
+
+
+class LiveMetricSamplerTests(unittest.IsolatedAsyncioTestCase):
+    @patch("benchmark_speech_service_endpoints.fetch_metrics", new_callable=AsyncMock)
+    async def test_sampler_records_peak_running_and_waiting(self, fetch_metrics):
+        responses = iter(
+            [
+                'vllm:num_requests_running{engine="0"} 4\nvllm:num_requests_waiting{engine="0"} 2',
+                'vllm:num_requests_running{engine="0"} 8\nvllm:num_requests_waiting{engine="0"} 1',
+            ]
+        )
+        stop = asyncio.Event()
+
+        async def next_metrics(*_args):
+            response = next(responses)
+            if fetch_metrics.await_count == 2:
+                stop.set()
+            return response
+
+        fetch_metrics.side_effect = next_metrics
+        summary = await sample_stt_live_metrics(AsyncMock(), "https://example.test", stop, interval_s=0)
+
+        self.assertEqual(summary["samples"], 2)
+        self.assertEqual(summary["peak_running"], 8.0)
+        self.assertEqual(summary["peak_waiting"], 2.0)
+        self.assertEqual(summary["errors"], [])
 
 
 if __name__ == "__main__":

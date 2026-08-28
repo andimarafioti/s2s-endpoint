@@ -1,0 +1,44 @@
+name: Run STT saturation benchmark
+
+on:
+  push:
+    branches:
+      - deploy/stt-tts-endpoints
+    paths:
+      - .github/workflows/run-stt-saturation-benchmark.yml
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    if: github.event.head_commit.message == 'Run STT saturation benchmark'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: requirements.txt
+
+      - name: Run saturation matrix
+        env:
+          HF_TOKEN: ${{ secrets.SPEECH_BENCHMARK_HF_TOKEN }}
+        run: |
+          uv run --with-requirements requirements.txt \
+            python scripts/benchmark_speech_service_endpoints.py \
+            --services stt \
+            --concurrencies 32 64 128 256 \
+            --waves 1 \
+            --stt-durations 5 \
+            --client-region github-actions \
+            --output logs/speech-services-stt-saturation.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speech-services-stt-saturation
+          path: logs/speech-services-stt-saturation.json
+          if-no-files-found: error

@@ -205,6 +205,41 @@ async def fetch_metrics(client: httpx.AsyncClient, base_url: str) -> str:
     return response.text
 
 
+async def sample_stt_live_metrics(
+    client: httpx.AsyncClient,
+    base_url: str,
+    stop: asyncio.Event,
+    *,
+    interval_s: float = 0.05,
+) -> dict[str, Any]:
+    peak_running = 0.0
+    peak_waiting = 0.0
+    samples = 0
+    errors: list[str] = []
+    while True:
+        try:
+            text = await fetch_metrics(client, base_url)
+            running = prometheus_value(text, "vllm:num_requests_running") or 0.0
+            waiting = prometheus_value(text, "vllm:num_requests_waiting") or 0.0
+            peak_running = max(peak_running, running)
+            peak_waiting = max(peak_waiting, waiting)
+            samples += 1
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+        if stop.is_set():
+            break
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_s)
+        except TimeoutError:
+            pass
+    return {
+        "samples": samples,
+        "peak_running": rounded(peak_running),
+        "peak_waiting": rounded(peak_waiting),
+        "errors": errors[:3],
+    }
+
+
 def stt_metric_snapshot(text: str) -> dict[str, float | None]:
     names = (
         "vllm:e2e_request_latency_seconds_count",
@@ -423,23 +458,30 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             for duration_s, wav_bytes in fixtures.items():
                 for concurrency in args.concurrencies:
                     before = stt_metric_snapshot(await fetch_metrics(client, args.stt_base_url))
+                    sampler_stop = asyncio.Event()
+                    sampler = asyncio.create_task(sample_stt_live_metrics(client, args.stt_base_url, sampler_stop))
 
                     async def stt_request(
                         wav_bytes: bytes = wav_bytes, duration_s: float = duration_s
                     ) -> RequestResult:
                         return await request_stt(client, args, wav_bytes, duration_s)
 
-                    results, wall_s = await run_load_cell(
-                        stt_request,
-                        concurrency=concurrency,
-                        waves=args.waves,
-                    )
+                    try:
+                        results, wall_s = await run_load_cell(
+                            stt_request,
+                            concurrency=concurrency,
+                            waves=args.waves,
+                        )
+                    finally:
+                        sampler_stop.set()
+                    live_metrics = await sampler
                     after = stt_metric_snapshot(await fetch_metrics(client, args.stt_base_url))
                     cell = {
                         "audio_s": duration_s,
                         "concurrency": concurrency,
                         **summarize_results(results, wall_s=wall_s, input_audio_s=duration_s),
                         "server_metrics": server_metric_summary(before, after, service="stt"),
+                        "live_metrics": live_metrics,
                     }
                     report["stt"].append(cell)
                     print(json.dumps({"service": "stt", **cell}), flush=True)
