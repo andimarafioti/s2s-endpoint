@@ -119,9 +119,7 @@ def endpoint_summary(endpoint, service: str) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Create dedicated GPU STT and TTS endpoints for s2s experiments."
-    )
+    parser = argparse.ArgumentParser(description="Create dedicated GPU STT and TTS endpoints for s2s experiments.")
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--services", nargs="+", choices=("stt", "tts"), default=["stt", "tts"])
     parser.add_argument("--stt-name", default=DEFAULT_STT_NAME)
