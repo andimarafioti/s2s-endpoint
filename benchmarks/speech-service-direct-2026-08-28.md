@@ -56,16 +56,42 @@ All STT requests succeeded, and vLLM reported no queued model time at any tested
 latency essentially flat through concurrency 8. Concurrency 16 remained healthy; only the longest input showed a
 material increase, from 0.51 seconds at concurrency 1 to 0.79 seconds.
 
+### Distributed saturation test
+
+The Zurich results established only a lower bound because a single uploader could not keep the endpoint busy. A
+second test ran from synchronized US-hosted clients against the same single-A10G endpoint. Each client sent four
+waves of five-second WAV inputs. Multiple clients were used above aggregate concurrency 64 so that a single
+client's network path would not determine the result.
+
+| Aggregate concurrency | Clients | Requests | Aggregate throughput | Worst client p95 | Peak vLLM running | Peak vLLM waiting |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 1 | 256 | 93.3 req/s | 1.37 s | 41 | 0 |
+| 128 | 2 | 512 | 172.6 req/s | 1.44 s | 63 | 0 |
+| 256 | 4 | 1,024 | 194.4 req/s | 4.02 s | 64 | 0 |
+| 512 | 4 | 2,048 | 187.4 req/s | 8.26 s | 109 | 0 |
+
+All 3,840 load requests succeeded. Throughput nearly doubled from concurrency 64 to 128, increased only 13% from
+128 to 256, and then declined slightly at 512. At the same time, worst-client p95 increased from 1.44 seconds at
+128 to 4.02 seconds at 256 and 8.26 seconds at 512. The practical latency knee is therefore between aggregate
+concurrency 128 and 256, and peak throughput for this five-second fixture is about 190 requests per second.
+
+vLLM's mean end-to-end latency rose only from 0.24 seconds at concurrency 64 to 0.37 seconds at concurrency 512,
+and its reported waiting queue remained zero. The latency above the knee is consequently outside the model
+scheduler, in request upload, parsing, preprocessing, or endpoint-front-door admission. Routing and autoscaling
+should use total outstanding STT calls and observed request latency rather than `vllm:num_requests_waiting` alone.
+
 ## Initial capacity recommendation
 
 - Treat four concurrent TTS generations as the interactive capacity of one A10G.
 - Start another warm TTS replica when the current replica reaches three concurrent generations.
 - Allow up to eight TTS generations only as short overload headroom; do not plan around concurrency 16.
-- Treat twelve concurrent STT requests as the initial admission target for one A10G, retaining 25% headroom below
-  the successful concurrency-16 result.
-- Permit short STT bursts to reach 16 while measuring request duration and speculative STT amplification from the
-  full pipeline.
-- Validate these numbers with a longer intra-region soak test before using them as hard production limits.
+- Use 128 concurrent five-second STT calls as the measured interactive ceiling of one A10G, not as its steady-state
+  target.
+- Start another warm STT replica around 80-96 outstanding calls, retaining 25-38% headroom before the measured
+  latency knee. Cap new admissions or spill to another replica at 128.
+- Do not plan around concurrency 256: it adds only 13% throughput while almost tripling worst-client p95 latency.
+- Re-run the distributed test with representative production utterances and a longer steady-state soak before
+  making these values hard limits.
 
 Both endpoints returned health 200 after the test. STT recorded zero aborts and zero errors, and TTS recorded only
 2xx speech responses.
