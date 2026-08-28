@@ -135,17 +135,3 @@ should use total outstanding STT calls and observed request latency rather than 
 
 Both endpoints returned health 200 after the test. STT recorded zero aborts and zero errors, and TTS recorded only
 2xx speech responses.
-
-## Reproduction
-
-```bash
-uv run --with-requirements requirements.txt \
-  python scripts/benchmark_speech_service_endpoints.py \
-  --concurrencies 1 2 4 8 \
-  --waves 2 \
-  --stt-durations 2 5 15 30 \
-  --client-region europe-zurich \
-  --output logs/speech-services-direct.json
-```
-
-The command requires `HF_TOKEN` in the environment. The report never writes the token or response transcripts.
