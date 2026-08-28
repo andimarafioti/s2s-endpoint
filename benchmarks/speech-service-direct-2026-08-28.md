@@ -1,0 +1,85 @@
+# Direct STT and TTS concurrency benchmark
+
+Date: 2026-08-28
+
+## Setup
+
+- Client: Zurich, Switzerland
+- Endpoints: AWS `us-east-1`
+- Hardware: one A10G replica per service, with autoscaling fixed at one replica
+- STT: `Qwen/Qwen3-ASR-1.7B` through vLLM
+- TTS: `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` through vLLM-Omni
+- TTS output: streaming 24 kHz PCM, voice `aiden`, language `English`
+- Main matrix: concurrency 1, 2, 4, and 8 with two waves per cell
+- Saturation check: concurrency 16 with one wave per cell
+- Load-cell requests: 184 STT and 138 TTS requests
+
+The benchmark generated a speech fixture through the TTS endpoint, repeated or truncated it to exact STT input
+durations, and sent the resulting mono WAV audio directly to STT. Each cell captured client-visible latency and
+endpoint Prometheus counters before and after the load.
+
+## TTS results
+
+The table reports client-visible p95 time to first audio. Network latency from Zurich is included consistently in
+every cell.
+
+| Concurrency | One sentence | Three sentences | Six sentences | Three-sentence audio throughput |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.253 s | 0.208 s | 0.349 s | 2.99 audio-s/s |
+| 2 | 0.560 s | 0.590 s | 0.609 s | 5.12 audio-s/s |
+| 4 | 0.732 s | 0.734 s | 0.768 s | 8.78 audio-s/s |
+| 8 | 2.457 s | 1.591 s | 0.870 s | 13.40 audio-s/s |
+| 16 | 4.543 s | 9.323 s | 24.164 s | 13.99 audio-s/s |
+
+All TTS requests succeeded. Throughput increased strongly through concurrency 8, but interactive responsiveness
+degraded after concurrency 4. At concurrency 16, throughput was effectively saturated and long-request throughput
+fell to 10.24 audio-s/s from 13.72 at concurrency 8.
+
+The three-sentence case most closely represents the pipeline's `stream_batch_sentences=3` configuration. Its p95
+time to first audio remained below 0.75 seconds through concurrency 4, reached 1.59 seconds at concurrency 8, and
+reached 9.32 seconds at concurrency 16.
+
+## STT results
+
+Client latency for large concurrent uploads was limited by the Zurich-to-`us-east-1` upload path. The table
+therefore reports vLLM's server-side mean end-to-end request latency, which excludes that client upload time.
+
+| Concurrency | 2 s audio | 5 s audio | 15 s audio | 30 s audio | Mean model queue time |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.099 s | 0.170 s | 0.383 s | 0.510 s | 0.000 s |
+| 2 | 0.099 s | 0.160 s | 0.372 s | 0.481 s | 0.000 s |
+| 4 | 0.102 s | 0.169 s | 0.378 s | 0.498 s | 0.000 s |
+| 8 | 0.105 s | 0.170 s | 0.385 s | 0.503 s | 0.000 s |
+| 16 | 0.118 s | 0.175 s | 0.419 s | 0.786 s | 0.000 s |
+
+All STT requests succeeded, and vLLM reported no queued model time at any tested concurrency. Dynamic batching kept
+latency essentially flat through concurrency 8. Concurrency 16 remained healthy; only the longest input showed a
+material increase, from 0.51 seconds at concurrency 1 to 0.79 seconds.
+
+## Initial capacity recommendation
+
+- Treat four concurrent TTS generations as the interactive capacity of one A10G.
+- Start another warm TTS replica when the current replica reaches three concurrent generations.
+- Allow up to eight TTS generations only as short overload headroom; do not plan around concurrency 16.
+- Treat twelve concurrent STT requests as the initial admission target for one A10G, retaining 25% headroom below
+  the successful concurrency-16 result.
+- Permit short STT bursts to reach 16 while measuring request duration and speculative STT amplification from the
+  full pipeline.
+- Validate these numbers with a longer intra-region soak test before using them as hard production limits.
+
+Both endpoints returned health 200 after the test. STT recorded zero aborts and zero errors, and TTS recorded only
+2xx speech responses.
+
+## Reproduction
+
+```bash
+uv run --with-requirements requirements.txt \
+  python scripts/benchmark_speech_service_endpoints.py \
+  --concurrencies 1 2 4 8 \
+  --waves 2 \
+  --stt-durations 2 5 15 30 \
+  --client-region europe-zurich \
+  --output logs/speech-services-direct.json
+```
+
+The command requires `HF_TOKEN` in the environment. The report never writes the token or response transcripts.
