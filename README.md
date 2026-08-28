@@ -19,6 +19,16 @@ This repo now builds two different images with two different app entrypoints:
 - load-balancer image: `Dockerfile.load_balancer`
   Starts `app.load_balancer_main:app` on a CPU instance, tracks a configured set of pre-created compute endpoints, keeps a warm pool, wakes parked endpoints when free session capacity gets tight, and allocates direct compute sessions for clients.
 
+For the split speech-service experiment it also builds two OpenAI-compatible
+GPU service images:
+
+- STT image: `Dockerfile.stt`
+  Runs Qwen3-ASR through vLLM on port 8000. The image adds the audio extras that
+  the official vLLM image intentionally omits.
+- TTS image: `Dockerfile.tts`
+  Runs Qwen3-TTS CustomVoice through vLLM-Omni on port 8091. Its bundled deploy
+  config keeps async chunking and multi-request batching enabled.
+
 This is intended for a deployment with:
 
 - one load-balancer endpoint
@@ -87,6 +97,40 @@ When deploying that image on a Hugging Face vLLM endpoint, use container argumen
 ```text
 --max-model-len 32768 --reasoning-parser qwen3 --chat-template /app/qwen3_nonthinking.jinja
 ```
+
+Build the dedicated speech-service images:
+
+```bash
+docker buildx build --platform linux/amd64 -f Dockerfile.stt \
+  -t your-registry/s2s-stt:v0.1 --push .
+docker buildx build --platform linux/amd64 -f Dockerfile.tts \
+  -t your-registry/s2s-tts:v0.1 --push .
+```
+
+Create one protected, warm A10G endpoint for each service in the production
+region. The script resolves and pins the current model revisions before it
+creates anything, and refuses to reuse an existing endpoint name:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/create_speech_service_endpoints.py \
+  --namespace HuggingFaceM4 \
+  --stt-image-url your-registry/s2s-stt:v0.1 \
+  --tts-image-url your-registry/s2s-tts:v0.1 \
+  --dry-run
+
+uv run --with-requirements requirements.txt python scripts/create_speech_service_endpoints.py \
+  --namespace HuggingFaceM4 \
+  --stt-image-url your-registry/s2s-stt:v0.1 \
+  --tts-image-url your-registry/s2s-tts:v0.1 \
+  --wait
+```
+
+The resulting OpenAI-compatible base URLs are the endpoint URL plus `/v1`.
+Because the endpoints are protected, pass a Hugging Face token as the
+`--openai_stt_api_key` or `--openai_tts_api_key` value when configuring the
+speech-to-speech pipeline. This deployment does not change
+`stream_batch_sentences`; the experiment should preserve the pipeline's current
+sentence batching while comparing service placement.
 
 ## Direct Session Flow
 
