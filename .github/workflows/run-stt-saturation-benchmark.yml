@@ -1,4 +1,4 @@
-name: Run STT saturation benchmark
+name: Run distributed STT saturation benchmark
 
 on:
   push:
@@ -11,10 +11,67 @@ permissions:
   contents: read
 
 jobs:
-  benchmark:
-    if: github.event.head_commit.message == 'Run STT saturation benchmark'
+  prepare:
+    if: github.event.head_commit.message == 'Run distributed STT saturation benchmark'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    outputs:
+      start-at-epoch: ${{ steps.start.outputs.epoch }}
+    steps:
+      - id: start
+        run: echo "epoch=$(($(date +%s) + 90))" >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: c064
+            worker: 1
+            concurrency: 64
+            offset: 0
+          - group: c128
+            worker: 1
+            concurrency: 64
+            offset: 25
+          - group: c128
+            worker: 2
+            concurrency: 64
+            offset: 25
+          - group: c256
+            worker: 1
+            concurrency: 64
+            offset: 50
+          - group: c256
+            worker: 2
+            concurrency: 64
+            offset: 50
+          - group: c256
+            worker: 3
+            concurrency: 64
+            offset: 50
+          - group: c256
+            worker: 4
+            concurrency: 64
+            offset: 50
+          - group: c512
+            worker: 1
+            concurrency: 128
+            offset: 75
+          - group: c512
+            worker: 2
+            concurrency: 128
+            offset: 75
+          - group: c512
+            worker: 3
+            concurrency: 128
+            offset: 75
+          - group: c512
+            worker: 4
+            concurrency: 128
+            offset: 75
     steps:
       - uses: actions/checkout@v7
 
@@ -24,21 +81,24 @@ jobs:
           enable-cache: true
           cache-dependency-glob: requirements.txt
 
-      - name: Run saturation matrix
+      - name: Run synchronized load
         env:
           HF_TOKEN: ${{ secrets.SPEECH_BENCHMARK_HF_TOKEN }}
+          START_AT_EPOCH: ${{ needs.prepare.outputs.start-at-epoch }}
         run: |
+          start_at_epoch=$((START_AT_EPOCH + ${{ matrix.offset }}))
           uv run --with-requirements requirements.txt \
             python scripts/benchmark_speech_service_endpoints.py \
             --services stt \
-            --concurrencies 32 64 128 256 \
-            --waves 1 \
+            --concurrencies ${{ matrix.concurrency }} \
+            --waves 4 \
             --stt-durations 5 \
-            --client-region github-actions \
-            --output logs/speech-services-stt-saturation.json
+            --stt-start-at-epoch "$start_at_epoch" \
+            --client-region github-actions-${{ matrix.group }}-worker-${{ matrix.worker }} \
+            --output logs/speech-services-stt-${{ matrix.group }}-worker-${{ matrix.worker }}.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: speech-services-stt-saturation
-          path: logs/speech-services-stt-saturation.json
+          name: speech-services-stt-${{ matrix.group }}-worker-${{ matrix.worker }}
+          path: logs/speech-services-stt-${{ matrix.group }}-worker-${{ matrix.worker }}.json
           if-no-files-found: error

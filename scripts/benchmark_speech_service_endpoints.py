@@ -240,6 +240,15 @@ async def sample_stt_live_metrics(
     }
 
 
+async def wait_until_epoch(start_at_epoch: float | None) -> None:
+    if start_at_epoch is None:
+        return
+    delay_s = start_at_epoch - time.time()
+    if delay_s > 0:
+        print(f"Waiting {delay_s:.1f}s for the synchronized STT start", flush=True)
+        await asyncio.sleep(delay_s)
+
+
 def stt_metric_snapshot(text: str) -> dict[str, float | None]:
     names = (
         "vllm:e2e_request_latency_seconds_count",
@@ -455,6 +464,7 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             warmup = await request_stt(client, args, fixtures[warmup_duration], warmup_duration)
             if not warmup.ok:
                 raise RuntimeError(f"STT warmup failed: {warmup.error}")
+            await wait_until_epoch(args.stt_start_at_epoch)
             for duration_s, wav_bytes in fixtures.items():
                 for concurrency in args.concurrencies:
                     before = stt_metric_snapshot(await fetch_metrics(client, args.stt_base_url))
@@ -502,6 +512,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrencies", nargs="+", type=int, default=[1, 2, 4, 8])
     parser.add_argument("--waves", type=int, default=2)
     parser.add_argument("--stt-durations", nargs="+", type=float, default=[2, 5, 15, 30])
+    parser.add_argument(
+        "--stt-start-at-epoch",
+        type=float,
+        help="Wait until this Unix timestamp after STT warmup, for synchronized distributed load",
+    )
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--client-region", default="local", help="Label recorded in the benchmark report")
     parser.add_argument("--output", type=Path)

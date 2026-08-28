@@ -17,6 +17,7 @@ from benchmark_speech_service_endpoints import (  # noqa: E402
     repeat_pcm,
     sample_stt_live_metrics,
     server_metric_summary,
+    wait_until_epoch,
 )
 
 
@@ -114,6 +115,18 @@ class LiveMetricSamplerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["peak_running"], 8.0)
         self.assertEqual(summary["peak_waiting"], 2.0)
         self.assertEqual(summary["errors"], [])
+
+    async def test_wait_until_epoch_sleeps_only_for_future_start(self):
+        with (
+            patch("benchmark_speech_service_endpoints.time.time", return_value=100.0),
+            patch("benchmark_speech_service_endpoints.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            await wait_until_epoch(103.5)
+            sleep.assert_awaited_once_with(3.5)
+
+        with patch("benchmark_speech_service_endpoints.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            await wait_until_epoch(None)
+            sleep.assert_not_awaited()
 
 
 if __name__ == "__main__":
