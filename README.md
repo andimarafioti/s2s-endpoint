@@ -105,15 +105,17 @@ Build the dedicated speech-service images:
 
 ```bash
 docker buildx build --platform linux/amd64 -f Dockerfile.stt \
-  -t your-registry/s2s-stt:v0.2 --push .
+  -t your-registry/s2s-stt:sha-YOUR_FULL_COMMIT_SHA --push .
 docker buildx build --platform linux/amd64 -f Dockerfile.tts \
-  -t your-registry/s2s-tts:v0.2 --push .
+  -t your-registry/s2s-tts:sha-YOUR_FULL_COMMIT_SHA --push .
 ```
 
-The `Publish speech service images` workflow publishes the repository defaults,
-`ghcr.io/andimarafioti/s2s-stt:v0.2` and
-`ghcr.io/andimarafioti/s2s-tts:v0.2`, as Linux AMD64 images. These images use
-the CUDA 12 vLLM runtime required by the current A10G endpoint hosts.
+On every relevant `main` change, the `Publish speech service images` workflow
+publishes Linux AMD64 images as
+`ghcr.io/andimarafioti/s2s-{stt,tts}:sha-<full-commit-sha>`. A manual workflow
+run can additionally promote an explicit version alias such as `v0.3`; normal
+builds never overwrite a version alias. These images use the CUDA 12 vLLM
+runtime required by the current A10G endpoint hosts.
 
 Create one protected, warm A10G endpoint for each service in the production
 region. The script resolves and pins the current model revisions before it
@@ -122,14 +124,14 @@ creates anything, and refuses to reuse an existing endpoint name:
 ```bash
 uv run --with-requirements requirements.txt python scripts/create_speech_service_endpoints.py \
   --namespace HuggingFaceM4 \
-  --stt-image-url your-registry/s2s-stt:v0.2 \
-  --tts-image-url your-registry/s2s-tts:v0.2 \
+  --stt-image-url ghcr.io/andimarafioti/s2s-stt:sha-YOUR_FULL_COMMIT_SHA \
+  --tts-image-url ghcr.io/andimarafioti/s2s-tts:sha-YOUR_FULL_COMMIT_SHA \
   --dry-run
 
 uv run --with-requirements requirements.txt python scripts/create_speech_service_endpoints.py \
   --namespace HuggingFaceM4 \
-  --stt-image-url your-registry/s2s-stt:v0.2 \
-  --tts-image-url your-registry/s2s-tts:v0.2 \
+  --stt-image-url ghcr.io/andimarafioti/s2s-stt:sha-YOUR_FULL_COMMIT_SHA \
+  --tts-image-url ghcr.io/andimarafioti/s2s-tts:sha-YOUR_FULL_COMMIT_SHA \
   --wait
 ```
 
@@ -144,23 +146,28 @@ Build and deploy the CPU-only pipeline after both speech services are running:
 
 ```bash
 docker buildx build --platform linux/amd64 -f Dockerfile.pipeline \
-  -t your-registry/s2s-pipeline:v0.1 --push .
+  -t your-registry/s2s-pipeline:sha-YOUR_FULL_COMMIT_SHA --push .
 
 export HF_TOKEN=...
 export OPENAI_API_KEY=...
 uv run --with-requirements requirements.txt python scripts/create_pipeline_endpoint.py \
   --namespace HuggingFaceM4 \
-  --image-url your-registry/s2s-pipeline:v0.1 \
+  --image-url your-registry/s2s-pipeline:sha-YOUR_FULL_COMMIT_SHA \
   --stt-base-url https://YOUR-STT-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
   --tts-base-url https://YOUR-TTS-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
   --dry-run
 uv run --with-requirements requirements.txt python scripts/create_pipeline_endpoint.py \
   --namespace HuggingFaceM4 \
-  --image-url your-registry/s2s-pipeline:v0.1 \
+  --image-url your-registry/s2s-pipeline:sha-YOUR_FULL_COMMIT_SHA \
   --stt-base-url https://YOUR-STT-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
   --tts-base-url https://YOUR-TTS-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
   --wait
 ```
+
+The `Publish pipeline image` workflow uses the same immutable commit-tag and
+manual version-alias convention as the speech-service workflow. The deployment
+helpers require explicit image references so the endpoint configuration always
+records the exact build selected by the operator.
 
 The default endpoint is a protected, always-warm AWS `intel-spr-x4` CPU
 instance in `us-east-1`. It preserves `stream_batch_sentences=3`, disables live
