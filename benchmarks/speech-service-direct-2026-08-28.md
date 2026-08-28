@@ -39,6 +39,29 @@ The three-sentence case most closely represents the pipeline's `stream_batch_sen
 time to first audio remained below 0.75 seconds through concurrency 4, reached 1.59 seconds at concurrency 8, and
 reached 9.32 seconds at concurrency 16.
 
+### US-hosted TTS confirmation
+
+A follow-up run from GitHub Actions used the same three-sentence, 231-character input. It sent eight waves at
+concurrency 1 through 8 and one wave at each higher concurrency. The concurrency-512 cell was stopped before it
+completed; the table contains only completed measurements.
+
+| Concurrency | Requests | First-audio p50 | First-audio p95 | Completion p50 | Completion p95 | Audio throughput |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 8 | 0.140 s | 0.168 s | 4.552 s | 4.975 s | 3.09 audio-s/s |
+| 2 | 16 | 0.179 s | 0.262 s | 5.182 s | 5.724 s | 5.60 audio-s/s |
+| 4 | 32 | 0.270 s | 0.444 s | 6.047 s | 6.773 s | 9.37 audio-s/s |
+| 8 | 64 | 0.512 s | 0.666 s | 8.044 s | 8.768 s | 14.14 audio-s/s |
+| 16 | 16 | 0.803 s | 9.183 s | 9.486 s | 15.883 s | 14.44 audio-s/s |
+| 32 | 32 | 9.473 s | 21.558 s | 16.920 s | 27.300 s | 15.24 audio-s/s |
+| 64 | 64 | 24.882 s | 46.815 s | 32.115 s | 52.910 s | 16.36 audio-s/s |
+| 128 | 128 | 50.467 s | 98.135 s | 57.984 s | 105.416 s | 16.99 audio-s/s |
+| 256 | 256 | 101.403 s | 198.368 s | 108.928 s | 205.829 s | 17.08 audio-s/s |
+
+The larger sample agrees with the original run at the important concurrency-16 boundary: first-audio p95 was
+9.183 seconds versus 9.323 seconds previously, and completion p95 was 15.883 seconds versus 16.014 seconds.
+Throughput was already nearly saturated at concurrency 16. Raising concurrency from 16 to 256 improved audio
+throughput by only 18%, while first-audio p95 increased from 9.18 seconds to 198.37 seconds.
+
 ## STT results
 
 Client latency for large concurrent uploads was limited by the Zurich-to-`us-east-1` upload path. The table
