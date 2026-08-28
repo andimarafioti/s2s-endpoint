@@ -151,10 +151,14 @@ export OPENAI_API_KEY=...
 uv run --with-requirements requirements.txt python scripts/create_pipeline_endpoint.py \
   --namespace HuggingFaceM4 \
   --image-url your-registry/s2s-pipeline:v0.1 \
+  --stt-base-url https://YOUR-STT-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
+  --tts-base-url https://YOUR-TTS-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
   --dry-run
 uv run --with-requirements requirements.txt python scripts/create_pipeline_endpoint.py \
   --namespace HuggingFaceM4 \
   --image-url your-registry/s2s-pipeline:v0.1 \
+  --stt-base-url https://YOUR-STT-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
+  --tts-base-url https://YOUR-TTS-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
   --wait
 ```
 

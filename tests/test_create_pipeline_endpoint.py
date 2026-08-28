@@ -55,7 +55,16 @@ class CreatePipelineEndpointTests(unittest.TestCase):
         api.create_inference_endpoint.return_value = endpoint
 
         with (
-            patch("sys.argv", ["create_pipeline_endpoint"]),
+            patch(
+                "sys.argv",
+                [
+                    "create_pipeline_endpoint",
+                    "--stt-base-url",
+                    "https://stt.example/v1",
+                    "--tts-base-url",
+                    "https://tts.example/v1",
+                ],
+            ),
             patch("sys.stdout", io.StringIO()),
             patch.dict(
                 "os.environ",
@@ -76,6 +85,8 @@ class CreatePipelineEndpointTests(unittest.TestCase):
         self.assertEqual(call.kwargs["max_replica"], 1)
         self.assertEqual(call.kwargs["custom_image"]["health_route"], "/v1/usage")
         self.assertEqual(call.kwargs["secrets"]["RESPONSES_API_API_KEY"], "openai-secret")
+        self.assertEqual(call.kwargs["env"]["STT_BASE_URL"], "https://stt.example/v1")
+        self.assertEqual(call.kwargs["env"]["TTS_BASE_URL"], "https://tts.example/v1")
 
 
 if __name__ == "__main__":

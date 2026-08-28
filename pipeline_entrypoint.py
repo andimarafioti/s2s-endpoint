@@ -9,18 +9,16 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
-DEFAULT_STT_BASE_URL = "https://go3quisjv5ta7203.us-east-1.aws.endpoints.huggingface.cloud/v1"
-DEFAULT_TTS_BASE_URL = "https://db6lx9j3kdymwu9w.us-east-1.aws.endpoints.huggingface.cloud/v1"
 DEFAULT_SMART_TURN_MODEL_PATH = "/opt/models/smart-turn-v3.2-cpu.onnx"
 
 
-def _required(environ: Mapping[str, str], *names: str) -> str:
+def _required(environ: Mapping[str, str], *names: str, kind: str = "configuration") -> str:
     for name in names:
         value = environ.get(name, "").strip()
         if value:
             return value
     joined = " or ".join(names)
-    raise ValueError(f"Missing required secret: {joined}")
+    raise ValueError(f"Missing required {kind}: {joined}")
 
 
 def _bool(environ: Mapping[str, str], name: str, default: bool) -> bool:
@@ -44,8 +42,15 @@ def _positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
 
 
 def build_config(environ: Mapping[str, str]) -> dict[str, object]:
-    hf_token = _required(environ, "HF_TOKEN")
-    openai_key = _required(environ, "RESPONSES_API_API_KEY", "OPENAI_API_KEY")
+    hf_token = _required(environ, "HF_TOKEN", kind="secret")
+    openai_key = _required(
+        environ,
+        "RESPONSES_API_API_KEY",
+        "OPENAI_API_KEY",
+        kind="secret",
+    )
+    stt_base_url = _required(environ, "STT_BASE_URL")
+    tts_base_url = _required(environ, "TTS_BASE_URL")
     config: dict[str, object] = {
         "host": "0.0.0.0",
         "port": int(environ.get("PORT", "7860")),
@@ -55,7 +60,7 @@ def build_config(environ: Mapping[str, str]) -> dict[str, object]:
         "enable_live_transcription": _bool(environ, "ENABLE_LIVE_TRANSCRIPTION", False),
         "smart_turn_model_path": environ.get("SMART_TURN_MODEL_PATH", DEFAULT_SMART_TURN_MODEL_PATH),
         "stt": "openai",
-        "openai_stt_base_url": environ.get("STT_BASE_URL", DEFAULT_STT_BASE_URL),
+        "openai_stt_base_url": stt_base_url,
         "openai_stt_api_key": hf_token,
         "openai_stt_model": environ.get("STT_MODEL", "Qwen/Qwen3-ASR-1.7B"),
         "openai_stt_response_format": "json",
@@ -66,7 +71,7 @@ def build_config(environ: Mapping[str, str]) -> dict[str, object]:
         "responses_api_reasoning_effort": environ.get("RESPONSES_API_REASONING_EFFORT", "none"),
         "stream_batch_sentences": _positive_int(environ, "STREAM_BATCH_SENTENCES", 3),
         "tts": "openai",
-        "openai_tts_base_url": environ.get("TTS_BASE_URL", DEFAULT_TTS_BASE_URL),
+        "openai_tts_base_url": tts_base_url,
         "openai_tts_api_key": hf_token,
         "openai_tts_model": environ.get(
             "TTS_MODEL",

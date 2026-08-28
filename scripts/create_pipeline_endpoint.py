@@ -83,14 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--type", choices=("protected", "public", "private"), default=DEFAULT_ENDPOINT_TYPE)
     parser.add_argument("--min-replica", type=int, default=1)
     parser.add_argument("--max-replica", type=int, default=1)
-    parser.add_argument(
-        "--stt-base-url",
-        default="https://go3quisjv5ta7203.us-east-1.aws.endpoints.huggingface.cloud/v1",
-    )
-    parser.add_argument(
-        "--tts-base-url",
-        default="https://db6lx9j3kdymwu9w.us-east-1.aws.endpoints.huggingface.cloud/v1",
-    )
+    parser.add_argument("--stt-base-url", required=True)
+    parser.add_argument("--tts-base-url", required=True)
     parser.add_argument("--model-name", default="gpt-5.6-terra")
     parser.add_argument("--num-pipelines", type=int, default=1)
     parser.add_argument("--stream-batch-sentences", type=int, default=3)

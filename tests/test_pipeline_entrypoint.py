@@ -32,9 +32,32 @@ class PipelineEntrypointTests(unittest.TestCase):
 
     def test_build_config_requires_both_credential_domains(self):
         with self.assertRaisesRegex(ValueError, "HF_TOKEN"):
-            build_config({"OPENAI_API_KEY": "openai-secret"})
+            build_config(
+                {
+                    "OPENAI_API_KEY": "openai-secret",
+                    "STT_BASE_URL": "https://stt.example/v1",
+                    "TTS_BASE_URL": "https://tts.example/v1",
+                }
+            )
         with self.assertRaisesRegex(ValueError, "RESPONSES_API_API_KEY or OPENAI_API_KEY"):
-            build_config({"HF_TOKEN": "hf-secret"})
+            build_config(
+                {
+                    "HF_TOKEN": "hf-secret",
+                    "STT_BASE_URL": "https://stt.example/v1",
+                    "TTS_BASE_URL": "https://tts.example/v1",
+                }
+            )
+
+    def test_build_config_requires_explicit_speech_service_urls(self):
+        base_environ = {
+            "HF_TOKEN": "hf-secret",
+            "OPENAI_API_KEY": "openai-secret",
+        }
+
+        with self.assertRaisesRegex(ValueError, "STT_BASE_URL"):
+            build_config({**base_environ, "TTS_BASE_URL": "https://tts.example/v1"})
+        with self.assertRaisesRegex(ValueError, "TTS_BASE_URL"):
+            build_config({**base_environ, "STT_BASE_URL": "https://stt.example/v1"})
 
     def test_write_private_config_uses_owner_only_permissions(self):
         config_path = write_private_config({"secret": "value"})
@@ -48,7 +71,12 @@ class PipelineEntrypointTests(unittest.TestCase):
         with (
             patch.dict(
                 os.environ,
-                {"HF_TOKEN": "hf-secret", "OPENAI_API_KEY": "openai-secret"},
+                {
+                    "HF_TOKEN": "hf-secret",
+                    "OPENAI_API_KEY": "openai-secret",
+                    "STT_BASE_URL": "https://stt.example/v1",
+                    "TTS_BASE_URL": "https://tts.example/v1",
+                },
                 clear=True,
             ),
             patch("pipeline_entrypoint.write_private_config", return_value="/tmp/private.json"),
