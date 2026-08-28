@@ -9,7 +9,7 @@ from huggingface_hub import HfApi
 
 DEFAULT_NAMESPACE = "HuggingFaceM4"
 DEFAULT_NAME = "reachy-s2s-pipeline-01"
-DEFAULT_IMAGE = "ghcr.io/andimarafioti/s2s-pipeline:v0.1"
+DEFAULT_IMAGE = "ghcr.io/andimarafioti/s2s-pipeline:v0.2"
 DEFAULT_VENDOR = "aws"
 DEFAULT_REGION = "us-east-1"
 DEFAULT_INSTANCE_TYPE = "intel-spr"

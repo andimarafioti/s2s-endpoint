@@ -35,6 +35,6 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
-          tags: ghcr.io/${{ github.repository_owner }}/s2s-pipeline:v0.1
+          tags: ghcr.io/${{ github.repository_owner }}/s2s-pipeline:v0.2
           cache-from: type=gha,scope=speech-pipeline
           cache-to: type=gha,mode=max,scope=speech-pipeline
