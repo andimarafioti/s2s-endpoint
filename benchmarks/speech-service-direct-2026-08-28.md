@@ -63,6 +63,23 @@ second test ran from synchronized US-hosted clients against the same single-A10G
 waves of five-second WAV inputs. Multiple clients were used above aggregate concurrency 64 so that a single
 client's network path would not determine the result.
 
+An additional equal-sample run sent 256 requests at every concurrency from 1 through 128. The complete US-side
+latency curve below uses that run through concurrency 64, then the synchronized multi-client results from 128
+through 512. Ranges show the lowest and highest p50 or p95 reported by the synchronized clients.
+
+| Aggregate concurrency | Load clients | Client p50 | Client p95 |
+| ---: | ---: | ---: | ---: |
+| 1 | 1 | 0.186 s | 0.191 s |
+| 2 | 1 | 0.202 s | 0.205 s |
+| 4 | 1 | 0.205 s | 0.207 s |
+| 8 | 1 | 0.211 s | 0.219 s |
+| 16 | 1 | 0.236 s | 0.398 s |
+| 32 | 1 | 0.275 s | 0.492 s |
+| 64 | 1 | 0.385 s | 0.705 s |
+| 128 | 2 | 0.513-0.542 s | 0.949-1.435 s |
+| 256 | 4 | 0.555-0.685 s | 3.166-4.019 s |
+| 512 | 4 | 0.771-0.857 s | 6.521-8.259 s |
+
 | Aggregate concurrency | Clients | Requests | Aggregate throughput | Worst client p95 | Peak vLLM running | Peak vLLM waiting |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 64 | 1 | 256 | 93.3 req/s | 1.37 s | 41 | 0 |
