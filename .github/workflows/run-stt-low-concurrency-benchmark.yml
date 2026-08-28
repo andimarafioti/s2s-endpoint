@@ -1,0 +1,55 @@
+name: Run low-concurrency STT benchmark
+
+on:
+  push:
+    branches:
+      - deploy/stt-tts-endpoints
+    paths:
+      - .github/workflows/run-stt-low-concurrency-benchmark.yml
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    if: github.event.head_commit.message == 'Run low-concurrency STT benchmark'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: requirements.txt
+
+      - name: Run equal-sample matrix
+        env:
+          HF_TOKEN: ${{ secrets.SPEECH_BENCHMARK_HF_TOKEN }}
+        run: |
+          while read -r concurrency waves; do
+            uv run --with-requirements requirements.txt \
+              python scripts/benchmark_speech_service_endpoints.py \
+              --services stt \
+              --concurrencies "$concurrency" \
+              --waves "$waves" \
+              --stt-durations 5 \
+              --client-region github-actions-c$(printf '%03d' "$concurrency") \
+              --output "logs/speech-services-stt-c$(printf '%03d' "$concurrency").json"
+          done <<'MATRIX'
+          1 256
+          2 128
+          4 64
+          8 32
+          16 16
+          32 8
+          64 4
+          128 2
+          MATRIX
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speech-services-stt-low-concurrency
+          path: logs/speech-services-stt-c*.json
+          if-no-files-found: error
