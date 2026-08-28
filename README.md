@@ -102,14 +102,15 @@ Build the dedicated speech-service images:
 
 ```bash
 docker buildx build --platform linux/amd64 -f Dockerfile.stt \
-  -t your-registry/s2s-stt:v0.1 --push .
+  -t your-registry/s2s-stt:v0.2 --push .
 docker buildx build --platform linux/amd64 -f Dockerfile.tts \
-  -t your-registry/s2s-tts:v0.1 --push .
+  -t your-registry/s2s-tts:v0.2 --push .
 ```
 
 The `Publish speech service images` workflow publishes the repository defaults,
-`ghcr.io/andimarafioti/s2s-stt:v0.1` and
-`ghcr.io/andimarafioti/s2s-tts:v0.1`, as Linux AMD64 images.
+`ghcr.io/andimarafioti/s2s-stt:v0.2` and
+`ghcr.io/andimarafioti/s2s-tts:v0.2`, as Linux AMD64 images. These images use
+the CUDA 12 vLLM runtime required by the current A10G endpoint hosts.
 
 Create one protected, warm A10G endpoint for each service in the production
 region. The script resolves and pins the current model revisions before it
@@ -118,14 +119,14 @@ creates anything, and refuses to reuse an existing endpoint name:
 ```bash
 uv run --with-requirements requirements.txt python scripts/create_speech_service_endpoints.py \
   --namespace HuggingFaceM4 \
-  --stt-image-url your-registry/s2s-stt:v0.1 \
-  --tts-image-url your-registry/s2s-tts:v0.1 \
+  --stt-image-url your-registry/s2s-stt:v0.2 \
+  --tts-image-url your-registry/s2s-tts:v0.2 \
   --dry-run
 
 uv run --with-requirements requirements.txt python scripts/create_speech_service_endpoints.py \
   --namespace HuggingFaceM4 \
-  --stt-image-url your-registry/s2s-stt:v0.1 \
-  --tts-image-url your-registry/s2s-tts:v0.1 \
+  --stt-image-url your-registry/s2s-stt:v0.2 \
+  --tts-image-url your-registry/s2s-tts:v0.2 \
   --wait
 ```
 
