@@ -49,7 +49,6 @@ class SpeechBackendSnapshot:
     active_requests: int
     active_work: float
     target_work: float
-    max_work: float
     ewma_latency: float | None
     requests: int
     successes: int
@@ -106,7 +105,6 @@ class SpeechBackendLease:
 class SpeechBackendPoolSettings:
     service: SpeechService
     target_work: float
-    max_work: float
     latency_target: float
     latency_weight: float = 0.25
     ewma_alpha: float = 0.2
@@ -126,8 +124,6 @@ class SpeechBackendPoolSettings:
             raise ValueError("service must be 'stt' or 'tts'")
         if self.target_work <= 0:
             raise ValueError("target_work must be > 0")
-        if self.max_work < self.target_work:
-            raise ValueError("max_work must be >= target_work")
         if self.latency_target <= 0:
             raise ValueError("latency_target must be > 0")
         if self.latency_weight < 0:
@@ -188,13 +184,10 @@ class SpeechBackendPool:
             candidates = [
                 state
                 for state in self._states.values()
-                if state.ready
-                and not state.draining
-                and state.config.name not in exclude
-                and state.active_work + work <= self.settings.max_work
+                if state.ready and not state.draining and state.config.name not in exclude
             ]
             if not candidates:
-                raise NoSpeechBackendAvailable("no ready speech backend has capacity")
+                raise NoSpeechBackendAvailable("no ready speech backend is available")
             state = min(candidates, key=self._score)
             self._selection_counter += 1
             state.last_selected = self._selection_counter
@@ -259,7 +252,6 @@ class SpeechBackendPool:
                     active_requests=state.active_requests,
                     active_work=round(state.active_work, 3),
                     target_work=self.settings.target_work,
-                    max_work=self.settings.max_work,
                     ewma_latency=state.ewma_latency,
                     requests=state.requests,
                     successes=state.successes,

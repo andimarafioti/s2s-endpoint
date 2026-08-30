@@ -32,36 +32,34 @@ class SpeechBackendPoolTests(unittest.IsolatedAsyncioTestCase):
         values = {
             "service": "tts",
             "target_work": 2,
-            "max_work": 2,
             "latency_target": 0.5,
             "tts_warmup_enabled": False,
         }
         values.update(overrides)
         return SpeechBackendPoolSettings(**values)
 
-    async def test_atomic_reservations_balance_and_honor_hard_capacity(self):
+    async def test_atomic_reservations_balance_and_continue_beyond_target(self):
         pool = SpeechBackendPool(_backends(), self.settings(), client=self.client)
         await pool.refresh_health()
 
-        leases = await asyncio.gather(*(pool.reserve(1) for _ in range(4)))
+        leases = await asyncio.gather(*(pool.reserve(1) for _ in range(6)))
         snapshots = {snapshot.name: snapshot for snapshot in await pool.snapshots()}
 
-        self.assertEqual([lease.backend_name for lease in leases], ["backend-1", "backend-2"] * 2)
-        self.assertEqual(snapshots["backend-1"].active_work, 2)
-        self.assertEqual(snapshots["backend-2"].active_work, 2)
-        with self.assertRaises(NoSpeechBackendAvailable):
-            await pool.reserve(1)
+        self.assertEqual([lease.backend_name for lease in leases], ["backend-1", "backend-2"] * 3)
+        self.assertEqual(snapshots["backend-1"].active_work, 3)
+        self.assertEqual(snapshots["backend-2"].active_work, 3)
+        self.assertGreater(snapshots["backend-1"].active_work, snapshots["backend-1"].target_work)
 
         await asyncio.gather(*(lease.release(success=True, latency=0.2) for lease in leases))
         snapshots = {snapshot.name: snapshot for snapshot in await pool.snapshots()}
         self.assertEqual(snapshots["backend-1"].active_work, 0)
-        self.assertEqual(snapshots["backend-1"].successes, 2)
+        self.assertEqual(snapshots["backend-1"].successes, 3)
         self.assertAlmostEqual(snapshots["backend-1"].ewma_latency or 0, 0.2)
 
     async def test_latency_penalty_routes_around_a_slow_idle_backend(self):
         pool = SpeechBackendPool(
             _backends(),
-            self.settings(max_work=4, latency_weight=1),
+            self.settings(latency_weight=1),
             client=self.client,
         )
         await pool.refresh_health()

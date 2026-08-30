@@ -46,7 +46,6 @@ def settings(service: str, count: int = 1, **overrides) -> SpeechProxySettings:
         ),
         "backend_api_key": "backend-secret",
         "target_work": 8 if service == "tts" else 96,
-        "max_work": 16 if service == "tts" else 128,
         "latency_target": 0.5 if service == "tts" else 0.1,
         "tts_warmup_enabled": False,
     }
@@ -71,8 +70,8 @@ class SpeechProxySettingsTests(unittest.TestCase):
         stt = SpeechProxySettings.from_env({**common, "SPEECH_PROXY_SERVICE": "stt"})
         tts = SpeechProxySettings.from_env({**common, "SPEECH_PROXY_SERVICE": "tts"})
 
-        self.assertEqual((stt.target_work, stt.max_work), (96, 128))
-        self.assertEqual((tts.target_work, tts.max_work), (8, 16))
+        self.assertEqual(stt.target_work, 96)
+        self.assertEqual(tts.target_work, 8)
         self.assertEqual(stt.backend_api_key, "hf-secret")
         self.assertEqual(stt.max_connections, 1024)
         self.assertEqual(stt.max_keepalive_connections, 256)

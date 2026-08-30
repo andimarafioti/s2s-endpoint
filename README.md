@@ -169,10 +169,11 @@ uv run --with-requirements requirements.txt python scripts/create_speech_proxy_e
 The same proxy image is configured as STT or TTS by environment. STT accounts
 for work in five-second audio equivalents; TTS accounts for concurrent calls.
 The initial operating targets are 96 STT work units and 8 TTS calls per worker,
-with hard admission limits of 128 and 16. Routing combines current work with an
-EWMA latency penalty. TTS readiness includes a real short synthesis, retries
-move to another worker only before audio reaches the caller, and cancellation
-closes the upstream response and releases its reservation.
+but these targets do not reject excess work. When every healthy worker is above
+target, new calls still go to the best available worker. Routing combines
+current work with an EWMA latency penalty. TTS readiness includes a real short
+synthesis, retries move to another worker only before audio reaches the caller,
+and cancellation closes the upstream response and releases its reservation.
 
 This first deployment intentionally uses one CPU proxy replica per service.
 Its reservations and latency history are process-local, so horizontally scaling

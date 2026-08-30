@@ -38,11 +38,9 @@ def make_args(**overrides):
         "stt_backends": ["reachy-s2s-stt-01"],
         "tts_backends": ["reachy-s2s-tts-01"],
         "stt_target_work": 96.0,
-        "stt_max_work": 128.0,
         "stt_latency_target": 0.1,
         "stt_audio_equivalent": 5.0,
         "tts_target_work": 8.0,
-        "tts_max_work": 16.0,
         "tts_latency_target": 0.5,
         "latency_weight": 0.25,
         "max_attempts": 2,
@@ -84,7 +82,6 @@ class SpeechProxyDeploymentTests(unittest.TestCase):
             "stt-proxy",
             (SpeechBackendTarget("stt-01", "https://stt.example"),),
             96,
-            128,
             0.1,
         )
         tts = SpeechProxySpec(
@@ -92,7 +89,6 @@ class SpeechProxyDeploymentTests(unittest.TestCase):
             "tts-proxy",
             (SpeechBackendTarget("tts-01", "https://tts.example"),),
             8,
-            16,
             0.5,
         )
 
@@ -104,7 +100,7 @@ class SpeechProxyDeploymentTests(unittest.TestCase):
         self.assertEqual(stt_env["STT_AUDIO_EQUIVALENT_S"], "5.0")
         self.assertNotIn("TTS_WARMUP_ENABLED", stt_env)
         self.assertEqual(tts_env["SPEECH_TARGET_WORK"], "8")
-        self.assertEqual(tts_env["SPEECH_MAX_WORK"], "16")
+        self.assertNotIn("SPEECH_MAX_WORK", tts_env)
         self.assertEqual(tts_env["TTS_WARMUP_ENABLED"], "true")
         self.assertNotIn("STT_AUDIO_EQUIVALENT_S", tts_env)
 
@@ -116,7 +112,7 @@ class SpeechProxyDeploymentTests(unittest.TestCase):
 
     def test_ensure_names_available_rejects_collisions(self):
         api = MagicMock()
-        spec = SpeechProxySpec("stt", "taken", (), 96, 128, 0.1)
+        spec = SpeechProxySpec("stt", "taken", (), 96, 0.1)
 
         with self.assertRaisesRegex(ValueError, "already exists: taken"):
             ensure_names_available(api, "org", [spec])

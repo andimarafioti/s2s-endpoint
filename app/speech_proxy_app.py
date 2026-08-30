@@ -70,7 +70,6 @@ class SpeechProxySettings:
     backends: tuple[SpeechBackendConfig, ...]
     backend_api_key: str | None = None
     target_work: float = 8.0
-    max_work: float = 16.0
     latency_target: float = 0.5
     latency_weight: float = 0.25
     ewma_alpha: float = 0.2
@@ -93,7 +92,6 @@ class SpeechProxySettings:
         SpeechBackendPoolSettings(
             service=self.service,
             target_work=self.target_work,
-            max_work=self.max_work,
             latency_target=self.latency_target,
             latency_weight=self.latency_weight,
             ewma_alpha=self.ewma_alpha,
@@ -125,8 +123,8 @@ class SpeechProxySettings:
         if service not in {"stt", "tts"}:
             raise ValueError("SPEECH_PROXY_SERVICE must be 'stt' or 'tts'")
         defaults = {
-            "stt": {"target_work": "96", "max_work": "128", "latency_target": "0.1"},
-            "tts": {"target_work": "8", "max_work": "16", "latency_target": "0.5"},
+            "stt": {"target_work": "96", "latency_target": "0.1"},
+            "tts": {"target_work": "8", "latency_target": "0.5"},
         }[service]
         backend_api_key = env_optional("SPEECH_BACKEND_API_KEY", environ=environ)
         if backend_api_key is None:
@@ -138,10 +136,6 @@ class SpeechProxySettings:
             target_work=_positive_float(
                 "SPEECH_TARGET_WORK",
                 env_text("SPEECH_TARGET_WORK", defaults["target_work"], environ=environ),
-            ),
-            max_work=_positive_float(
-                "SPEECH_MAX_WORK",
-                env_text("SPEECH_MAX_WORK", defaults["max_work"], environ=environ),
             ),
             latency_target=_positive_float(
                 "SPEECH_LATENCY_TARGET",
@@ -197,7 +191,6 @@ class SpeechProxySettings:
         return SpeechBackendPoolSettings(
             service=self.service,
             target_work=self.target_work,
-            max_work=self.max_work,
             latency_target=self.latency_target,
             latency_weight=self.latency_weight,
             ewma_alpha=self.ewma_alpha,

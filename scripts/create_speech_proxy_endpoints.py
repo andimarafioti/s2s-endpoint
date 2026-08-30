@@ -35,7 +35,6 @@ class SpeechProxySpec:
     name: str
     backends: tuple[SpeechBackendTarget, ...]
     target_work: float
-    max_work: float
     latency_target: float
 
 
@@ -66,7 +65,6 @@ def build_specs(args: argparse.Namespace, api: HfApi) -> list[SpeechProxySpec]:
                 name=args.stt_proxy_name,
                 backends=resolve_backend_targets(api, args.namespace, args.stt_backends),
                 target_work=args.stt_target_work,
-                max_work=args.stt_max_work,
                 latency_target=args.stt_latency_target,
             )
         )
@@ -77,7 +75,6 @@ def build_specs(args: argparse.Namespace, api: HfApi) -> list[SpeechProxySpec]:
                 name=args.tts_proxy_name,
                 backends=resolve_backend_targets(api, args.namespace, args.tts_backends),
                 target_work=args.tts_target_work,
-                max_work=args.tts_max_work,
                 latency_target=args.tts_latency_target,
             )
         )
@@ -112,7 +109,6 @@ def deployment_env(args: argparse.Namespace, spec: SpeechProxySpec) -> dict[str,
         "SPEECH_PROXY_SERVICE": spec.service,
         "SPEECH_BACKENDS": backends,
         "SPEECH_TARGET_WORK": str(spec.target_work),
-        "SPEECH_MAX_WORK": str(spec.max_work),
         "SPEECH_LATENCY_TARGET": str(spec.latency_target),
         "SPEECH_LATENCY_WEIGHT": str(args.latency_weight),
         "SPEECH_MAX_ATTEMPTS": str(args.max_attempts),
@@ -187,11 +183,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stt-backends", nargs="+", default=DEFAULT_STT_BACKENDS)
     parser.add_argument("--tts-backends", nargs="+", default=DEFAULT_TTS_BACKENDS)
     parser.add_argument("--stt-target-work", type=float, default=96)
-    parser.add_argument("--stt-max-work", type=float, default=128)
     parser.add_argument("--stt-latency-target", type=float, default=0.1)
     parser.add_argument("--stt-audio-equivalent", type=float, default=5)
     parser.add_argument("--tts-target-work", type=float, default=8)
-    parser.add_argument("--tts-max-work", type=float, default=16)
     parser.add_argument("--tts-latency-target", type=float, default=0.5)
     parser.add_argument("--latency-weight", type=float, default=0.25)
     parser.add_argument("--max-attempts", type=int, default=2)
@@ -212,11 +206,9 @@ def parse_args() -> argparse.Namespace:
 
     for name in (
         "stt_target_work",
-        "stt_max_work",
         "stt_latency_target",
         "stt_audio_equivalent",
         "tts_target_work",
-        "tts_max_work",
         "tts_latency_target",
         "health_interval",
         "health_timeout",
@@ -224,10 +216,6 @@ def parse_args() -> argparse.Namespace:
         "wait_timeout",
     ):
         _positive(parser, f"--{name.replace('_', '-')}", getattr(args, name))
-    if args.stt_max_work < args.stt_target_work:
-        parser.error("--stt-max-work must be >= --stt-target-work")
-    if args.tts_max_work < args.tts_target_work:
-        parser.error("--tts-max-work must be >= --tts-target-work")
     if args.latency_weight < 0:
         parser.error("--latency-weight must be >= 0")
     if args.max_attempts < 1:
