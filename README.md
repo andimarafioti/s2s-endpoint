@@ -12,7 +12,7 @@ Speech-to-speech endpoint project.
 
 ## Deployment Split
 
-This repo now builds two different images with two different app entrypoints:
+This repo builds separate images for session compute and routing:
 
 - compute image: `Dockerfile.compute`
   Starts `app.compute_main:app` on a GPU instance, runs local `speech-to-speech serve` subprocesses, and serves `/v1/realtime` directly.
@@ -31,6 +31,9 @@ GPU service images:
 - pipeline image: `Dockerfile.pipeline`
   Runs only VAD, Smart Turn, and `speech-to-speech serve` on CPU. It sends STT
   and TTS requests to the dedicated GPU endpoints and LLM requests to OpenAI.
+- speech proxy image: `Dockerfile.speech_proxy`
+  Runs as two small CPU endpoints: one stable STT address and one stable TTS
+  address. Each request is independently assigned to a ready speech worker.
 
 This is intended for a deployment with:
 
@@ -142,6 +145,46 @@ speech-to-speech pipeline. This deployment does not change
 `stream_batch_sentences`; the experiment should preserve the pipeline's current
 sentence batching while comparing service placement.
 
+Build and deploy the request-level speech proxies after the GPU workers exist:
+
+```bash
+docker buildx build --platform linux/amd64 -f Dockerfile.speech_proxy \
+  -t your-registry/s2s-speech-proxy:sha-YOUR_FULL_COMMIT_SHA --push .
+
+export HF_TOKEN=...
+uv run --with-requirements requirements.txt python scripts/create_speech_proxy_endpoints.py \
+  --namespace HuggingFaceM4 \
+  --image-url your-registry/s2s-speech-proxy:sha-YOUR_FULL_COMMIT_SHA \
+  --stt-backends reachy-s2s-stt-01 \
+  --tts-backends reachy-s2s-tts-01 \
+  --dry-run
+uv run --with-requirements requirements.txt python scripts/create_speech_proxy_endpoints.py \
+  --namespace HuggingFaceM4 \
+  --image-url your-registry/s2s-speech-proxy:sha-YOUR_FULL_COMMIT_SHA \
+  --stt-backends reachy-s2s-stt-01 \
+  --tts-backends reachy-s2s-tts-01 \
+  --wait
+```
+
+The same proxy image is configured as STT or TTS by environment. STT accounts
+for work in five-second audio equivalents; TTS accounts for concurrent calls.
+The initial operating targets are 96 STT work units and 8 TTS calls per worker,
+with hard admission limits of 128 and 16. Routing combines current work with an
+EWMA latency penalty. TTS readiness includes a real short synthesis, retries
+move to another worker only before audio reaches the caller, and cancellation
+closes the upstream response and releases its reservation.
+
+This first deployment intentionally uses one CPU proxy replica per service.
+Its reservations and latency history are process-local, so horizontally scaling
+the proxy would make its capacity view inconsistent. Worker membership is also
+an explicit endpoint-name list at deployment time. The autoscaling controller
+can later add, drain, wake, or remove workers behind these same stable proxy
+URLs without changing any pipeline assignment.
+
+The `Publish speech proxy image` workflow publishes immutable
+`ghcr.io/andimarafioti/s2s-speech-proxy:sha-<full-commit-sha>` images. A manual
+run can also promote a version alias.
+
 Build and deploy the CPU-only pipeline after both speech services are running:
 
 ```bash
@@ -153,14 +196,14 @@ export OPENAI_API_KEY=...
 uv run --with-requirements requirements.txt python scripts/create_pipeline_endpoint.py \
   --namespace HuggingFaceM4 \
   --image-url your-registry/s2s-pipeline:sha-YOUR_FULL_COMMIT_SHA \
-  --stt-base-url https://YOUR-STT-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
-  --tts-base-url https://YOUR-TTS-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
+  --stt-base-url https://YOUR-STT-PROXY.us-east-1.aws.endpoints.huggingface.cloud/v1 \
+  --tts-base-url https://YOUR-TTS-PROXY.us-east-1.aws.endpoints.huggingface.cloud/v1 \
   --dry-run
 uv run --with-requirements requirements.txt python scripts/create_pipeline_endpoint.py \
   --namespace HuggingFaceM4 \
   --image-url your-registry/s2s-pipeline:sha-YOUR_FULL_COMMIT_SHA \
-  --stt-base-url https://YOUR-STT-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
-  --tts-base-url https://YOUR-TTS-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
+  --stt-base-url https://YOUR-STT-PROXY.us-east-1.aws.endpoints.huggingface.cloud/v1 \
+  --tts-base-url https://YOUR-TTS-PROXY.us-east-1.aws.endpoints.huggingface.cloud/v1 \
   --wait
 ```
 
