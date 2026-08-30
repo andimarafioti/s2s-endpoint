@@ -29,7 +29,9 @@ on:
       - app/app_utils.py
       - app/speech_proxy_app.py
       - app/speech_proxy_main.py
+      - app/speech_proxy_metrics.py
       - app/speech_proxy_router.py
+      - app/speech_service_timing.py
 
 permissions:
   contents: read

@@ -132,6 +132,14 @@ def main() -> None:
     parser.add_argument(
         "--hf-endpoint-namespace", help="Namespace that owns the compute endpoints; defaults to --namespace"
     )
+    parser.add_argument("--speech-stt-proxy-url", help="Root URL of the protected STT proxy for dashboard metrics")
+    parser.add_argument("--speech-tts-proxy-url", help="Root URL of the protected TTS proxy for dashboard metrics")
+    parser.add_argument(
+        "--speech-proxy-metrics-timeout-s",
+        type=float,
+        default=5,
+        help="Timeout for load-balancer dashboard requests to speech proxy metrics",
+    )
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY, help=argparse.SUPPRESS)
     parser.add_argument("--account-id", help="Optional account id")
     parser.add_argument("--revision", help="Optional repo revision")
@@ -147,6 +155,8 @@ def main() -> None:
     args.session_shared_secret = args.session_shared_secret.strip()
     if not args.session_shared_secret:
         raise ValueError("--session-shared-secret must be a non-empty string")
+    if args.speech_proxy_metrics_timeout_s <= 0:
+        raise ValueError("--speech-proxy-metrics-timeout-s must be > 0")
 
     env = load_json_file(args.env_file) or {}
     secrets = load_json_file(args.secret_file) or {}
@@ -189,6 +199,12 @@ def main() -> None:
             "SESSION_REAP_INTERVAL_S": str(args.session_reap_interval_s),
         }
     )
+    if args.speech_stt_proxy_url:
+        env["SPEECH_STT_PROXY_URL"] = args.speech_stt_proxy_url.rstrip("/")
+    if args.speech_tts_proxy_url:
+        env["SPEECH_TTS_PROXY_URL"] = args.speech_tts_proxy_url.rstrip("/")
+    if args.speech_stt_proxy_url or args.speech_tts_proxy_url:
+        env["SPEECH_PROXY_METRICS_TIMEOUT_S"] = str(args.speech_proxy_metrics_timeout_s)
 
     custom_image = build_custom_image(args.image_url, args.image_health_route, args.image_port)
 

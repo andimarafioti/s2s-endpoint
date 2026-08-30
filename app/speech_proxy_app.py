@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import time
+import uuid
 import wave
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -14,6 +15,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import UploadFile
 
 from app.app_utils import build_lifespan, env_bool, env_optional, env_text, setup_logging
+from app.speech_proxy_metrics import (
+    SERVICE_LATENCY_HEADER,
+    SpeechProxyMetrics,
+    SpeechRequestTrace,
+    sample_headers,
+)
 from app.speech_proxy_router import (
     NoSpeechBackendAvailable,
     SpeechBackendConfig,
@@ -211,6 +218,7 @@ class SpeechProxySettings:
 class SpeechProxyDependencies:
     pool: SpeechBackendPool
     client: httpx.AsyncClient
+    metrics: SpeechProxyMetrics | None = None
     owns_client: bool = True
 
     async def start(self) -> None:
@@ -230,7 +238,11 @@ def create_dependencies(settings: SpeechProxySettings) -> SpeechProxyDependencie
     )
     client = httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True)
     pool = SpeechBackendPool(settings.backends, settings.pool_settings(), client=client)
-    return SpeechProxyDependencies(pool=pool, client=client)
+    return SpeechProxyDependencies(
+        pool=pool,
+        client=client,
+        metrics=SpeechProxyMetrics(settings.service),
+    )
 
 
 def _backend_headers(settings: SpeechProxySettings) -> dict[str, str]:
@@ -242,6 +254,19 @@ def _backend_headers(settings: SpeechProxySettings) -> dict[str, str]:
 
 def _response_headers(response: httpx.Response) -> dict[str, str]:
     return {name: value for name, value in response.headers.items() if name.lower() in RESPONSE_HEADERS}
+
+
+def _request_id(request: Request) -> str:
+    supplied = request.headers.get("x-speech-request-id", "").strip()
+    supplied = "".join(character for character in supplied if character.isalnum() or character in "-_.")[:128]
+    return supplied or uuid.uuid4().hex
+
+
+def _traced_response_headers(response: httpx.Response, trace: SpeechRequestTrace) -> dict[str, str]:
+    headers = _response_headers(response)
+    if trace.sample is not None:
+        headers.update(sample_headers(trace.sample))
+    return headers
 
 
 def _wav_duration(content: bytes) -> float | None:
@@ -315,50 +340,73 @@ async def _proxy_stt(
     request: Request,
     settings: SpeechProxySettings,
     dependencies: SpeechProxyDependencies,
+    trace: SpeechRequestTrace,
 ) -> Response:
-    multipart, duration_s = await _stt_form(request)
-    work = max(duration_s / settings.stt_audio_equivalent_s, 1.0)
-    excluded: set[str] = set()
-    last_error = "no backend attempt was made"
-    for _ in range(settings.max_attempts):
-        try:
-            lease = await dependencies.pool.reserve(work, exclude=frozenset(excluded))
-        except NoSpeechBackendAvailable:
-            break
-        excluded.add(lease.backend_name)
-        started = time.monotonic()
-        try:
-            response = await dependencies.client.post(
-                f"{lease.backend_url}/v1/audio/transcriptions",
-                headers=_backend_headers(settings),
-                files=multipart,
-                timeout=settings.request_timeout_s,
+    try:
+        multipart, duration_s = await _stt_form(request)
+        work = max(duration_s / settings.stt_audio_equivalent_s, 1.0)
+        excluded: set[str] = set()
+        last_error = "no backend attempt was made"
+        for _ in range(settings.max_attempts):
+            try:
+                lease = await dependencies.pool.reserve(work, exclude=frozenset(excluded))
+            except NoSpeechBackendAvailable:
+                break
+            excluded.add(lease.backend_name)
+            started = time.monotonic()
+            trace.start_upstream(lease.backend_name)
+            try:
+                response = await dependencies.client.post(
+                    f"{lease.backend_url}/v1/audio/transcriptions",
+                    headers={
+                        **_backend_headers(settings),
+                        "X-Speech-Request-Id": trace.request_id,
+                    },
+                    files=multipart,
+                    timeout=settings.request_timeout_s,
+                )
+            except asyncio.CancelledError:
+                trace.finish_upstream()
+                await lease.release(success=False, cancelled=True)
+                raise
+            except httpx.HTTPError as exc:
+                trace.finish_upstream()
+                last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("STT backend %s transport failed: %s", lease.backend_name, last_error)
+                await lease.release(success=False, retryable_failure=True, error=last_error)
+                continue
+            trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
+            elapsed = time.monotonic() - started
+            success = 200 <= response.status_code < 300
+            retryable = _retryable_response(response.status_code, response.content)
+            latency_metric = elapsed / duration_s if duration_s > 0 else elapsed
+            await lease.release(
+                success=success,
+                latency=latency_metric,
+                retryable_failure=retryable,
+                error=None if success else f"HTTP {response.status_code}",
             )
-        except asyncio.CancelledError:
-            await lease.release(success=False, cancelled=True)
-            raise
-        except httpx.HTTPError as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            logger.warning("STT backend %s transport failed: %s", lease.backend_name, last_error)
-            await lease.release(success=False, retryable_failure=True, error=last_error)
-            continue
-        elapsed = time.monotonic() - started
-        success = 200 <= response.status_code < 300
-        retryable = _retryable_response(response.status_code, response.content)
-        latency_metric = elapsed / duration_s if duration_s > 0 else elapsed
-        await lease.release(
-            success=success,
-            latency=latency_metric,
-            retryable_failure=retryable,
-            error=None if success else f"HTTP {response.status_code}",
-        )
-        if retryable:
-            last_error = f"backend returned HTTP {response.status_code}"
-            logger.warning("STT backend %s %s", lease.backend_name, last_error)
-            continue
-        return _upstream_error(response.status_code, response.content, _response_headers(response))
-    logger.error("No STT backend completed the request: %s", last_error)
-    return _unavailable_response("stt")
+            if retryable:
+                last_error = f"backend returned HTTP {response.status_code}"
+                logger.warning("STT backend %s %s", lease.backend_name, last_error)
+                continue
+            await trace.record("success" if success else "error")
+            return _upstream_error(
+                response.status_code,
+                response.content,
+                _traced_response_headers(response, trace),
+            )
+        logger.error("No STT backend completed the request: %s", last_error)
+        sample = await trace.record("error")
+        response = _unavailable_response("stt")
+        response.headers.update(sample_headers(sample))
+        return response
+    except asyncio.CancelledError:
+        await trace.record("cancelled")
+        raise
+    except Exception:
+        await trace.record("error")
+        raise
 
 
 async def _read_first_chunk(response: httpx.Response) -> tuple[bytes, Any]:
@@ -406,76 +454,100 @@ async def _proxy_tts(
     request: Request,
     settings: SpeechProxySettings,
     dependencies: SpeechProxyDependencies,
+    trace: SpeechRequestTrace,
 ) -> Response:
-    body = await request.body()
-    excluded: set[str] = set()
-    last_error = "no backend attempt was made"
-    for _ in range(settings.max_attempts):
-        try:
-            lease = await dependencies.pool.reserve(1.0, exclude=frozenset(excluded))
-        except NoSpeechBackendAvailable:
-            break
-        excluded.add(lease.backend_name)
-        started = time.monotonic()
-        upstream_request = dependencies.client.build_request(
-            "POST",
-            f"{lease.backend_url}/v1/audio/speech",
-            headers={
-                **_backend_headers(settings),
-                "Content-Type": request.headers.get("content-type", "application/json"),
-            },
-            content=body,
-            timeout=settings.request_timeout_s,
-        )
-        try:
-            response = await dependencies.client.send(upstream_request, stream=True)
-        except asyncio.CancelledError:
-            await lease.release(success=False, cancelled=True)
-            raise
-        except httpx.HTTPError as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            logger.warning("TTS backend %s transport failed: %s", lease.backend_name, last_error)
-            await lease.release(success=False, retryable_failure=True, error=last_error)
-            continue
-        if not 200 <= response.status_code < 300:
-            response_body = await response.aread()
-            headers = _response_headers(response)
-            retryable = _retryable_response(response.status_code, response_body)
-            await response.aclose()
-            await lease.release(
-                success=False,
-                retryable_failure=retryable,
-                error=f"HTTP {response.status_code}",
+    try:
+        body = await request.body()
+        excluded: set[str] = set()
+        last_error = "no backend attempt was made"
+        for _ in range(settings.max_attempts):
+            try:
+                lease = await dependencies.pool.reserve(1.0, exclude=frozenset(excluded))
+            except NoSpeechBackendAvailable:
+                break
+            excluded.add(lease.backend_name)
+            started = time.monotonic()
+            trace.start_upstream(lease.backend_name)
+            upstream_request = dependencies.client.build_request(
+                "POST",
+                f"{lease.backend_url}/v1/audio/speech",
+                headers={
+                    **_backend_headers(settings),
+                    "Content-Type": request.headers.get("content-type", "application/json"),
+                    "X-Speech-Request-Id": trace.request_id,
+                },
+                content=body,
+                timeout=settings.request_timeout_s,
             )
-            if retryable:
-                last_error = f"backend returned HTTP {response.status_code}"
-                logger.warning("TTS backend %s %s", lease.backend_name, last_error)
+            try:
+                response = await dependencies.client.send(upstream_request, stream=True)
+            except asyncio.CancelledError:
+                trace.finish_upstream()
+                await lease.release(success=False, cancelled=True)
+                raise
+            except httpx.HTTPError as exc:
+                trace.finish_upstream()
+                last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("TTS backend %s transport failed: %s", lease.backend_name, last_error)
+                await lease.release(success=False, retryable_failure=True, error=last_error)
                 continue
-            return _upstream_error(response.status_code, response_body, headers)
-        try:
-            first_chunk, iterator = await _read_first_chunk(response)
-        except asyncio.CancelledError:
-            await response.aclose()
-            await lease.release(
-                success=False,
-                cancelled=True,
-                latency=time.monotonic() - started,
+            if not 200 <= response.status_code < 300:
+                response_body = await response.aread()
+                trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
+                retryable = _retryable_response(response.status_code, response_body)
+                await response.aclose()
+                await lease.release(
+                    success=False,
+                    retryable_failure=retryable,
+                    error=f"HTTP {response.status_code}",
+                )
+                if retryable:
+                    last_error = f"backend returned HTTP {response.status_code}"
+                    logger.warning("TTS backend %s %s", lease.backend_name, last_error)
+                    continue
+                await trace.record("error")
+                return _upstream_error(
+                    response.status_code,
+                    response_body,
+                    _traced_response_headers(response, trace),
+                )
+            try:
+                first_chunk, iterator = await _read_first_chunk(response)
+            except asyncio.CancelledError:
+                trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
+                await response.aclose()
+                await lease.release(
+                    success=False,
+                    cancelled=True,
+                    latency=time.monotonic() - started,
+                )
+                raise
+            except (httpx.HTTPError, httpx.StreamError, StopAsyncIteration) as exc:
+                trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
+                last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("TTS backend %s failed before first audio: %s", lease.backend_name, last_error)
+                await response.aclose()
+                await lease.release(success=False, retryable_failure=True, error=last_error)
+                continue
+            trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
+            first_audio_latency = time.monotonic() - started
+            await trace.record("success")
+            return StreamingResponse(
+                _tts_stream(first_chunk, iterator, response, lease, first_audio_latency),
+                status_code=response.status_code,
+                headers=_traced_response_headers(response, trace),
             )
-            raise
-        except (httpx.HTTPError, httpx.StreamError, StopAsyncIteration) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            logger.warning("TTS backend %s failed before first audio: %s", lease.backend_name, last_error)
-            await response.aclose()
-            await lease.release(success=False, retryable_failure=True, error=last_error)
-            continue
-        first_audio_latency = time.monotonic() - started
-        return StreamingResponse(
-            _tts_stream(first_chunk, iterator, response, lease, first_audio_latency),
-            status_code=response.status_code,
-            headers=_response_headers(response),
-        )
-    logger.error("No TTS backend started a response: %s", last_error)
-    return _unavailable_response("tts")
+        logger.error("No TTS backend started a response: %s", last_error)
+        sample = await trace.record("error")
+        response = _unavailable_response("tts")
+        response.headers.update(sample_headers(sample))
+        return response
+    except asyncio.CancelledError:
+        await trace.record("cancelled")
+        raise
+    except Exception:
+        await trace.record("error")
+        raise
 
 
 def create_app(
@@ -483,6 +555,8 @@ def create_app(
     dependencies: SpeechProxyDependencies | None = None,
 ) -> FastAPI:
     dependencies = dependencies or create_dependencies(settings)
+    if dependencies.metrics is None:
+        dependencies.metrics = SpeechProxyMetrics(settings.service)
 
     app = FastAPI(
         title=f"S2S {settings.service.upper()} proxy",
@@ -498,6 +572,7 @@ def create_app(
             "role": APP_ROLE,
             "service": settings.service,
             "health": "/health",
+            "metrics": "/metrics",
         }
 
     @app.get("/health")
@@ -514,16 +589,26 @@ def create_app(
             return JSONResponse(payload, status_code=503)
         return payload
 
+    @app.get("/metrics")
+    async def metrics(window_s: float = 300.0):
+        try:
+            payload = await dependencies.metrics.snapshot(window_s)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return payload
+
     if settings.service == "stt":
 
         @app.post("/v1/audio/transcriptions")
         async def transcriptions(request: Request):
-            return await _proxy_stt(request, settings, dependencies)
+            trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
+            return await _proxy_stt(request, settings, dependencies, trace)
 
     else:
 
         @app.post("/v1/audio/speech")
         async def speech(request: Request):
-            return await _proxy_tts(request, settings, dependencies)
+            trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
+            return await _proxy_tts(request, settings, dependencies, trace)
 
     return app

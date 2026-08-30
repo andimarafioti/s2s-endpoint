@@ -20,6 +20,7 @@ from app.requester_identity import RequesterIdentity
 from app.requester_usage import RequesterUsageService, RequesterUsageThresholds
 
 SnapshotProvider = Callable[[], Awaitable[tuple[bool, Optional[str], dict[str, object]]]]
+SpeechTelemetryProvider = Callable[[float], Awaitable[dict[str, object]]]
 ROLLING_VIEW_WINDOWS: tuple[tuple[str, int], ...] = (
     ("1h", 60),
     ("6h", 6 * 60),
@@ -197,6 +198,7 @@ class SwarmDashboard:
         self,
         *,
         snapshot_provider: SnapshotProvider,
+        speech_telemetry_provider: SpeechTelemetryProvider | None = None,
         sample_interval_s: float = 15.0,
         retention_minutes: int = 28 * 24 * 60,
         history_store: Optional[DashboardHistoryStore] = None,
@@ -216,6 +218,7 @@ class SwarmDashboard:
             raise ValueError("sample_interval_s must be > 0")
 
         self.snapshot_provider = snapshot_provider
+        self.speech_telemetry_provider = speech_telemetry_provider
         self.sample_interval_s = sample_interval_s
         self.retention_minutes = retention_minutes
         self.history_store = history_store
@@ -349,6 +352,11 @@ class SwarmDashboard:
         summary = await self.summary(window_minutes=window_minutes, requested_window=window or "6h")
         requesters = await self.requesters.data(window_minutes=window_minutes)
         summary.update(requesters["summary"])
+        speech_proxies = (
+            await self.speech_telemetry_provider(window_minutes * 60.0)
+            if self.speech_telemetry_provider is not None
+            else {"configured": False, "window_s": window_minutes * 60.0, "services": {}}
+        )
 
         return {
             "generated_at": _isoformat(self._time_fn()),
@@ -360,6 +368,7 @@ class SwarmDashboard:
             "current": current.to_dict(),
             "summary": summary,
             "requesters": requesters,
+            "speech_proxies": speech_proxies,
             "series": series,
             "rolling_windows": [{"label": label, "minutes": minutes} for label, minutes in ROLLING_VIEW_WINDOWS],
             "rolling_series": rolling_series,
@@ -798,6 +807,34 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
     .status-pill.warm { color: var(--warm); background: rgba(217, 130, 43, 0.12); }
     .status-pill.bad { color: var(--danger); background: rgba(187, 45, 59, 0.10); }
 
+    .speech-latency-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+      margin-top: 14px;
+    }
+
+    .speech-latency-service {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.58);
+      overflow-x: auto;
+    }
+
+    .speech-latency-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .speech-latency-title strong {
+      font-size: 20px;
+      letter-spacing: -0.03em;
+    }
+
     .fleet-summary {
       display: flex;
       flex-wrap: wrap;
@@ -956,7 +993,7 @@ def _dashboard_html(*, history_persisted: bool = False) -> str:
 __REQUESTER_DASHBOARD_STYLES__
 
     @media (max-width: 1100px) {
-      .hero, .kpis, .rolling-grid { grid-template-columns: 1fr; }
+      .hero, .kpis, .rolling-grid, .speech-latency-grid { grid-template-columns: 1fr; }
       .span-4, .span-6, .span-8 { grid-column: span 12; }
     }
 
@@ -1064,6 +1101,17 @@ __REQUESTER_DASHBOARD_STYLES__
       </div>
 
 __REQUESTER_DASHBOARD_MARKUP__
+
+      <div class="panel card span-12">
+        <div class="label">Speech / Selected Window</div>
+        <h2>Proxy And GPU Latency</h2>
+        <div id="speech-latency"></div>
+        <div class="footer-note">
+          Proxy total is measured from proxy handler arrival to the transcription or first audio.
+          GPU service time is reported inside the model server; backend transport covers the remaining
+          proxy-to-GPU endpoint and gateway time. Client-to-proxy gateway time is outside this measurement.
+        </div>
+      </div>
 
       <div class="panel card span-12">
         <div class="label">Current Fleet</div>
@@ -1293,6 +1341,64 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
         kpiCard('Free slots', prettyNumber(current.free_slots), 'Currently running free slots'),
         kpiCard('Errors', prettyNumber(current.errors_count), current.healthy ? 'No active router errors' : (current.detail || 'Swarm is degraded')),
       ].join('');
+    }
+
+    function formatLatencyMs(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return '—';
+      if (numeric >= 1000) return `${(numeric / 1000).toFixed(2)} s`;
+      return `${numeric.toFixed(numeric >= 100 ? 0 : 1)} ms`;
+    }
+
+    function renderSpeechLatency(telemetry, windowLabel) {
+      const target = document.getElementById('speech-latency');
+      if (!telemetry.configured) {
+        target.innerHTML = '<div class="muted">Speech proxy telemetry is not configured on this load balancer.</div>';
+        return;
+      }
+      const labels = {
+        total: 'Proxy-observed total',
+        proxy_path_overhead: 'Proxy-path overhead',
+        backend_service: 'GPU service',
+        backend_transport: 'Backend transport / gateway',
+        proxy_application: 'Proxy application',
+        backend_round_trip: 'Backend round trip',
+      };
+      target.innerHTML = `<div class="speech-latency-grid">${['stt', 'tts'].map((service) => {
+        const entry = (telemetry.services || {})[service];
+        if (!entry) return '';
+        if (!entry.reachable) {
+          return `<div class="speech-latency-service">
+            <div class="speech-latency-title"><strong>${service.toUpperCase()}</strong><span class="status-pill bad">unavailable</span></div>
+            <div class="muted">${htmlEscape(entry.error || 'Metrics endpoint could not be reached.')}</div>
+          </div>`;
+        }
+        const requests = entry.requests || {};
+        const coverage = entry.service_timing_coverage || {};
+        const latency = entry.latency_ms || {};
+        const rows = Object.entries(labels).map(([key, label]) => {
+          const stats = latency[key] || { n: 0 };
+          return `<tr>
+            <td>${htmlEscape(label)}</td>
+            <td class="mono">${htmlEscape(formatLatencyMs(stats.p50))}</td>
+            <td class="mono">${htmlEscape(formatLatencyMs(stats.p95))}</td>
+            <td class="mono">${htmlEscape(prettyNumber(stats.n || 0))}</td>
+          </tr>`;
+        }).join('');
+        const phase = entry.phase === 'first_audio' ? 'first audio' : 'transcription';
+        const coveragePercent = `${(Number(coverage.ratio || 0) * 100).toFixed(0)}%`;
+        return `<div class="speech-latency-service">
+          <div class="speech-latency-title">
+            <strong>${service.toUpperCase()} · ${htmlEscape(phase)}</strong>
+            <span class="status-pill good">${htmlEscape(prettyNumber(requests.window || 0))} requests / ${htmlEscape(windowLabel)}</span>
+          </div>
+          <table>
+            <thead><tr><th>Component</th><th>p50</th><th>p95</th><th>n</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+          <div class="footer-note">GPU timing coverage ${htmlEscape(coveragePercent)} · pre-result errors ${htmlEscape(prettyNumber(requests.errors || 0))} · cancellations ${htmlEscape(prettyNumber(requests.cancellations || 0))}</div>
+        </div>`;
+      }).join('')}</div>`;
     }
 
 __REQUESTER_DASHBOARD_SCRIPT__
@@ -1634,6 +1740,7 @@ __REQUESTER_DASHBOARD_SCRIPT__
 
       renderHeroStats(current, summary);
       renderKpis(current, summary);
+      renderSpeechLatency(payload.speech_proxies || {}, summary.window_label || payload.window.requested);
       renderRequesterUsage(payload.requesters || {}, summary);
       renderHealth(current);
       renderEndpointWall(current.endpoints || []);

@@ -9,7 +9,10 @@ ARG VLLM_VERSION
 # Keep the extra version aligned with the preinstalled vLLM package.
 RUN uv pip install --system --no-cache-dir "vllm[audio]==${VLLM_VERSION}"
 
+COPY app/speech_service_timing.py /opt/s2s-observability/speech_service_timing.py
+ENV PYTHONPATH=/opt/s2s-observability
+
 EXPOSE 8000
 
 ENTRYPOINT ["vllm", "serve"]
-CMD ["/repository", "--served-model-name", "Qwen/Qwen3-ASR-1.7B", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["/repository", "--served-model-name", "Qwen/Qwen3-ASR-1.7B", "--host", "0.0.0.0", "--port", "8000", "--middleware", "speech_service_timing.SpeechServiceTimingMiddleware", "--enable-request-id-headers"]

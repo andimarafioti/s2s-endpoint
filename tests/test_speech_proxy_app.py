@@ -106,7 +106,11 @@ class SpeechProxyApplicationTests(unittest.TestCase):
                 return httpx.Response(200, json={"status": "ok"})
             snapshot = (await deps_holder["value"].pool.snapshots())[0]
             active_work.append(snapshot.active_work)
-            return httpx.Response(200, json={"text": "hello"})
+            return httpx.Response(
+                200,
+                json={"text": "hello"},
+                headers={"x-speech-service-latency-ms": "0.010"},
+            )
 
         proxy_settings = settings("stt")
         deps = dependencies(proxy_settings, handler)
@@ -116,13 +120,18 @@ class SpeechProxyApplicationTests(unittest.TestCase):
         with TestClient(app) as client:
             response = client.post(
                 "/v1/audio/transcriptions",
+                headers={"X-Speech-Request-Id": "trace-stt"},
                 data={"model": "asr-model", "response_format": "json"},
                 files={"file": ("audio.wav", wav_bytes(20), "audio/wav")},
             )
             health = client.get("/health").json()
+            metrics = client.get("/metrics", params={"window_s": 60}).json()
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"text": "hello"})
+        self.assertEqual(response.headers["x-speech-request-id"], "trace-stt")
+        self.assertEqual(float(response.headers["x-speech-service-latency-ms"]), 0.010)
+        self.assertIn("speech-proxy;dur=", response.headers["server-timing"])
         upstream = next(item for item in seen if item[1] == "/v1/audio/transcriptions")
         self.assertEqual(upstream[2], "Bearer backend-secret")
         self.assertIn(b"asr-model", upstream[3])
@@ -132,6 +141,9 @@ class SpeechProxyApplicationTests(unittest.TestCase):
         self.assertEqual(backend["active_work"], 0)
         self.assertEqual(backend["successes"], 1)
         self.assertEqual(backend["requests"], 1)
+        self.assertEqual(metrics["requests"]["successes"], 1)
+        self.assertEqual(metrics["latency_ms"]["backend_service"]["n"], 1)
+        self.assertEqual(metrics["service_timing_coverage"]["ratio"], 1)
 
     def test_tts_retries_another_backend_before_streaming_begins(self):
         attempts: list[str] = []

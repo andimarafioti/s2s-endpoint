@@ -186,6 +186,34 @@ The `Publish speech service images` workflow can selectively publish immutable
 `ghcr.io/andimarafioti/s2s-speech-proxy:sha-<full-commit-sha>` images. A manual
 run can also promote a version alias.
 
+All STT and TTS requests use the same telemetry implementation. Proxy responses
+include `X-Speech-Request-Id`, `Server-Timing`, and component latency headers,
+and each proxy exposes `/metrics?window_s=...` with p50, p90, p95, and p99
+latencies. The metrics separate proxy application work from the backend round
+trip. The GPU service images add the same timing middleware to both vLLM
+servers, allowing the proxies to split that backend round trip into model
+service time and endpoint transport/gateway time. For TTS, service time ends at
+the first non-empty audio chunk; for STT, it ends at the transcription body.
+These metrics are process-local, keep the most recent 50,000 requests, and reset
+when the proxy restarts.
+
+Configure the load-balancer dashboard with the two proxy root URLs. Protected
+proxy requests reuse `HF_CONTROL_TOKEN`/`HF_TOKEN` unless
+`SPEECH_PROXY_API_KEY` is set explicitly:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/update_load_balancer_endpoint_env.py \
+  --namespace HuggingFaceM4 \
+  --name reachy-s2s-lb \
+  --env SPEECH_STT_PROXY_URL=https://STT-PROXY-HOST \
+  --env SPEECH_TTS_PROXY_URL=https://TTS-PROXY-HOST
+```
+
+The dashboard displays STT and TTS together for the selected dashboard window.
+If the GPU images have not yet been redeployed with the timing middleware, the
+proxy and backend-round-trip metrics still work, while GPU-service timing is
+shown as unavailable with zero reporting coverage.
+
 Build and deploy the CPU-only pipeline after both speech services are running:
 
 ```bash
