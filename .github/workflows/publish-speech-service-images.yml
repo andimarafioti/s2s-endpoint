@@ -3,6 +3,16 @@ name: Publish speech service images
 on:
   workflow_dispatch:
     inputs:
+      service:
+        description: Image to publish
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - stt
+          - tts
+          - proxy
       release_tag:
         description: Optional version alias to publish, such as v0.3
         required: false
@@ -14,6 +24,12 @@ on:
       - .github/workflows/publish-speech-service-images.yml
       - Dockerfile.stt
       - Dockerfile.tts
+      - Dockerfile.speech_proxy
+      - requirements.txt
+      - app/app_utils.py
+      - app/speech_proxy_app.py
+      - app/speech_proxy_main.py
+      - app/speech_proxy_router.py
 
 permissions:
   contents: read
@@ -21,15 +37,26 @@ permissions:
 
 jobs:
   publish:
+    if: inputs.service == '' || inputs.service == 'all' || inputs.service == matrix.service
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service:
-          - stt
-          - tts
+        include:
+          - service: stt
+            image: s2s-stt
+            dockerfile: Dockerfile.stt
+            cache_scope: speech-stt
+          - service: tts
+            image: s2s-tts
+            dockerfile: Dockerfile.tts
+            cache_scope: speech-tts
+          - service: proxy
+            image: s2s-speech-proxy
+            dockerfile: Dockerfile.speech_proxy
+            cache_scope: speech-proxy
     env:
-      IMAGE: ghcr.io/${{ github.repository_owner }}/s2s-${{ matrix.service }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
 
@@ -63,10 +90,10 @@ jobs:
       - uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile.${{ matrix.service }}
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
           provenance: false
           tags: ${{ steps.tags.outputs.value }}
-          cache-from: type=gha,scope=speech-${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=speech-${{ matrix.service }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}

@@ -182,7 +182,7 @@ an explicit endpoint-name list at deployment time. The autoscaling controller
 can later add, drain, wake, or remove workers behind these same stable proxy
 URLs without changing any pipeline assignment.
 
-The `Publish speech proxy image` workflow publishes immutable
+The `Publish speech service images` workflow can selectively publish immutable
 `ghcr.io/andimarafioti/s2s-speech-proxy:sha-<full-commit-sha>` images. A manual
 run can also promote a version alias.
 
