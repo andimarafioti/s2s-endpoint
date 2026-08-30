@@ -1,3 +1,4 @@
+import asyncio
 import io
 import unittest
 import wave
@@ -73,6 +74,8 @@ class SpeechProxySettingsTests(unittest.TestCase):
         self.assertEqual((stt.target_work, stt.max_work), (96, 128))
         self.assertEqual((tts.target_work, tts.max_work), (8, 16))
         self.assertEqual(stt.backend_api_key, "hf-secret")
+        self.assertEqual(stt.max_connections, 1024)
+        self.assertEqual(stt.max_keepalive_connections, 256)
 
     def test_invalid_service_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "must be 'stt' or 'tts'"):
@@ -250,6 +253,61 @@ class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(lease.releases), 1)
         self.assertFalse(lease.releases[0]["success"])
         self.assertTrue(lease.releases[0]["retryable_failure"])
+
+
+class ProxyCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def _cancel_inflight_request(self, service: str) -> dict:
+        request_started = asyncio.Event()
+
+        async def handler(request: httpx.Request):
+            if request.url.path == "/health":
+                return httpx.Response(200, json={"status": "ok"})
+            request_started.set()
+            await asyncio.Event().wait()
+
+        proxy_settings = settings(service)
+        deps = dependencies(proxy_settings, handler)
+        await deps.pool.refresh_health()
+        app = create_app(proxy_settings, deps)
+        proxy_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy.test",
+        )
+        self.addAsyncCleanup(proxy_client.aclose)
+        self.addAsyncCleanup(deps.stop)
+
+        if service == "tts":
+            task = asyncio.create_task(
+                proxy_client.post(
+                    "/v1/audio/speech",
+                    json={"model": "tts-model", "voice": "aiden", "input": "Hello"},
+                )
+            )
+        else:
+            task = asyncio.create_task(
+                proxy_client.post(
+                    "/v1/audio/transcriptions",
+                    data={"model": "asr-model"},
+                    files={"file": ("audio.wav", wav_bytes(), "audio/wav")},
+                )
+            )
+        await asyncio.wait_for(request_started.wait(), timeout=1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        return (await deps.pool.snapshots())[0].__dict__
+
+    async def test_tts_cancellation_before_first_audio_releases_capacity(self):
+        snapshot = await self._cancel_inflight_request("tts")
+
+        self.assertEqual(snapshot["active_work"], 0)
+        self.assertEqual(snapshot["cancellations"], 1)
+
+    async def test_stt_cancellation_releases_duration_weighted_capacity(self):
+        snapshot = await self._cancel_inflight_request("stt")
+
+        self.assertEqual(snapshot["active_work"], 0)
+        self.assertEqual(snapshot["cancellations"], 1)
 
 
 if __name__ == "__main__":

@@ -79,6 +79,8 @@ class SpeechProxySettings:
     health_interval_s: float = 10.0
     health_timeout_s: float = 5.0
     request_timeout_s: float = 120.0
+    max_connections: int = 1024
+    max_keepalive_connections: int = 256
     max_attempts: int = 2
     stt_audio_equivalent_s: float = 5.0
     tts_warmup_enabled: bool = True
@@ -108,6 +110,10 @@ class SpeechProxySettings:
         )
         if self.request_timeout_s <= 0:
             raise ValueError("request_timeout_s must be > 0")
+        if self.max_connections < 1:
+            raise ValueError("max_connections must be >= 1")
+        if not 0 <= self.max_keepalive_connections <= self.max_connections:
+            raise ValueError("max_keepalive_connections must be between 0 and max_connections")
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if self.stt_audio_equivalent_s <= 0:
@@ -160,6 +166,11 @@ class SpeechProxySettings:
                 "SPEECH_REQUEST_TIMEOUT_S",
                 env_text("SPEECH_REQUEST_TIMEOUT_S", "120", environ=environ),
             ),
+            max_connections=_positive_int(
+                "SPEECH_MAX_CONNECTIONS",
+                env_text("SPEECH_MAX_CONNECTIONS", "1024", environ=environ),
+            ),
+            max_keepalive_connections=int(env_text("SPEECH_MAX_KEEPALIVE_CONNECTIONS", "256", environ=environ)),
             max_attempts=_positive_int(
                 "SPEECH_MAX_ATTEMPTS",
                 env_text("SPEECH_MAX_ATTEMPTS", "2", environ=environ),
@@ -220,7 +231,11 @@ class SpeechProxyDependencies:
 
 def create_dependencies(settings: SpeechProxySettings) -> SpeechProxyDependencies:
     timeout = httpx.Timeout(settings.request_timeout_s, connect=min(settings.request_timeout_s, 10.0))
-    client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+    limits = httpx.Limits(
+        max_connections=settings.max_connections,
+        max_keepalive_connections=settings.max_keepalive_connections,
+    )
+    client = httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True)
     pool = SpeechBackendPool(settings.backends, settings.pool_settings(), client=client)
     return SpeechProxyDependencies(pool=pool, client=client)
 
@@ -326,6 +341,9 @@ async def _proxy_stt(
                 files=multipart,
                 timeout=settings.request_timeout_s,
             )
+        except asyncio.CancelledError:
+            await lease.release(success=False, cancelled=True)
+            raise
         except httpx.HTTPError as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             logger.warning("STT backend %s transport failed: %s", lease.backend_name, last_error)
@@ -418,6 +436,9 @@ async def _proxy_tts(
         )
         try:
             response = await dependencies.client.send(upstream_request, stream=True)
+        except asyncio.CancelledError:
+            await lease.release(success=False, cancelled=True)
+            raise
         except httpx.HTTPError as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             logger.warning("TTS backend %s transport failed: %s", lease.backend_name, last_error)
@@ -440,6 +461,14 @@ async def _proxy_tts(
             return _upstream_error(response.status_code, response_body, headers)
         try:
             first_chunk, iterator = await _read_first_chunk(response)
+        except asyncio.CancelledError:
+            await response.aclose()
+            await lease.release(
+                success=False,
+                cancelled=True,
+                latency=time.monotonic() - started,
+            )
+            raise
         except (httpx.HTTPError, httpx.StreamError, StopAsyncIteration) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             logger.warning("TTS backend %s failed before first audio: %s", lease.backend_name, last_error)
