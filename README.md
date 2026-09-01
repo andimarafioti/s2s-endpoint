@@ -180,9 +180,12 @@ first audio/token reaches the caller, and cancellation closes the upstream
 response and releases its reservation.
 
 Create the LLM proxy explicitly after the Gemma workers exist. The tested RTX
-PRO 6000 endpoint is in AWS `us-east-2`, so deploy this proxy in `us-east-2` as
-well; `us-east-1` and `us-east-2` are different regions despite sharing the
-`us-east` prefix.
+PRO 6000 endpoint is in AWS `us-east-2`, but Hugging Face currently offers no
+CPU endpoint shapes in that region. The inexpensive managed placement is
+therefore AWS `us-east-1`; measure its cross-region overhead rather than
+assuming the shared `us-east` prefix means colocation. Exact colocation would
+require running this CPU proxy outside Hugging Face Endpoints or consuming a
+second RTX PRO 6000 just for the proxy.
 
 ```bash
 uv run --with-requirements requirements.txt python scripts/create_speech_proxy_endpoints.py \
@@ -191,7 +194,7 @@ uv run --with-requirements requirements.txt python scripts/create_speech_proxy_e
   --image-url your-registry/s2s-speech-proxy:sha-YOUR_FULL_COMMIT_SHA \
   --llm-backends reachy-s2s-llm-01 \
   --llm-model nvidia/Gemma-4-26B-A4B-NVFP4 \
-  --region us-east-2 \
+  --region us-east-1 \
   --wait
 ```
 
