@@ -137,6 +137,7 @@ class LoadBalancerSettings:
     dashboard_preview_mode: bool = False
     speech_stt_proxy_url: str | None = None
     speech_tts_proxy_url: str | None = None
+    speech_llm_proxy_url: str | None = None
     speech_proxy_api_key: str | None = None
     speech_proxy_metrics_timeout_s: float = 5.0
 
@@ -327,6 +328,7 @@ class LoadBalancerSettings:
             dashboard_preview_mode=preview_mode,
             speech_stt_proxy_url=env_optional("SPEECH_STT_PROXY_URL", environ=environ),
             speech_tts_proxy_url=env_optional("SPEECH_TTS_PROXY_URL", environ=environ),
+            speech_llm_proxy_url=env_optional("SPEECH_LLM_PROXY_URL", environ=environ),
             speech_proxy_api_key=env_optional("SPEECH_PROXY_API_KEY", environ=environ),
             speech_proxy_metrics_timeout_s=float(env_text("SPEECH_PROXY_METRICS_TIMEOUT_S", "5", environ=environ)),
         )
@@ -424,6 +426,7 @@ def build_load_balancer_dependencies(settings: LoadBalancerSettings) -> LoadBala
         for service, url in (
             ("stt", settings.speech_stt_proxy_url),
             ("tts", settings.speech_tts_proxy_url),
+            ("llm", settings.speech_llm_proxy_url),
         )
         if url
     )

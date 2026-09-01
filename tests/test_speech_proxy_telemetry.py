@@ -6,12 +6,12 @@ from app.speech_proxy_telemetry import SpeechProxyTelemetryClient, SpeechProxyTe
 
 
 class SpeechProxyTelemetryClientTests(unittest.IsolatedAsyncioTestCase):
-    async def test_fetches_both_services_with_shared_window_and_auth(self):
+    async def test_fetches_all_services_with_shared_window_and_auth(self):
         seen = []
 
         async def handler(request: httpx.Request):
             seen.append(request)
-            service = "stt" if request.url.host == "stt.example" else "tts"
+            service = (request.url.host or "").split(".")[0]
             return httpx.Response(200, json={"status": "ok", "service": service, "latency_ms": {}})
 
         http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -20,6 +20,7 @@ class SpeechProxyTelemetryClientTests(unittest.IsolatedAsyncioTestCase):
             (
                 SpeechProxyTelemetryTarget("stt", "https://stt.example"),
                 SpeechProxyTelemetryTarget("tts", "https://tts.example/"),
+                SpeechProxyTelemetryTarget("llm", "https://llm.example/"),
             ),
             api_key="secret",
             client=http_client,
@@ -28,7 +29,7 @@ class SpeechProxyTelemetryClientTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await client.snapshot(3600)
 
         self.assertTrue(snapshot["configured"])
-        self.assertEqual(set(snapshot["services"]), {"stt", "tts"})
+        self.assertEqual(set(snapshot["services"]), {"stt", "tts", "llm"})
         self.assertTrue(snapshot["services"]["stt"]["reachable"])
         self.assertEqual({request.url.path for request in seen}, {"/metrics"})
         self.assertEqual({request.url.params["window_s"] for request in seen}, {"3600"})

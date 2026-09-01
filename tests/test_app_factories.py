@@ -212,6 +212,7 @@ class LoadBalancerSettingsTests(unittest.TestCase):
                 "SESSION_SHARED_SECRET": " session-secret ",
                 "SPEECH_STT_PROXY_URL": " https://stt-proxy.example ",
                 "SPEECH_TTS_PROXY_URL": " https://tts-proxy.example ",
+                "SPEECH_LLM_PROXY_URL": " https://llm-proxy.example ",
             }
         )
 
@@ -224,6 +225,7 @@ class LoadBalancerSettingsTests(unittest.TestCase):
         self.assertEqual(settings.speech_proxy_api_key, "hf-control")
         self.assertEqual(settings.speech_stt_proxy_url, "https://stt-proxy.example")
         self.assertEqual(settings.speech_tts_proxy_url, "https://tts-proxy.example")
+        self.assertEqual(settings.speech_llm_proxy_url, "https://llm-proxy.example")
         self.assertEqual(settings.dashboard_bucket_token, "hf-control")
         self.assertEqual(settings.request_usage_hash_secret, "session-secret")
 

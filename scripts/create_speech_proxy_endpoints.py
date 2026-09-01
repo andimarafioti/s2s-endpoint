@@ -17,8 +17,11 @@ DEFAULT_INSTANCE_SIZE = "x1"
 DEFAULT_ENDPOINT_TYPE = "protected"
 DEFAULT_STT_PROXY_NAME = "reachy-s2s-stt-proxy"
 DEFAULT_TTS_PROXY_NAME = "reachy-s2s-tts-proxy"
+DEFAULT_LLM_PROXY_NAME = "reachy-s2s-llm-proxy"
 DEFAULT_STT_BACKENDS = ["reachy-s2s-stt-01"]
 DEFAULT_TTS_BACKENDS = ["reachy-s2s-tts-01"]
+DEFAULT_LLM_BACKENDS = ["reachy-s2s-llm-01"]
+DEFAULT_LLM_MODEL = "nvidia/Gemma-4-26B-A4B-NVFP4"
 DEFAULT_PORT = 7860
 DEFAULT_HEALTH_ROUTE = "/health"
 
@@ -78,6 +81,16 @@ def build_specs(args: argparse.Namespace, api: HfApi) -> list[SpeechProxySpec]:
                 latency_target=args.tts_latency_target,
             )
         )
+    if "llm" in requested_services:
+        specs.append(
+            SpeechProxySpec(
+                service="llm",
+                name=args.llm_proxy_name,
+                backends=resolve_backend_targets(api, args.namespace, args.llm_backends),
+                target_work=args.llm_target_work,
+                latency_target=args.llm_latency_target,
+            )
+        )
     return specs
 
 
@@ -120,8 +133,11 @@ def deployment_env(args: argparse.Namespace, spec: SpeechProxySpec) -> dict[str,
     }
     if spec.service == "stt":
         env["STT_AUDIO_EQUIVALENT_S"] = str(args.stt_audio_equivalent)
-    else:
+    elif spec.service == "tts":
         env["TTS_WARMUP_ENABLED"] = "true"
+    else:
+        env["LLM_WARMUP_ENABLED"] = "true"
+        env["LLM_WARMUP_MODEL"] = args.llm_model
     return env
 
 
@@ -171,22 +187,27 @@ def _positive(parser: argparse.ArgumentParser, name: str, value: float) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create stable CPU STT and TTS proxies in front of dedicated speech workers."
+        description="Create stable CPU STT, TTS, and LLM proxies in front of dedicated inference workers."
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
-    parser.add_argument("--services", nargs="+", choices=("stt", "tts"), default=["stt", "tts"])
+    parser.add_argument("--services", nargs="+", choices=("stt", "tts", "llm"), default=["stt", "tts"])
     parser.add_argument("--image-url", required=True)
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY)
     parser.add_argument("--revision")
     parser.add_argument("--stt-proxy-name", default=DEFAULT_STT_PROXY_NAME)
     parser.add_argument("--tts-proxy-name", default=DEFAULT_TTS_PROXY_NAME)
+    parser.add_argument("--llm-proxy-name", default=DEFAULT_LLM_PROXY_NAME)
     parser.add_argument("--stt-backends", nargs="+", default=DEFAULT_STT_BACKENDS)
     parser.add_argument("--tts-backends", nargs="+", default=DEFAULT_TTS_BACKENDS)
+    parser.add_argument("--llm-backends", nargs="+", default=DEFAULT_LLM_BACKENDS)
     parser.add_argument("--stt-target-work", type=float, default=96)
     parser.add_argument("--stt-latency-target", type=float, default=0.1)
     parser.add_argument("--stt-audio-equivalent", type=float, default=5)
     parser.add_argument("--tts-target-work", type=float, default=8)
     parser.add_argument("--tts-latency-target", type=float, default=0.5)
+    parser.add_argument("--llm-target-work", type=float, default=64)
+    parser.add_argument("--llm-latency-target", type=float, default=0.5)
+    parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL)
     parser.add_argument("--latency-weight", type=float, default=0.25)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--max-connections", type=int, default=1024)
@@ -210,6 +231,8 @@ def parse_args() -> argparse.Namespace:
         "stt_audio_equivalent",
         "tts_target_work",
         "tts_latency_target",
+        "llm_target_work",
+        "llm_latency_target",
         "health_interval",
         "health_timeout",
         "request_timeout",

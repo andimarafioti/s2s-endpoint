@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 
 import httpx
@@ -146,6 +147,37 @@ class SpeechBackendPoolTests(unittest.IsolatedAsyncioTestCase):
         snapshot = (await pool.snapshots())[0]
         self.assertFalse(snapshot.ready)
         self.assertIn("empty response", snapshot.last_health_error or "")
+
+    async def test_llm_transition_to_ready_requires_real_completion(self):
+        requests: list[tuple[str, str, dict | None]] = []
+
+        async def handler(request: httpx.Request):
+            body = None if request.method == "GET" else json.loads(await request.aread())
+            requests.append((request.method, request.url.path, body))
+            if request.url.path == "/health":
+                return httpx.Response(200, json={"status": "ok"})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(client.aclose)
+        pool = SpeechBackendPool(
+            _backends(1),
+            self.settings(
+                service="llm",
+                target_work=64,
+                llm_warmup_enabled=True,
+                llm_warmup_model="gemma-test",
+            ),
+            client=client,
+        )
+
+        await pool.refresh_health()
+
+        self.assertTrue((await pool.snapshots())[0].ready)
+        self.assertEqual(requests[0][0:2], ("GET", "/health"))
+        self.assertEqual(requests[1][0:2], ("POST", "/v1/chat/completions"))
+        self.assertEqual(requests[1][2]["model"], "gemma-test")
+        self.assertEqual(requests[1][2]["max_tokens"], 2)
 
 
 if __name__ == "__main__":

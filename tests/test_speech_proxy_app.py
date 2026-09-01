@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import unittest
 import wave
 
@@ -45,9 +46,10 @@ def settings(service: str, count: int = 1, **overrides) -> SpeechProxySettings:
             for index in range(1, count + 1)
         ),
         "backend_api_key": "backend-secret",
-        "target_work": 8 if service == "tts" else 96,
-        "latency_target": 0.5 if service == "tts" else 0.1,
+        "target_work": {"stt": 96, "tts": 8, "llm": 64}[service],
+        "latency_target": {"stt": 0.1, "tts": 0.5, "llm": 0.5}[service],
         "tts_warmup_enabled": False,
+        "llm_warmup_enabled": False,
     }
     defaults.update(overrides)
     return SpeechProxySettings(**defaults)
@@ -69,15 +71,19 @@ class SpeechProxySettingsTests(unittest.TestCase):
 
         stt = SpeechProxySettings.from_env({**common, "SPEECH_PROXY_SERVICE": "stt"})
         tts = SpeechProxySettings.from_env({**common, "SPEECH_PROXY_SERVICE": "tts"})
+        llm = SpeechProxySettings.from_env({**common, "SPEECH_PROXY_SERVICE": "llm"})
 
         self.assertEqual(stt.target_work, 96)
         self.assertEqual(tts.target_work, 8)
+        self.assertEqual(llm.target_work, 64)
+        self.assertEqual(llm.latency_target, 0.5)
+        self.assertEqual(llm.llm_warmup_model, "nvidia/Gemma-4-26B-A4B-NVFP4")
         self.assertEqual(stt.backend_api_key, "hf-secret")
         self.assertEqual(stt.max_connections, 1024)
         self.assertEqual(stt.max_keepalive_connections, 256)
 
     def test_invalid_service_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "must be 'stt' or 'tts'"):
+        with self.assertRaisesRegex(ValueError, "must be 'stt', 'tts', or 'llm'"):
             SpeechProxySettings.from_env(
                 {
                     "SPEECH_PROXY_SERVICE": "other",
@@ -198,19 +204,104 @@ class SpeechProxyApplicationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(attempts, ["backend-1.example"])
 
+    def test_llm_streams_tool_calls_without_changing_the_body(self):
+        seen: list[tuple[str, str, str, bytes]] = []
+
+        async def handler(request: httpx.Request):
+            if request.url.path == "/health":
+                return httpx.Response(200, json={"status": "ok"})
+            body = await request.aread()
+            seen.append(
+                (
+                    request.method,
+                    request.url.path,
+                    request.headers.get("authorization", ""),
+                    body,
+                )
+            )
+            return httpx.Response(
+                200,
+                stream=AsyncBytes(
+                    b'data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"set_fan"}}]}}]}\n\n',
+                    b"data: [DONE]\n\n",
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        proxy_settings = settings("llm")
+        app = create_app(proxy_settings, dependencies(proxy_settings, handler))
+        request_body = {
+            "model": "nvidia/Gemma-4-26B-A4B-NVFP4",
+            "messages": [{"role": "user", "content": "Turn on the fan"}],
+            "tools": [{"type": "function", "function": {"name": "set_fan"}}],
+            "stream": True,
+        }
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"X-Speech-Request-Id": "trace-llm"},
+                json=request_body,
+            )
+            metrics = client.get("/metrics", params={"window_s": 60}).json()
+            health = client.get("/health").json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'"tool_calls"', response.content)
+        self.assertTrue(response.content.endswith(b"data: [DONE]\n\n"))
+        self.assertEqual(response.headers["x-speech-request-id"], "trace-llm")
+        self.assertEqual(seen[0][0:3], ("POST", "/v1/chat/completions", "Bearer backend-secret"))
+        self.assertEqual(json.loads(seen[0][3]), request_body)
+        self.assertEqual(metrics["service"], "llm")
+        self.assertEqual(metrics["phase"], "first_token")
+        self.assertEqual(metrics["requests"]["successes"], 1)
+        self.assertEqual(health["backends"][0]["active_work"], 0)
+        self.assertEqual(health["backends"][0]["successes"], 1)
+
+    def test_llm_responses_route_is_forwarded(self):
+        paths: list[str] = []
+
+        async def handler(request: httpx.Request):
+            if request.url.path == "/health":
+                return httpx.Response(200, json={"status": "ok"})
+            paths.append(request.url.path)
+            return httpx.Response(
+                200,
+                stream=AsyncBytes(b'{"id":"resp_1","output":[]}'),
+                headers={"content-type": "application/json"},
+            )
+
+        proxy_settings = settings("llm")
+        app = create_app(proxy_settings, dependencies(proxy_settings, handler))
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/responses",
+                json={"model": "nvidia/Gemma-4-26B-A4B-NVFP4", "input": "Hello"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"id": "resp_1", "output": []})
+        self.assertEqual(paths, ["/v1/responses"])
+
     def test_app_exposes_only_the_configured_openai_route(self):
         async def handler(request: httpx.Request):
             return httpx.Response(200, json={"status": "ok"})
 
         stt_settings = settings("stt")
         tts_settings = settings("tts")
+        llm_settings = settings("llm")
         stt_app = create_app(stt_settings, dependencies(stt_settings, handler))
         tts_app = create_app(tts_settings, dependencies(tts_settings, handler))
+        llm_app = create_app(llm_settings, dependencies(llm_settings, handler))
 
         self.assertIn("/v1/audio/transcriptions", stt_app.openapi()["paths"])
         self.assertNotIn("/v1/audio/speech", stt_app.openapi()["paths"])
         self.assertIn("/v1/audio/speech", tts_app.openapi()["paths"])
         self.assertNotIn("/v1/audio/transcriptions", tts_app.openapi()["paths"])
+        self.assertIn("/v1/chat/completions", llm_app.openapi()["paths"])
+        self.assertIn("/v1/responses", llm_app.openapi()["paths"])
+        self.assertNotIn("/v1/audio/speech", llm_app.openapi()["paths"])
 
 
 class _FakeResponse:
@@ -294,12 +385,23 @@ class ProxyCancellationTests(unittest.IsolatedAsyncioTestCase):
                     json={"model": "tts-model", "voice": "aiden", "input": "Hello"},
                 )
             )
-        else:
+        elif service == "stt":
             task = asyncio.create_task(
                 proxy_client.post(
                     "/v1/audio/transcriptions",
                     data={"model": "asr-model"},
                     files={"file": ("audio.wav", wav_bytes(), "audio/wav")},
+                )
+            )
+        else:
+            task = asyncio.create_task(
+                proxy_client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "nvidia/Gemma-4-26B-A4B-NVFP4",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "stream": True,
+                    },
                 )
             )
         await asyncio.wait_for(request_started.wait(), timeout=1)
@@ -316,6 +418,12 @@ class ProxyCancellationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stt_cancellation_releases_duration_weighted_capacity(self):
         snapshot = await self._cancel_inflight_request("stt")
+
+        self.assertEqual(snapshot["active_work"], 0)
+        self.assertEqual(snapshot["cancellations"], 1)
+
+    async def test_llm_cancellation_before_first_token_releases_capacity(self):
+        snapshot = await self._cancel_inflight_request("llm")
 
         self.assertEqual(snapshot["active_work"], 0)
         self.assertEqual(snapshot["cancellations"], 1)

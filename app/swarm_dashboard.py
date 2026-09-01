@@ -1364,7 +1364,7 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
         proxy_application: 'Proxy application',
         backend_round_trip: 'Backend round trip',
       };
-      target.innerHTML = `<div class="speech-latency-grid">${['stt', 'tts'].map((service) => {
+      target.innerHTML = `<div class="speech-latency-grid">${['stt', 'tts', 'llm'].map((service) => {
         const entry = (telemetry.services || {})[service];
         if (!entry) return '';
         if (!entry.reachable) {

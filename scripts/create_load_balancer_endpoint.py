@@ -134,6 +134,7 @@ def main() -> None:
     )
     parser.add_argument("--speech-stt-proxy-url", help="Root URL of the protected STT proxy for dashboard metrics")
     parser.add_argument("--speech-tts-proxy-url", help="Root URL of the protected TTS proxy for dashboard metrics")
+    parser.add_argument("--speech-llm-proxy-url", help="Root URL of the protected LLM proxy for dashboard metrics")
     parser.add_argument(
         "--speech-proxy-metrics-timeout-s",
         type=float,
@@ -203,7 +204,9 @@ def main() -> None:
         env["SPEECH_STT_PROXY_URL"] = args.speech_stt_proxy_url.rstrip("/")
     if args.speech_tts_proxy_url:
         env["SPEECH_TTS_PROXY_URL"] = args.speech_tts_proxy_url.rstrip("/")
-    if args.speech_stt_proxy_url or args.speech_tts_proxy_url:
+    if args.speech_llm_proxy_url:
+        env["SPEECH_LLM_PROXY_URL"] = args.speech_llm_proxy_url.rstrip("/")
+    if args.speech_stt_proxy_url or args.speech_tts_proxy_url or args.speech_llm_proxy_url:
         env["SPEECH_PROXY_METRICS_TIMEOUT_S"] = str(args.speech_proxy_metrics_timeout_s)
 
     custom_image = build_custom_image(args.image_url, args.image_health_route, args.image_port)

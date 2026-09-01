@@ -13,14 +13,14 @@ class SpeechProxyTelemetryTarget:
     url: str
 
     def __post_init__(self) -> None:
-        if self.service not in {"stt", "tts"}:
-            raise ValueError("service must be 'stt' or 'tts'")
+        if self.service not in {"stt", "tts", "llm"}:
+            raise ValueError("service must be 'stt', 'tts', or 'llm'")
         if not self.url.startswith(("http://", "https://")):
             raise ValueError("speech proxy URL must use http or https")
 
 
 class SpeechProxyTelemetryClient:
-    """Fetch correlated STT/TTS metrics for the load-balancer dashboard."""
+    """Fetch correlated STT/TTS/LLM metrics for the load-balancer dashboard."""
 
     def __init__(
         self,

@@ -9,7 +9,7 @@ import httpx
 
 from app.app_utils import cancel_and_await
 
-SpeechService = Literal["stt", "tts"]
+SpeechService = Literal["stt", "tts", "llm"]
 
 
 class NoSpeechBackendAvailable(RuntimeError):
@@ -118,10 +118,13 @@ class SpeechBackendPoolSettings:
     tts_warmup_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     tts_warmup_voice: str = "aiden"
     tts_warmup_language: str = "English"
+    llm_warmup_enabled: bool = True
+    llm_warmup_timeout_s: float = 120.0
+    llm_warmup_model: str = "nvidia/Gemma-4-26B-A4B-NVFP4"
 
     def __post_init__(self) -> None:
-        if self.service not in {"stt", "tts"}:
-            raise ValueError("service must be 'stt' or 'tts'")
+        if self.service not in {"stt", "tts", "llm"}:
+            raise ValueError("service must be 'stt', 'tts', or 'llm'")
         if self.target_work <= 0:
             raise ValueError("target_work must be > 0")
         if self.latency_target <= 0:
@@ -299,8 +302,11 @@ class SpeechBackendPool:
                 timeout=self.settings.health_timeout_s,
             )
             response.raise_for_status()
-            if self.settings.service == "tts" and self.settings.tts_warmup_enabled and not was_ready:
-                await self._warm_tts(url, headers)
+            if not was_ready:
+                if self.settings.service == "tts" and self.settings.tts_warmup_enabled:
+                    await self._warm_tts(url, headers)
+                elif self.settings.service == "llm" and self.settings.llm_warmup_enabled:
+                    await self._warm_llm(url, headers)
             ready = True
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -329,6 +335,23 @@ class SpeechBackendPool:
         response.raise_for_status()
         if not response.content:
             raise RuntimeError("TTS warmup returned an empty response")
+
+    async def _warm_llm(self, url: str, headers: dict[str, str]) -> None:
+        response = await self._client.post(
+            f"{url.rstrip('/')}/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": self.settings.llm_warmup_model,
+                "messages": [{"role": "user", "content": "Reply OK."}],
+                "max_tokens": 2,
+                "temperature": 0,
+                "stream": False,
+            },
+            timeout=self.settings.llm_warmup_timeout_s,
+        )
+        response.raise_for_status()
+        if not response.content:
+            raise RuntimeError("LLM warmup returned an empty response")
 
     def _authorization_headers(self) -> dict[str, str]:
         if not self.settings.backend_api_key:

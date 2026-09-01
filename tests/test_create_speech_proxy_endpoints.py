@@ -35,13 +35,18 @@ def make_args(**overrides):
         "services": ["stt", "tts"],
         "stt_proxy_name": "reachy-s2s-stt-proxy",
         "tts_proxy_name": "reachy-s2s-tts-proxy",
+        "llm_proxy_name": "reachy-s2s-llm-proxy",
         "stt_backends": ["reachy-s2s-stt-01"],
         "tts_backends": ["reachy-s2s-tts-01"],
+        "llm_backends": ["reachy-s2s-llm-01"],
         "stt_target_work": 96.0,
         "stt_latency_target": 0.1,
         "stt_audio_equivalent": 5.0,
         "tts_target_work": 8.0,
         "tts_latency_target": 0.5,
+        "llm_target_work": 64.0,
+        "llm_latency_target": 0.5,
+        "llm_model": "nvidia/Gemma-4-26B-A4B-NVFP4",
         "latency_weight": 0.25,
         "max_attempts": 2,
         "max_connections": 1024,
@@ -75,6 +80,25 @@ class SpeechProxyDeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not have a URL"):
             build_specs(make_args(services=["stt"]), api)
 
+    def test_build_specs_uses_llm_specific_capacity_defaults(self):
+        api = MagicMock()
+        api.get_inference_endpoint.return_value = MagicMock(url="https://llm.example/")
+
+        specs = build_specs(make_args(services=["llm"]), api)
+
+        self.assertEqual(
+            specs,
+            [
+                SpeechProxySpec(
+                    "llm",
+                    "reachy-s2s-llm-proxy",
+                    (SpeechBackendTarget("reachy-s2s-llm-01", "https://llm.example"),),
+                    64,
+                    0.5,
+                )
+            ],
+        )
+
     def test_deployment_env_keeps_stt_and_tts_capacity_independent(self):
         args = make_args()
         stt = SpeechProxySpec(
@@ -91,9 +115,17 @@ class SpeechProxyDeploymentTests(unittest.TestCase):
             8,
             0.5,
         )
+        llm = SpeechProxySpec(
+            "llm",
+            "llm-proxy",
+            (SpeechBackendTarget("llm-01", "https://llm.example"),),
+            64,
+            0.5,
+        )
 
         stt_env = deployment_env(args, stt)
         tts_env = deployment_env(args, tts)
+        llm_env = deployment_env(args, llm)
 
         self.assertEqual(stt_env["SPEECH_BACKENDS"], "stt-01=https://stt.example")
         self.assertEqual(stt_env["SPEECH_TARGET_WORK"], "96")
@@ -103,6 +135,9 @@ class SpeechProxyDeploymentTests(unittest.TestCase):
         self.assertNotIn("SPEECH_MAX_WORK", tts_env)
         self.assertEqual(tts_env["TTS_WARMUP_ENABLED"], "true")
         self.assertNotIn("STT_AUDIO_EQUIVALENT_S", tts_env)
+        self.assertEqual(llm_env["SPEECH_TARGET_WORK"], "64")
+        self.assertEqual(llm_env["LLM_WARMUP_ENABLED"], "true")
+        self.assertEqual(llm_env["LLM_WARMUP_MODEL"], "nvidia/Gemma-4-26B-A4B-NVFP4")
 
     def test_resolve_secrets_maps_hf_token_to_backend_key(self):
         self.assertEqual(

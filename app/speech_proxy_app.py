@@ -94,6 +94,9 @@ class SpeechProxySettings:
     tts_warmup_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     tts_warmup_voice: str = "aiden"
     tts_warmup_language: str = "English"
+    llm_warmup_enabled: bool = True
+    llm_warmup_timeout_s: float = 120.0
+    llm_warmup_model: str = "nvidia/Gemma-4-26B-A4B-NVFP4"
 
     def __post_init__(self) -> None:
         SpeechBackendPoolSettings(
@@ -112,6 +115,9 @@ class SpeechProxySettings:
             tts_warmup_model=self.tts_warmup_model,
             tts_warmup_voice=self.tts_warmup_voice,
             tts_warmup_language=self.tts_warmup_language,
+            llm_warmup_enabled=self.llm_warmup_enabled,
+            llm_warmup_timeout_s=self.llm_warmup_timeout_s,
+            llm_warmup_model=self.llm_warmup_model,
         )
         if self.request_timeout_s <= 0:
             raise ValueError("request_timeout_s must be > 0")
@@ -127,11 +133,12 @@ class SpeechProxySettings:
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> SpeechProxySettings:
         service = env_text("SPEECH_PROXY_SERVICE", environ=environ).lower()
-        if service not in {"stt", "tts"}:
-            raise ValueError("SPEECH_PROXY_SERVICE must be 'stt' or 'tts'")
+        if service not in {"stt", "tts", "llm"}:
+            raise ValueError("SPEECH_PROXY_SERVICE must be 'stt', 'tts', or 'llm'")
         defaults = {
             "stt": {"target_work": "96", "latency_target": "0.1"},
             "tts": {"target_work": "8", "latency_target": "0.5"},
+            "llm": {"target_work": "64", "latency_target": "0.5"},
         }[service]
         backend_api_key = env_optional("SPEECH_BACKEND_API_KEY", environ=environ)
         if backend_api_key is None:
@@ -192,6 +199,16 @@ class SpeechProxySettings:
             ),
             tts_warmup_voice=env_text("TTS_WARMUP_VOICE", "aiden", environ=environ),
             tts_warmup_language=env_text("TTS_WARMUP_LANGUAGE", "English", environ=environ),
+            llm_warmup_enabled=env_bool("LLM_WARMUP_ENABLED", True, environ=environ),
+            llm_warmup_timeout_s=_positive_float(
+                "LLM_WARMUP_TIMEOUT_S",
+                env_text("LLM_WARMUP_TIMEOUT_S", "120", environ=environ),
+            ),
+            llm_warmup_model=env_text(
+                "LLM_WARMUP_MODEL",
+                "nvidia/Gemma-4-26B-A4B-NVFP4",
+                environ=environ,
+            ),
         )
 
     def pool_settings(self) -> SpeechBackendPoolSettings:
@@ -211,6 +228,9 @@ class SpeechProxySettings:
             tts_warmup_model=self.tts_warmup_model,
             tts_warmup_voice=self.tts_warmup_voice,
             tts_warmup_language=self.tts_warmup_language,
+            llm_warmup_enabled=self.llm_warmup_enabled,
+            llm_warmup_timeout_s=self.llm_warmup_timeout_s,
+            llm_warmup_model=self.llm_warmup_model,
         )
 
 
@@ -417,12 +437,12 @@ async def _read_first_chunk(response: httpx.Response) -> tuple[bytes, Any]:
             return chunk, iterator
 
 
-async def _tts_stream(
+async def _proxy_stream(
     first_chunk: bytes,
     iterator: Any,
     response: httpx.Response,
     lease: SpeechBackendLease,
-    first_audio_latency: float,
+    routing_latency: float,
 ):
     completed = False
     try:
@@ -432,12 +452,12 @@ async def _tts_stream(
                 yield chunk
         completed = True
     except asyncio.CancelledError:
-        await lease.release(success=False, cancelled=True, latency=first_audio_latency)
+        await lease.release(success=False, cancelled=True, latency=routing_latency)
         raise
     except Exception as exc:
         await lease.release(
             success=False,
-            latency=first_audio_latency,
+            latency=routing_latency,
             retryable_failure=True,
             error=f"{type(exc).__name__}: {exc}",
         )
@@ -445,17 +465,25 @@ async def _tts_stream(
     finally:
         await response.aclose()
         if completed:
-            await lease.release(success=True, latency=first_audio_latency)
+            await lease.release(success=True, latency=routing_latency)
         else:
-            await lease.release(success=False, cancelled=True, latency=first_audio_latency)
+            await lease.release(success=False, cancelled=True, latency=routing_latency)
 
 
-async def _proxy_tts(
+# Retain the original test/helper name while sharing the lifecycle implementation
+# with streamed LLM responses.
+_tts_stream = _proxy_stream
+
+
+async def _proxy_streaming_json(
     request: Request,
+    path: str,
     settings: SpeechProxySettings,
     dependencies: SpeechProxyDependencies,
     trace: SpeechRequestTrace,
 ) -> Response:
+    service = settings.service
+    first_result = "audio" if service == "tts" else "token"
     try:
         body = await request.body()
         excluded: set[str] = set()
@@ -470,7 +498,7 @@ async def _proxy_tts(
             trace.start_upstream(lease.backend_name)
             upstream_request = dependencies.client.build_request(
                 "POST",
-                f"{lease.backend_url}/v1/audio/speech",
+                f"{lease.backend_url}{path}",
                 headers={
                     **_backend_headers(settings),
                     "Content-Type": request.headers.get("content-type", "application/json"),
@@ -488,7 +516,7 @@ async def _proxy_tts(
             except httpx.HTTPError as exc:
                 trace.finish_upstream()
                 last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning("TTS backend %s transport failed: %s", lease.backend_name, last_error)
+                logger.warning("%s backend %s transport failed: %s", service.upper(), lease.backend_name, last_error)
                 await lease.release(success=False, retryable_failure=True, error=last_error)
                 continue
             if not 200 <= response.status_code < 300:
@@ -503,7 +531,7 @@ async def _proxy_tts(
                 )
                 if retryable:
                     last_error = f"backend returned HTTP {response.status_code}"
-                    logger.warning("TTS backend %s %s", lease.backend_name, last_error)
+                    logger.warning("%s backend %s %s", service.upper(), lease.backend_name, last_error)
                     continue
                 await trace.record("error")
                 return _upstream_error(
@@ -525,21 +553,27 @@ async def _proxy_tts(
             except (httpx.HTTPError, httpx.StreamError, StopAsyncIteration) as exc:
                 trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
                 last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning("TTS backend %s failed before first audio: %s", lease.backend_name, last_error)
+                logger.warning(
+                    "%s backend %s failed before first %s: %s",
+                    service.upper(),
+                    lease.backend_name,
+                    first_result,
+                    last_error,
+                )
                 await response.aclose()
                 await lease.release(success=False, retryable_failure=True, error=last_error)
                 continue
             trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
-            first_audio_latency = time.monotonic() - started
+            first_result_latency = time.monotonic() - started
             await trace.record("success")
             return StreamingResponse(
-                _tts_stream(first_chunk, iterator, response, lease, first_audio_latency),
+                _proxy_stream(first_chunk, iterator, response, lease, first_result_latency),
                 status_code=response.status_code,
                 headers=_traced_response_headers(response, trace),
             )
-        logger.error("No TTS backend started a response: %s", last_error)
+        logger.error("No %s backend started a response: %s", service.upper(), last_error)
         sample = await trace.record("error")
-        response = _unavailable_response("tts")
+        response = _unavailable_response(service)
         response.headers.update(sample_headers(sample))
         return response
     except asyncio.CancelledError:
@@ -548,6 +582,31 @@ async def _proxy_tts(
     except Exception:
         await trace.record("error")
         raise
+
+
+async def _proxy_tts(
+    request: Request,
+    settings: SpeechProxySettings,
+    dependencies: SpeechProxyDependencies,
+    trace: SpeechRequestTrace,
+) -> Response:
+    return await _proxy_streaming_json(
+        request,
+        "/v1/audio/speech",
+        settings,
+        dependencies,
+        trace,
+    )
+
+
+async def _proxy_llm(
+    request: Request,
+    path: str,
+    settings: SpeechProxySettings,
+    dependencies: SpeechProxyDependencies,
+    trace: SpeechRequestTrace,
+) -> Response:
+    return await _proxy_streaming_json(request, path, settings, dependencies, trace)
 
 
 def create_app(
@@ -604,11 +663,23 @@ def create_app(
             trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
             return await _proxy_stt(request, settings, dependencies, trace)
 
-    else:
+    elif settings.service == "tts":
 
         @app.post("/v1/audio/speech")
         async def speech(request: Request):
             trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
             return await _proxy_tts(request, settings, dependencies, trace)
+
+    else:
+
+        @app.post("/v1/chat/completions")
+        async def chat_completions(request: Request):
+            trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
+            return await _proxy_llm(request, "/v1/chat/completions", settings, dependencies, trace)
+
+        @app.post("/v1/responses")
+        async def responses(request: Request):
+            trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
+            return await _proxy_llm(request, "/v1/responses", settings, dependencies, trace)
 
     return app

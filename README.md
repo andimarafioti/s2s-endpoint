@@ -30,10 +30,11 @@ GPU service images:
   config keeps async chunking and multi-request batching enabled.
 - pipeline image: `Dockerfile.pipeline`
   Runs only VAD, Smart Turn, and `speech-to-speech serve` on CPU. It sends STT
-  and TTS requests to the dedicated GPU endpoints and LLM requests to OpenAI.
-- speech proxy image: `Dockerfile.speech_proxy`
-  Runs as two small CPU endpoints: one stable STT address and one stable TTS
-  address. Each request is independently assigned to a ready speech worker.
+  and TTS requests to dedicated GPU endpoints and can send LLM requests either
+  to OpenAI or to the dedicated LLM proxy.
+- service proxy image: `Dockerfile.speech_proxy`
+  Runs as small CPU endpoints that provide stable STT, TTS, and LLM addresses.
+  Each request is independently assigned to a ready inference worker.
 
 This is intended for a deployment with:
 
@@ -166,14 +167,51 @@ uv run --with-requirements requirements.txt python scripts/create_speech_proxy_e
   --wait
 ```
 
-The same proxy image is configured as STT or TTS by environment. STT accounts
-for work in five-second audio equivalents; TTS accounts for concurrent calls.
-The initial operating targets are 96 STT work units and 8 TTS calls per worker,
-but these targets do not reject excess work. When every healthy worker is above
-target, new calls still go to the best available worker. Routing combines
-current work with an EWMA latency penalty. TTS readiness includes a real short
-synthesis, retries move to another worker only before audio reaches the caller,
-and cancellation closes the upstream response and releases its reservation.
+The same proxy image is configured as STT, TTS, or LLM by environment. STT
+accounts for work in five-second audio equivalents; TTS and LLM account for
+concurrent calls. The initial operating targets are 96 STT work units, 8 TTS
+calls, and 64 LLM generations per worker. The LLM latency target is 500 ms to
+first token, based on the Gemma 4 26B-A4B NVFP4 RTX PRO 6000 curve. These are
+soft routing targets and do not reject excess work. When every healthy worker
+is above target, new calls still go to the best available worker. Routing
+combines current work with an EWMA latency penalty. TTS and LLM readiness each
+include a real short inference. Retries move to another worker only before the
+first audio/token reaches the caller, and cancellation closes the upstream
+response and releases its reservation.
+
+Create the LLM proxy explicitly after the Gemma workers exist. The tested RTX
+PRO 6000 endpoint is in AWS `us-east-2`, so deploy this proxy in `us-east-2` as
+well; `us-east-1` and `us-east-2` are different regions despite sharing the
+`us-east` prefix.
+
+```bash
+uv run --with-requirements requirements.txt python scripts/create_speech_proxy_endpoints.py \
+  --namespace HuggingFaceM4 \
+  --services llm \
+  --image-url your-registry/s2s-speech-proxy:sha-YOUR_FULL_COMMIT_SHA \
+  --llm-backends reachy-s2s-llm-01 \
+  --llm-model nvidia/Gemma-4-26B-A4B-NVFP4 \
+  --region us-east-2 \
+  --wait
+```
+
+The resulting base URL supports both `/v1/chat/completions` and
+`/v1/responses`. Request JSON and streamed SSE bytes pass through unchanged, so
+tool calls and multimodal request bodies use the same vLLM behavior as direct
+requests.
+
+To point a deployed CPU pipeline at this proxy, add the following arguments to
+`create_pipeline_endpoint.py`. Chat Completions is the recommended Gemma path
+because that is the API used for the tool-call and vision validation.
+
+```bash
+  --llm-base-url https://YOUR-LLM-PROXY.us-east-2.aws.endpoints.huggingface.cloud/v1 \
+  --llm-backend chat-completions \
+  --model-name nvidia/Gemma-4-26B-A4B-NVFP4
+```
+
+In this mode the deployment reuses `HF_TOKEN` for the protected LLM proxy and
+does not require an OpenAI API key.
 
 This first deployment intentionally uses one CPU proxy replica per service.
 Its reservations and latency history are process-local, so horizontally scaling
@@ -186,18 +224,19 @@ The `Publish speech service images` workflow can selectively publish immutable
 `ghcr.io/andimarafioti/s2s-speech-proxy:sha-<full-commit-sha>` images. A manual
 run can also promote a version alias.
 
-All STT and TTS requests use the same telemetry implementation. Proxy responses
+All STT, TTS, and LLM requests use the same telemetry implementation. Proxy responses
 include `X-Speech-Request-Id`, `Server-Timing`, and component latency headers,
 and each proxy exposes `/metrics?window_s=...` with p50, p90, p95, and p99
 latencies. The metrics separate proxy application work from the backend round
-trip. The GPU service images add the same timing middleware to both vLLM
-servers, allowing the proxies to split that backend round trip into model
-service time and endpoint transport/gateway time. For TTS, service time ends at
-the first non-empty audio chunk; for STT, it ends at the transcription body.
+trip. The GPU speech-service images add the same timing middleware to both vLLM
+servers, allowing their proxies to split that backend round trip into model
+service time and endpoint transport/gateway time. For TTS, proxy latency ends
+at the first non-empty audio chunk; for STT, it ends at the transcription body;
+for streaming LLM calls, it ends at the first response chunk.
 These metrics are process-local, keep the most recent 50,000 requests, and reset
 when the proxy restarts.
 
-Configure the load-balancer dashboard with the two proxy root URLs. Protected
+Configure the load-balancer dashboard with the proxy root URLs. Protected
 proxy requests reuse `HF_CONTROL_TOKEN`/`HF_TOKEN` unless
 `SPEECH_PROXY_API_KEY` is set explicitly:
 
@@ -206,10 +245,11 @@ uv run --with-requirements requirements.txt python scripts/update_load_balancer_
   --namespace HuggingFaceM4 \
   --name reachy-s2s-lb \
   --env SPEECH_STT_PROXY_URL=https://STT-PROXY-HOST \
-  --env SPEECH_TTS_PROXY_URL=https://TTS-PROXY-HOST
+  --env SPEECH_TTS_PROXY_URL=https://TTS-PROXY-HOST \
+  --env SPEECH_LLM_PROXY_URL=https://LLM-PROXY-HOST
 ```
 
-The dashboard displays STT and TTS together for the selected dashboard window.
+The dashboard displays STT, TTS, and LLM together for the selected dashboard window.
 If the GPU images have not yet been redeployed with the timing middleware, the
 proxy and backend-round-trip metrics still work, while GPU-service timing is
 shown as unavailable with zero reporting coverage.

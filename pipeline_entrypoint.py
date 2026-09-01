@@ -43,12 +43,20 @@ def _positive_int(environ: Mapping[str, str], name: str, default: int) -> int:
 
 def build_config(environ: Mapping[str, str]) -> dict[str, object]:
     hf_token = _required(environ, "HF_TOKEN", kind="secret")
-    openai_key = _required(
-        environ,
-        "RESPONSES_API_API_KEY",
-        "OPENAI_API_KEY",
-        kind="secret",
+    llm_base_url = environ.get("LLM_BASE_URL", "").strip()
+    llm_api_key = (
+        environ.get("LLM_API_KEY", "").strip() or hf_token
+        if llm_base_url
+        else _required(
+            environ,
+            "RESPONSES_API_API_KEY",
+            "OPENAI_API_KEY",
+            kind="secret",
+        )
     )
+    llm_backend = environ.get("LLM_BACKEND", "responses-api").strip().lower()
+    if llm_backend not in {"responses-api", "chat-completions"}:
+        raise ValueError("LLM_BACKEND must be 'responses-api' or 'chat-completions'")
     stt_base_url = _required(environ, "STT_BASE_URL")
     tts_base_url = _required(environ, "TTS_BASE_URL")
     config: dict[str, object] = {
@@ -64,11 +72,10 @@ def build_config(environ: Mapping[str, str]) -> dict[str, object]:
         "openai_stt_api_key": hf_token,
         "openai_stt_model": environ.get("STT_MODEL", "Qwen/Qwen3-ASR-1.7B"),
         "openai_stt_response_format": "json",
-        "llm_backend": "responses-api",
+        "llm_backend": llm_backend,
         "model_name": environ.get("MODEL_NAME", "gpt-5.6-terra"),
-        "responses_api_api_key": openai_key,
+        "responses_api_api_key": llm_api_key,
         "responses_api_stream": True,
-        "responses_api_reasoning_effort": environ.get("RESPONSES_API_REASONING_EFFORT", "none"),
         "stream_batch_sentences": _positive_int(environ, "STREAM_BATCH_SENTENCES", 3),
         "tts": "openai",
         "openai_tts_base_url": tts_base_url,
@@ -83,6 +90,13 @@ def build_config(environ: Mapping[str, str]) -> dict[str, object]:
         "openai_tts_sample_rate": 24000,
         "openai_tts_stream": True,
     }
+    if llm_base_url:
+        config["responses_api_base_url"] = llm_base_url
+    reasoning_effort = environ.get("RESPONSES_API_REASONING_EFFORT", "").strip()
+    if reasoning_effort:
+        config["responses_api_reasoning_effort"] = reasoning_effort
+    elif not llm_base_url:
+        config["responses_api_reasoning_effort"] = "none"
     init_chat_prompt = environ.get("INIT_CHAT_PROMPT", "").strip()
     if init_chat_prompt:
         config["init_chat_prompt"] = init_chat_prompt

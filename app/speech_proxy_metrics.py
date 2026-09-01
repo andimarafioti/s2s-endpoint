@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from statistics import mean
 from typing import Literal
 
-SpeechService = Literal["stt", "tts"]
+SpeechService = Literal["stt", "tts", "llm"]
 SpeechOutcome = Literal["success", "error", "cancelled"]
 SERVICE_LATENCY_HEADER = "x-speech-service-latency-ms"
 logger = logging.getLogger("s2s-endpoint")
@@ -99,7 +99,11 @@ class SpeechProxyMetrics:
         return {
             "status": "ok",
             "service": self.service,
-            "phase": "transcription" if self.service == "stt" else "first_audio",
+            "phase": {
+                "stt": "transcription",
+                "tts": "first_audio",
+                "llm": "first_token",
+            }[self.service],
             "generated_at_s": now,
             "window_s": window_s,
             "retained_samples": len(retained),

@@ -30,6 +30,24 @@ class PipelineEntrypointTests(unittest.TestCase):
         self.assertFalse(config["enable_live_transcription"])
         self.assertEqual(config["stream_batch_sentences"], 3)
 
+    def test_build_config_routes_llm_to_protected_chat_completions_proxy(self):
+        config = build_config(
+            {
+                "HF_TOKEN": "hf-secret",
+                "STT_BASE_URL": "https://stt.example/v1",
+                "TTS_BASE_URL": "https://tts.example/v1",
+                "LLM_BASE_URL": "https://llm.example/v1",
+                "LLM_BACKEND": "chat-completions",
+                "MODEL_NAME": "nvidia/Gemma-4-26B-A4B-NVFP4",
+            }
+        )
+
+        self.assertEqual(config["llm_backend"], "chat-completions")
+        self.assertEqual(config["responses_api_base_url"], "https://llm.example/v1")
+        self.assertEqual(config["responses_api_api_key"], "hf-secret")
+        self.assertEqual(config["model_name"], "nvidia/Gemma-4-26B-A4B-NVFP4")
+        self.assertNotIn("responses_api_reasoning_effort", config)
+
     def test_build_config_requires_both_credential_domains(self):
         with self.assertRaisesRegex(ValueError, "HF_TOKEN"):
             build_config(
@@ -58,6 +76,18 @@ class PipelineEntrypointTests(unittest.TestCase):
             build_config({**base_environ, "TTS_BASE_URL": "https://tts.example/v1"})
         with self.assertRaisesRegex(ValueError, "TTS_BASE_URL"):
             build_config({**base_environ, "STT_BASE_URL": "https://stt.example/v1"})
+
+    def test_build_config_rejects_unknown_llm_backend(self):
+        with self.assertRaisesRegex(ValueError, "LLM_BACKEND"):
+            build_config(
+                {
+                    "HF_TOKEN": "hf-secret",
+                    "STT_BASE_URL": "https://stt.example/v1",
+                    "TTS_BASE_URL": "https://tts.example/v1",
+                    "LLM_BASE_URL": "https://llm.example/v1",
+                    "LLM_BACKEND": "other",
+                }
+            )
 
     def test_write_private_config_uses_owner_only_permissions(self):
         config_path = write_private_config({"secret": "value"})
