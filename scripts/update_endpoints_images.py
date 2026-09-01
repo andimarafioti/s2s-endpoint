@@ -26,6 +26,7 @@ from huggingface_hub import HfApi, get_token
 from huggingface_hub.errors import HfHubHTTPError
 
 DEFAULT_LOAD_BALANCER_NAME = "reachy-s2s-lb"
+LB_ADMIN_AUTH_HEADER = "X-Reachy-Mini-Admin-Authorization"
 DEFAULT_COMPUTE_INDEX_START = 1
 DEFAULT_COMPUTE_INDEX_WIDTH = 2
 TRANSIENT_LOAD_BALANCER_HTTP_STATUSES = {502, 503, 504}
@@ -987,7 +988,7 @@ def request_json(
     headers: dict[str, str] = {}
     data = None
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers[LB_ADMIN_AUTH_HEADER] = f"Bearer {token}"
     if payload is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode("utf-8")
