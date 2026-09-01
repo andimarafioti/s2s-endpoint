@@ -327,7 +327,10 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `COMPUTE_ENDPOINT_PARK_STRATEGY`: `pause` or `scale_to_zero`
 - `HF_CONTROL_TOKEN`: token used to call the Inference Endpoints API
 - `LB_ADMIN_AUTH_TOKEN`: dedicated bearer token required by the internal endpoint
-  status and drain routes; do not reuse `HF_CONTROL_TOKEN`
+  status and drain routes. Send it in
+  `X-Reachy-Mini-Admin-Authorization` because HF Inference Endpoints consumes
+  the standard `Authorization` header; the LB retains the standard header as a
+  fallback for non-HF deployments. Do not reuse `HF_CONTROL_TOKEN`.
 - `LB_CALLBACK_AUTH_TOKEN`: dedicated bearer credential required from compute
   endpoints at `/internal/llm-proxy-usage`. Use the same value on the LB and
   every compute endpoint; do not reuse a requester's HF token. Compute sends
@@ -805,7 +808,7 @@ endpoint is safe to reopen:
 
 ```bash
 curl --fail-with-body -X POST \
-  -H "Authorization: Bearer $LB_ADMIN_AUTH_TOKEN" \
+  -H "X-Reachy-Mini-Admin-Authorization: Bearer $LB_ADMIN_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   --data '{"draining": false, "force": true}' \
   "$LOAD_BALANCER_URL/internal/endpoints/reachy-s2s-01/drain"
