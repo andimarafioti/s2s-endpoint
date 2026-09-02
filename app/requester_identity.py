@@ -484,6 +484,8 @@ def _client_kind(user_agent: str | None) -> str:
         return "reachy-mini"
     if "reachy-mini-mobile-app" in value:
         return "reachy-mini-mobile-app"
+    if "hf-realtime-voice-space" in value:
+        return "realtime-space"
 
     automation_markers = (
         ("python-httpx", "automation:httpx"),
