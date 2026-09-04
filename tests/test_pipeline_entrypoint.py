@@ -8,6 +8,51 @@ from pipeline_entrypoint import build_config, write_private_config
 
 
 class PipelineEntrypointTests(unittest.TestCase):
+    def test_managed_pipeline_execs_compute_wrapper_and_requires_session_secret(self):
+        from pipeline_entrypoint import main
+
+        with patch.dict(os.environ, {"PIPELINE_MANAGED": "true"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "SESSION_SHARED_SECRET"):
+                main([])
+        with (
+            patch.dict(os.environ, {"PIPELINE_MANAGED": "true", "SESSION_SHARED_SECRET": "private"}, clear=True),
+            patch("pipeline_entrypoint.os.execv") as execv,
+        ):
+            main(["--port", "7860"])
+        self.assertIn("app.compute_main:app", execv.call_args.args[1])
+        self.assertNotIn("private", " ".join(execv.call_args.args[1]))
+
+    def test_managed_compute_command_runs_internal_cpu_entrypoint(self):
+        from app.compute_app import ComputeSettings, build_s2s_command
+
+        settings = ComputeSettings.from_env({"PIPELINE_MANAGED": "true"})
+        command = build_s2s_command("127.0.0.1", 9000, settings)
+        self.assertIn("--internal", command)
+        self.assertEqual(command[-4:], ["--host", "127.0.0.1", "--port", "9000"])
+        self.assertNotIn("cuda", command)
+
+    def test_internal_server_does_not_recursively_start_wrapper(self):
+        from pipeline_entrypoint import main
+
+        env = {
+            "PIPELINE_MANAGED": "true",
+            "HF_TOKEN": "hf-secret",
+            "LLM_BASE_URL": "https://llm/v1",
+            "STT_BASE_URL": "https://stt/v1",
+            "TTS_BASE_URL": "https://tts/v1",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("pipeline_entrypoint.write_private_config", return_value="/tmp/private.json") as config,
+            patch("pipeline_entrypoint.os.execvp") as execvp,
+            patch("pipeline_entrypoint.os.execv") as execv,
+        ):
+            main(["--internal", "--host", "127.0.0.1", "--port", "9000"])
+        execv.assert_not_called()
+        self.assertEqual(config.call_args.args[0]["port"], 9000)
+        self.assertEqual(config.call_args.args[0]["host"], "127.0.0.1")
+        self.assertEqual(execvp.call_args.args[0], "speech-to-speech")
+
     def test_build_config_routes_all_inference_to_remote_services(self):
         config = build_config(
             {
@@ -114,7 +159,7 @@ class PipelineEntrypointTests(unittest.TestCase):
         ):
             from pipeline_entrypoint import main
 
-            main()
+            main([])
 
         execvp.assert_called_once_with(
             "speech-to-speech",
