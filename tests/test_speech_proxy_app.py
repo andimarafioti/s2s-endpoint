@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import io
 import json
 import unittest
@@ -93,6 +94,50 @@ class SpeechProxySettingsTests(unittest.TestCase):
 
 
 class SpeechProxyApplicationTests(unittest.TestCase):
+    def test_proxy_decodes_compressed_response_bodies(self):
+        for service, path, content_type, content in (
+            ("tts", "/v1/audio/speech", "audio/pcm", b"\x00\x01\x02\x03" * 32),
+            (
+                "llm",
+                "/v1/chat/completions",
+                "text/event-stream",
+                b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\ndata: [DONE]\n\n',
+            ),
+            ("llm", "/v1/responses", "application/json", b'{"id":"resp_1","output":[]}'),
+        ):
+            with self.subTest(service=service, path=path):
+                encoded = gzip.compress(content)
+
+                async def handler(request: httpx.Request):
+                    if request.url.path == "/health":
+                        return httpx.Response(200)
+                    self.assertIn("gzip", request.headers["accept-encoding"])
+                    return httpx.Response(
+                        200,
+                        # A gzip header contains no result bytes. Decoding must
+                        # skip it and continue consuming subsequent chunks.
+                        stream=AsyncBytes(encoded[:10], encoded[10:20], encoded[20:]),
+                        headers={
+                            "content-type": content_type,
+                            "content-encoding": "gzip",
+                            "content-length": str(len(encoded)),
+                        },
+                    )
+
+                proxy_settings = settings(service)
+                app = create_app(proxy_settings, dependencies(proxy_settings, handler))
+                with TestClient(app) as client:
+                    response = client.post(path, json={"model": "test"})
+                    health = client.get("/health").json()
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.content, content)
+                self.assertEqual(response.headers["content-type"], content_type)
+                self.assertNotIn("content-encoding", response.headers)
+                self.assertNotIn("content-length", response.headers)
+                self.assertEqual(health["backends"][0]["active_work"], 0)
+                self.assertEqual(health["backends"][0]["successes"], 1)
+
     def test_broken_error_body_releases_capacity_and_retries(self):
         class BrokenBody(httpx.AsyncByteStream):
             closed = False

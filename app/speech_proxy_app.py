@@ -430,7 +430,9 @@ async def _proxy_stt(
 
 
 async def _read_first_chunk(response: httpx.Response) -> tuple[bytes, Any]:
-    iterator = response.aiter_raw()
+    # The downstream header allowlist omits Content-Encoding/Content-Length,
+    # so forward decoded bytes just as the buffered STT/error paths do.
+    iterator = response.aiter_bytes()
     while True:
         chunk = await anext(iterator)
         if chunk:
