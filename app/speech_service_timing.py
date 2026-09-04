@@ -78,25 +78,28 @@ class SpeechServiceTimingMiddleware:
 
             if message_type == "http.response.body" and response_start is not None and not start_sent:
                 body = message.get("body", b"")
-                if body or not message.get("more_body", False):
-                    latency_ms = max((time.perf_counter() - started) * 1000.0, 0.0)
-                    headers = response_start["headers"]
-                    _append_header(headers, REQUEST_ID_HEADER, request_id.encode("ascii"))
-                    _append_header(headers, SERVICE_LATENCY_HEADER, f"{latency_ms:.3f}".encode("ascii"))
-                    _append_header(
-                        headers,
-                        SERVER_TIMING_HEADER,
-                        f"speech-service;dur={latency_ms:.3f}".encode("ascii"),
-                    )
-                    await send(response_start)
-                    start_sent = True
-                    logger.info(
-                        "Speech service result request_id=%s path=%s status=%s service_latency_ms=%.3f",
-                        request_id,
-                        scope.get("path"),
-                        response_start.get("status"),
-                        latency_ms,
-                    )
+                if not body and message.get("more_body", False):
+                    # Empty intermediate chunks carry no result and cannot be
+                    # forwarded while http.response.start is still held.
+                    return
+                latency_ms = max((time.perf_counter() - started) * 1000.0, 0.0)
+                headers = response_start["headers"]
+                _append_header(headers, REQUEST_ID_HEADER, request_id.encode("ascii"))
+                _append_header(headers, SERVICE_LATENCY_HEADER, f"{latency_ms:.3f}".encode("ascii"))
+                _append_header(
+                    headers,
+                    SERVER_TIMING_HEADER,
+                    f"speech-service;dur={latency_ms:.3f}".encode("ascii"),
+                )
+                await send(response_start)
+                start_sent = True
+                logger.info(
+                    "Speech service result request_id=%s path=%s status=%s service_latency_ms=%.3f",
+                    request_id,
+                    scope.get("path"),
+                    response_start.get("status"),
+                    latency_ms,
+                )
 
             await send(message)
 
