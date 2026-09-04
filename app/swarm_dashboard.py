@@ -1107,7 +1107,7 @@ __REQUESTER_DASHBOARD_MARKUP__
         <h2>Proxy And GPU Latency</h2>
         <div id="speech-latency"></div>
         <div class="footer-note">
-          Proxy total is measured from proxy handler arrival to the transcription or first audio.
+          Proxy total is measured from proxy handler arrival to the transcription, first audio, or first LLM response chunk.
           GPU service time is reported inside the model server; backend transport covers the remaining
           proxy-to-GPU endpoint and gateway time. Client-to-proxy gateway time is outside this measurement.
         </div>
@@ -1364,6 +1364,11 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
         proxy_application: 'Proxy application',
         backend_round_trip: 'Backend round trip',
       };
+      const phaseLabels = {
+        transcription: 'transcription',
+        first_audio: 'first audio',
+        first_token: 'first token',
+      };
       target.innerHTML = `<div class="speech-latency-grid">${['stt', 'tts', 'llm'].map((service) => {
         const entry = (telemetry.services || {})[service];
         if (!entry) return '';
@@ -1385,7 +1390,7 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
             <td class="mono">${htmlEscape(prettyNumber(stats.n || 0))}</td>
           </tr>`;
         }).join('');
-        const phase = entry.phase === 'first_audio' ? 'first audio' : 'transcription';
+        const phase = phaseLabels[entry.phase] || entry.phase || 'unknown';
         const coveragePercent = `${(Number(coverage.ratio || 0) * 100).toFixed(0)}%`;
         return `<div class="speech-latency-service">
           <div class="speech-latency-title">

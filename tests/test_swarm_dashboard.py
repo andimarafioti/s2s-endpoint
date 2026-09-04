@@ -529,6 +529,10 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Median Duration", html)
         self.assertIn("Proxy And GPU Latency", html)
         self.assertIn("renderSpeechLatency", html)
+        self.assertIn("transcription: 'transcription'", html)
+        self.assertIn("first_audio: 'first audio'", html)
+        self.assertIn("first_token: 'first token'", html)
+        self.assertIn("phaseLabels[entry.phase]", html)
         self.assertIn("renderRollingChartCards();", html)
 
     async def test_summary_peak_connected_sessions_uses_bucket_max(self):
