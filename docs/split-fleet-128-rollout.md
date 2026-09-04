@@ -2,14 +2,23 @@
 
 Deployment date: 2026-09-04. Namespace: `HuggingFaceM4`.
 
-**Quota-blocked at 44 live session slots:** GPU autoscaling is enabled for the
-128-user target, and all 32 CPU workers are provisioned. However, AWS Intel SPR
+**Live configuration still has 44 session slots; four slots per worker is not a
+measured CPU limit.** A subsequent [CPU density retest](cpu-pipeline-density-20260904.md)
+completed short- and longer-turn tests at 16 users per worker and a clean
+short-turn repeat at 32.
+The recommended next configuration is eight 16-slot workers: 32 fleet vCPUs +
+15 other vCPUs = 47, within the existing 60-vCPU quota. That density change has
+not been rolled out; the live settings below still describe four-slot workers.
+
+GPU autoscaling is enabled for the 128-user target, and all 32 CPU workers are
+provisioned. At the original four-slot density, AWS Intel SPR
 quota is only 60 vCPUs. Existing non-fleet CPU endpoints consume 15 vCPUs, leaving
 45; at four vCPUs per worker this permits 11 workers / 44 sessions. The split LB
 is therefore temporarily restricted to `reachy-s2s-pipeline-02` through `-12`.
 The other 21 prepared workers remain paused and unregistered. Nothing was deleted.
 
-Raise the Intel SPR quota to at least 160 vCPUs before registering all 32 names:
+Keeping four slots per worker would require an Intel SPR quota of at least
+160 vCPUs before registering all 32 names:
 128 fleet vCPUs + 15 other vCPUs = 143 required, plus headroom. The provider-quota
 API reports units as `maxAccelerators` / `usedAccelerators` even for CPUs; these
 are vCPUs here, not endpoint counts. Observed A10G quota is 64 and RTX PRO 6000
@@ -43,9 +52,10 @@ occupy every GPU stage. Long audio, long context, long output, and request burst
 change the actual capacity/latency relationship. These are provisioning targets,
 not an end-to-end 128-user latency certification or a cloud capacity reservation.
 
-Four CPU slots is a conservative choice from the earlier 2/4/8-pipeline tests;
-eight completed the test but had a worse full-turn tail. Three-sentence TTS
-batching remains unchanged.
+Four CPU slots was a conservative choice from the earlier 2/4/8-pipeline tests;
+eight completed that test but had a worse full-turn tail. The density retest
+supersedes that sizing recommendation: full-turn tails alone did not establish
+a CPU capacity limit. Three-sentence TTS batching remains unchanged.
 
 ## Images and configuration
 
@@ -141,6 +151,8 @@ The original production load balancer remains available and unchanged.
   test timeout; that test passed on isolated rerun. No runtime source changes
   were made in this rollout, beyond the previously tested lifecycle PR.
 
-The complete 128-conversation workload has not been run and is currently blocked
-by CPU quota. The prepared inventory, quota-limited live ceiling,
-warm-floor behavior, and the scale-up checks above are the validated scope.
+The complete 128-conversation workload has not been run. The current four-slot
+configuration cannot reach it within CPU quota, but eight 16-slot workers would
+fit; deploying the higher density and validating the full fleet remain separate
+steps. The prepared inventory, current live ceiling, warm-floor behavior, and
+the scale-up checks above are the validated scope.
