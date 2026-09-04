@@ -1392,6 +1392,10 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
         }).join('');
         const phase = phaseLabels[entry.phase] || entry.phase || 'unknown';
         const coveragePercent = `${(Number(coverage.ratio || 0) * 100).toFixed(0)}%`;
+        const fleet = entry.lifecycle;
+        const workers = fleet && fleet.enabled ? (fleet.workers || []).map(worker =>
+          `<div class="footer-note"><strong>${htmlEscape(worker.name)}</strong> · ${htmlEscape(worker.phase)} · ${htmlEscape(worker.active_requests)} active · work ${htmlEscape(worker.active_work)}/${htmlEscape(worker.target_work)}${worker.reason ? ` · ${htmlEscape(worker.reason)}` : ''}${worker.last_error ? ` · ${htmlEscape(worker.last_error)}` : ''}</div>`
+        ).join('') : '';
         return `<div class="speech-latency-service">
           <div class="speech-latency-title">
             <strong>${service.toUpperCase()} · ${htmlEscape(phase)}</strong>
@@ -1402,6 +1406,7 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
             <tbody>${rows}</tbody>
           </table>
           <div class="footer-note">GPU timing coverage ${htmlEscape(coveragePercent)} · pre-result errors ${htmlEscape(prettyNumber(requests.errors || 0))} · cancellations ${htmlEscape(prettyNumber(requests.cancellations || 0))}</div>
+          ${workers}
         </div>`;
       }).join('')}</div>`;
     }

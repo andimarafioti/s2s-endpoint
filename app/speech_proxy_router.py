@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import httpx
@@ -38,6 +38,10 @@ class SpeechBackendState:
     last_selected: int = 0
     last_health_error: str | None = None
     last_health_at: float | None = None
+    available: bool = True
+    generation: int = 0
+    last_used_at: float = field(default_factory=time.monotonic)
+    last_latency_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,8 @@ class SpeechBackendSnapshot:
     consecutive_failures: int
     last_health_error: str | None
     last_health_at: float | None
+    idle_for_s: float = 0.0
+    latency_age_s: float | None = None
 
 
 class SpeechBackendLease:
@@ -154,13 +160,14 @@ class SpeechBackendPool:
         names = [backend.name for backend in backends]
         if len(names) != len(set(names)):
             raise ValueError("speech backend names must be unique")
-        urls = [backend.url for backend in backends]
+        urls = [backend.url for backend in backends if backend.url]
         if len(urls) != len(set(urls)):
             raise ValueError("speech backend URLs must be unique")
         self.settings = settings
         self._states = {backend.name: SpeechBackendState(config=backend) for backend in backends}
         self._lock = asyncio.Lock()
         self._selection_counter = 0
+        self._peak_work = 0.0
         self._health_task: asyncio.Task | None = None
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=True)
@@ -197,6 +204,8 @@ class SpeechBackendPool:
             state.active_requests += 1
             state.active_work += work
             state.requests += 1
+            state.last_used_at = time.monotonic()
+            self._peak_work = max(self._peak_work, sum(s.active_work for s in self._states.values()))
             return SpeechBackendLease(
                 self,
                 state.config.name,
@@ -219,6 +228,7 @@ class SpeechBackendPool:
             state = self._states[backend_name]
             state.active_requests = max(state.active_requests - 1, 0)
             state.active_work = max(state.active_work - work, 0.0)
+            state.last_used_at = time.monotonic()
             if cancelled:
                 state.cancellations += 1
                 state.consecutive_failures = 0
@@ -228,6 +238,7 @@ class SpeechBackendPool:
                 state.consecutive_failures = 0
                 state.last_health_error = None
                 state.ewma_latency = self._ewma(state.ewma_latency, latency)
+                state.last_latency_at = time.monotonic()
                 return
             state.errors += 1
             if error:
@@ -240,6 +251,53 @@ class SpeechBackendPool:
     async def set_draining(self, backend_name: str, draining: bool) -> None:
         async with self._lock:
             self._states[backend_name].draining = draining
+
+    async def take_work_peak(self) -> float:
+        """Retain short STT bursts that complete between controller polls."""
+        async with self._lock:
+            peak = self._peak_work
+            self._peak_work = sum(s.active_work for s in self._states.values())
+            return peak
+
+    async def set_available(self, backend_name: str, available: bool, *, url: str | None = None) -> None:
+        """Gate managed workers before probing them; parked HTTP probes can wake GPUs."""
+        async with self._lock:
+            state = self._states[backend_name]
+            changed_url = url is not None and url != state.config.url
+            if available != state.available or changed_url:
+                state.generation += 1
+                state.ready = False
+                state.ewma_latency = None
+                state.last_latency_at = None
+            state.available = available
+            if changed_url:
+                state.config = SpeechBackendConfig(name=backend_name, url=url)
+
+    async def drain_if_surplus(self, backend_name: str, *, min_ready: int, utilization: float) -> bool:
+        """Stop admission atomically; existing streams retain their reservations."""
+        async with self._lock:
+            state = self._states[backend_name]
+            others = [s for s in self._states.values() if s is not state and s.ready and not s.draining]
+            if (
+                not state.ready
+                or state.draining
+                or len(others) < min_ready
+                or sum(s.active_work for s in self._states.values())
+                > len(others) * self.settings.target_work * utilization
+            ):
+                return False
+            state.draining = True
+            return True
+
+    async def quarantine_if_idle(self, backend_name: str) -> bool:
+        async with self._lock:
+            state = self._states[backend_name]
+            if state.active_requests:
+                return False
+            state.available = False
+            state.ready = False
+            state.generation += 1
+            return True
 
     async def refresh_health(self) -> None:
         await asyncio.gather(*(self._refresh_one(name) for name in self._states))
@@ -263,6 +321,10 @@ class SpeechBackendPool:
                     consecutive_failures=state.consecutive_failures,
                     last_health_error=state.last_health_error,
                     last_health_at=state.last_health_at,
+                    idle_for_s=max(time.monotonic() - state.last_used_at, 0.0),
+                    latency_age_s=(
+                        time.monotonic() - state.last_latency_at if state.last_latency_at is not None else None
+                    ),
                 )
                 for state in self._states.values()
             )
@@ -290,8 +352,11 @@ class SpeechBackendPool:
     async def _refresh_one(self, backend_name: str) -> None:
         async with self._lock:
             state = self._states[backend_name]
+            if not state.available:
+                return
             url = state.config.url
             was_ready = state.ready
+            generation = state.generation
         error: str | None = None
         ready = False
         headers = self._authorization_headers()
@@ -312,6 +377,8 @@ class SpeechBackendPool:
             error = f"{type(exc).__name__}: {exc}"
         async with self._lock:
             state = self._states[backend_name]
+            if generation != state.generation or not state.available:
+                return
             state.last_health_at = time.time()
             state.ready = ready
             state.last_health_error = error

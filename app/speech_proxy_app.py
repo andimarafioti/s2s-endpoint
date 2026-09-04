@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import UploadFile
 
 from app.app_utils import build_lifespan, env_bool, env_optional, env_text, setup_logging
+from app.endpoint_pool_router import HuggingFaceEndpointController
 from app.speech_proxy_metrics import (
     SERVICE_LATENCY_HEADER,
     SpeechProxyMetrics,
@@ -29,6 +30,7 @@ from app.speech_proxy_router import (
     SpeechBackendPoolSettings,
     SpeechService,
 )
+from app.speech_worker_lifecycle import SpeechWorkerLifecycle, WorkerLifecycleSettings
 
 logger = setup_logging()
 APP_ROLE = "speech_proxy"
@@ -51,7 +53,7 @@ def _positive_int(name: str, value: str) -> int:
     return parsed
 
 
-def parse_backends(value: str) -> tuple[SpeechBackendConfig, ...]:
+def parse_backends(value: str, *, managed: bool = False) -> tuple[SpeechBackendConfig, ...]:
     backends: list[SpeechBackendConfig] = []
     for index, raw_entry in enumerate(value.split(","), start=1):
         entry = raw_entry.strip()
@@ -59,11 +61,13 @@ def parse_backends(value: str) -> tuple[SpeechBackendConfig, ...]:
             continue
         if "=" in entry:
             name, url = (part.strip() for part in entry.split("=", 1))
+        elif managed and not entry.startswith(("http://", "https://")):
+            name, url = entry, ""
         else:
             name, url = f"backend-{index:02d}", entry
-        if not name or not url:
+        if not name or (not url and not managed):
             raise ValueError(f"Invalid SPEECH_BACKENDS entry: {entry!r}")
-        if not url.startswith(("http://", "https://")):
+        if url and not url.startswith(("http://", "https://")):
             raise ValueError(f"Speech backend URL must use http or https: {url!r}")
         backends.append(SpeechBackendConfig(name=name, url=url.rstrip("/")))
     if not backends:
@@ -97,6 +101,9 @@ class SpeechProxySettings:
     llm_warmup_enabled: bool = True
     llm_warmup_timeout_s: float = 120.0
     llm_warmup_model: str = "nvidia/Gemma-4-26B-A4B-NVFP4"
+    lifecycle: WorkerLifecycleSettings | None = None
+    control_token: str | None = None
+    endpoint_namespace: str | None = None
 
     def __post_init__(self) -> None:
         SpeechBackendPoolSettings(
@@ -129,6 +136,10 @@ class SpeechProxySettings:
             raise ValueError("max_attempts must be >= 1")
         if self.stt_audio_equivalent_s <= 0:
             raise ValueError("stt_audio_equivalent_s must be > 0")
+        if self.lifecycle is not None and (not self.control_token or not self.endpoint_namespace):
+            raise ValueError("autoscaling requires HF_CONTROL_TOKEN and HF_ENDPOINT_NAMESPACE")
+        if self.lifecycle is not None and self.lifecycle.max_workers > len(self.backends):
+            raise ValueError("max_workers cannot exceed the explicit worker inventory")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> SpeechProxySettings:
@@ -143,9 +154,22 @@ class SpeechProxySettings:
         backend_api_key = env_optional("SPEECH_BACKEND_API_KEY", environ=environ)
         if backend_api_key is None:
             backend_api_key = env_optional("HF_TOKEN", environ=environ)
+        autoscale = env_bool("SPEECH_AUTOSCALE_ENABLED", False, environ=environ)
+        backends = parse_backends(env_text("SPEECH_BACKENDS", environ=environ), managed=autoscale)
+        lifecycle = None
+        if autoscale:
+            lifecycle = WorkerLifecycleSettings(
+                **{
+                    name: type(default)(env_text(f"SPEECH_WORKER_{name.upper()}", str(default), environ=environ))
+                    for name, default in asdict(WorkerLifecycleSettings(max_workers=len(backends))).items()
+                }
+            )
         return cls(
             service=service,  # type: ignore[arg-type]
-            backends=parse_backends(env_text("SPEECH_BACKENDS", environ=environ)),
+            backends=backends,
+            lifecycle=lifecycle,
+            control_token=env_optional("HF_CONTROL_TOKEN", environ=environ),
+            endpoint_namespace=env_optional("HF_ENDPOINT_NAMESPACE", environ=environ),
             backend_api_key=backend_api_key,
             target_work=_positive_float(
                 "SPEECH_TARGET_WORK",
@@ -240,11 +264,16 @@ class SpeechProxyDependencies:
     client: httpx.AsyncClient
     metrics: SpeechProxyMetrics | None = None
     owns_client: bool = True
+    lifecycle: SpeechWorkerLifecycle | None = None
 
     async def start(self) -> None:
+        if self.lifecycle is not None:
+            await self.lifecycle.start()
         await self.pool.start()
 
     async def stop(self) -> None:
+        if self.lifecycle is not None:
+            await self.lifecycle.stop()
         await self.pool.stop()
         if self.owns_client:
             await self.client.aclose()
@@ -258,10 +287,20 @@ def create_dependencies(settings: SpeechProxySettings) -> SpeechProxyDependencie
     )
     client = httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True)
     pool = SpeechBackendPool(settings.backends, settings.pool_settings(), client=client)
+    lifecycle = None
+    if settings.lifecycle is not None:
+        controller = HuggingFaceEndpointController(
+            namespace=settings.endpoint_namespace,
+            token=settings.control_token,
+            park_strategy="pause",
+            http_timeout_s=10,
+        )
+        lifecycle = SpeechWorkerLifecycle(pool, controller, settings.lifecycle)
     return SpeechProxyDependencies(
         pool=pool,
         client=client,
         metrics=SpeechProxyMetrics(settings.service),
+        lifecycle=lifecycle,
     )
 
 
@@ -645,6 +684,7 @@ def create_app(
             "service": settings.service,
             "ready_backends": sum(snapshot.ready and not snapshot.draining for snapshot in snapshots),
             "backends": [asdict(snapshot) for snapshot in snapshots],
+            "lifecycle": await dependencies.lifecycle.snapshot() if dependencies.lifecycle else {"enabled": False},
         }
         if payload["ready_backends"] == 0:
             return JSONResponse(payload, status_code=503)
@@ -654,6 +694,8 @@ def create_app(
     async def metrics(window_s: float = 300.0):
         try:
             payload = await dependencies.metrics.snapshot(window_s)
+            if dependencies.lifecycle is not None:
+                payload["lifecycle"] = await dependencies.lifecycle.snapshot()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return payload
