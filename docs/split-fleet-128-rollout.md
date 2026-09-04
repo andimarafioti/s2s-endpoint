@@ -24,6 +24,17 @@ API reports units as `maxAccelerators` / `usedAccelerators` even for CPUs; these
 are vCPUs here, not endpoint counts. Observed A10G quota is 64 and RTX PRO 6000
 quota is 4; the target GPU inventories fit those limits alongside the currently
 used resources. Quota is still not a guarantee of regional hardware availability.
+The density-test follow-up demonstrated this distinction: TTS scale-out attempts
+at 15:43 and 15:46 UTC could not obtain A10G hardware. One worker remained waiting
+for hardware and another failed with an out-of-availability error. Neither served
+the 32-user tests; both runs used the same existing TTS and LLM GPUs. See the
+[follow-up evidence](cpu-pipeline-density-20260904.md#follow-up-gpu-scale-out-was-attempted-but-did-not-supply-extra-capacity).
+The 128-user GPU scale-out target is therefore not validated by the quota check
+or by the successful single-worker CPU density tests.
+At the user's request, the two unsuccessful TTS starts were subsequently paused;
+the dedicated CPU density test LB and worker were also confirmed paused. Shared
+serving workers and the live autoscalers remain running; endpoint configurations
+and benchmark results were retained.
 
 This is a separate live fleet behind `reachy-s2s-split-lb`. The existing
 `reachy-s2s-lb`, its monolithic GPU workers, and the directly accessible

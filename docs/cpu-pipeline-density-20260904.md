@@ -94,6 +94,43 @@ The repeat completed all 96 turns. Its worst source-end to first audio was
 was at most 65 ms in the failed run and 30 ms in the repeat. That rules out a
 large local scheduling pause, but not buffering after a WebSocket send.
 
+### Follow-up: GPU scale-out was attempted, but did not supply extra capacity
+
+The TTS lifecycle log records `begin_wake` for `reachy-s2s-tts-01` at
+15:43:44.997 UTC and `reachy-s2s-tts-03` at 15:46:12.084 UTC. These followed the
+earlier burst tests, before the first 32-user cell (15:47:12–15:49:59 UTC).
+"One ready backend" did not mean that no other workers were starting.
+
+HF control-state inspection afterward reported `tts-01` still initializing,
+waiting for requested hardware, and `tts-03` failed because AWS us-east-1 A10G
+hardware was unavailable. These were hardware-availability failures, not evidence
+of slow model loading. Neither worker served requests in either 32-user window.
+There were no LLM wake actions in the 15:43–15:55 UTC log window.
+
+Both the first run and the repeat (15:52:11–15:54:02 UTC) sent their logged TTS
+requests exclusively to `reachy-s2s-tts-02`, and LLM requests exclusively to
+`gemma4-26b-a4b-nvfp4-rtx6000-test`. Routing selects ready, non-draining workers;
+it does not hold requests for a warming worker while ready capacity exists.
+
+| 32-user window | Successful TTS proxy samples | Proxy-measured first audio p50 / p95 / max |
+| --- | ---: | ---: |
+| First run | 98 | 140 / 403 / 501 ms |
+| Repeat | 96 | 178 / 233 / 248 ms |
+
+These are proxy-window request samples, not a one-to-one mapping to completed
+conversation turns; speculative/reopened turns can produce additional requests.
+They exclude failed/canceled requests. This TTS variation cannot by itself
+account for the 13.6-second source-end-to-first-audio p95 or the 10.4-second
+source-end-to-speech-stop p95 in the first run. The successful repeat did not
+benefit from additional GPUs becoming ready. The large end-to-end spike remains
+unresolved, while the unavailable scale-out capacity is a separate operational
+finding. Future density comparisons should hold prewarmed GPU capacity fixed,
+and validate scale-out and provider capacity separately.
+
+Historical proxy logs supporting this check are retained locally in
+`logs/cpu-density-20260904/autoscale-investigation/`. GPU quotas fitting the
+planned inventory does not establish that the GPUs can actually be allocated.
+
 ## Longer utterances at 16 users
 
 All 48 turns completed across three staggered rounds with a 19.42-second input
@@ -130,3 +167,13 @@ are retained locally under `logs/cpu-density-20260904/`, including the failed ru
 The initial matrix has prefix `20260904T153957Z`; the 32-user repeat has prefix
 `20260904T155110Z`. Disposable test scripts are not added to the PR.
 The 16-user longer-utterance check has prefix `20260904T155422Z`.
+
+After the follow-up investigation, the user requested test-instance shutdown.
+`reachy-s2s-cpu-density-lb` and `reachy-s2s-pipeline-33` were confirmed already
+paused, with the latter restored to four pipelines. The unsuccessful TTS startup
+attempts were canceled by pausing `reachy-s2s-tts-01` and `reachy-s2s-tts-03`, after
+verifying neither was ready, busy, or undergoing a controller action. Both pauses
+were confirmed through the HF control API. No endpoint or benchmark data was
+deleted. Shared serving STT/TTS/Gemma workers, proxies, the direct pipeline, and
+the live split LB's two-worker warm floor were preserved. Live autoscaling remains
+enabled; future real demand can legitimately resume standby workers.
