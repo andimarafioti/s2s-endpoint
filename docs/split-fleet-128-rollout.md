@@ -87,3 +87,39 @@ of already-running backend URLs. Do not register paused URLs in unmanaged mode,
 because health probes can wake scale-to-zero backends. Do not roll a second live
 controller over the same inventory while the first is still draining requests.
 The original production load balancer remains available and unchanged.
+
+## Rollout checks
+
+- The new proxy image first served requests with lifecycle disabled, then each
+  controller was enabled with its complete inventory. All three health endpoints
+  report the expected managed settings and no reconciliation errors.
+- An eight-call TTS burst automatically resumed `reachy-s2s-tts-02`; all eight
+  streamed requests succeeded, and the new worker passed inference warmup.
+- A 56-call LLM burst automatically resumed `reachy-s2s-llm-02`; all 56 streamed
+  requests succeeded. This was a short-context lifecycle check, not a context
+  capacity or steady-state latency benchmark.
+- One conversation, followed by nine synchronized conversations through the new
+  LB, completed successfully. The CPU fleet grew from two to four workers (nine
+  sessions plus the configured four-slot headroom), then session counts returned
+  to zero on both LB and worker health. No manual GPU/CPU resume was used for
+  these scale-up checks.
+- Nine-turn speech-end to first-audio latency: p50 1.022 s, p95 1.181 s. Stage
+  event intervals were STT 203/226 ms, LLM first output batch 600/616 ms, and TTS
+  first audio after that batch 218/373 ms (p50/p95). LLM first output batch is
+  **not** the same measurement as model first token.
+- Ten 50-second synthetic repeated-speech STT uploads completed successfully,
+  but the local upload bottleneck spread out backend arrivals. This did not
+  cross the production work threshold, so it does not verify deployed STT
+  load-triggered scale-up. Its control logic has unit coverage and the standby
+  had already passed a remote wake/readiness/transcription/park smoke test.
+- A separate five-second all-silence transcription hit the existing 120-second
+  proxy timeout while the ASR model kept generating. Ordinary speech succeeded
+  afterward and GPU metrics returned to zero running/waiting requests. Do not
+  interpret that silence failure as a scaling benchmark; nonspeech generation
+  bounds remain a follow-up ASR robustness issue.
+- CI is green. A local full-suite run encountered one one-second idle-parking
+  test timeout; that test passed on isolated rerun. No runtime source changes
+  were made in this rollout, beyond the previously tested lifecycle PR.
+
+The complete 128-conversation workload has not been run. The inventory ceiling,
+warm-floor behavior, and the scale-up checks above are the validated scope.
