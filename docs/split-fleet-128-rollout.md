@@ -2,6 +2,20 @@
 
 Deployment date: 2026-09-04. Namespace: `HuggingFaceM4`.
 
+**Quota-blocked at 44 live session slots:** GPU autoscaling is enabled for the
+128-user target, and all 32 CPU workers are provisioned. However, AWS Intel SPR
+quota is only 60 vCPUs. Existing non-fleet CPU endpoints consume 15 vCPUs, leaving
+45; at four vCPUs per worker this permits 11 workers / 44 sessions. The split LB
+is therefore temporarily restricted to `reachy-s2s-pipeline-02` through `-12`.
+The other 21 prepared workers remain paused and unregistered. Nothing was deleted.
+
+Raise the Intel SPR quota to at least 160 vCPUs before registering all 32 names:
+128 fleet vCPUs + 15 other vCPUs = 143 required, plus headroom. The provider-quota
+API reports units as `maxAccelerators` / `usedAccelerators` even for CPUs; these
+are vCPUs here, not endpoint counts. Observed A10G quota is 64 and RTX PRO 6000
+quota is 4; the target GPU inventories fit those limits alongside the currently
+used resources. Quota is still not a guarantee of regional hardware availability.
+
 This is a separate live fleet behind `reachy-s2s-split-lb`. The existing
 `reachy-s2s-lb`, its monolithic GPU workers, and the directly accessible
 `reachy-s2s-pipeline-01` are not migrated. The three existing speech proxies
@@ -11,7 +25,7 @@ are updated, so the direct-testing pipeline also benefits from GPU autoscaling.
 
 | Stage | Hardware / region | Per-worker operating target | Warm floor | Maximum workers | Inventory |
 | --- | --- | ---: | ---: | ---: | --- |
-| Pipeline | Intel SPR x4 / us-east-1 | 4 connected sessions | 2 | 32 | `reachy-s2s-pipeline-02` through `-33` |
+| Pipeline | Intel SPR x4 / us-east-1 | 4 connected sessions | 2 | 11 live / 32 prepared | `reachy-s2s-pipeline-02` through `-12` live; through `-33` prepared |
 | STT | A10G / us-east-1 | 96 five-second audio equivalents | 1 | 2 | `reachy-s2s-stt-01`, `-02` |
 | TTS | A10G / us-east-1 | 8 active generations | 1 | 19 | `reachy-s2s-tts-01` through `-19` |
 | LLM | RTX PRO 6000 / us-east-2 | 64 active generations | 1 | 3 | `gemma4-26b-a4b-nvfp4-rtx6000-test`, `reachy-s2s-llm-02`, `-03` |
@@ -20,7 +34,8 @@ All endpoints have exactly one HF replica. The CPU LB and speech proxies run
 in us-east-1. Gemma retains its tested us-east-2 placement; this is **not** a
 same-region LLM proxy/backend pair.
 
-The pipeline limit is 32 × 4 = 128 connected sessions. GPU maxima are
+The target pipeline limit is 32 × 4 = 128 connected sessions; the quota-limited
+live ceiling is currently 11 × 4 = 44. GPU maxima are
 `ceil(128 / (target_work * 0.85))`: 2 STT, 19 TTS, and 3 LLM workers. This
 allows the configured 85% growth threshold to retain headroom at 128 simultaneous
 stage calls, assuming five-second STT audio. A connected user does not constantly
@@ -47,7 +62,7 @@ Other lifecycle settings retain the documented defaults: 5-second reconciliation
 sustained surplus before consolidation, 300-second minimum uptime, and
 180-second scale-down cooldown. Busy workers drain before parking.
 
-The split LB uses the 32 managed pipeline names, `COMPUTE_ENDPOINT_MIN_WARM=2`,
+The split LB currently uses 11 of the 32 prepared managed pipeline names, `COMPUTE_ENDPOINT_MIN_WARM=2`,
 `COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS=4`, 5-second reconciliation, 600-second
 idle parking, and 180-second parking cooldown. `NUM_PIPELINES=4` is configured
 on each managed worker and learned through authenticated health polling.
@@ -58,6 +73,11 @@ send that token in `X-Reachy-Mini-Authorization`; protected pipeline ingress use
 standard `Authorization`, while the signed session token is in the returned
 connection URL. Existing per-requester rate limits are retained: 128 total users
 does not imply 128 parallel sessions permitted for one identity.
+Pipeline endpoints retain protected HF ingress for this testing rollout, so
+clients also need namespace-authorized HF credentials. Admission with an arbitrary
+valid HF identity alone does not confer access to protected worker ingress.
+Before a general-public client cutover, decide whether to use public HF worker
+ingress with the already-required signed application session tokens.
 
 New LB/worker application secrets are shared only within the split fleet. HF
 credentials are endpoint secrets, not plain environment configuration. The
@@ -121,5 +141,6 @@ The original production load balancer remains available and unchanged.
   test timeout; that test passed on isolated rerun. No runtime source changes
   were made in this rollout, beyond the previously tested lifecycle PR.
 
-The complete 128-conversation workload has not been run. The inventory ceiling,
+The complete 128-conversation workload has not been run and is currently blocked
+by CPU quota. The prepared inventory, quota-limited live ceiling,
 warm-floor behavior, and the scale-up checks above are the validated scope.
