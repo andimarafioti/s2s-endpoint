@@ -214,21 +214,27 @@ class SpeechWorkerLifecycle:
                     deficit -= 1
                     pending_capacity += 1
             # Recover minimum availability immediately; load growth uses a cooldown.
+            running = sum(w.status not in PARKED | FAILED or w.action is not None for w in self._workers.values())
+            started = 0
             if deficit > 0 and (now >= self._next_up_at or pending_capacity < self.settings.min_warm):
                 candidates = [
                     w
                     for w in self._workers.values()
                     if w.status in PARKED and not w.action and not w.park_requested and now >= w.retry_at
                 ]
-                running = sum(w.status not in PARKED or w.action is not None for w in self._workers.values())
-                for w in candidates[: min(deficit, max(self.settings.max_workers - running, 0))]:
+                for w in candidates[: min(1, deficit, max(self.settings.max_workers - running, 0))]:
                     await self._schedule(w, "begin_wake", "fleet headroom or latency")
+                    started += 1
+                    running += 1
+                    deficit -= 1
                     self._next_up_at = now + self.settings.scale_up_cooldown_s
                     self._next_down_at = now + self.settings.scale_down_cooldown_s
 
             for w in self._workers.values():
                 b = backends[w.name]
                 if w.action or w.status == "unknown" or now < w.retry_at:
+                    continue
+                if w.status in FAILED and (deficit <= 0 or started or running >= self.settings.max_workers):
                     continue
                 if w.park_requested and not b.active_requests:
                     await self._schedule(w, "park", "complete quarantined park")
@@ -246,6 +252,10 @@ class SpeechWorkerLifecycle:
                     )
                 ):
                     if await self.pool.quarantine_if_idle(w.name):
+                        if w.status in FAILED:
+                            started += 1
+                            running += 1
+                            deficit -= 1
                         w.restarts += 1
                         await self._schedule(w, "force_restart", "recover unhealthy worker")
 

@@ -228,11 +228,28 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_workers_recover_with_bounded_attempts(self):
         await self.make_fleet(("running", "failed"), max_restart_attempts=1)
+        await self.load(7)
+        await self.tick()
         self.assertEqual(self.controller.calls, [("restart", "backend-2")])
         self.controller.statuses["backend-2"] = "failed"
         self.now += 1000
         await self.tick()
         self.assertEqual(len(self.controller.calls), 1)
+
+    async def test_one_short_burst_does_not_wake_entire_inventory(self):
+        await self.make_fleet(("running", "paused", "paused", "paused"))
+        leases = await self.load(40)
+        await asyncio.gather(*(lease.release(success=True, latency=0.1) for lease in leases))
+        await self.tick()
+        self.now += 31
+        await self.tick()
+        self.assertEqual(self.controller.calls, [("wake", "backend-2")])
+
+    async def test_unused_failed_standbys_do_not_activate_above_budget(self):
+        await self.make_fleet(("running", "failed", "failed"), max_workers=1)
+        await self.load(20)
+        await self.tick()
+        self.assertEqual(self.controller.calls, [])
 
     async def test_late_health_result_cannot_revive_parked_worker(self):
         await self.make_fleet(("running",))
