@@ -9,13 +9,16 @@ from app.ws_proxy import proxy_websocket
 
 
 class FakeClientWS:
-    def __init__(self, events=None):
+    def __init__(self, events=None, headers=None):
         self.events = events if events is not None else []
+        self.headers = headers if headers is not None else {}
         self.sent = []
         self.close_calls = []
+        self.accepted_subprotocols = []
 
-    async def accept(self):
+    async def accept(self, subprotocol=None):
         self.events.append("accept")
+        self.accepted_subprotocols.append(subprotocol)
 
     async def send_text(self, text):
         self.sent.append(text)
@@ -125,7 +128,7 @@ class ProxyWebsocketLeaseHookTests(unittest.IsolatedAsyncioTestCase):
         # completes; the compute lease must be released or the pipeline slot
         # is permanently lost until the process restarts.
         class AcceptFailsWS(FakeClientWS):
-            async def accept(self):
+            async def accept(self, subprotocol=None):
                 raise RuntimeError("client went away before accept")
 
         client = AcceptFailsWS()
@@ -179,6 +182,61 @@ class ProxyWebsocketLeaseHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(acquired)
         self.assertEqual(released, [7])
         self.assertEqual(client.close_calls[-1][0], 1011)
+
+
+class ProxyWebsocketSubprotocolTests(unittest.IsolatedAsyncioTestCase):
+    async def _proxy(self, client, *, capacity_available=True):
+        async def acquire(_timeout):
+            if not capacity_available:
+                raise RuntimeError("all pipeline sessions are in use")
+            return _lease()
+
+        async def release(_slot_id):
+            pass
+
+        with patch("app.ws_proxy.websockets.connect", _FakeConnectCtx):
+            return await proxy_websocket(
+                client,
+                acquire_lease=acquire,
+                release_lease=release,
+                describe_lease=lambda lease: str(lease.slot_id),
+                no_capacity_reason="No pipeline capacity available",
+                no_capacity_log="no capacity",
+            )
+
+    async def test_selects_realtime_from_offered_subprotocols(self):
+        client = FakeClientWS(
+            headers={
+                "sec-websocket-protocol": ("realtime, openai-insecure-api-key.s2s-local, openai-agents-sdk.0.14.3")
+            }
+        )
+
+        acquired = await self._proxy(client)
+
+        self.assertTrue(acquired)
+        self.assertEqual(client.accepted_subprotocols, ["realtime"])
+
+    async def test_capacity_rejection_selects_realtime(self):
+        client = FakeClientWS(headers={"sec-websocket-protocol": "realtime, client-metadata"})
+
+        acquired = await self._proxy(client, capacity_available=False)
+
+        self.assertFalse(acquired)
+        self.assertEqual(client.accepted_subprotocols, ["realtime"])
+
+    async def test_does_not_echo_unknown_subprotocol(self):
+        client = FakeClientWS(headers={"sec-websocket-protocol": "client-auth, client-metadata"})
+
+        await self._proxy(client)
+
+        self.assertEqual(client.accepted_subprotocols, [None])
+
+    async def test_accepts_clients_without_subprotocols(self):
+        client = FakeClientWS()
+
+        await self._proxy(client)
+
+        self.assertEqual(client.accepted_subprotocols, [None])
 
 
 class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
@@ -264,7 +322,7 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
         # accept() fails. The pipeline slot must be released and the LB must
         # still receive 'disconnected' so the session does not leak.
         class AcceptFailsWS(FakeClientWS):
-            async def accept(self):
+            async def accept(self, subprotocol=None):
                 raise RuntimeError("client went away before accept")
 
         client = AcceptFailsWS()

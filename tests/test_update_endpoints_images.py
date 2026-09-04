@@ -15,6 +15,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from update_endpoints_images import (  # noqa: E402
+    LB_ADMIN_AUTH_HEADER,
     acquire_compute_endpoint_drain,
     build_compute_summary,
     compute_endpoint_ready_for_update,
@@ -619,6 +620,23 @@ class UpdateEndpointImagesTests(unittest.TestCase):
 
         self.assertEqual(urlopen.call_count, 1)
         sleep.assert_not_called()
+
+    def test_request_json_uses_ingress_safe_admin_header(self):
+        with patch(
+            "update_endpoints_images.urlopen",
+            return_value=BytesIO(b'{"status":"ok"}'),
+        ) as urlopen:
+            response = request_json(
+                "https://lb.example/internal/endpoints/reachy-s2s-01",
+                token="admin-secret",
+                timeout_s=3,
+            )
+
+        request = urlopen.call_args.args[0]
+        request_headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(response, {"status": "ok"})
+        self.assertEqual(request_headers[LB_ADMIN_AUTH_HEADER.lower()], "Bearer admin-secret")
+        self.assertIsNone(request.get_header("Authorization"))
 
     def test_wait_for_compute_endpoint_free_accepts_parked_unsynced_endpoint(self):
         for status in ("paused", "scaledToZero"):

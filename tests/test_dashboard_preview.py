@@ -212,6 +212,57 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
         self.assertEqual(status.status_code, 503)
         self.assertEqual(status.json()["detail"], "Endpoint status is not available")
 
+    def test_admin_routes_accept_custom_auth_when_ingress_removes_authorization(self):
+        module = self._import_load_balancer(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "TEST",
+                "SESSION_SHARED_SECRET": "",
+                "HF_CONTROL_TOKEN": "",
+                "HF_TOKEN": "",
+                "LB_ADMIN_AUTH_TOKEN": "admin-secret",
+            }
+        )
+        client = TestClient(module.app)
+        headers = {"X-Reachy-Mini-Admin-Authorization": "Bearer admin-secret"}
+
+        drain = client.post(
+            "/internal/endpoints/preview-compute-01/drain",
+            headers=headers,
+            json={"draining": True},
+        )
+        status = client.get(
+            "/internal/endpoints/preview-compute-01",
+            headers=headers,
+        )
+
+        self.assertEqual(drain.status_code, 503)
+        self.assertEqual(drain.json()["detail"], "Endpoint draining is not available")
+        self.assertEqual(status.status_code, 503)
+        self.assertEqual(status.json()["detail"], "Endpoint status is not available")
+
+    def test_admin_custom_auth_takes_precedence(self):
+        module = self._import_load_balancer(
+            {
+                "COMPUTE_ENDPOINT_NAMES": "TEST",
+                "SESSION_SHARED_SECRET": "",
+                "HF_CONTROL_TOKEN": "",
+                "HF_TOKEN": "",
+                "LB_ADMIN_AUTH_TOKEN": "admin-secret",
+            }
+        )
+        client = TestClient(module.app)
+
+        response = client.post(
+            "/internal/endpoints/preview-compute-01/drain",
+            headers={
+                "X-Reachy-Mini-Admin-Authorization": "Bearer wrong-secret",
+                "Authorization": "Bearer admin-secret",
+            },
+            json={"draining": True},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
     def test_drain_route_validates_endpoint_before_mutating(self):
         module = self._import_load_balancer(
             {

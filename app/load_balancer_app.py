@@ -60,6 +60,7 @@ from app.verification_admission_limiter import (
 logger = setup_logging()
 APP_ROLE = "load_balancer"
 DASHBOARD_PREVIEW_SENTINELS = {"test", "preview", "dashboard_preview"}
+LB_ADMIN_AUTH_HEADER = "X-Reachy-Mini-Admin-Authorization"
 
 
 @dataclass(frozen=True)
@@ -1458,7 +1459,10 @@ def require_callback_auth(runtime: LoadBalancerRuntime, request: Request) -> Non
 
 
 def require_admin_auth(runtime: LoadBalancerRuntime, request: Request) -> None:
-    _require_bearer_auth(request.headers.get("authorization"), runtime.settings.lb_admin_auth_token, "admin")
+    authorization = request.headers.get(LB_ADMIN_AUTH_HEADER)
+    if authorization is None:
+        authorization = request.headers.get("authorization")
+    _require_bearer_auth(authorization, runtime.settings.lb_admin_auth_token, "admin")
 
 
 def _require_bearer_auth(authorization: str | None, expected_token: str | None, label: str) -> None:
