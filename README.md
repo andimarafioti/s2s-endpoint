@@ -216,12 +216,55 @@ because that is the API used for the tool-call and vision validation.
 In this mode the deployment reuses `HF_TOKEN` for the protected LLM proxy and
 does not require an OpenAI API key.
 
-This first deployment intentionally uses one CPU proxy replica per service.
-Its reservations and latency history are process-local, so horizontally scaling
-the proxy would make its capacity view inconsistent. Worker membership is also
-an explicit endpoint-name list at deployment time. The autoscaling controller
-can later add, drain, wake, or remove workers behind these same stable proxy
-URLs without changing any pipeline assignment.
+Each service keeps one stable CPU proxy replica because reservations and
+latency history are process-local. Its bounded worker inventory may contain
+running or paused endpoints. With autoscaling enabled, the proxy discovers URLs
+through the endpoint control API, keeps the configured warm floor, records
+short load peaks between control polls, and starts one additional worker when
+per-worker work or fresh fleet-wide latency crosses its target. The targets are
+soft: requests continue using available workers while capacity warms.
+
+Scale-down requires sustained surplus capacity, atomically marks one worker as
+draining, sends it no new requests, waits for every active request/stream to
+release, and only then pauses it. A burst can cancel a drain before the pause
+begins. Pending starts count as capacity, control failures block scale-down,
+and ambiguous pause failures remain quarantined. Unhealthy workers are restarted
+with bounded attempts and backoff. Parked workers are never HTTP health-probed,
+because an inference request can wake a scaled-to-zero service.
+
+Create the complete endpoint inventory first, leaving the standbys paused:
+
+```bash
+export HF_TOKEN=...
+uv run --default-index https://pypi.org/simple --with-requirements requirements.txt \
+  python scripts/create_worker_standbys.py \
+  --source reachy-s2s-tts-01 --names reachy-s2s-tts-02 \
+  --apply --wait-ready
+```
+
+Then configure the service proxy with every worker name and a dedicated HF
+control credential. Initial scale-up utilization is 85%: 81.6 five-second STT
+equivalents, 6.8 TTS generations, or 54.4 LLM generations per ready worker.
+Latency only votes after every ready worker is above its service target for 30
+seconds; an isolated slow worker cannot wake capacity.
+
+```bash
+export HF_TOKEN=...
+export HF_CONTROL_TOKEN=...
+uv run --default-index https://pypi.org/simple --with-requirements requirements.txt \
+  python scripts/create_speech_proxy_endpoints.py \
+  --services stt tts llm --autoscale --min-warm-workers 1 --max-workers 2 \
+  --stt-backends reachy-s2s-stt-01 reachy-s2s-stt-02 \
+  --tts-backends reachy-s2s-tts-01 reachy-s2s-tts-02 \
+  --llm-backends gemma4-26b-a4b-nvfp4-rtx6000-test reachy-s2s-llm-02 \
+  --image-url ghcr.io/andimarafioti/s2s-speech-proxy:sha-YOUR_FULL_COMMIT_SHA
+```
+
+Worker phases, actions, active work, target work, and lifecycle errors appear in
+both proxy health/metrics and the load-balancer dashboard. Set
+`SPEECH_WORKER_MIN_WARM=2` when immediate single-worker failover is worth the
+second always-on GPU; a warm floor of one optimizes cost but accepts model-load
+time after failure or scale-up.
 
 The `Publish speech service images` workflow can selectively publish immutable
 `ghcr.io/andimarafioti/s2s-speech-proxy:sha-<full-commit-sha>` images. A manual
@@ -302,6 +345,68 @@ speech-to-speech talk \
 
 Current upstream uses the command name `talk`; older checkouts may call the
 same client `listen`.
+
+### Managed CPU pipeline workers
+
+For pipeline autoscaling, deploy with `create_pipeline_endpoint.py --managed`
+and supply `SESSION_SHARED_SECRET` in the environment, matching the LB's session
+signing secret. This selects `PIPELINE_MANAGED=true` and `/health` readiness.
+The same CPU image then runs the existing compute wrapper on port 7860 and the
+remote-only S2S process on loopback port 9000. Health reports real session slots;
+session-token validation, connected/disconnected callbacks, and drain recovery
+use the existing LB protocol. The original direct-testing mode stays unchanged
+when `PIPELINE_MANAGED` is false.
+
+Add the managed pipeline names to the LB's `COMPUTE_ENDPOINT_NAMES` and use its
+existing `COMPUTE_ENDPOINT_MIN_WARM`, `COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS`,
+idle parking, and recovery settings. Do not add raw/direct S2S endpoints to this
+inventory: their health and session-allocation contracts are different. The LB
+now supplies its HF ingress credential when reading protected worker health.
+End-user clients must also have HF ingress access to protected pipeline endpoints;
+public pipeline endpoints instead rely on signed session tokens.
+
+### Worker scaling controls and rollout boundary
+
+Autoscaling is opt-in (`SPEECH_AUTOSCALE_ENABLED=true`) and requires separate
+`HF_CONTROL_TOKEN` and `HF_ENDPOINT_NAMESPACE` configuration. `SPEECH_BACKENDS`
+accepts `name=url` entries or, in managed mode, endpoint names alone. All listed
+endpoints belong exclusively to that proxy; do not run a second controller over
+the same inventory, enable HF replica autoscaling, or send inference directly
+to those GPUs. Bypassing the proxy makes active-work/drain accounting incomplete.
+
+Every `WorkerLifecycleSettings` field is configurable as
+`SPEECH_WORKER_<UPPERCASE_FIELD>`. Important defaults:
+
+| Setting suffix | Default | Meaning |
+| --- | ---: | --- |
+| `MIN_WARM` / `MAX_WORKERS` | 1 / inventory size | Warm floor and bounded activation budget |
+| `SCALE_UP_UTILIZATION` / `SCALE_DOWN_UTILIZATION` | 0.85 / 0.5 | Growth and consolidation thresholds |
+| `RECONCILE_INTERVAL_S` | 5 | Control-plane poll interval |
+| `LATENCY_BREACH_S` / `LATENCY_MAX_AGE_S` | 30 / 60 | Sustained breach and freshness windows |
+| `SCALE_UP_COOLDOWN_S` / `SCALE_DOWN_COOLDOWN_S` | 30 / 180 | Change-rate limits |
+| `IDLE_TIMEOUT_S` / `MIN_UPTIME_S` | 600 / 300 | Sustained surplus window and minimum worker uptime |
+| `STARTUP_TIMEOUT_S` / `UNHEALTHY_RESTART_S` | 900 / 120 | Pending-capacity expiry and unhealthy recovery delay |
+| `MAX_RESTART_ATTEMPTS` / `RETRY_BACKOFF_S` | 3 / 30 | Bounded restarts with capped exponential backoff |
+
+STT latency is normalized by uploaded duration, not compared as raw seconds.
+The fleet can consolidate under light continuous traffic, not only complete
+silence. A timed-out remote operation stays out of routing; initialization that
+exceeds its timeout stops counting as pending capacity but is not blindly
+restarted while HF still reports an ongoing transition.
+
+Provisioning never creates capacity in response to unbounded demand: the helper
+pre-creates a fixed inventory, and runtime control only starts/stops those names.
+It preserves source runtime arguments, model revision, hardware, and region;
+all source secret names must be supplied from environment variables (use
+`--secret-from-env ENDPOINT_SECRET=ENV_VAR_NAME` for aliases). Its default is a
+read-only plan; `--apply` creates and pauses, and `--wait-ready` boots once first.
+Prefer immutable image digests for managed engines with mutable upstream tags.
+
+Roll out a new proxy image with autoscaling disabled first. Verify its inventory,
+then enable one service at a time. To disable lifecycle control, set
+`SPEECH_AUTOSCALE_ENABLED=false` and use an explicit list of already-warm backend
+URLs. This does not pause or delete workers. Metrics and controller state remain
+process-local, and durable telemetry/multi-proxy coordination are separate work.
 
 ## Direct Session Flow
 
