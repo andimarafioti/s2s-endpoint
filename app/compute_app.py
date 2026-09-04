@@ -1,11 +1,13 @@
 import asyncio
 import json
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Optional
 
 import httpx
@@ -37,6 +39,7 @@ class ComputeSettings:
     internal_ws_base_port: int = 9000
     s2s_repo_dir: str = "/opt/speech-to-speech"
     num_pipelines: str = "1"
+    remote_pipeline: bool = False
     language: str = "en"
     chat_size: str = "30"
     stt: str = "parakeet-tdt"
@@ -72,6 +75,7 @@ class ComputeSettings:
             internal_ws_base_port=int(env_text("INTERNAL_WS_PORT", "9000", environ=environ, strip=False)),
             s2s_repo_dir=env_text("S2S_REPO_DIR", "/opt/speech-to-speech", environ=environ, strip=False),
             num_pipelines=env_text("NUM_PIPELINES", "1", environ=environ),
+            remote_pipeline=env_bool("PIPELINE_MANAGED", False, environ=environ),
             language=env_text("LANGUAGE", "en", environ=environ),
             chat_size=env_text("CHAT_SIZE", "30", environ=environ),
             stt=env_text("STT", "parakeet-tdt", environ=environ),
@@ -143,6 +147,16 @@ def build_s2s_command(
     port: int,
     settings: ComputeSettings,
 ) -> list[str]:
+    if settings.remote_pipeline:
+        return [
+            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "pipeline_entrypoint.py"),
+            "--internal",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
     cmd = [
         "uv",
         "run",

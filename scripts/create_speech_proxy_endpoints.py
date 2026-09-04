@@ -45,6 +45,8 @@ def resolve_backend_targets(
     api: HfApi,
     namespace: str,
     names: list[str],
+    *,
+    managed: bool = False,
 ) -> tuple[SpeechBackendTarget, ...]:
     if len(names) != len(set(names)):
         raise ValueError("Speech backend endpoint names must be unique")
@@ -53,7 +55,9 @@ def resolve_backend_targets(
         endpoint = api.get_inference_endpoint(name, namespace=namespace)
         url = getattr(endpoint, "url", None)
         if not isinstance(url, str) or not url.strip():
-            raise ValueError(f"Speech backend endpoint does not have a URL: {name}")
+            if not managed:
+                raise ValueError(f"Speech backend endpoint does not have a URL: {name}")
+            url = ""
         targets.append(SpeechBackendTarget(name=name, url=url.rstrip("/")))
     return tuple(targets)
 
@@ -66,7 +70,9 @@ def build_specs(args: argparse.Namespace, api: HfApi) -> list[SpeechProxySpec]:
             SpeechProxySpec(
                 service="stt",
                 name=args.stt_proxy_name,
-                backends=resolve_backend_targets(api, args.namespace, args.stt_backends),
+                backends=resolve_backend_targets(
+                    api, args.namespace, args.stt_backends, managed=getattr(args, "autoscale", False)
+                ),
                 target_work=args.stt_target_work,
                 latency_target=args.stt_latency_target,
             )
@@ -76,7 +82,9 @@ def build_specs(args: argparse.Namespace, api: HfApi) -> list[SpeechProxySpec]:
             SpeechProxySpec(
                 service="tts",
                 name=args.tts_proxy_name,
-                backends=resolve_backend_targets(api, args.namespace, args.tts_backends),
+                backends=resolve_backend_targets(
+                    api, args.namespace, args.tts_backends, managed=getattr(args, "autoscale", False)
+                ),
                 target_work=args.tts_target_work,
                 latency_target=args.tts_latency_target,
             )
@@ -86,7 +94,9 @@ def build_specs(args: argparse.Namespace, api: HfApi) -> list[SpeechProxySpec]:
             SpeechProxySpec(
                 service="llm",
                 name=args.llm_proxy_name,
-                backends=resolve_backend_targets(api, args.namespace, args.llm_backends),
+                backends=resolve_backend_targets(
+                    api, args.namespace, args.llm_backends, managed=getattr(args, "autoscale", False)
+                ),
                 target_work=args.llm_target_work,
                 latency_target=args.llm_latency_target,
             )
@@ -109,11 +119,17 @@ def ensure_names_available(api: HfApi, namespace: str, specs: list[SpeechProxySp
         raise ValueError(f"Inference Endpoint name already exists: {', '.join(collisions)}")
 
 
-def resolve_secrets(environ: dict[str, str]) -> dict[str, str]:
+def resolve_secrets(environ: dict[str, str], *, autoscale: bool = False) -> dict[str, str]:
     token = environ.get("HF_TOKEN", "").strip()
     if not token:
         raise ValueError("Missing required deployment secret: HF_TOKEN")
-    return {"SPEECH_BACKEND_API_KEY": token}
+    secrets = {"SPEECH_BACKEND_API_KEY": token}
+    if autoscale:
+        control_token = environ.get("HF_CONTROL_TOKEN", "").strip()
+        if not control_token:
+            raise ValueError("autoscaling requires an explicit HF_CONTROL_TOKEN secret")
+        secrets["HF_CONTROL_TOKEN"] = control_token
+    return secrets
 
 
 def deployment_env(args: argparse.Namespace, spec: SpeechProxySpec) -> dict[str, str]:
@@ -138,6 +154,16 @@ def deployment_env(args: argparse.Namespace, spec: SpeechProxySpec) -> dict[str,
     else:
         env["LLM_WARMUP_ENABLED"] = "true"
         env["LLM_WARMUP_MODEL"] = args.llm_model
+    if getattr(args, "autoscale", False):
+        maximum = args.max_workers if args.max_workers is not None else len(spec.backends)
+        if not 1 <= args.min_warm_workers <= maximum <= len(spec.backends):
+            raise ValueError("autoscaling requires 1 <= min-warm-workers <= max-workers <= inventory size")
+        env.update(
+            SPEECH_AUTOSCALE_ENABLED="true",
+            HF_ENDPOINT_NAMESPACE=args.namespace,
+            SPEECH_WORKER_MIN_WARM=str(args.min_warm_workers),
+            SPEECH_WORKER_MAX_WORKERS=str(maximum),
+        )
     return env
 
 
@@ -215,6 +241,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--health-interval", type=float, default=10)
     parser.add_argument("--health-timeout", type=float, default=5)
     parser.add_argument("--request-timeout", type=float, default=120)
+    parser.add_argument("--autoscale", action="store_true", help="Manage the supplied endpoint inventory")
+    parser.add_argument("--min-warm-workers", type=int, default=1)
+    parser.add_argument("--max-workers", type=int, help="Maximum active workers; defaults to supplied inventory size")
     parser.add_argument("--vendor", default=DEFAULT_VENDOR)
     parser.add_argument("--region", default=DEFAULT_REGION)
     parser.add_argument("--instance-type", default=DEFAULT_INSTANCE_TYPE)
@@ -269,7 +298,8 @@ def main() -> None:
                     "type": args.type,
                     "min_replica": 1,
                     "max_replica": 1,
-                    "required_secret_names": ["SPEECH_BACKEND_API_KEY"],
+                    "required_secret_names": ["SPEECH_BACKEND_API_KEY"]
+                    + (["HF_CONTROL_TOKEN"] if args.autoscale else []),
                     "endpoints": [{**asdict(spec), "env": deployment_env(args, spec)} for spec in specs],
                 },
                 indent=2,
@@ -277,7 +307,7 @@ def main() -> None:
         )
         return
 
-    secrets = resolve_secrets(dict(os.environ))
+    secrets = resolve_secrets(dict(os.environ), autoscale=args.autoscale)
     endpoints = [(spec, create_endpoint(api, args, spec, secrets)) for spec in specs]
     if args.wait:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoints) or 1) as executor:

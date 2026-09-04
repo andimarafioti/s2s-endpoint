@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import sys
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -116,8 +118,31 @@ def write_private_config(config: dict[str, object]) -> Path:
     return config_path
 
 
-def main() -> None:
-    config_path = write_private_config(build_config(os.environ))
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--internal", action="store_true")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "7860")))
+    args = parser.parse_args(argv)
+    if _bool(os.environ, "PIPELINE_MANAGED", False) and not args.internal:
+        _required(os.environ, "SESSION_SHARED_SECRET", kind="secret")
+        os.execv(
+            sys.executable,
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "app.compute_main:app",
+                "--host",
+                args.host,
+                "--port",
+                str(args.port),
+            ],
+        )
+        return
+    config = build_config(os.environ)
+    config.update(host=args.host, port=args.port)
+    config_path = write_private_config(config)
     os.execvp(
         "speech-to-speech",
         ["speech-to-speech", "serve", str(config_path)],

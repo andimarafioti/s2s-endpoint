@@ -20,6 +20,12 @@ ReleaseLease = Callable[[object], Awaitable[None]]
 DescribeLease = Callable[[LeaseLike], str]
 
 
+def _select_client_subprotocol(client_ws: WebSocket) -> Optional[str]:
+    offered = client_ws.headers.get("sec-websocket-protocol", "")
+    offered_subprotocols = {protocol.strip() for protocol in offered.split(",")}
+    return "realtime" if "realtime" in offered_subprotocols else None
+
+
 async def proxy_websocket(
     client_ws: WebSocket,
     *,
@@ -45,7 +51,7 @@ async def proxy_websocket(
         lease = await acquire_lease(900.0)
     except Exception as exc:
         try:
-            await client_ws.accept()
+            await client_ws.accept(subprotocol=_select_client_subprotocol(client_ws))
             await client_ws.send_text(
                 json.dumps(
                     {
@@ -85,7 +91,7 @@ async def proxy_websocket(
                     pass
                 return True
 
-        await client_ws.accept()
+        await client_ws.accept(subprotocol=_select_client_subprotocol(client_ws))
         logger.info("Client websocket connected to %s", describe_lease(lease))
 
         try:
