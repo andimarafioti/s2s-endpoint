@@ -146,6 +146,33 @@ class EndpointPoolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(usage, ComputeUsage(active_sessions=2, max_sessions=4))
 
+    def test_protected_compute_health_uses_hf_ingress_credential(self):
+        with patch(
+            "app.endpoint_pool_router.urllib.request.urlopen",
+            return_value=FakeUrlopenResponse({"router": {"active_sessions": 0, "max_sessions": 2}}),
+        ) as urlopen:
+            fetch_compute_usage("https://compute.example", api_key="hf-ingress")
+        self.assertEqual(urlopen.call_args.args[0].get_header("Authorization"), "Bearer hf-ingress")
+
+    def test_begin_wake_initiates_without_waiting_for_model_readiness(self):
+        from types import SimpleNamespace
+
+        from app.endpoint_pool_router import HuggingFaceEndpointController
+
+        controller = HuggingFaceEndpointController(namespace="org", token="token")
+        try:
+            with (
+                patch.object(controller, "_get", return_value=SimpleNamespace(status="paused", url=None)),
+                patch.object(controller, "_resume", return_value=SimpleNamespace(status="pending", url=None)) as resume,
+                patch.object(controller, "_wait") as wait,
+            ):
+                result = controller.begin_wake("worker")
+            self.assertEqual(result.status, "pending")
+            resume.assert_called_once_with("worker", running_ok=True)
+            wait.assert_not_called()
+        finally:
+            controller.close()
+
     def test_huggingface_controller_uses_an_isolated_bounded_http_client(self):
         from huggingface_hub import get_session
 
