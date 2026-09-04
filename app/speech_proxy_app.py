@@ -496,54 +496,53 @@ async def _proxy_streaming_json(
             excluded.add(lease.backend_name)
             started = time.monotonic()
             trace.start_upstream(lease.backend_name)
-            upstream_request = dependencies.client.build_request(
-                "POST",
-                f"{lease.backend_url}{path}",
-                headers={
-                    **_backend_headers(settings),
-                    "Content-Type": request.headers.get("content-type", "application/json"),
-                    "X-Speech-Request-Id": trace.request_id,
-                },
-                content=body,
-                timeout=settings.request_timeout_s,
-            )
+            response: httpx.Response | None = None
+            stream_owns_response = False
             try:
+                upstream_request = dependencies.client.build_request(
+                    "POST",
+                    f"{lease.backend_url}{path}",
+                    headers={
+                        **_backend_headers(settings),
+                        "Content-Type": request.headers.get("content-type", "application/json"),
+                        "X-Speech-Request-Id": trace.request_id,
+                    },
+                    content=body,
+                    timeout=settings.request_timeout_s,
+                )
                 response = await dependencies.client.send(upstream_request, stream=True)
-            except asyncio.CancelledError:
-                trace.finish_upstream()
-                await lease.release(success=False, cancelled=True)
-                raise
-            except httpx.HTTPError as exc:
-                trace.finish_upstream()
-                last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning("%s backend %s transport failed: %s", service.upper(), lease.backend_name, last_error)
-                await lease.release(success=False, retryable_failure=True, error=last_error)
-                continue
-            if not 200 <= response.status_code < 300:
-                response_body = await response.aread()
-                trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
-                retryable = _retryable_response(response.status_code, response_body)
-                await response.aclose()
-                await lease.release(
-                    success=False,
-                    retryable_failure=retryable,
-                    error=f"HTTP {response.status_code}",
-                )
-                if retryable:
-                    last_error = f"backend returned HTTP {response.status_code}"
-                    logger.warning("%s backend %s %s", service.upper(), lease.backend_name, last_error)
-                    continue
-                await trace.record("error")
-                return _upstream_error(
-                    response.status_code,
-                    response_body,
-                    _traced_response_headers(response, trace),
-                )
-            try:
+                if not 200 <= response.status_code < 300:
+                    response_body = await response.aread()
+                    trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
+                    retryable = _retryable_response(response.status_code, response_body)
+                    await lease.release(
+                        success=False,
+                        retryable_failure=retryable,
+                        error=f"HTTP {response.status_code}",
+                    )
+                    if retryable:
+                        last_error = f"backend returned HTTP {response.status_code}"
+                        logger.warning("%s backend %s %s", service.upper(), lease.backend_name, last_error)
+                        continue
+                    await trace.record("error")
+                    return _upstream_error(
+                        response.status_code,
+                        response_body,
+                        _traced_response_headers(response, trace),
+                    )
                 first_chunk, iterator = await _read_first_chunk(response)
-            except asyncio.CancelledError:
                 trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
-                await response.aclose()
+                first_result_latency = time.monotonic() - started
+                await trace.record("success")
+                downstream_response = StreamingResponse(
+                    _proxy_stream(first_chunk, iterator, response, lease, first_result_latency),
+                    status_code=response.status_code,
+                    headers=_traced_response_headers(response, trace),
+                )
+                stream_owns_response = True
+                return downstream_response
+            except asyncio.CancelledError:
+                trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER) if response is not None else None)
                 await lease.release(
                     success=False,
                     cancelled=True,
@@ -551,7 +550,7 @@ async def _proxy_streaming_json(
                 )
                 raise
             except (httpx.HTTPError, httpx.StreamError, StopAsyncIteration) as exc:
-                trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
+                trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER) if response is not None else None)
                 last_error = f"{type(exc).__name__}: {exc}"
                 logger.warning(
                     "%s backend %s failed before first %s: %s",
@@ -560,17 +559,18 @@ async def _proxy_streaming_json(
                     first_result,
                     last_error,
                 )
-                await response.aclose()
                 await lease.release(success=False, retryable_failure=True, error=last_error)
                 continue
-            trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
-            first_result_latency = time.monotonic() - started
-            await trace.record("success")
-            return StreamingResponse(
-                _proxy_stream(first_chunk, iterator, response, lease, first_result_latency),
-                status_code=response.status_code,
-                headers=_traced_response_headers(response, trace),
-            )
+            except Exception as exc:
+                trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER) if response is not None else None)
+                await lease.release(success=False, error=f"{type(exc).__name__}: {exc}")
+                raise
+            finally:
+                # Only the downstream stream may keep a response/lease beyond this
+                # attempt. Failed reads, cancellation, and passthrough errors all
+                # release above, before closing can itself fail.
+                if response is not None and not stream_owns_response:
+                    await response.aclose()
         logger.error("No %s backend started a response: %s", service.upper(), last_error)
         sample = await trace.record("error")
         response = _unavailable_response(service)

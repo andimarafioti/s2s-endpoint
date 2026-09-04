@@ -93,6 +93,52 @@ class SpeechProxySettingsTests(unittest.TestCase):
 
 
 class SpeechProxyApplicationTests(unittest.TestCase):
+    def test_broken_error_body_releases_capacity_and_retries(self):
+        class BrokenBody(httpx.AsyncByteStream):
+            closed = False
+
+            async def __aiter__(self):
+                yield b'{"error":'
+                raise httpx.ReadError("upstream disconnected")
+
+            async def aclose(self):
+                self.closed = True
+
+        for service, path in (
+            ("tts", "/v1/audio/speech"),
+            ("llm", "/v1/chat/completions"),
+            ("llm", "/v1/responses"),
+        ):
+            for backend_count in (1, 2):
+                with self.subTest(service=service, path=path, backend_count=backend_count):
+                    broken_body = BrokenBody()
+                    attempts = []
+
+                    async def handler(request: httpx.Request):
+                        if request.url.path == "/health":
+                            return httpx.Response(200)
+                        attempts.append(request.url.host)
+                        if request.url.host == "backend-1.example":
+                            return httpx.Response(503, stream=broken_body)
+                        return httpx.Response(200, stream=AsyncBytes(b"result"))
+
+                    proxy_settings = settings(service, count=backend_count)
+                    app = create_app(proxy_settings, dependencies(proxy_settings, handler))
+                    with TestClient(app) as client:
+                        response = client.post(path, json={"model": "test"})
+                        health = client.get("/health").json()
+
+                    self.assertTrue(broken_body.closed)
+                    self.assertEqual(response.status_code, 200 if backend_count == 2 else 503)
+                    self.assertEqual(len(attempts), backend_count)
+                    failed_backend = health["backends"][0]
+                    self.assertEqual(failed_backend["active_requests"], 0)
+                    self.assertEqual(failed_backend["active_work"], 0)
+                    self.assertEqual(failed_backend["errors"], 1)
+                    if backend_count == 2:
+                        self.assertEqual(response.content, b"result")
+                        self.assertEqual(health["backends"][1]["successes"], 1)
+
     def test_stt_forwards_openai_multipart_and_tracks_duration_weight(self):
         seen: list[tuple[str, str, str, bytes]] = []
         active_work: list[float] = []
@@ -358,6 +404,54 @@ class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProxyCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancellation_while_reading_error_body_releases_capacity(self):
+        for service, path in (
+            ("tts", "/v1/audio/speech"),
+            ("llm", "/v1/chat/completions"),
+            ("llm", "/v1/responses"),
+        ):
+            with self.subTest(service=service, path=path):
+                body_started = asyncio.Event()
+
+                class StalledBody(httpx.AsyncByteStream):
+                    closed = False
+
+                    async def __aiter__(self):
+                        body_started.set()
+                        await asyncio.Event().wait()
+                        yield b"unreachable"
+
+                    async def aclose(self):
+                        self.closed = True
+
+                body = StalledBody()
+
+                async def handler(request: httpx.Request):
+                    if request.url.path == "/health":
+                        return httpx.Response(200)
+                    return httpx.Response(503, stream=body)
+
+                proxy_settings = settings(service)
+                deps = dependencies(proxy_settings, handler)
+                self.addAsyncCleanup(deps.stop)
+                await deps.pool.refresh_health()
+                app = create_app(proxy_settings, deps)
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+                ) as client:
+                    task = asyncio.create_task(client.post(path, json={"model": "test"}))
+                    await asyncio.wait_for(body_started.wait(), timeout=1)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+
+                snapshot = (await deps.pool.snapshots())[0]
+                self.assertTrue(body.closed)
+                self.assertEqual(snapshot.active_requests, 0)
+                self.assertEqual(snapshot.active_work, 0)
+                self.assertEqual(snapshot.cancellations, 1)
+                self.assertEqual(snapshot.errors, 0)
+
     async def _cancel_inflight_request(self, service: str) -> dict:
         request_started = asyncio.Event()
 
