@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import patch
 
 import httpx
 
@@ -311,6 +312,26 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.pool.quarantine_if_idle("backend-1"))
         with self.assertRaises(NoSpeechBackendAvailable):
             await self.pool.reserve(1)
+
+    async def test_admission_between_policy_snapshot_and_drain_is_not_parked(self):
+        await self.make_fleet(("running", "running"))
+        self.now += 601
+        self.pool._states["backend-1"].last_used_at -= 100
+        original = self.pool.drain_if_surplus
+        leases = []
+
+        async def race(name, **kwargs):
+            leases.append(await self.pool.reserve(1))
+            self.assertEqual(leases[0].backend_name, name)
+            return await original(name, **kwargs)
+
+        with patch.object(self.pool, "drain_if_surplus", side_effect=race):
+            await self.tick()
+        self.assertEqual(self.controller.calls, [])
+        self.assertTrue(self.lifecycle._workers["backend-1"].park_requested)
+        await leases[0].release(success=True)
+        await self.tick()
+        self.assertEqual(self.controller.calls, [("park", "backend-1")])
 
 
 if __name__ == "__main__":

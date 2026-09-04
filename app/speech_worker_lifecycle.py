@@ -292,7 +292,11 @@ class SpeechWorkerLifecycle:
                         w.park_requested = True
                         w.phase = "draining"
                         w.reason = "sustained surplus capacity"
-                        if not b.active_requests:
+                        # Admission may have changed after the policy snapshot
+                        # but before the atomic drain. Re-read once fenced; now
+                        # reservations can only decrease, never increase.
+                        drained = next(s for s in await self.pool.snapshots() if s.name == b.name)
+                        if not drained.active_requests:
                             await self._schedule(w, "park", w.reason)
                         self._next_down_at = now + self.settings.scale_down_cooldown_s
                         self._low_load_since = None
