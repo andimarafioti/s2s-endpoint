@@ -50,6 +50,7 @@ from app.session_manager import SessionManager
 from app.session_request_metadata import reported_hardware_id
 from app.session_requester_tracker import SessionRequesterTracker
 from app.session_tokens import llm_token_fingerprint
+from app.speech_proxy_telemetry import SpeechProxyTelemetryClient, SpeechProxyTelemetryTarget
 from app.swarm_dashboard import SwarmDashboard
 from app.verification_admission_limiter import (
     VerificationAdmissionConfig,
@@ -134,6 +135,11 @@ class LoadBalancerSettings:
     dashboard_bucket_prefix: str = "s2s-endpoint/swarm-dashboard"
     dashboard_bucket_token: str | None = None
     dashboard_preview_mode: bool = False
+    speech_stt_proxy_url: str | None = None
+    speech_tts_proxy_url: str | None = None
+    speech_llm_proxy_url: str | None = None
+    speech_proxy_api_key: str | None = None
+    speech_proxy_metrics_timeout_s: float = 5.0
 
     def __post_init__(self) -> None:
         if self.session_hf_token_verify_timeout_s <= 0:
@@ -165,6 +171,10 @@ class LoadBalancerSettings:
             object.__setattr__(self, "request_usage_hash_secret", self.session_shared_secret)
         if self.dashboard_bucket_token is None and self.hf_control_token:
             object.__setattr__(self, "dashboard_bucket_token", self.hf_control_token)
+        if self.speech_proxy_api_key is None and self.hf_control_token:
+            object.__setattr__(self, "speech_proxy_api_key", self.hf_control_token)
+        if self.speech_proxy_metrics_timeout_s <= 0:
+            raise ValueError("SPEECH_PROXY_METRICS_TIMEOUT_S must be > 0")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "LoadBalancerSettings":
@@ -316,6 +326,11 @@ class LoadBalancerSettings:
             ),
             dashboard_bucket_token=env_optional("DASHBOARD_BUCKET_TOKEN", environ=environ),
             dashboard_preview_mode=preview_mode,
+            speech_stt_proxy_url=env_optional("SPEECH_STT_PROXY_URL", environ=environ),
+            speech_tts_proxy_url=env_optional("SPEECH_TTS_PROXY_URL", environ=environ),
+            speech_llm_proxy_url=env_optional("SPEECH_LLM_PROXY_URL", environ=environ),
+            speech_proxy_api_key=env_optional("SPEECH_PROXY_API_KEY", environ=environ),
+            speech_proxy_metrics_timeout_s=float(env_text("SPEECH_PROXY_METRICS_TIMEOUT_S", "5", environ=environ)),
         )
 
 
@@ -373,6 +388,7 @@ class LoadBalancerDependencies:
     requester_rate_limiter: RequesterRateLimiter
     session_requester_tracker: SessionRequesterTracker
     queue_requester_tracker: SessionRequesterTracker
+    speech_proxy_telemetry: SpeechProxyTelemetryClient | None = None
 
 
 def build_load_balancer_dependencies(settings: LoadBalancerSettings) -> LoadBalancerDependencies:
@@ -405,8 +421,28 @@ def build_load_balancer_dependencies(settings: LoadBalancerSettings) -> LoadBala
         if settings.dashboard_preview_mode:
             dashboard_history_store = ReadOnlyDashboardHistoryStore(dashboard_history_store)
 
+    speech_targets = tuple(
+        SpeechProxyTelemetryTarget(service=service, url=url.rstrip("/"))
+        for service, url in (
+            ("stt", settings.speech_stt_proxy_url),
+            ("tts", settings.speech_tts_proxy_url),
+            ("llm", settings.speech_llm_proxy_url),
+        )
+        if url
+    )
+    speech_proxy_telemetry = (
+        SpeechProxyTelemetryClient(
+            speech_targets,
+            api_key=settings.speech_proxy_api_key,
+            timeout_s=settings.speech_proxy_metrics_timeout_s,
+        )
+        if speech_targets
+        else None
+    )
+
     dashboard = SwarmDashboard(
         snapshot_provider=session_manager.healthcheck,
+        speech_telemetry_provider=(speech_proxy_telemetry.snapshot if speech_proxy_telemetry else None),
         sample_interval_s=settings.dashboard_sample_interval_s,
         retention_minutes=settings.dashboard_retention_minutes,
         history_store=dashboard_history_store,
@@ -463,6 +499,7 @@ def build_load_balancer_dependencies(settings: LoadBalancerSettings) -> LoadBala
         requester_rate_limiter=requester_rate_limiter,
         session_requester_tracker=session_requester_tracker,
         queue_requester_tracker=queue_requester_tracker,
+        speech_proxy_telemetry=speech_proxy_telemetry,
     )
 
 
@@ -528,6 +565,8 @@ class LoadBalancerRuntime:
     async def stop(self) -> None:
         await self.dependencies.requester_identity_resolver.stop()
         await self.dependencies.dashboard.stop()
+        if self.dependencies.speech_proxy_telemetry is not None:
+            await self.dependencies.speech_proxy_telemetry.close()
         await self.dependencies.session_manager.stop()
 
 

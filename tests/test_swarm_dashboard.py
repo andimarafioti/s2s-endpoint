@@ -274,6 +274,37 @@ def _bucket_store(api: FakeBucketApi) -> HuggingFaceBucketHistoryStore:
 
 
 class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_data_correlates_speech_proxy_metrics_for_selected_window(self):
+        observed_windows = []
+
+        async def speech_telemetry(window_s):
+            observed_windows.append(window_s)
+            return {
+                "configured": True,
+                "window_s": window_s,
+                "services": {"stt": {"reachable": True}, "tts": {"reachable": True}},
+            }
+
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=0,
+                    pending=0,
+                    running=0,
+                    waking=0,
+                    free_slots=0,
+                    effective_free_slots=0,
+                )
+            ),
+            speech_telemetry_provider=speech_telemetry,
+        )
+
+        payload = await dashboard.data(window="60m", resolution="minute")
+
+        self.assertEqual(observed_windows, [3600])
+        self.assertTrue(payload["speech_proxies"]["configured"])
+        self.assertEqual(set(payload["speech_proxies"]["services"]), {"stt", "tts"})
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(
@@ -496,6 +527,12 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("const rollingCharts = [", html)
         self.assertIn("Maximum Connected Users", html)
         self.assertIn("Median Duration", html)
+        self.assertIn("Proxy And GPU Latency", html)
+        self.assertIn("renderSpeechLatency", html)
+        self.assertIn("transcription: 'transcription'", html)
+        self.assertIn("first_audio: 'first audio'", html)
+        self.assertIn("first_token: 'first token'", html)
+        self.assertIn("phaseLabels[entry.phase]", html)
         self.assertIn("renderRollingChartCards();", html)
 
     async def test_summary_peak_connected_sessions_uses_bucket_max(self):
