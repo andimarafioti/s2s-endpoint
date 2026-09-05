@@ -789,7 +789,9 @@ class EndpointPoolRouter:
         self._spawn_wake_tasks(wake_names)
         return lease
 
-    async def try_acquire(self, *, pipeline: Optional[str] = None) -> Optional[EndpointLease]:
+    async def try_acquire(
+        self, *, pipeline: Optional[str] = None, earlier_pipelines: tuple[Optional[str], ...] = ()
+    ) -> Optional[EndpointLease]:
         """Single non-blocking attempt to grab a free slot.
 
         Returns a lease if one is available right now, otherwise ``None``. When
@@ -800,6 +802,15 @@ class EndpointPoolRouter:
             self._raise_if_closed()
             if self.pipeline_capacity is not None:
                 pipeline = self.pipeline_capacity.resolve(pipeline)
+                # Eligibility and the claim share one lock and demand snapshot.
+                # An unavailable optional route must not hold other routes, but
+                # an earlier eligible ticket retains first claim on shared CPU.
+                counts = self._pipeline_counts_unlocked()
+                if any(
+                    self.pipeline_capacity.can_admit(self.pipeline_capacity.resolve(earlier), counts)
+                    for earlier in earlier_pipelines
+                ):
+                    return None
             lease, wake_names = self._claim_slot_unlocked(waited_for_capacity=False, pipeline=pipeline)
 
         self._spawn_wake_tasks(wake_names)

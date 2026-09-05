@@ -288,6 +288,10 @@ authorize an inference-worker drain. Stale gateway observations stop new
 admissions; they do not disconnect healthy existing conversations. Health
 reports `pipeline_capacity`, with per-choice stage headroom and the limiting
 stage. Alternative capacities are never added together.
+In routed admission, the oldest currently eligible ticket has first claim on
+shared capacity. A ticket waiting for an unavailable optional route does not
+hold healthy choices. Queue positions still describe arrival order; deadlines
+and abandonment cleanup are unchanged. Unconfigured queues retain strict FIFO.
 
 Clients may include `{"pipeline":"qwen-gemma-qwen"}` in `POST /session`; omission
 uses the configured default. Unknown choices fail with 400. The selected
@@ -297,6 +301,11 @@ Client copies of that header are not forwarded. Enable `SESSION_ROUTING_ENABLED`
 on those CPU workers and use the companion speech-to-speech revision supporting
 the [initial routing handoff](https://github.com/huggingface/speech-to-speech/blob/feature/session-routing-handoff/docs/session-routing-handoff.md).
 All advertised choices must match the worker's LLM adapter and audio settings.
+The capacity response retains logical model labels and supplies a `request_model`
+for inference. This uses the pool's first unique alias when present. Admission
+pools sharing a logical model/provider must each declare an alias, so changing
+the default cannot redirect an admitted session to a different revision. Retain
+those aliases and pools until their admitted sessions have finished.
 
 Provider-specific request options must also be compatible across those choices.
 `RESPONSES_API_DISABLE_THINKING=false` disables the automatic vLLM chat-template

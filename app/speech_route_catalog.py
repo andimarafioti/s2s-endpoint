@@ -222,6 +222,12 @@ class SpeechRouteCatalog(CatalogModel):
         urls: dict[str, str] = {}
         workers: set[tuple[str, str]] = set()
         for route in self.pools:
+            if (
+                route.session_workload
+                and not route.aliases
+                and sum(other.model == route.model and other.provider == route.provider for other in self.pools) > 1
+            ):
+                raise ValueError("session capacity requires a unique alias for each pool sharing a model/provider")
             for backend in route.backends:
                 url = backend.url.rstrip("/")
                 if url in urls and (route.kind != "external" or urls[url] != "external"):

@@ -133,7 +133,7 @@ class DirectSessionManager:
     async def allocate(
         self, lb_base_url: str, *, llm_fingerprint: Optional[str] = None, pipeline: Optional[str] = None
     ) -> dict[str, object]:
-        """Grant a session if a slot is free *and* nobody is waiting; otherwise
+        """Grant a session if capacity is free and no eligible ticket is ahead; otherwise
         mint a queue ticket. Never blocks — the waiting lives in the queue, polled
         via ``poll``. Raises ``QueueAtCapacityError`` when the queue itself is full.
 
@@ -145,15 +145,18 @@ class DirectSessionManager:
             lease = await self.endpoint_router.acquire(timeout_s=self.allocate_timeout_s)
         else:
             lease = None
-            # The empty-line check and the slot grab must be one atomic step, or two
-            # concurrent callers could both see an empty queue and both fast-path into
+            # Queue eligibility and the slot grab must be one atomic step, or two
+            # concurrent callers could both pass the queue check and fast-path into
             # the same freed capacity, jumping the line. Holding the lock across
             # ``try_acquire`` is safe: it only touches the router's own lock and never
             # calls back into this manager, and it never waits for capacity.
             async with self._lock:
-                # FIFO: only fast-path a grant when the line is empty. If anyone is
-                # already waiting, a fresh caller joins the back — no queue-jumping.
-                if not self._queue:
+                routed = getattr(self.endpoint_router, "pipeline_capacity", None) is not None
+                if routed:
+                    lease = await self.endpoint_router.try_acquire(
+                        pipeline=pipeline, earlier_pipelines=self._earlier_pipelines_unlocked()
+                    )
+                elif not self._queue:
                     lease = await self.endpoint_router.try_acquire(
                         **({"pipeline": pipeline} if pipeline is not None else {})
                     )
@@ -196,11 +199,11 @@ class DirectSessionManager:
 
     async def poll(self, ticket_id: str, lb_base_url: str) -> dict[str, object]:
         """Advance a waiting ticket. Refreshes its last-seen, reports position, and
-        — only for the head of the line — claims a free slot if one is available,
+        — only for the oldest eligible ticket — claims available capacity,
         returning a grant. Raises ``KeyError`` for an unknown/expired ticket."""
         lease: Optional[EndpointLease] = None
-        # Hold the lock across the whole claim — the head check, the slot grab, and
-        # the pop — so two overlapping polls for the same head ticket can't each
+        # Hold the lock across eligibility, the slot grab, and the pop so two
+        # overlapping polls for the same eligible ticket can't each
         # grant a session. The loser finds the ticket already gone and 404s. Safe
         # to await ``try_acquire`` here: it only takes the router's own lock.
         async with self._lock:
@@ -212,10 +215,15 @@ class DirectSessionManager:
             created_at = ticket.created_at
             position = list(self._queue).index(ticket_id) + 1
 
-            if position == 1 and now < created_at + QUEUE_MAX_WAIT_S:
-                lease = await self.endpoint_router.try_acquire(
-                    **({"pipeline": ticket.pipeline} if ticket.pipeline is not None else {})
-                )
+            if now < created_at + QUEUE_MAX_WAIT_S:
+                if getattr(self.endpoint_router, "pipeline_capacity", None) is not None:
+                    lease = await self.endpoint_router.try_acquire(
+                        pipeline=ticket.pipeline, earlier_pipelines=self._earlier_pipelines_unlocked(ticket_id)
+                    )
+                elif position == 1:
+                    lease = await self.endpoint_router.try_acquire(
+                        **({"pipeline": ticket.pipeline} if ticket.pipeline is not None else {})
+                    )
             # Recheck after the router lock: a claim may cross the deadline.
             timed_out = monotonic() >= created_at + QUEUE_MAX_WAIT_S
             if lease is not None or timed_out:
@@ -253,15 +261,25 @@ class DirectSessionManager:
                 )
             except BaseException:
                 # The ticket was popped optimistically under the lock; a grant
-                # failure must not evict the head of the line after its whole
-                # wait. Put it back in front so the next poll retries.
+                # failure must not evict the ticket after its whole wait. Restore
+                # its original place, including any older unavailable routes.
                 async with self._lock:
                     if ticket_id not in self._queue:
                         self._queue[ticket_id] = ticket
-                        self._queue.move_to_end(ticket_id, last=False)
+                        self._queue = OrderedDict(sorted(self._queue.items(), key=lambda item: item[1].created_at))
                 raise
 
         return self._ticket_view(ticket_id, position)
+
+    def _earlier_pipelines_unlocked(self, ticket_id: Optional[str] = None) -> tuple[Optional[str], ...]:
+        now = monotonic()
+        earlier = []
+        for queued_id, ticket in self._queue.items():
+            if queued_id == ticket_id:
+                break
+            if now < ticket.created_at + QUEUE_MAX_WAIT_S:
+                earlier.append(ticket.pipeline)
+        return tuple(earlier)
 
     async def leave(self, ticket_id: str) -> bool:
         """Drop a waiting ticket (explicit "leave the queue" / teardown beacon).

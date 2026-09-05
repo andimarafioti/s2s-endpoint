@@ -941,6 +941,7 @@ def create_app(
             await deps.pool.set_session_demand(count, reserve_sessions=update.reserve_sessions)
             results[pool] = {
                 **route.labels(),
+                "request_model": route.aliases[0] if route.aliases else route.model,
                 "protocols": route.protocols,
                 "voices": route.capabilities.voices,
                 "profile": route.session_workload.profile,

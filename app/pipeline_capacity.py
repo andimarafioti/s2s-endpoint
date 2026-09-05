@@ -117,7 +117,8 @@ class PipelineCapacity:
                     if view.get("demand_stale", True):
                         raise ValueError("gateway demand is stale")
                     if not all(
-                        isinstance(view.get(field), str) and view[field] for field in ("model", "provider", "profile")
+                        isinstance(view.get(field), str) and view[field]
+                        for field in ("model", "request_model", "provider", "profile")
                     ):
                         raise ValueError("missing route identity or workload profile")
                 for pool, count in selected.items():
@@ -148,7 +149,7 @@ class PipelineCapacity:
         for service in SERVICES:
             view = self._views[(service, getattr(route, service))]
             routes[service] = {
-                "model": view["model"],
+                "model": view["request_model"],
                 "provider": view["provider"],
                 "protocol": {"stt": "transcriptions", "tts": "speech", "llm": self.config.llm_protocol}[service],
             }
