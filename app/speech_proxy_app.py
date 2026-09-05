@@ -748,6 +748,7 @@ async def _proxy_streaming_json(
 async def _dispatch_request(
     request: Request, path: str, settings: SpeechProxySettings, dependencies: SpeechProxyDependencies
 ) -> Response:
+    trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
     prepared_form = None
     body = None
     if settings.catalog:
@@ -801,13 +802,19 @@ async def _dispatch_request(
             else:
                 body = json.dumps(payload).encode()
         except (ValueError, HTTPException) as exc:
-            await SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request)).record("error")
+            await trace.record("error")
             if isinstance(exc, HTTPException):
                 raise
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except asyncio.CancelledError:
+            await trace.record("cancelled")
+            raise
+        except Exception:
+            await trace.record("error")
+            raise
         settings = selected
         dependencies = dependencies.routes[route.pool]
-    trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
+        trace.metrics = dependencies.metrics
     if settings.service == "stt":
         response = await _proxy_stt(request, settings, dependencies, trace, prepared_form)
     else:

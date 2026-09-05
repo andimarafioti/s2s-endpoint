@@ -11,8 +11,10 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.speech_proxy_app import SpeechProxySettings, create_app
+from app.speech_proxy_metrics import SpeechRequestTrace
 from app.speech_proxy_router import SpeechPoolCapacityExceeded
 from tests.test_speech_proxy_app import AsyncBytes, wav_bytes
+from tests.test_speech_proxy_metrics import MutableClock
 from tests.test_speech_worker_lifecycle import Controller
 
 
@@ -62,6 +64,41 @@ def catalog_client(env, handler):
 
 
 class CatalogApplicationTests(unittest.TestCase):
+    def test_nullable_token_and_cache_fields_are_forwarded_without_bypassing_nonnull_checks(self):
+        seen = []
+
+        async def backend(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": "deployed-model"}]})
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, content=b"result")
+
+        env = environment(
+            route("external", "model", kind="external", provider="api", protocols=["chat_completions", "responses"])
+        )
+        with catalog_client(env, backend) as client:
+            for field, unsupported in (
+                ("max_tokens", 8193),
+                ("max_completion_tokens", 8193),
+                ("max_output_tokens", 8193),
+                ("prompt_cache_key", "cache"),
+                ("prompt_cache_retention", "24h"),
+            ):
+                with self.subTest(field=field):
+                    path = "/v1/responses" if field == "max_output_tokens" else "/v1/chat/completions"
+                    context = (
+                        {"input": "hi"}
+                        if path.endswith("responses")
+                        else {"messages": [{"role": "user", "content": "hi"}]}
+                    )
+                    payload = {"model": "model", **context, field: None}
+                    response = client.post(path, json=payload)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(seen[-1], {**payload, "model": "deployed-model"})
+                    count = len(seen)
+                    self.assertEqual(client.post(path, json={**payload, field: unsupported}).status_code, 400)
+                    self.assertEqual(len(seen), count)
+
     def test_external_models_share_api_url_with_independent_request_budgets(self):
         seen = []
 
@@ -492,6 +529,79 @@ class CatalogValidationTests(unittest.TestCase):
 
 
 class CatalogIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_or_cancelled_catalog_upload_is_recorded_without_reservation(self):
+        for exception, outcome in ((asyncio.CancelledError, "cancellations"), (httpx.ReadError, "errors")):
+            with self.subTest(outcome=outcome):
+
+                async def backend(request):
+                    return httpx.Response(200)
+
+                app = make_app(environment(route("one", "model")), backend)
+                deps = app.state.dependencies
+                self.addAsyncCleanup(deps.stop)
+
+                async def upload():
+                    yield b'{"model":'
+                    raise exception("upload interrupted")
+
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app)) as client:
+                    with self.assertRaises(exception):
+                        await client.post("http://proxy/v1/chat/completions", content=upload())
+                metrics = await deps.metrics.snapshot(300)
+                self.assertEqual(metrics["requests"][outcome], 1)
+                self.assertEqual((await deps.routes["one"].pool.snapshots())[0].requests, 0)
+
+    async def test_trace_includes_body_parsing_time_for_json_multipart_and_validation_errors(self):
+        for service, protocol, valid in (
+            ("llm", "chat_completions", True),
+            ("stt", "transcriptions", True),
+            ("llm", "chat_completions", False),
+        ):
+            with self.subTest(service=service, valid=valid):
+                clock = MutableClock()
+
+                async def backend(request):
+                    return httpx.Response(200, content=b"result")
+
+                env = environment(route("one", "model", protocols=[protocol]))
+                env["SPEECH_PROXY_SERVICE"] = service
+                app = make_app(env, backend)
+                deps = app.state.dependencies
+                self.addAsyncCleanup(deps.stop)
+                await deps.routes["one"].pool.refresh_health()
+                if service == "stt":
+                    original = httpx.Request(
+                        "POST",
+                        "http://proxy/v1/audio/transcriptions",
+                        data={"model": "model"},
+                        files={"file": ("audio.wav", wav_bytes(), "audio/wav")},
+                    )
+                else:
+                    original = httpx.Request(
+                        "POST",
+                        "http://proxy/v1/chat/completions",
+                        json={"model": "model" if valid else "unknown", "messages": []},
+                    )
+                body = original.read()
+
+                async def upload():
+                    clock.value += 0.1
+                    yield body
+
+                def trace(*args, **kwargs):
+                    return SpeechRequestTrace(*args, **kwargs, monotonic_fn=clock.now)
+
+                with patch("app.speech_proxy_app.SpeechRequestTrace", side_effect=trace):
+                    async with httpx.AsyncClient(transport=httpx.ASGITransport(app)) as client:
+                        response = await client.post(str(original.url), headers=original.headers, content=upload())
+                self.assertEqual(response.status_code, 200 if valid else 400)
+                metrics = await deps.metrics.snapshot(300)
+                self.assertEqual(metrics["latency_ms"]["total"]["p50"], 100)
+                self.assertEqual(metrics["latency_ms"]["proxy_application"]["p50"], 100)
+                if valid:
+                    pool_metrics = await deps.routes["one"].metrics.snapshot(300)
+                    self.assertEqual(pool_metrics["latency_ms"]["total"]["p50"], 100)
+
     async def test_slow_optional_startup_does_not_block_healthy_requests(self):
         blocked = asyncio.Event()
 

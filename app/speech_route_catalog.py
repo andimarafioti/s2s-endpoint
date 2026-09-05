@@ -139,10 +139,10 @@ class SpeechRoute(CatalogModel):
         if caps.continuation == "full_context" and (payload.get("previous_response_id") or payload.get("conversation")):
             raise ValueError("the selected route requires complete context; backend-local continuation is unsupported")
         for key in ("prompt_cache_key", "prompt_cache_retention"):
-            if key in payload and key not in caps.cache_controls:
+            if payload.get(key) is not None and key not in caps.cache_controls:
                 raise ValueError(f"the selected route does not support {key}")
         for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
-            if key in payload:
+            if payload.get(key) is not None:
                 value = payload[key]
                 if type(value) is not int or value < 1 or (caps.context_window and value > caps.context_window):
                     raise ValueError(f"{key} must fit the selected route's context window")
