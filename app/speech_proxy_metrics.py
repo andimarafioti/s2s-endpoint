@@ -55,6 +55,10 @@ class SpeechLatencySample:
     backend_service_ms: float | None
     backend_transport_ms: float | None
     proxy_path_overhead_ms: float | None
+    model: str | None = None
+    provider: str | None = None
+    pool: str | None = None
+    revision: str | None = None
 
 
 class SpeechProxyMetrics:
@@ -64,10 +68,14 @@ class SpeechProxyMetrics:
         *,
         max_samples: int = 50_000,
         time_fn=time.time,
+        route: dict[str, str] | None = None,
+        parent: SpeechProxyMetrics | None = None,
     ) -> None:
         if max_samples < 1:
             raise ValueError("max_samples must be >= 1")
         self.service = service
+        self.route = route or {}
+        self.parent = parent
         self.max_samples = max_samples
         self._time_fn = time_fn
         self._samples: deque[SpeechLatencySample] = deque(maxlen=max_samples)
@@ -78,6 +86,8 @@ class SpeechProxyMetrics:
         async with self._lock:
             self._samples.append(sample)
             self._lifetime_outcomes[sample.outcome] += 1
+        if self.parent is not None:
+            await self.parent.record(sample)
 
     async def snapshot(self, window_s: float) -> dict[str, object]:
         if window_s <= 0:
@@ -92,13 +102,17 @@ class SpeechProxyMetrics:
         reported = sum(sample.backend_service_ms is not None for sample in samples)
         eligible = sum(sample.backend_round_trip_ms is not None for sample in samples)
         by_backend: dict[str, dict[str, object]] = {}
-        for backend in sorted({sample.backend for sample in samples if sample.backend}):
-            backend_samples = [sample for sample in samples if sample.backend == backend]
-            by_backend[str(backend)] = self._latency_summary(backend_samples)
+        for pool, backend in sorted({(sample.pool or "", sample.backend) for sample in samples if sample.backend}):
+            backend_samples = [
+                sample for sample in samples if sample.backend == backend and (sample.pool or "") == pool
+            ]
+            key = f"{pool}/{backend}" if pool else backend
+            by_backend[key] = self._latency_summary(backend_samples)
 
         return {
             "status": "ok",
             "service": self.service,
+            **self.route,
             "phase": {
                 "stt": "transcription",
                 "tts": "first_audio",
@@ -204,11 +218,13 @@ class SpeechRequestTrace:
             backend_service_ms=service_ms,
             backend_transport_ms=transport_ms,
             proxy_path_overhead_ms=path_overhead_ms,
+            **self.metrics.route,
         )
         await self.metrics.record(self._sample)
         logger.info(
             "Speech proxy result service=%s request_id=%s outcome=%s backend=%s total_ms=%.3f "
-            "overhead_ms=%s proxy_ms=%.3f backend_ms=%.3f service_ms=%s transport_ms=%s attempts=%s",
+            "overhead_ms=%s proxy_ms=%.3f backend_ms=%.3f service_ms=%s transport_ms=%s attempts=%s "
+            "model=%s provider=%s pool=%s revision=%s",
             self.metrics.service,
             self._sample.request_id,
             self._sample.outcome,
@@ -220,6 +236,10 @@ class SpeechRequestTrace:
             self._sample.backend_service_ms,
             self._sample.backend_transport_ms,
             self._sample.attempts,
+            self._sample.model,
+            self._sample.provider,
+            self._sample.pool,
+            self._sample.revision,
         )
         return self._sample
 

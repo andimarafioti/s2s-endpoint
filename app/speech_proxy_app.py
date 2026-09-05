@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import io
+import json
+import math
 import time
 import uuid
 import wave
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 import httpx
@@ -14,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import UploadFile
 
-from app.app_utils import build_lifespan, env_bool, env_optional, env_text, setup_logging
+from app.app_utils import build_lifespan, cancel_and_await, env_bool, env_optional, env_text, setup_logging
 from app.endpoint_pool_router import HuggingFaceEndpointController
 from app.speech_proxy_metrics import (
     SERVICE_LATENCY_HEADER,
@@ -28,8 +31,10 @@ from app.speech_proxy_router import (
     SpeechBackendLease,
     SpeechBackendPool,
     SpeechBackendPoolSettings,
+    SpeechPoolCapacityExceeded,
     SpeechService,
 )
+from app.speech_route_catalog import SpeechRoute, SpeechRouteCatalog
 from app.speech_worker_lifecycle import SpeechWorkerLifecycle, WorkerLifecycleSettings
 
 logger = setup_logging()
@@ -104,6 +109,10 @@ class SpeechProxySettings:
     lifecycle: WorkerLifecycleSettings | None = None
     control_token: str | None = None
     endpoint_namespace: str | None = None
+    catalog: SpeechRouteCatalog | None = None
+    routes: tuple[SpeechProxySettings, ...] = ()
+    route: SpeechRoute | None = None
+    access_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         SpeechBackendPoolSettings(
@@ -155,7 +164,11 @@ class SpeechProxySettings:
         if backend_api_key is None:
             backend_api_key = env_optional("HF_TOKEN", environ=environ)
         autoscale = env_bool("SPEECH_AUTOSCALE_ENABLED", False, environ=environ)
-        backends = parse_backends(env_text("SPEECH_BACKENDS", environ=environ), managed=autoscale)
+        raw_catalog = env_text("SPEECH_ROUTE_CATALOG", environ=environ)
+        catalog = SpeechRouteCatalog.model_validate_json(raw_catalog) if raw_catalog else None
+        if catalog and autoscale:
+            raise ValueError("catalog mode requires lifecycle settings per pool, not SPEECH_AUTOSCALE_ENABLED")
+        backends = () if catalog else parse_backends(env_text("SPEECH_BACKENDS", environ=environ), managed=autoscale)
         lifecycle = None
         if autoscale:
             lifecycle = WorkerLifecycleSettings(
@@ -164,7 +177,7 @@ class SpeechProxySettings:
                     for name, default in asdict(WorkerLifecycleSettings(max_workers=len(backends))).items()
                 }
             )
-        return cls(
+        settings = cls(
             service=service,  # type: ignore[arg-type]
             backends=backends,
             lifecycle=lifecycle,
@@ -234,6 +247,44 @@ class SpeechProxySettings:
                 environ=environ,
             ),
         )
+        if catalog is None:
+            return settings
+        catalog.validate_service(service)
+
+        def secret(name: str | None) -> str | None:
+            if name is None:
+                return None
+            value = env_optional(name, environ=environ)
+            if not value:
+                raise ValueError(f"Missing required route secret: {name}")
+            return value
+
+        routes = []
+        for route in catalog.pools:
+            policy = route.policy.model_dump(exclude_unset=True)
+            if service == "tts":
+                policy.setdefault("tts_warmup_voice", route.capabilities.voices[0])
+                if policy["tts_warmup_voice"] not in route.capabilities.voices:
+                    raise ValueError("tts_warmup_voice must be supported by its route")
+            if route.kind == "external":
+                policy.update(tts_warmup_enabled=False, llm_warmup_enabled=False)
+                policy.setdefault("health_path", "/v1/models")
+            routes.append(
+                replace(
+                    settings,
+                    route=route,
+                    backends=tuple(SpeechBackendConfig(b.name, b.url.rstrip("/")) for b in route.backends),
+                    backend_api_key=secret(route.credential_env),
+                    access_api_key=secret(route.access_key_env),
+                    lifecycle=WorkerLifecycleSettings(**route.lifecycle) if route.lifecycle is not None else None,
+                    control_token=secret(route.control_token_env),
+                    endpoint_namespace=route.namespace,
+                    llm_warmup_model=route.upstream_model,
+                    tts_warmup_model=route.upstream_model,
+                    **policy,
+                )
+            )
+        return replace(settings, catalog=catalog, routes=tuple(routes))
 
     def pool_settings(self) -> SpeechBackendPoolSettings:
         return SpeechBackendPoolSettings(
@@ -252,26 +303,54 @@ class SpeechProxySettings:
             tts_warmup_model=self.tts_warmup_model,
             tts_warmup_voice=self.tts_warmup_voice,
             tts_warmup_language=self.tts_warmup_language,
+            tts_warmup_format=self.route.capabilities.audio_formats[0]
+            if self.route and self.service == "tts"
+            else "pcm",
             llm_warmup_enabled=self.llm_warmup_enabled,
             llm_warmup_timeout_s=self.llm_warmup_timeout_s,
             llm_warmup_model=self.llm_warmup_model,
+            external=self.route is not None and self.route.kind == "external",
+            llm_warmup_api="responses"
+            if self.route and "responses" in self.route.protocols and "chat_completions" not in self.route.protocols
+            else "chat_completions",
+            max_concurrency=self.route.capacity.max_concurrency if self.route and self.route.capacity else None,
+            requests_per_minute=self.route.capacity.requests_per_minute if self.route and self.route.capacity else None,
         )
 
 
 @dataclass
 class SpeechProxyDependencies:
-    pool: SpeechBackendPool
-    client: httpx.AsyncClient
+    pool: SpeechBackendPool | None = None
+    client: httpx.AsyncClient | None = None
     metrics: SpeechProxyMetrics | None = None
     owns_client: bool = True
     lifecycle: SpeechWorkerLifecycle | None = None
+    routes: dict[str, SpeechProxyDependencies] = field(default_factory=dict)
+    startup_tasks: list[asyncio.Task] = field(default_factory=list)
 
     async def start(self) -> None:
+        if self.routes:
+            # Optional cold/unavailable models must not delay healthy routes' admission.
+            self.startup_tasks = [
+                asyncio.create_task(self._start_route(name, route)) for name, route in self.routes.items()
+            ]
+            return
         if self.lifecycle is not None:
             await self.lifecycle.start()
         await self.pool.start()
 
+    async def _start_route(self, name: str, route: SpeechProxyDependencies) -> None:
+        try:
+            await route.start()
+        except Exception as exc:
+            logger.error("Pool startup failed pool=%s error_type=%s", name, type(exc).__name__)
+
     async def stop(self) -> None:
+        if self.routes:
+            for task in self.startup_tasks:
+                await cancel_and_await(task)
+            await asyncio.gather(*(route.stop() for route in self.routes.values()))
+            return
         if self.lifecycle is not None:
             await self.lifecycle.stop()
         await self.pool.stop()
@@ -280,6 +359,14 @@ class SpeechProxyDependencies:
 
 
 def create_dependencies(settings: SpeechProxySettings) -> SpeechProxyDependencies:
+    if settings.catalog:
+        dependencies = SpeechProxyDependencies(
+            routes={route.route.pool: create_dependencies(route) for route in settings.routes},
+            metrics=SpeechProxyMetrics(settings.service),
+        )
+        for route in dependencies.routes.values():
+            route.metrics.parent = dependencies.metrics
+        return dependencies
     timeout = httpx.Timeout(settings.request_timeout_s, connect=min(settings.request_timeout_s, 10.0))
     limits = httpx.Limits(
         max_connections=settings.max_connections,
@@ -299,7 +386,7 @@ def create_dependencies(settings: SpeechProxySettings) -> SpeechProxyDependencie
     return SpeechProxyDependencies(
         pool=pool,
         client=client,
-        metrics=SpeechProxyMetrics(settings.service),
+        metrics=SpeechProxyMetrics(settings.service, route=settings.route.labels() if settings.route else None),
         lifecycle=lifecycle,
     )
 
@@ -323,6 +410,8 @@ def _request_id(request: Request) -> str:
 
 def _traced_response_headers(response: httpx.Response, trace: SpeechRequestTrace) -> dict[str, str]:
     headers = _response_headers(response)
+    if trace.metrics.route and "retry-after" in response.headers:
+        headers["Retry-After"] = response.headers["retry-after"]
     if trace.sample is not None:
         headers.update(sample_headers(trace.sample))
     return headers
@@ -395,23 +484,36 @@ def _unavailable_response(service: SpeechService) -> JSONResponse:
     )
 
 
+def _capacity_response(exc: SpeechPoolCapacityExceeded) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"message": str(exc), "type": "rate_limit_error", "code": "pool_capacity_exceeded"}},
+        status_code=429,
+        headers={"Retry-After": str(max(1, math.ceil(exc.retry_after)))},
+    )
+
+
 async def _proxy_stt(
     request: Request,
     settings: SpeechProxySettings,
     dependencies: SpeechProxyDependencies,
     trace: SpeechRequestTrace,
+    prepared_form: tuple[list, float] | None = None,
 ) -> Response:
     try:
-        multipart, duration_s = await _stt_form(request)
+        multipart, duration_s = prepared_form if prepared_form is not None else await _stt_form(request)
         work = max(duration_s / settings.stt_audio_equivalent_s, 1.0)
         excluded: set[str] = set()
         last_error = "no backend attempt was made"
         for _ in range(settings.max_attempts):
             try:
                 lease = await dependencies.pool.reserve(work, exclude=frozenset(excluded))
+            except SpeechPoolCapacityExceeded as exc:
+                await trace.record("error")
+                return _capacity_response(exc)
             except NoSpeechBackendAvailable:
                 break
-            excluded.add(lease.backend_name)
+            if not dependencies.pool.settings.external:
+                excluded.add(lease.backend_name)
             started = time.monotonic()
             trace.start_upstream(lease.backend_name)
             try:
@@ -438,6 +540,9 @@ async def _proxy_stt(
             elapsed = time.monotonic() - started
             success = 200 <= response.status_code < 300
             retryable = _retryable_response(response.status_code, response.content)
+            if dependencies.pool.settings.external and response.status_code == 429:
+                await dependencies.pool.rate_limited(response.headers.get("retry-after"))
+                retryable = False
             latency_metric = elapsed / duration_s if duration_s > 0 else elapsed
             await lease.release(
                 success=success,
@@ -522,19 +627,24 @@ async def _proxy_streaming_json(
     settings: SpeechProxySettings,
     dependencies: SpeechProxyDependencies,
     trace: SpeechRequestTrace,
+    body: bytes | None = None,
 ) -> Response:
     service = settings.service
     first_result = "audio" if service == "tts" else "token"
     try:
-        body = await request.body()
+        body = await request.body() if body is None else body
         excluded: set[str] = set()
         last_error = "no backend attempt was made"
         for _ in range(settings.max_attempts):
             try:
                 lease = await dependencies.pool.reserve(1.0, exclude=frozenset(excluded))
+            except SpeechPoolCapacityExceeded as exc:
+                await trace.record("error")
+                return _capacity_response(exc)
             except NoSpeechBackendAvailable:
                 break
-            excluded.add(lease.backend_name)
+            if not dependencies.pool.settings.external:
+                excluded.add(lease.backend_name)
             started = time.monotonic()
             trace.start_upstream(lease.backend_name)
             response: httpx.Response | None = None
@@ -553,9 +663,14 @@ async def _proxy_streaming_json(
                 )
                 response = await dependencies.client.send(upstream_request, stream=True)
                 if not 200 <= response.status_code < 300:
+                    provider_limited = dependencies.pool.settings.external and response.status_code == 429
+                    if provider_limited:
+                        await dependencies.pool.rate_limited(response.headers.get("retry-after"))
                     response_body = await response.aread()
                     trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
                     retryable = _retryable_response(response.status_code, response_body)
+                    if provider_limited:
+                        retryable = False
                     await lease.release(
                         success=False,
                         retryable_failure=retryable,
@@ -625,29 +740,76 @@ async def _proxy_streaming_json(
         raise
 
 
-async def _proxy_tts(
-    request: Request,
-    settings: SpeechProxySettings,
-    dependencies: SpeechProxyDependencies,
-    trace: SpeechRequestTrace,
+async def _dispatch_request(
+    request: Request, path: str, settings: SpeechProxySettings, dependencies: SpeechProxyDependencies
 ) -> Response:
-    return await _proxy_streaming_json(
-        request,
-        "/v1/audio/speech",
-        settings,
-        dependencies,
-        trace,
-    )
-
-
-async def _proxy_llm(
-    request: Request,
-    path: str,
-    settings: SpeechProxySettings,
-    dependencies: SpeechProxyDependencies,
-    trace: SpeechRequestTrace,
-) -> Response:
-    return await _proxy_streaming_json(request, path, settings, dependencies, trace)
+    prepared_form = None
+    body = None
+    if settings.catalog:
+        try:
+            if settings.service == "stt":
+                prepared_form = await _stt_form(request)
+                fields = [(name, value) for name, (filename, value, _) in prepared_form[0] if filename is None]
+                if len([1 for name, _ in fields if name in {"model", "provider"}]) != len(
+                    {name for name, _ in fields if name in {"model", "provider"}}
+                ):
+                    raise ValueError("model and provider must not be repeated")
+                payload = dict(fields)
+            else:
+                payload = await request.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("request body must be an object")
+            model = payload.get("model")
+            provider = request.headers.get("X-Speech-Provider", payload.get("provider"))
+            if not isinstance(model, str) or not model or (provider is not None and not isinstance(provider, str)):
+                raise ValueError("model and optional provider must be nonempty strings")
+            if "provider" in payload and "X-Speech-Provider" in request.headers and payload["provider"] != provider:
+                raise ValueError("provider field and header disagree")
+            route = settings.catalog.resolve(model, provider)
+            selected = next(item for item in settings.routes if item.route.pool == route.pool)
+            if selected.access_api_key:
+                credential = request.headers.get("X-Speech-Authorization", request.headers.get("Authorization", ""))
+                if not hmac.compare_digest(credential.encode(), f"Bearer {selected.access_api_key}".encode()):
+                    raise HTTPException(status_code=401, detail="route authorization required")
+            route.validate_request(path, payload)
+            required_context = request.headers.get("X-Speech-Required-Context-Tokens")
+            if required_context is not None:
+                required = int(required_context)
+                if (
+                    required < 1
+                    or route.capabilities.context_window is None
+                    or required > route.capabilities.context_window
+                ):
+                    raise ValueError("the selected route cannot satisfy the required context window")
+            payload["model"] = route.upstream_model
+            payload.pop("provider", None)
+            if prepared_form is not None:
+                multipart, duration = prepared_form
+                prepared_form = (
+                    [
+                        (name, (None, route.upstream_model, None) if name == "model" else value)
+                        for name, value in multipart
+                        if name != "provider"
+                    ],
+                    duration,
+                )
+            else:
+                body = json.dumps(payload).encode()
+        except (ValueError, HTTPException) as exc:
+            await SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request)).record("error")
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        settings = selected
+        dependencies = dependencies.routes[route.pool]
+    trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
+    if settings.service == "stt":
+        response = await _proxy_stt(request, settings, dependencies, trace, prepared_form)
+    else:
+        response = await _proxy_streaming_json(request, path, settings, dependencies, trace, body)
+    if settings.route:
+        response.headers.update({f"X-Speech-{key}": value for key, value in settings.route.labels().items()})
+    return response
 
 
 def create_app(
@@ -677,6 +839,35 @@ def create_app(
 
     @app.get("/health")
     async def health():
+        if settings.catalog:
+            pools = {}
+            backends = []
+            for selected in settings.routes:
+                route = selected.route
+                deps = dependencies.routes[route.pool]
+                snapshots = await deps.pool.snapshots()
+                ready = sum(snapshot.ready and not snapshot.draining for snapshot in snapshots)
+                pools[route.pool] = {
+                    **route.labels(),
+                    "ready_backends": ready,
+                    "status": "ok" if ready else "unhealthy",
+                    "backends": [asdict(snapshot) for snapshot in snapshots],
+                    "capacity": await deps.pool.capacity_snapshot(),
+                    "lifecycle": await deps.lifecycle.snapshot() if deps.lifecycle else {"enabled": False},
+                }
+                backends.extend({**asdict(snapshot), **route.labels()} for snapshot in snapshots)
+            ready = sum(pool["ready_backends"] for pool in pools.values())
+            return JSONResponse(
+                {
+                    "status": "ok" if ready else "unhealthy",
+                    "role": APP_ROLE,
+                    "service": settings.service,
+                    "ready_backends": ready,
+                    "backends": backends,
+                    "pools": pools,
+                },
+                status_code=200 if ready else 503,
+            )
         snapshots = await dependencies.pool.snapshots()
         payload = {
             "status": "ok" if await dependencies.pool.healthy() else "unhealthy",
@@ -694,6 +885,13 @@ def create_app(
     async def metrics(window_s: float = 300.0):
         try:
             payload = await dependencies.metrics.snapshot(window_s)
+            if settings.catalog:
+                payload["pools"] = {}
+                for pool, deps in dependencies.routes.items():
+                    snapshot = await deps.metrics.snapshot(window_s)
+                    if deps.lifecycle:
+                        snapshot["lifecycle"] = await deps.lifecycle.snapshot()
+                    payload["pools"][pool] = snapshot
             if dependencies.lifecycle is not None:
                 payload["lifecycle"] = await dependencies.lifecycle.snapshot()
         except ValueError as exc:
@@ -704,26 +902,22 @@ def create_app(
 
         @app.post("/v1/audio/transcriptions")
         async def transcriptions(request: Request):
-            trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
-            return await _proxy_stt(request, settings, dependencies, trace)
+            return await _dispatch_request(request, "/v1/audio/transcriptions", settings, dependencies)
 
     elif settings.service == "tts":
 
         @app.post("/v1/audio/speech")
         async def speech(request: Request):
-            trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
-            return await _proxy_tts(request, settings, dependencies, trace)
+            return await _dispatch_request(request, "/v1/audio/speech", settings, dependencies)
 
     else:
 
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request):
-            trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
-            return await _proxy_llm(request, "/v1/chat/completions", settings, dependencies, trace)
+            return await _dispatch_request(request, "/v1/chat/completions", settings, dependencies)
 
         @app.post("/v1/responses")
         async def responses(request: Request):
-            trace = SpeechRequestTrace(dependencies.metrics, request_id=_request_id(request))
-            return await _proxy_llm(request, "/v1/responses", settings, dependencies, trace)
+            return await _dispatch_request(request, "/v1/responses", settings, dependencies)
 
     return app

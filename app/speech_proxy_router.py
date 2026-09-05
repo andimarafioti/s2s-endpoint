@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from typing import Literal
 
 import httpx
@@ -14,6 +16,12 @@ SpeechService = Literal["stt", "tts", "llm"]
 
 class NoSpeechBackendAvailable(RuntimeError):
     """Raised when no ready backend can accept the requested work."""
+
+
+class SpeechPoolCapacityExceeded(NoSpeechBackendAvailable):
+    def __init__(self, retry_after: float):
+        super().__init__("provider pool capacity is temporarily exhausted")
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -124,9 +132,14 @@ class SpeechBackendPoolSettings:
     tts_warmup_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     tts_warmup_voice: str = "aiden"
     tts_warmup_language: str = "English"
+    tts_warmup_format: str = "pcm"
     llm_warmup_enabled: bool = True
     llm_warmup_timeout_s: float = 120.0
     llm_warmup_model: str = "nvidia/Gemma-4-26B-A4B-NVFP4"
+    llm_warmup_api: Literal["chat_completions", "responses"] = "chat_completions"
+    external: bool = False
+    max_concurrency: int | None = None
+    requests_per_minute: int | None = None
 
     def __post_init__(self) -> None:
         if self.service not in {"stt", "tts", "llm"}:
@@ -143,6 +156,8 @@ class SpeechBackendPoolSettings:
             raise ValueError("failure_threshold must be >= 1")
         if self.health_interval_s <= 0 or self.health_timeout_s <= 0:
             raise ValueError("health intervals and timeouts must be > 0")
+        if self.external and (not self.max_concurrency or not self.requests_per_minute):
+            raise ValueError("external pools require concurrency and request limits")
 
 
 class SpeechBackendPool:
@@ -168,6 +183,8 @@ class SpeechBackendPool:
         self._lock = asyncio.Lock()
         self._selection_counter = 0
         self._peak_work = 0.0
+        self._request_times: deque[float] = deque()
+        self._cooldown_until = 0.0
         self._health_task: asyncio.Task | None = None
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=True)
@@ -191,6 +208,16 @@ class SpeechBackendPool:
         if work <= 0:
             raise ValueError("work must be > 0")
         async with self._lock:
+            if self.settings.external:
+                now = time.monotonic()
+                while self._request_times and self._request_times[0] <= now - 60:
+                    self._request_times.popleft()
+                if now < self._cooldown_until:
+                    raise SpeechPoolCapacityExceeded(self._cooldown_until - now)
+                if len(self._request_times) >= self.settings.requests_per_minute:
+                    raise SpeechPoolCapacityExceeded(self._request_times[0] + 60 - now)
+                if sum(s.active_requests for s in self._states.values()) >= self.settings.max_concurrency:
+                    raise SpeechPoolCapacityExceeded(1)
             candidates = [
                 state
                 for state in self._states.values()
@@ -199,6 +226,8 @@ class SpeechBackendPool:
             if not candidates:
                 raise NoSpeechBackendAvailable("no ready speech backend is available")
             state = min(candidates, key=self._score)
+            if self.settings.external:
+                self._request_times.append(time.monotonic())
             self._selection_counter += 1
             state.last_selected = self._selection_counter
             state.active_requests += 1
@@ -251,6 +280,35 @@ class SpeechBackendPool:
     async def set_draining(self, backend_name: str, draining: bool) -> None:
         async with self._lock:
             self._states[backend_name].draining = draining
+
+    async def rate_limited(self, retry_after: str | None) -> None:
+        """Honor provider backpressure for the entire pool, including aliases and retries."""
+        delay = 1.0
+        if retry_after:
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                try:
+                    delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        if not 0 < delay < float("inf"):
+            delay = 1.0
+        async with self._lock:
+            self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
+
+    async def capacity_snapshot(self) -> dict:
+        if not self.settings.external:
+            return {"mode": "soft_target"}
+        async with self._lock:
+            now = time.monotonic()
+            return {
+                "mode": "external",
+                "max_concurrency": self.settings.max_concurrency,
+                "requests_per_minute": self.settings.requests_per_minute,
+                "requests_in_window": sum(start > now - 60 for start in self._request_times),
+                "retry_after_s": max(self._cooldown_until - now, 0),
+            }
 
     async def take_work_peak(self) -> float:
         """Retain short STT bursts that complete between controller polls."""
@@ -367,6 +425,10 @@ class SpeechBackendPool:
                 timeout=self.settings.health_timeout_s,
             )
             response.raise_for_status()
+            if self.settings.external and self.settings.service == "llm":
+                models = response.json().get("data", [])
+                if not any(model.get("id") == self.settings.llm_warmup_model for model in models):
+                    raise ValueError("configured model is unavailable from provider")
             if not was_ready:
                 if self.settings.service == "tts" and self.settings.tts_warmup_enabled:
                     await self._warm_tts(url, headers)
@@ -394,7 +456,7 @@ class SpeechBackendPool:
                 "voice": self.settings.tts_warmup_voice,
                 "language": self.settings.tts_warmup_language,
                 "input": "Ready.",
-                "response_format": "pcm",
+                "response_format": self.settings.tts_warmup_format,
                 "stream": True,
             },
             timeout=self.settings.tts_warmup_timeout_s,
@@ -404,16 +466,16 @@ class SpeechBackendPool:
             raise RuntimeError("TTS warmup returned an empty response")
 
     async def _warm_llm(self, url: str, headers: dict[str, str]) -> None:
+        responses = self.settings.llm_warmup_api == "responses"
+        payload = {"model": self.settings.llm_warmup_model, "stream": False}
+        if responses:
+            payload.update(input="Reply OK.", max_output_tokens=2)
+        else:
+            payload.update(messages=[{"role": "user", "content": "Reply OK."}], max_tokens=2, temperature=0)
         response = await self._client.post(
-            f"{url.rstrip('/')}/v1/chat/completions",
+            f"{url.rstrip('/')}/v1/{'responses' if responses else 'chat/completions'}",
             headers=headers,
-            json={
-                "model": self.settings.llm_warmup_model,
-                "messages": [{"role": "user", "content": "Reply OK."}],
-                "max_tokens": 2,
-                "temperature": 0,
-                "stream": False,
-            },
+            json=payload,
             timeout=self.settings.llm_warmup_timeout_s,
         )
         response.raise_for_status()
