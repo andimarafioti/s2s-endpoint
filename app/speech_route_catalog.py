@@ -151,7 +151,7 @@ class SpeechRoute(CatalogModel):
                 raise ValueError("the selected route does not support this voice")
             if payload.get("response_format", "mp3") not in caps.audio_formats:
                 raise ValueError("the selected route does not support this audio format")
-        # Inspect message/input content only; tool JSON schemas may contain arbitrary type names.
+        # Inspect input content and tool results, not tool JSON schemas.
         pending = [payload.get("messages", payload.get("input", []))]
         while pending:
             item = pending.pop()
@@ -174,6 +174,8 @@ class SpeechRoute(CatalogModel):
                     raise ValueError("the selected route does not support tool history")
                 if "content" in item:
                     pending.append(item["content"])
+                if kind == "function_call_output":
+                    pending.append(item.get("output"))
 
 
 class SpeechRouteCatalog(CatalogModel):

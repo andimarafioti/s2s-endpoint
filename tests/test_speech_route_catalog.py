@@ -64,6 +64,63 @@ def catalog_client(env, handler):
 
 
 class CatalogApplicationTests(unittest.TestCase):
+    def test_responses_tool_output_images_require_declared_capability(self):
+        image = {"type": "input_image", "image_url": "data:image/png;base64,eA=="}
+        for kind in ("self_hosted", "external"):
+            for images in (False, True):
+                with self.subTest(kind=kind, images=images):
+                    seen = []
+
+                    async def backend(request):
+                        if request.method == "GET":
+                            return httpx.Response(200, json={"data": [{"id": "deployed-model"}]})
+                        seen.append(json.loads(request.content))
+                        return httpx.Response(200, json={"id": "resp_result", "output": []})
+
+                    configured = route(
+                        "one",
+                        "model",
+                        kind=kind,
+                        provider="api" if kind == "external" else "hf",
+                        protocols=["responses"],
+                        capabilities={"context_window": 8192, "tools": True, "images": images},
+                    )
+                    with catalog_client(environment(configured), backend) as client:
+                        for output, expected in (
+                            ([image], 200 if images else 400),
+                            ("camera unavailable", 200),
+                            (json.dumps(image), 200),
+                        ):
+                            payload = {
+                                "model": "model",
+                                "input": [
+                                    {
+                                        "type": "function_call",
+                                        "call_id": "call_camera",
+                                        "name": "camera",
+                                        "arguments": "{}",
+                                    },
+                                    {"type": "function_call_output", "call_id": "call_camera", "output": output},
+                                ],
+                                "tools": [
+                                    {
+                                        "type": "function",
+                                        "name": "camera",
+                                        "parameters": {
+                                            "type": "object",
+                                            "properties": {"image_url": {"type": "string"}},
+                                        },
+                                    }
+                                ],
+                            }
+                            before = len(seen)
+                            response = client.post("/v1/responses", json=payload)
+                            self.assertEqual(response.status_code, expected, response.text)
+                            if expected == 200:
+                                self.assertEqual(seen[-1], {**payload, "model": "deployed-model"})
+                            self.assertEqual(len(seen), before + (expected == 200))
+                            self.assertEqual(client.get("/health").json()["backends"][0]["requests"], len(seen))
+
     def test_nullable_token_and_cache_fields_are_forwarded_without_bypassing_nonnull_checks(self):
         seen = []
 
