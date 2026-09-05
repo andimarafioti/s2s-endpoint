@@ -181,6 +181,23 @@ class SessionQueueTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await manager.poll(ticket["queue_id"], "https://lb.example"))["state"], "timed_out")
             self.assertEqual(router.acquire_calls, before)
 
+    async def test_claim_crossing_deadline_releases_capacity(self):
+        router = GatedCapacityRouter()
+        router._first = False
+        manager = self._make(router)
+        with patch("app.direct_session_manager.monotonic", return_value=100) as clock:
+            ticket = await manager.allocate("https://lb.example")
+            clock.return_value = 399
+            router._first = True
+            router.free = 1
+            polling = asyncio.create_task(manager.poll(ticket["queue_id"], "https://lb.example"))
+            await router.first_entered.wait()
+            clock.return_value = 400
+            router.gate.set()
+            self.assertEqual((await polling)["state"], "timed_out")
+        self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual((await manager.snapshot())["pending_sessions"], 0)
+
     async def test_busy_pool_queues_and_head_claims_when_capacity_returns(self):
         router = ToggleCapacityRouter(has_capacity=False)
         manager = self._make(router, queue_max_depth=5)

@@ -12,6 +12,7 @@ from app.session_manager import SessionReleaseHandler, TicketExpiredHandler
 from app.session_tokens import attach_session_token, create_session_token, verify_session_token
 
 logger = logging.getLogger("s2s-endpoint")
+QUEUE_MAX_WAIT_S = 300.0
 
 
 class QueueAtCapacityError(RuntimeError):
@@ -23,7 +24,8 @@ class QueueTicket:
     """A held place in the waiting line. Not a session — only a promise of a spot.
 
     ``last_seen`` is refreshed on every poll; a ticket that goes un-polled past
-    the TTL is how we detect a caller who abandoned the queue.
+    the TTL is how we detect a caller who abandoned the queue. ``created_at``
+    never changes: polling and failed claims cannot extend the waiting deadline.
 
     ``llm_fingerprint`` is computed from the caller's HF token when the ticket
     is created (queue polls are bodyless GETs that carry no Authorization), so
@@ -188,7 +190,6 @@ class DirectSessionManager:
         """Advance a waiting ticket. Refreshes its last-seen, reports position, and
         — only for the head of the line — claims a free slot if one is available,
         returning a grant. Raises ``KeyError`` for an unknown/expired ticket."""
-        now = monotonic()
         lease: Optional[EndpointLease] = None
         # Hold the lock across the whole claim — the head check, the slot grab, and
         # the pop — so two overlapping polls for the same head ticket can't each
@@ -198,14 +199,31 @@ class DirectSessionManager:
             ticket = self._queue.get(ticket_id)
             if ticket is None:
                 raise KeyError("unknown or expired ticket")
+            now = monotonic()
             ticket.last_seen = now
             created_at = ticket.created_at
             position = list(self._queue).index(ticket_id) + 1
 
-            if position == 1:
+            if position == 1 and now < created_at + QUEUE_MAX_WAIT_S:
                 lease = await self.endpoint_router.try_acquire()
-                if lease is not None:
-                    self._queue.pop(ticket_id, None)
+            # Recheck after the router lock: a claim may cross the deadline.
+            timed_out = monotonic() >= created_at + QUEUE_MAX_WAIT_S
+            if lease is not None or timed_out:
+                self._queue.pop(ticket_id, None)
+
+        if timed_out:
+            if lease is not None:
+                await self.endpoint_router.release(lease.slot_id, connected=False)
+            logger.info(
+                "Queue waiting deadline reached ticket_id=%s",
+                ticket_id,
+                extra={"ticket_id": ticket_id, "outcome": "queue_timed_out"},
+            )
+            return {
+                "state": "timed_out",
+                "detail": "No capacity became available within the 300-second waiting limit. Retry with a new session request.",
+                "retry_after_s": max(1, int(self.queue_poll_interval_s)),
+            }
 
         if lease is not None:
             logger.info(
@@ -255,6 +273,7 @@ class DirectSessionManager:
             "position": position,
             "poll_interval_s": self.queue_poll_interval_s,
             "ticket_ttl_s": self.queue_ticket_ttl_s,
+            "max_wait_s": QUEUE_MAX_WAIT_S,
         }
 
     async def _grant_from_lease(

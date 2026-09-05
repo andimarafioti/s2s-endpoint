@@ -15,6 +15,15 @@ which is how an abandoned waiter is detected. The queue is FIFO and tier-blind, 
 is bounded (`QUEUE_MAX_DEPTH`, default 100) — a would-be waiter past the cap is told
 the queue is at capacity rather than admitted to an unbounded line.
 
+Waiting also has an absolute **300-second limit** from ticket creation. Polling
+and failed claim retries do not extend it. At the deadline a poll returns HTTP
+503 with `state: "timed_out"`, a `Retry-After` header and `retry_after_s`; the
+ticket and requester admission permit are released. The client must stop polling
+that ticket and offer a new session attempt. Queued responses advertise
+`max_wait_s: 300`. This deadline is separate from `QUEUE_TICKET_TTL_S`: missed
+polls still cause prompt abandonment cleanup, and connected sessions are not
+subject to the queue waiting limit.
+
 Admission is **pull-driven**: the LB keeps an ordered list of waiting ticket ids,
 and only the head ticket may claim a free slot on its next poll. `release()` is
 unchanged. Budget is *not* reserved when a ticket is minted; the Space reserves (and

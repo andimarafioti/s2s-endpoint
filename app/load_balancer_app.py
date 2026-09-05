@@ -1129,6 +1129,11 @@ async def queue_status(runtime: LoadBalancerRuntime, queue_id: str, request: Req
         if requester is not None:
             dependencies.queue_requester_tracker.remember(queue_id, requester)  # refresh retention
         return JSONResponse(result)
+    if result.get("state") == "timed_out":
+        if requester is not None:
+            dependencies.requester_rate_limiter.record_allocation_failure(requester)
+        await dependencies.dashboard.record_session_allocation_failure(requester)
+        return JSONResponse(result, status_code=503, headers={"Retry-After": str(result["retry_after_s"])})
 
     # Head of line claimed a slot — same delivery path as a fast-path grant. The
     # requester was resolved at ticket creation; falling back to the poll request
