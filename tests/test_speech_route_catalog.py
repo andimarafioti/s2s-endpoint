@@ -64,6 +64,67 @@ def catalog_client(env, handler):
 
 
 class CatalogApplicationTests(unittest.TestCase):
+    def test_capacity_handoff_keeps_the_selected_revision_when_the_default_changes(self):
+        from app.pipeline_capacity import PipelineCapacity, PipelineCapacityConfig
+
+        pools = [
+            route(
+                name,
+                "model",
+                aliases=[f"model-{name}"],
+                policy={"target_work": 2, "max_work": 4, "llm_warmup_enabled": False},
+                session_workload={"profile": "recorded workload", "work_per_session": 0.5},
+            )
+            for name in ("old", "new")
+        ]
+        for default in ("old", "new"):
+            seen = []
+
+            def backend(request):
+                if request.method == "POST":
+                    seen.append(request.url.host)
+                return httpx.Response(200, json={"choices": []})
+
+            env = {**environment(*pools, defaults={"model": default}), "SPEECH_CAPACITY_API_KEY": "control"}
+            with catalog_client(env, backend) as client:
+                views = client.post(
+                    "/internal/capacity",
+                    headers={"X-Speech-Capacity-Authorization": "Bearer control"},
+                    json={"session_counts": {"old": 0, "new": 0}, "reserve_sessions": 5},
+                ).json()["pools"]
+                config = PipelineCapacityConfig.model_validate(
+                    {"default": "canary", "routes": {"canary": {"stt": "new", "llm": "new", "tts": "new"}}}
+                )
+                capacity = PipelineCapacity(
+                    config, dict.fromkeys(("stt", "llm", "tts"), "http://gateway"), "key", client=client
+                )
+                capacity._views = {
+                    (stage, "new"): {**views["new"], "voices": ["alloy"]} for stage in ("stt", "llm", "tts")
+                }
+                admitted = capacity.routing("canary")["routes"]["llm"]
+                self.assertEqual(views["new"]["model"], "model")  # telemetry keeps the logical identity
+                self.assertEqual(admitted["model"], "model-new")
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"X-Speech-Provider": admitted["provider"]},
+                    json={"model": admitted["model"], "messages": [{"role": "user", "content": "Hello"}]},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(seen, ["new.example"])
+
+    def test_session_capacity_requires_aliases_for_duplicate_model_provider_pairs(self):
+        pools = [
+            route(
+                name,
+                "model",
+                policy={"target_work": 2, "max_work": 4},
+                session_workload={"profile": "recorded workload", "work_per_session": 0.5},
+            )
+            for name in ("old", "new")
+        ]
+        with self.assertRaisesRegex(ValueError, "alias"):
+            SpeechProxySettings.from_env(environment(*pools, defaults={"model": "old"}))
+
     def test_capacity_control_auth_and_schema_precede_demand_mutation(self):
         configured = route(
             "one",

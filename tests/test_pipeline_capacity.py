@@ -114,6 +114,7 @@ class PipelineAdmissionTests(unittest.IsolatedAsyncioTestCase):
                     "pools": {
                         pool: {
                             "model": f"{service}-{pool}",
+                            "request_model": f"{service}-{pool}",
                             "provider": pool,
                             "profile": "small recorded workload",
                             "protocols": {"stt": ["transcriptions"], "llm": ["chat_completions"], "tts": ["speech"]}[
@@ -168,6 +169,68 @@ class PipelineAdmissionTests(unittest.IsolatedAsyncioTestCase):
         await self.capacity.refresh({})
         self.assertFalse(self.capacity.can_admit("openai", {}))
         self.assertEqual(self.capacity.snapshot({}, 10)["routes"]["qwen"]["limiting_stage"], "tts")
+
+    def manager_with_capacity(self):
+        controller = FakeEndpointController([("cpu", "running", "https://cpu.example")])
+        router = _make_test_router(
+            endpoint_names=["cpu"],
+            endpoint_slots=20,
+            min_warm_endpoints=1,
+            wake_threshold_slots=1,
+            idle_park_timeout_s=60,
+            reconcile_interval_s=10,
+            waking_capacity_timeout_s=60,
+            park_cooldown_s=60,
+            controller=controller,
+            pipeline_capacity=self.capacity,
+        )
+        router._endpoints["cpu"].apply_snapshot(controller.fetch("cpu"))
+        manager = DirectSessionManager(endpoint_router=router, session_shared_secret="secret", queue_enabled=True)
+        self.addAsyncCleanup(manager.stop)
+        return manager
+
+    async def test_unavailable_optional_route_does_not_block_eligible_fifo(self):
+        manager = self.manager_with_capacity()
+        self.capacity._views[("stt", "qwen")]["admissible_sessions"] = 0
+        failed = await manager.allocate("https://allocator.example", pipeline="qwen")
+        self.assertEqual(failed["state"], "queued")
+        healthy = await manager.allocate("https://allocator.example", pipeline="openai")
+        self.assertEqual(healthy["state"], "granted")
+        # Shared-stage exhaustion queues both routes; recovery must retain the
+        # oldest eligible ticket, including against new arrivals and later polls.
+        self.capacity._views[("llm", "shared")]["admissible_sessions"] = 0
+        first = await manager.allocate("https://allocator.example", pipeline="openai")
+        self.capacity._views[("llm", "shared")]["admissible_sessions"] = 7
+        later = await manager.allocate("https://allocator.example", pipeline="openai")
+        self.assertEqual(later["state"], "queued")
+        self.assertEqual((await manager.poll(later["queue_id"], "https://allocator.example"))["state"], "queued")
+        self.assertEqual((await manager.poll(first["queue_id"], "https://allocator.example"))["state"], "granted")
+        self.assertEqual((await manager.poll(later["queue_id"], "https://allocator.example"))["state"], "granted")
+        self.assertEqual((await manager.poll(failed["queue_id"], "https://allocator.example"))["state"], "queued")
+
+    async def test_failed_eligible_grant_restores_original_order(self):
+        manager = self.manager_with_capacity()
+        self.capacity._views[("llm", "shared")]["admissible_sessions"] = 0
+        first = await manager.allocate("https://allocator.example", pipeline="qwen")
+        second = await manager.allocate("https://allocator.example", pipeline="openai")
+        self.capacity._views[("llm", "shared")]["admissible_sessions"] = 7
+        self.capacity._views[("stt", "qwen")]["admissible_sessions"] = 0
+        with patch.object(self.capacity, "routing", side_effect=ValueError("invalid handoff")):
+            with self.assertRaises(ValueError):
+                await manager.poll(second["queue_id"], "https://allocator.example")
+        self.assertEqual(list(manager._queue), [first["queue_id"], second["queue_id"]])
+        self.assertEqual(sum(manager.endpoint_router._pipeline_counts_unlocked().values()), 0)
+        self.capacity._views[("stt", "qwen")]["admissible_sessions"] = 7
+        self.assertEqual((await manager.poll(second["queue_id"], "https://allocator.example"))["state"], "queued")
+
+    async def test_expired_routed_ticket_does_not_hold_eligible_admission(self):
+        manager = self.manager_with_capacity()
+        self.capacity._views[("llm", "shared")]["admissible_sessions"] = 0
+        first = await manager.allocate("https://allocator.example", pipeline="qwen")
+        manager._queue[first["queue_id"]].created_at -= 300
+        self.capacity._views[("llm", "shared")]["admissible_sessions"] = 7
+        self.assertEqual((await manager.allocate("https://allocator.example", pipeline="openai"))["state"], "granted")
+        self.assertEqual((await manager.poll(first["queue_id"], "https://allocator.example"))["state"], "timed_out")
 
     async def test_pending_grants_are_atomic_and_signed_routing_survives_queue(self):
         controller = FakeEndpointController([("cpu", "running", "https://cpu.example")])
