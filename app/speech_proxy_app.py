@@ -942,6 +942,9 @@ def create_app(
             results[pool] = {
                 **route.labels(),
                 "request_model": route.aliases[0] if route.aliases else route.model,
+                "aliases": route.aliases,
+                "default_model_route": settings.catalog.defaults.get(route.model) == pool,
+                "capabilities": route.capabilities.model_dump(mode="json"),
                 "protocols": route.protocols,
                 "voices": route.capabilities.voices,
                 "profile": route.session_workload.profile,

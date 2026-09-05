@@ -9,15 +9,20 @@ from collections import Counter
 import httpx
 from pydantic import Field, model_validator
 
-from app.speech_route_catalog import CatalogModel, PoolId
+from app.speech_route_catalog import CatalogModel, Identifier, PoolId
 
 SERVICES = ("stt", "llm", "tts")
 
 
 class PipelineRoute(CatalogModel):
-    stt: PoolId
-    llm: PoolId
-    tts: PoolId
+    stt: PoolId | None
+    llm: PoolId | None
+    tts: PoolId | None
+
+
+class ModelChoice(CatalogModel):
+    model: Identifier
+    provider: Identifier | None = None
 
 
 class PipelineCapacityConfig(CatalogModel):
@@ -27,6 +32,7 @@ class PipelineCapacityConfig(CatalogModel):
     refresh_interval_s: float = Field(default=5, gt=0, le=30)
     snapshot_max_age_s: float = Field(default=15, gt=0, le=60)
     llm_protocol: str = "chat_completions"
+    session_updates_enabled: bool = False
 
     @model_validator(mode="after")
     def validate_routes(self):
@@ -36,6 +42,10 @@ class PipelineCapacityConfig(CatalogModel):
             raise ValueError("llm_protocol must match the CPU adapter")
         if self.snapshot_max_age_s <= self.refresh_interval_s:
             raise ValueError("snapshot_max_age_s must exceed the refresh interval")
+        if not self.session_updates_enabled and any(
+            getattr(r, s) is None for r in self.routes.values() for s in SERVICES
+        ):
+            raise ValueError("partial pipeline routes require session_updates_enabled")
         return self
 
 
@@ -69,23 +79,88 @@ class PipelineCapacity:
             await self._client.aclose()
 
     def resolve(self, name: str | None) -> str:
-        name = self.config.default if name is None else name
-        if name not in self.config.routes:
-            raise ValueError("unknown pipeline route")
+        if name is None:
+            name = "@::" if self.config.session_updates_enabled else self.config.default
+        self._pools(name)
         return name
 
+    def _pools(self, name: str) -> dict[str, tuple[str, ...]]:
+        if name in self.config.routes:
+            route = self.config.routes[name]
+            return {s: (getattr(route, s),) if getattr(route, s) is not None else () for s in SERVICES}
+        # A compact, self-describing accounting key lets compute health retain
+        # partial selections and an old/new union through allocator restarts.
+        if self.config.session_updates_enabled and name.startswith("@") and len(name) <= 800:
+            parts = name[1:].split(":")
+            if len(parts) == len(SERVICES):
+                pools = {s: tuple(part.split("+")) if part else () for s, part in zip(SERVICES, parts)}
+                if all(
+                    len(values) <= 2
+                    and len(set(values)) == len(values)
+                    and all(p in {getattr(r, s) for r in self.config.routes.values()} for p in values)
+                    for s, values in pools.items()
+                ):
+                    return pools
+        raise ValueError("unknown pipeline route")
+
+    @staticmethod
+    def _key(pools: dict[str, tuple[str, ...]]) -> str:
+        return "@" + ":".join("+".join(sorted(pools[s])) for s in SERVICES)
+
+    def select_models(self, current: str | None, models: dict) -> str:
+        if not self.config.session_updates_enabled:
+            raise ValueError("session model selection is disabled")
+        if not isinstance(models, dict) or set(models) - set(SERVICES):
+            raise ValueError("models must contain only stt, llm and tts")
+        pools = self._pools(self.resolve(current))
+        for service, raw in models.items():
+            if raw is None:
+                pools[service] = ()
+                continue
+            choice = ModelChoice.model_validate({"model": raw} if isinstance(raw, str) else raw)
+            candidates = [
+                pool
+                for (stage, pool), view in self._views.items()
+                if stage == service
+                and choice.model in {view["model"], view["request_model"], *view.get("aliases", [])}
+                and (choice.provider is None or choice.provider == view["provider"])
+            ]
+            if len(candidates) > 1:
+                candidates = [p for p in candidates if self._views[(service, p)].get("default_model_route")]
+            if len(candidates) != 1:
+                raise ValueError("unknown or ambiguous model/provider selection")
+            pools[service] = (candidates[0],)
+        return self._key(pools)
+
+    def hold_selection(self, current: str, proposed: str) -> str:
+        old, new = self._pools(current), self._pools(proposed)
+        return self._key({s: tuple(set(old[s]) | set(new[s])) for s in SERVICES})
+
+    def can_switch(self, current: str, proposed: str, sessions: dict[str, int]) -> bool:
+        old, new = self._pools(current), self._pools(proposed)
+        counts = self.pool_counts(sessions)
+        return all(
+            self._remaining((s, p), counts, "admissible_sessions") >= 1
+            for s in SERVICES
+            for p in set(new[s]) - set(old[s])
+        )
+
     def pool_counts(self, sessions: dict[str, int]) -> dict[tuple[str, str], int]:
-        counts = Counter({(s, getattr(r, s)): 0 for r in self.config.routes.values() for s in SERVICES})
+        counts = Counter(
+            {(s, getattr(r, s)): 0 for r in self.config.routes.values() for s in SERVICES if getattr(r, s) is not None}
+        )
         for name, count in sessions.items():
-            route = self.config.routes.get(name)
-            if route is None:
+            try:
+                pools = self._pools(name)
+            except ValueError:
                 # A surviving connection from an older allocator/configuration
                 # must not disappear from capacity estimates after a restart.
                 for key in counts:
                     counts[key] += count
             else:
-                for service in SERVICES:
-                    counts[(service, getattr(route, service))] += count
+                for service, selected in pools.items():
+                    for pool in selected:
+                        counts[(service, pool)] += count
         return dict(counts)
 
     async def refresh(self, sessions: dict[str, int]):
@@ -139,15 +214,22 @@ class PipelineCapacity:
         return max(0, self._views[key][field] - max(0, counts[key] - self._counts[key]))
 
     def can_admit(self, name: str, sessions: dict[str, int]) -> bool:
-        route = self.config.routes[name]
         counts = self.pool_counts(sessions)
-        return all(self._remaining((s, getattr(route, s)), counts, "admissible_sessions") >= 1 for s in SERVICES)
+        return all(
+            self._remaining((s, p), counts, "admissible_sessions") >= 1
+            for s, pools in self._pools(name).items()
+            for p in pools
+        )
 
     def routing(self, name: str) -> dict:
-        route = self.config.routes[name]
         routes = {}
-        for service in SERVICES:
-            view = self._views[(service, getattr(route, service))]
+        for service, pools in self._pools(name).items():
+            if not pools:
+                routes[service] = None
+                continue
+            if len(pools) != 1:
+                raise ValueError("an accounting hold is not an inference selection")
+            view = self._views[(service, pools[0])]
             routes[service] = {
                 "model": view["request_model"],
                 "provider": view["provider"],
@@ -155,13 +237,27 @@ class PipelineCapacity:
             }
             if service == "tts":
                 routes[service]["voice"] = view["voices"][0]
-        return {"pipeline": name, "routes": routes}
+            if self.config.session_updates_enabled and service == "llm":
+                routes[service]["capabilities"] = {
+                    key: value
+                    for key, value in view.get("capabilities", {}).items()
+                    if key in {"tools", "images", "audio_input", "context_window", "continuation"}
+                }
+        return {
+            "pipeline": name,
+            "routes": routes,
+            **({"updates_enabled": True} if self.config.session_updates_enabled else {}),
+        }
 
     def snapshot(self, sessions: dict[str, int], cpu_slots: int) -> dict:
         counts = self.pool_counts(sessions)
         routes = {}
-        for name, route in self.config.routes.items():
-            stages = {s: self._remaining((s, getattr(route, s)), counts, "available_sessions") for s in SERVICES}
+        for name in self.config.routes:
+            stages = {
+                s: self._remaining((s, p), counts, "available_sessions")
+                for s, pools in self._pools(name).items()
+                for p in pools
+            }
             stages["cpu"] = cpu_slots
             limiting = min(stages, key=stages.get)
             routes[name] = {"available_pipelines": stages[limiting], "limiting_stage": limiting, "stages": stages}

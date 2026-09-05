@@ -1022,6 +1022,15 @@ async def create_session(runtime: LoadBalancerRuntime, request: Request):
         or pipeline not in settings.pipeline_capacity.routes
     ):
         raise HTTPException(status_code=400, detail="unknown pipeline route")
+    if "models" in metadata:
+        if settings.pipeline_capacity is None:
+            raise HTTPException(status_code=400, detail="session model selection is disabled")
+        try:
+            pipeline = dependencies.session_manager.endpoint_router.pipeline_capacity.select_models(
+                pipeline, metadata["models"]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid or unavailable session model selection") from exc
     requester = dependencies.requester_identity_resolver.identify(
         request,
         hardware_id=hardware_id,
