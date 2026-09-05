@@ -1,6 +1,8 @@
 import argparse
 import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -19,6 +21,9 @@ from create_speech_proxy_endpoints import (  # noqa: E402
     parse_args,
     resolve_secrets,
 )
+
+from app.speech_route_catalog import SpeechRouteCatalog  # noqa: E402
+from tests.test_speech_route_catalog import route  # noqa: E402
 
 
 class FakeResponse:
@@ -60,6 +65,71 @@ def make_args(**overrides):
 
 
 class SpeechProxyDeploymentTests(unittest.TestCase):
+    def test_catalog_deployment_uses_explicit_pools_without_hf_inventory_lookup(self):
+        catalog = SpeechRouteCatalog.model_validate_json(
+            json.dumps({"pools": [route("external", "model", kind="external", provider="api")]})
+        )
+        args = make_args(services=["llm"], catalog=catalog)
+        api = MagicMock()
+        specs = build_specs(args, api)
+        api.get_inference_endpoint.assert_not_called()
+        env = deployment_env(args, specs[0])
+        self.assertNotIn("SPEECH_BACKENDS", env)
+        self.assertNotIn("SPEECH_AUTOSCALE_ENABLED", env)
+        self.assertEqual(json.loads(env["SPEECH_ROUTE_CATALOG"])["pools"][0]["pool"], "external")
+        self.assertEqual(
+            resolve_secrets({"KEY_EXTERNAL": "provider-secret"}, catalog=catalog), {"KEY_EXTERNAL": "provider-secret"}
+        )
+        with self.assertRaisesRegex(ValueError, "KEY_EXTERNAL"):
+            resolve_secrets({"HF_TOKEN": "ingress"}, catalog=catalog)
+
+    def test_catalog_cli_rejects_multiple_services_or_global_autoscaling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            path.write_text(json.dumps({"pools": [route("one", "model")]}))
+            for extra in ([], ["--services", "llm", "--autoscale"], ["--services", "llm", "--type", "public"]):
+                with (
+                    self.subTest(extra=extra),
+                    patch(
+                        "sys.argv",
+                        ["create_speech_proxy_endpoints", "--image-url", "image", "--route-catalog", str(path), *extra],
+                    ),
+                    patch("sys.stderr", io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    parse_args()
+
+    def test_catalog_dry_run_reports_secret_names_without_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            path.write_text(json.dumps({"pools": [route("one", "model")]}))
+            api = MagicMock()
+            api.get_inference_endpoint.side_effect = FakeNotFound()
+            output = io.StringIO()
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "create_speech_proxy_endpoints",
+                        "--image-url",
+                        "image",
+                        "--route-catalog",
+                        str(path),
+                        "--services",
+                        "llm",
+                        "--dry-run",
+                    ],
+                ),
+                patch("sys.stdout", output),
+                patch("create_speech_proxy_endpoints.HfApi", return_value=api),
+                patch.dict("os.environ", {"KEY_ONE": "secret-value"}),
+            ):
+                main()
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["required_secret_names"], ["KEY_ONE"])
+            self.assertNotIn("secret-value", output.getvalue())
+            api.create_inference_endpoint.assert_not_called()
+
     def test_autoscale_inventory_can_include_parked_workers_without_urls(self):
         args = make_args(autoscale=True, min_warm_workers=1, max_workers=None)
         api = MagicMock()

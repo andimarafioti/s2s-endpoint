@@ -15,6 +15,7 @@ def create_session_token(
     callback_url: str,
     ttl_s: float,
     llm_fingerprint: str | None = None,
+    routing: dict[str, Any] | None = None,
 ) -> str:
     expires_at = int(time.time() + ttl_s)
     payload = {
@@ -29,6 +30,8 @@ def create_session_token(
         # paths to api keys matching this claim while the session's
         # websocket is connected. Never a raw token.
         payload["llmf"] = llm_fingerprint
+    if routing is not None:
+        payload["routing"] = routing
     encoded_payload = _b64encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     signature = _sign(secret, encoded_payload)
     return f"{encoded_payload}.{signature}"

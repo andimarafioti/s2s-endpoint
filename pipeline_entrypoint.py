@@ -78,6 +78,7 @@ def build_config(environ: Mapping[str, str]) -> dict[str, object]:
         "model_name": environ.get("MODEL_NAME", "gpt-5.6-terra"),
         "responses_api_api_key": llm_api_key,
         "responses_api_stream": True,
+        "responses_api_disable_thinking": _bool(environ, "RESPONSES_API_DISABLE_THINKING", True),
         "stream_batch_sentences": _positive_int(environ, "STREAM_BATCH_SENTENCES", 3),
         "tts": "openai",
         "openai_tts_base_url": tts_base_url,
@@ -90,10 +91,12 @@ def build_config(environ: Mapping[str, str]) -> dict[str, object]:
         "openai_tts_language": environ.get("TTS_LANGUAGE", "English"),
         "openai_tts_response_format": "pcm",
         "openai_tts_sample_rate": 24000,
-        "openai_tts_stream": True,
+        "openai_tts_stream": _bool(environ, "TTS_STREAM", True),
     }
     if llm_base_url:
         config["responses_api_base_url"] = llm_base_url
+    if _bool(environ, "SESSION_ROUTING_ENABLED", False):
+        config["session_routing_enabled"] = True
     reasoning_effort = environ.get("RESPONSES_API_REASONING_EFFORT", "").strip()
     if reasoning_effort:
         config["responses_api_reasoning_effort"] = reasoning_effort

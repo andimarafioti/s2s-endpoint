@@ -2,6 +2,7 @@ import asyncio
 import logging
 import secrets
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass
 from time import monotonic
 from typing import Optional
@@ -12,6 +13,7 @@ from app.session_manager import SessionReleaseHandler, TicketExpiredHandler
 from app.session_tokens import attach_session_token, create_session_token, verify_session_token
 
 logger = logging.getLogger("s2s-endpoint")
+QUEUE_MAX_WAIT_S = 300.0
 
 
 class QueueAtCapacityError(RuntimeError):
@@ -23,7 +25,8 @@ class QueueTicket:
     """A held place in the waiting line. Not a session — only a promise of a spot.
 
     ``last_seen`` is refreshed on every poll; a ticket that goes un-polled past
-    the TTL is how we detect a caller who abandoned the queue.
+    the TTL is how we detect a caller who abandoned the queue. ``created_at``
+    never changes: polling and failed claims cannot extend the waiting deadline.
 
     ``llm_fingerprint`` is computed from the caller's HF token when the ticket
     is created (queue polls are bodyless GETs that carry no Authorization), so
@@ -34,6 +37,16 @@ class QueueTicket:
     created_at: float
     last_seen: float
     llm_fingerprint: Optional[str] = None
+    pipeline: Optional[str] = None
+
+
+@dataclass
+class RoutingUpdate:
+    update_id: str
+    models: dict
+    previous: str
+    proposed: str
+    routing: dict
 
 
 @dataclass
@@ -47,6 +60,8 @@ class DirectSession:
     waited_for_capacity: bool
     connected: bool = False
     connected_at_monotonic: Optional[float] = None
+    routing_update: RoutingUpdate | None = None
+    last_routing_update: tuple[str, bool] | None = None
 
 
 class DirectSessionManager:
@@ -72,6 +87,8 @@ class DirectSessionManager:
             raise ValueError("session_shared_secret must be set")
         if queue_max_depth < 0:
             raise ValueError("queue_max_depth must be >= 0")
+        if getattr(endpoint_router, "pipeline_capacity", None) is not None and not queue_enabled:
+            raise ValueError("pipeline capacity requires ticket-and-poll admission")
 
         self.endpoint_router = endpoint_router
         self.endpoint_router._on_endpoint_down = self._release_sessions_for_endpoint
@@ -98,6 +115,57 @@ class DirectSessionManager:
     def set_abnormal_disconnect_handler(self, handler: Optional[SessionReleaseHandler]) -> None:
         self._abnormal_disconnect_handler = handler
 
+    def _routing_session_unlocked(self, session_id: str, token: str) -> DirectSession:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError("unknown session")
+        # A connected session may outlive its original admission token's TTL.
+        # The compute-only route also requires the server credential; bind this
+        # operation to the exact grant, without expiring a healthy connection.
+        if not session.connected or not secrets.compare_digest(session.session_token, token):
+            raise ValueError("routing update does not match a connected session")
+        capacity = self.endpoint_router.pipeline_capacity
+        if capacity is None or not capacity.config.session_updates_enabled:
+            raise ValueError("session model updates are disabled")
+        return session
+
+    async def prepare_routing(self, session_id: str, token: str, update_id: str, models: dict) -> dict:
+        async with self._lock:
+            session = self._routing_session_unlocked(session_id, token)
+            pending = session.routing_update
+            if pending is not None:
+                if pending.update_id == update_id and pending.models == models:
+                    return {"routing": pending.routing, "hold": session.lease.pipeline}
+                raise ValueError("a routing update is already pending")
+            if session.last_routing_update and session.last_routing_update[0] == update_id:
+                raise ValueError("routing update has already finished")
+            capacity = self.endpoint_router.pipeline_capacity
+            previous = session.lease.pipeline
+            proposed = capacity.select_models(previous, models)
+            routing = capacity.routing(proposed)
+            hold = capacity.hold_selection(previous, proposed)
+            await self.endpoint_router.replace_pipeline(session.lease.slot_id, previous, hold, proposed=proposed)
+            session.lease.pipeline = hold
+            session.routing_update = RoutingUpdate(update_id, deepcopy(models), previous, proposed, routing)
+            return {"routing": routing, "hold": hold}
+
+    async def finish_routing(self, session_id: str, token: str, update_id: str, *, accepted: bool) -> dict:
+        async with self._lock:
+            session = self._routing_session_unlocked(session_id, token)
+            pending = session.routing_update
+            if pending is None:
+                if session.last_routing_update == (update_id, accepted):
+                    return {"pipeline": session.lease.pipeline}
+                raise ValueError("unknown routing update")
+            if pending.update_id != update_id:
+                raise ValueError("routing update does not match")
+            selected = pending.proposed if accepted else pending.previous
+            await self.endpoint_router.replace_pipeline(session.lease.slot_id, session.lease.pipeline, selected)
+            session.lease.pipeline = selected
+            session.routing_update = None
+            session.last_routing_update = (update_id, accepted)
+            return {"pipeline": selected}
+
     def set_ticket_expired_handler(self, handler: Optional[TicketExpiredHandler]) -> None:
         """Called with each ticket_id the reaper drops for going un-polled past the
         TTL — the caller's chance to record the abandoned request."""
@@ -121,12 +189,14 @@ class DirectSessionManager:
             self._queue.clear()
 
         for session in sessions:
-            await self.endpoint_router.release(session.lease.slot_id, connected=session.connected)
+            await self._release_lease(session.lease, connected=session.connected)
 
         await self.endpoint_router.stop()
 
-    async def allocate(self, lb_base_url: str, *, llm_fingerprint: Optional[str] = None) -> dict[str, object]:
-        """Grant a session if a slot is free *and* nobody is waiting; otherwise
+    async def allocate(
+        self, lb_base_url: str, *, llm_fingerprint: Optional[str] = None, pipeline: Optional[str] = None
+    ) -> dict[str, object]:
+        """Grant a session if capacity is free and no eligible ticket is ahead; otherwise
         mint a queue ticket. Never blocks — the waiting lives in the queue, polled
         via ``poll``. Raises ``QueueAtCapacityError`` when the queue itself is full.
 
@@ -138,16 +208,21 @@ class DirectSessionManager:
             lease = await self.endpoint_router.acquire(timeout_s=self.allocate_timeout_s)
         else:
             lease = None
-            # The empty-line check and the slot grab must be one atomic step, or two
-            # concurrent callers could both see an empty queue and both fast-path into
+            # Queue eligibility and the slot grab must be one atomic step, or two
+            # concurrent callers could both pass the queue check and fast-path into
             # the same freed capacity, jumping the line. Holding the lock across
             # ``try_acquire`` is safe: it only touches the router's own lock and never
             # calls back into this manager, and it never waits for capacity.
             async with self._lock:
-                # FIFO: only fast-path a grant when the line is empty. If anyone is
-                # already waiting, a fresh caller joins the back — no queue-jumping.
-                if not self._queue:
-                    lease = await self.endpoint_router.try_acquire()
+                routed = getattr(self.endpoint_router, "pipeline_capacity", None) is not None
+                if routed:
+                    lease = await self.endpoint_router.try_acquire(
+                        pipeline=pipeline, earlier_pipelines=self._earlier_pipelines_unlocked()
+                    )
+                elif not self._queue:
+                    lease = await self.endpoint_router.try_acquire(
+                        **({"pipeline": pipeline} if pipeline is not None else {})
+                    )
                 if lease is None:
                     # No slot free (or someone already waiting): join the queue. A
                     # depth of 0 disables the waiting room entirely — every caller
@@ -161,6 +236,7 @@ class DirectSessionManager:
                         created_at=now,
                         last_seen=now,
                         llm_fingerprint=llm_fingerprint,
+                        pipeline=pipeline,
                     )
                     position = len(self._queue)  # just appended, so it's last in line
 
@@ -186,26 +262,49 @@ class DirectSessionManager:
 
     async def poll(self, ticket_id: str, lb_base_url: str) -> dict[str, object]:
         """Advance a waiting ticket. Refreshes its last-seen, reports position, and
-        — only for the head of the line — claims a free slot if one is available,
+        — only for the oldest eligible ticket — claims available capacity,
         returning a grant. Raises ``KeyError`` for an unknown/expired ticket."""
-        now = monotonic()
         lease: Optional[EndpointLease] = None
-        # Hold the lock across the whole claim — the head check, the slot grab, and
-        # the pop — so two overlapping polls for the same head ticket can't each
+        # Hold the lock across eligibility, the slot grab, and the pop so two
+        # overlapping polls for the same eligible ticket can't each
         # grant a session. The loser finds the ticket already gone and 404s. Safe
         # to await ``try_acquire`` here: it only takes the router's own lock.
         async with self._lock:
             ticket = self._queue.get(ticket_id)
             if ticket is None:
                 raise KeyError("unknown or expired ticket")
+            now = monotonic()
             ticket.last_seen = now
             created_at = ticket.created_at
             position = list(self._queue).index(ticket_id) + 1
 
-            if position == 1:
-                lease = await self.endpoint_router.try_acquire()
-                if lease is not None:
-                    self._queue.pop(ticket_id, None)
+            if now < created_at + QUEUE_MAX_WAIT_S:
+                if getattr(self.endpoint_router, "pipeline_capacity", None) is not None:
+                    lease = await self.endpoint_router.try_acquire(
+                        pipeline=ticket.pipeline, earlier_pipelines=self._earlier_pipelines_unlocked(ticket_id)
+                    )
+                elif position == 1:
+                    lease = await self.endpoint_router.try_acquire(
+                        **({"pipeline": ticket.pipeline} if ticket.pipeline is not None else {})
+                    )
+            # Recheck after the router lock: a claim may cross the deadline.
+            timed_out = monotonic() >= created_at + QUEUE_MAX_WAIT_S
+            if lease is not None or timed_out:
+                self._queue.pop(ticket_id, None)
+
+        if timed_out:
+            if lease is not None:
+                await self._release_lease(lease, connected=False)
+            logger.info(
+                "Queue waiting deadline reached ticket_id=%s",
+                ticket_id,
+                extra={"ticket_id": ticket_id, "outcome": "queue_timed_out"},
+            )
+            return {
+                "state": "timed_out",
+                "detail": "No capacity became available within the 300-second waiting limit. Retry with a new session request.",
+                "retry_after_s": max(1, int(self.queue_poll_interval_s)),
+            }
 
         if lease is not None:
             logger.info(
@@ -225,15 +324,25 @@ class DirectSessionManager:
                 )
             except BaseException:
                 # The ticket was popped optimistically under the lock; a grant
-                # failure must not evict the head of the line after its whole
-                # wait. Put it back in front so the next poll retries.
+                # failure must not evict the ticket after its whole wait. Restore
+                # its original place, including any older unavailable routes.
                 async with self._lock:
                     if ticket_id not in self._queue:
                         self._queue[ticket_id] = ticket
-                        self._queue.move_to_end(ticket_id, last=False)
+                        self._queue = OrderedDict(sorted(self._queue.items(), key=lambda item: item[1].created_at))
                 raise
 
         return self._ticket_view(ticket_id, position)
+
+    def _earlier_pipelines_unlocked(self, ticket_id: Optional[str] = None) -> tuple[Optional[str], ...]:
+        now = monotonic()
+        earlier = []
+        for queued_id, ticket in self._queue.items():
+            if queued_id == ticket_id:
+                break
+            if now < ticket.created_at + QUEUE_MAX_WAIT_S:
+                earlier.append(ticket.pipeline)
+        return tuple(earlier)
 
     async def leave(self, ticket_id: str) -> bool:
         """Drop a waiting ticket (explicit "leave the queue" / teardown beacon).
@@ -255,6 +364,7 @@ class DirectSessionManager:
             "position": position,
             "poll_interval_s": self.queue_poll_interval_s,
             "ticket_ttl_s": self.queue_ticket_ttl_s,
+            "max_wait_s": QUEUE_MAX_WAIT_S,
         }
 
     async def _grant_from_lease(
@@ -267,37 +377,42 @@ class DirectSessionManager:
         waited_for_capacity: bool = False,
         llm_fingerprint: Optional[str] = None,
     ) -> dict[str, object]:
-        session_id = secrets.token_urlsafe(18)
-        callback_url = _build_callback_url(lb_base_url, session_id)
-        session_token = create_session_token(
-            self.session_shared_secret,
-            session_id=session_id,
-            websocket_url=lease.ws_url,
-            callback_url=callback_url,
-            ttl_s=self.session_token_ttl_s,
-            llm_fingerprint=llm_fingerprint,
-        )
-        pending_expires_at = allocated_at + self.pending_timeout_s
-
-        session = DirectSession(
-            session_id=session_id,
-            lease=lease,
-            session_token=session_token,
-            pending_expires_at=pending_expires_at,
-            allocated_at_monotonic=allocated_at,
-            allocation_wait_ms=allocation_wait_ms,
-            waited_for_capacity=waited_for_capacity,
-        )
-
         try:
+            session_id = secrets.token_urlsafe(18)
+            callback_url = _build_callback_url(lb_base_url, session_id)
+            routing = (
+                self.endpoint_router.pipeline_capacity.routing(lease.pipeline) if lease.pipeline is not None else None
+            )
+            session_token = create_session_token(
+                self.session_shared_secret,
+                session_id=session_id,
+                websocket_url=lease.ws_url,
+                callback_url=callback_url,
+                ttl_s=self.session_token_ttl_s,
+                llm_fingerprint=llm_fingerprint,
+                routing=routing,
+            )
+            pending_expires_at = allocated_at + self.pending_timeout_s
+
+            session = DirectSession(
+                session_id=session_id,
+                lease=lease,
+                session_token=session_token,
+                pending_expires_at=pending_expires_at,
+                allocated_at_monotonic=allocated_at,
+                allocation_wait_ms=allocation_wait_ms,
+                waited_for_capacity=waited_for_capacity,
+            )
+
             async with self._lock:
                 self._sessions[session_id] = session
         except BaseException:
-            await self.endpoint_router.release(lease.slot_id, connected=False)
+            await self._release_lease(lease, connected=False)
             raise
 
         return {
             "state": "granted",
+            **({"routing": routing} if routing else {}),
             "session_id": session_id,
             "websocket_url": lease.ws_url,
             # HTTP origin of the replica that owns the session, for the LLM
@@ -318,7 +433,7 @@ class DirectSessionManager:
             if session is None or session.connected:
                 return
             self._sessions.pop(session_id)
-        await self.endpoint_router.release(session.lease.slot_id, connected=False)
+        await self._release_lease(session.lease, connected=False)
         logger.info(
             "Released abandoned pending session %s for endpoint %s slot_id=%s "
             "allocation_wait_ms=%d waited_for_capacity=%s "
@@ -332,10 +447,6 @@ class DirectSessionManager:
         )
 
     async def handle_event(self, session_id: str, session_token: str, event: str) -> dict[str, object]:
-        payload = verify_session_token(session_token, self.session_shared_secret)
-        if payload.get("sid") != session_id:
-            raise ValueError("session token does not match session id")
-
         if event not in {"connected", "disconnected"}:
             raise ValueError("event must be 'connected' or 'disconnected'")
 
@@ -344,6 +455,18 @@ class DirectSessionManager:
 
         async with self._lock:
             session = self._sessions.get(session_id)
+            if (
+                session is not None
+                and session.connected
+                and secrets.compare_digest(session.session_token, session_token)
+            ):
+                # Admission expiry must not prevent a live connection from
+                # releasing its current selection (including a pending update).
+                payload = {"sid": session_id, "ws_url": session.lease.ws_url}
+            else:
+                payload = verify_session_token(session_token, self.session_shared_secret)
+            if payload.get("sid") != session_id:
+                raise ValueError("session token does not match session id")
             if session is None:
                 raise KeyError("unknown session id")
             if session.lease.ws_url != payload.get("ws_url"):
@@ -361,7 +484,10 @@ class DirectSessionManager:
                 session_to_release = self._sessions.pop(session_id)
 
         if connected_session is not None:
-            await self.endpoint_router.mark_connected(connected_session.lease.slot_id)
+            lease = connected_session.lease
+            await self.endpoint_router.mark_connected(
+                lease.slot_id, **({"pipeline": lease.pipeline} if lease.pipeline else {})
+            )
             return {
                 "status": "ok",
                 "session_id": session_id,
@@ -376,8 +502,8 @@ class DirectSessionManager:
             }
 
         assert session_to_release is not None
-        await self.endpoint_router.release(
-            session_to_release.lease.slot_id,
+        await self._release_lease(
+            session_to_release.lease,
             connected=session_to_release.connected,
         )
         return self._release_result(session_to_release, release_reason="client_disconnected")
@@ -478,7 +604,7 @@ class DirectSessionManager:
                 expired.append(self._sessions.pop(session_id))
 
         for session in expired:
-            await self.endpoint_router.release(session.lease.slot_id, connected=False)
+            await self._release_lease(session.lease, connected=False)
             logger.info(
                 "Released expired pending session %s for endpoint %s slot_id=%s "
                 "allocation_wait_ms=%d waited_for_capacity=%s",
@@ -500,7 +626,7 @@ class DirectSessionManager:
 
         for session in to_release:
             # Keep slot cleanup independent from best-effort dashboard accounting.
-            await self.endpoint_router.release(session.lease.slot_id, connected=session.connected)
+            await self._release_lease(session.lease, connected=session.connected)
             result = self._release_result(session, release_reason="endpoint_unavailable")
             logger.info(
                 "Released session %s for downed endpoint %s (connected=%s)",
@@ -509,6 +635,11 @@ class DirectSessionManager:
                 session.connected,
             )
             await self._record_abnormal_disconnect(result)
+
+    async def _release_lease(self, lease: EndpointLease, *, connected: bool):
+        await self.endpoint_router.release(
+            lease.slot_id, connected=connected, **({"pipeline": lease.pipeline} if lease.pipeline else {})
+        )
 
     def _release_result(self, session: DirectSession, *, release_reason: str) -> dict[str, object]:
         conversation_duration_s = 0.0

@@ -175,9 +175,11 @@ class SpeechWorkerLifecycle:
             ready = [b for b in backends.values() if b.ready and not b.draining]
             warming = [w for w in self._workers.values() if w.phase == "warming"]
             peak = max(await self.pool.take_work_peak(), sum(b.active_work for b in backends.values()))
+            capacity = await self.pool.capacity_snapshot()
+            demand = max(peak, capacity.get("session_work", 0)) + capacity.get("reserve_work", 0)
             wanted = max(
                 self.settings.min_warm,
-                math.ceil(peak / (self.pool.settings.target_work * self.settings.scale_up_utilization)),
+                math.ceil(demand / (self.pool.settings.target_work * self.settings.scale_up_utilization)),
             )
             # One slow worker is not fleet saturation. Unknown or stale latency
             # never votes to add GPUs, and idle history cannot trigger scale-up.
@@ -261,10 +263,11 @@ class SpeechWorkerLifecycle:
 
             low_load = (
                 not warming
+                and not capacity.get("demand_stale", False)
                 and wanted < len(ready)
                 and not all_slow
                 and all(w.status != "unknown" and not w.action and not w.park_requested for w in self._workers.values())
-                and peak <= (len(ready) - 1) * self.pool.settings.target_work * self.settings.scale_down_utilization
+                and demand <= (len(ready) - 1) * self.pool.settings.target_work * self.settings.scale_down_utilization
             )
             if not low_load:
                 self._low_load_since = None
