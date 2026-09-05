@@ -1034,6 +1034,8 @@ __REQUESTER_DASHBOARD_STYLES__
           <span style="color: #182125">Session Requests</span>
           <span style="color: #117a65">Allocations</span>
           <span style="color: #bb2d3b">Allocation Failures</span>
+          <span style="color: #c0392b">Auth Rejections</span>
+          <span style="color: #8e44ad">Rate Limited</span>
           <span style="color: #0b5cab">Session Connects</span>
           <span style="color: #d9822b">Session Disconnects</span>
         </div>
