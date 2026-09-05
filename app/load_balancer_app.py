@@ -182,6 +182,8 @@ class LoadBalancerSettings:
         if self.speech_proxy_metrics_timeout_s <= 0:
             raise ValueError("SPEECH_PROXY_METRICS_TIMEOUT_S must be > 0")
         if self.pipeline_capacity is not None:
+            if self.pipeline_capacity.session_updates_enabled and not self.lb_callback_auth_token:
+                raise ValueError("session model updates require LB_CALLBACK_AUTH_TOKEN")
             if not self.session_queue_enabled:
                 raise ValueError("PIPELINE_CAPACITY requires SESSION_QUEUE_ENABLED")
             if not all(
@@ -1596,6 +1598,26 @@ def create_app(
     async def session_event_route(session_id: str, payload: dict[str, Any]):
         return await session_event(runtime, session_id, payload)
 
+    async def session_routing_route(session_id: str, request: Request):
+        require_callback_auth(runtime, request)
+        payload = await session_metadata(request, strict=True, max_body_bytes=LLM_PROXY_CALLBACK_BODY_MAX_BYTES)
+        token, update_id = payload.get("session_token"), payload.get("update_id")
+        if not isinstance(token, str) or not isinstance(update_id, str) or not 1 <= len(update_id) <= 64:
+            raise HTTPException(status_code=400, detail="invalid routing update")
+        manager = runtime.dependencies.session_manager
+        try:
+            if payload.get("action") == "prepare":
+                return await manager.prepare_routing(session_id, token, update_id, payload.get("models"))
+            if payload.get("action") in {"commit", "abort"}:
+                return await manager.finish_routing(
+                    session_id, token, update_id, accepted=payload["action"] == "commit"
+                )
+            raise HTTPException(status_code=400, detail="invalid routing action")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="unknown session") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="routing update unavailable or incompatible") from exc
+
     async def llm_proxy_usage_route(request: Request):
         require_callback_auth(runtime, request)
         return await llm_proxy_usage(runtime, await _llm_proxy_usage_payload(request))
@@ -1646,6 +1668,13 @@ def create_app(
         methods=["POST"],
         name="session_event",
     )
+    if settings.pipeline_capacity is not None and settings.pipeline_capacity.session_updates_enabled:
+        application.add_api_route(
+            "/internal/sessions/{session_id}/routing",
+            session_routing_route,
+            methods=["POST"],
+            name="session_routing",
+        )
     application.add_api_route(
         "/internal/llm-proxy-usage",
         llm_proxy_usage_route,

@@ -106,4 +106,65 @@ class SessionModelSelectionTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.session_tokens.time.time", return_value=1000000):
             await manager.prepare_routing(sid, token, "after-expiry", {"stt": "stt-openai"})
             await manager.handle_event(sid, token, "disconnected")
-        self.assertEqual(sum(self.capacity.pool_counts(manager.endpoint_router._pipeline_counts_unlocked()).values()), 0)
+        self.assertEqual(
+            sum(self.capacity.pool_counts(manager.endpoint_router._pipeline_counts_unlocked()).values()), 0
+        )
+
+    async def test_http_session_selection_and_private_callback_authentication(self):
+        from dataclasses import replace
+
+        import httpx
+
+        from app.load_balancer_app import LoadBalancerSettings, build_load_balancer_dependencies, create_app
+        from app.session_tokens import verify_session_token
+
+        self.enable_updates()
+        manager = self.manager_with_capacity()
+        base = LoadBalancerSettings(dashboard_preview_mode=True, session_shared_secret="secret")
+        dependencies = replace(build_load_balancer_dependencies(base), session_manager=manager)
+        self.addAsyncCleanup(dependencies.requester_identity_resolver.stop)
+        settings = replace(
+            base,
+            pipeline_capacity=self.capacity.config,
+            session_queue_enabled=True,
+            speech_stt_proxy_url="https://stt",
+            speech_llm_proxy_url="https://llm",
+            speech_tts_proxy_url="https://tts",
+            speech_capacity_api_key="capacity",
+            lb_callback_auth_token="callback",
+        )
+        client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app(settings, dependencies)), base_url="https://lb"
+        )
+        self.addAsyncCleanup(client.aclose)
+        empty = await client.post("/session", json={})
+        self.assertEqual(empty.status_code, 200, empty.text)
+        self.assertEqual(
+            verify_session_token(empty.json()["session_token"], "secret")["routing"]["routes"],
+            {"stt": None, "llm": None, "tts": None},
+        )
+        selected = await client.post("/session", json={"models": {"stt": "stt-qwen"}})
+        self.assertEqual(selected.status_code, 200, selected.text)
+        grant = selected.json()
+        self.assertEqual(
+            verify_session_token(grant["session_token"], "secret")["routing"]["routes"]["stt"]["model"], "stt-qwen"
+        )
+        sid = grant["session_id"]
+        token = manager._sessions[sid].session_token
+        await manager.handle_event(sid, token, "connected")
+        path = f"/internal/sessions/{sid}/routing"
+        payload = {"session_token": token, "action": "prepare", "update_id": "private", "models": {"stt": None}}
+        self.assertIn((await client.post(path, json=payload)).status_code, (401, 403))
+        wrong = await client.post(
+            path,
+            json=payload,
+            headers={"Authorization": "Bearer callback", "X-Reachy-Mini-Callback-Authorization": "Bearer wrong"},
+        )
+        self.assertIn(wrong.status_code, (401, 403))
+        accepted = await client.post(
+            path,
+            json=payload,
+            headers={"Authorization": "Bearer ingress", "X-Reachy-Mini-Callback-Authorization": "Bearer callback"},
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertIsNone(accepted.json()["routing"]["routes"]["stt"])

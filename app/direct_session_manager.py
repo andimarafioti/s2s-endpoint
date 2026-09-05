@@ -2,6 +2,7 @@ import asyncio
 import logging
 import secrets
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass
 from time import monotonic
 from typing import Optional
@@ -40,6 +41,15 @@ class QueueTicket:
 
 
 @dataclass
+class RoutingUpdate:
+    update_id: str
+    models: dict
+    previous: str
+    proposed: str
+    routing: dict
+
+
+@dataclass
 class DirectSession:
     session_id: str
     lease: EndpointLease
@@ -50,6 +60,8 @@ class DirectSession:
     waited_for_capacity: bool
     connected: bool = False
     connected_at_monotonic: Optional[float] = None
+    routing_update: RoutingUpdate | None = None
+    last_routing_update: tuple[str, bool] | None = None
 
 
 class DirectSessionManager:
@@ -102,6 +114,57 @@ class DirectSessionManager:
 
     def set_abnormal_disconnect_handler(self, handler: Optional[SessionReleaseHandler]) -> None:
         self._abnormal_disconnect_handler = handler
+
+    def _routing_session_unlocked(self, session_id: str, token: str) -> DirectSession:
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError("unknown session")
+        # A connected session may outlive its original admission token's TTL.
+        # The compute-only route also requires the server credential; bind this
+        # operation to the exact grant, without expiring a healthy connection.
+        if not session.connected or not secrets.compare_digest(session.session_token, token):
+            raise ValueError("routing update does not match a connected session")
+        capacity = self.endpoint_router.pipeline_capacity
+        if capacity is None or not capacity.config.session_updates_enabled:
+            raise ValueError("session model updates are disabled")
+        return session
+
+    async def prepare_routing(self, session_id: str, token: str, update_id: str, models: dict) -> dict:
+        async with self._lock:
+            session = self._routing_session_unlocked(session_id, token)
+            pending = session.routing_update
+            if pending is not None:
+                if pending.update_id == update_id and pending.models == models:
+                    return {"routing": pending.routing, "hold": session.lease.pipeline}
+                raise ValueError("a routing update is already pending")
+            if session.last_routing_update and session.last_routing_update[0] == update_id:
+                raise ValueError("routing update has already finished")
+            capacity = self.endpoint_router.pipeline_capacity
+            previous = session.lease.pipeline
+            proposed = capacity.select_models(previous, models)
+            routing = capacity.routing(proposed)
+            hold = capacity.hold_selection(previous, proposed)
+            await self.endpoint_router.replace_pipeline(session.lease.slot_id, previous, hold, proposed=proposed)
+            session.lease.pipeline = hold
+            session.routing_update = RoutingUpdate(update_id, deepcopy(models), previous, proposed, routing)
+            return {"routing": routing, "hold": hold}
+
+    async def finish_routing(self, session_id: str, token: str, update_id: str, *, accepted: bool) -> dict:
+        async with self._lock:
+            session = self._routing_session_unlocked(session_id, token)
+            pending = session.routing_update
+            if pending is None:
+                if session.last_routing_update == (update_id, accepted):
+                    return {"pipeline": session.lease.pipeline}
+                raise ValueError("unknown routing update")
+            if pending.update_id != update_id:
+                raise ValueError("routing update does not match")
+            selected = pending.proposed if accepted else pending.previous
+            await self.endpoint_router.replace_pipeline(session.lease.slot_id, session.lease.pipeline, selected)
+            session.lease.pipeline = selected
+            session.routing_update = None
+            session.last_routing_update = (update_id, accepted)
+            return {"pipeline": selected}
 
     def set_ticket_expired_handler(self, handler: Optional[TicketExpiredHandler]) -> None:
         """Called with each ticket_id the reaper drops for going un-polled past the
@@ -384,10 +447,6 @@ class DirectSessionManager:
         )
 
     async def handle_event(self, session_id: str, session_token: str, event: str) -> dict[str, object]:
-        payload = verify_session_token(session_token, self.session_shared_secret)
-        if payload.get("sid") != session_id:
-            raise ValueError("session token does not match session id")
-
         if event not in {"connected", "disconnected"}:
             raise ValueError("event must be 'connected' or 'disconnected'")
 
@@ -396,6 +455,18 @@ class DirectSessionManager:
 
         async with self._lock:
             session = self._sessions.get(session_id)
+            if (
+                session is not None
+                and session.connected
+                and secrets.compare_digest(session.session_token, session_token)
+            ):
+                # Admission expiry must not prevent a live connection from
+                # releasing its current selection (including a pending update).
+                payload = {"sid": session_id, "ws_url": session.lease.ws_url}
+            else:
+                payload = verify_session_token(session_token, self.session_shared_secret)
+            if payload.get("sid") != session_id:
+                raise ValueError("session token does not match session id")
             if session is None:
                 raise KeyError("unknown session id")
             if session.lease.ws_url != payload.get("ws_url"):

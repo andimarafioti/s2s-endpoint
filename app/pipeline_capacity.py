@@ -237,6 +237,8 @@ class PipelineCapacity:
             }
             if service == "tts":
                 routes[service]["voice"] = view["voices"][0]
+                if self.config.session_updates_enabled:
+                    routes[service]["voices"] = view["voices"]
             if self.config.session_updates_enabled and service == "llm":
                 routes[service]["capabilities"] = {
                     key: value

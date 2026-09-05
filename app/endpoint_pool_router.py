@@ -832,6 +832,23 @@ class EndpointPoolRouter:
 
             self._condition.notify_all()
 
+    async def replace_pipeline(
+        self, slot_id: str, previous: str, selected: str, *, proposed: str | None = None
+    ) -> None:
+        """Replace one connected session's forecast without claiming another CPU slot."""
+        async with self._condition:
+            endpoint = self._endpoints.get(slot_id)
+            if endpoint is None or endpoint.route_connected.get(previous, 0) < 1:
+                raise ValueError("connected pipeline selection was not found")
+            if proposed is not None and not self.pipeline_capacity.can_switch(
+                previous, proposed, self._pipeline_counts_unlocked()
+            ):
+                raise ValueError("selected model capacity is not ready; retry the update")
+            for counts in (endpoint.route_active, endpoint.route_connected):
+                counts[previous] = max(0, counts.get(previous, 0) - 1)
+                counts[selected] = counts.get(selected, 0) + 1
+            self._condition.notify_all()
+
     async def release(self, slot_id: str, *, connected: bool = False, pipeline: Optional[str] = None) -> None:
         async with self._condition:
             endpoint = self._endpoints.get(slot_id)

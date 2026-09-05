@@ -7,6 +7,8 @@ import websockets
 from fastapi import WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 
+from app.app_utils import cancel_and_await
+
 logger = logging.getLogger("s2s-endpoint")
 
 
@@ -36,6 +38,7 @@ async def proxy_websocket(
     no_capacity_log: str,
     additional_headers: Optional[list[tuple[str, str]]] = None,
     on_lease_acquired: Optional[Callable[[], Awaitable[None]]] = None,
+    message_interceptor=None,
 ) -> bool:
     """Proxy a client websocket to an upstream pipeline slot.
 
@@ -103,10 +106,20 @@ async def proxy_websocket(
                 ping_timeout=20,
                 max_size=None,
             ) as upstream_ws:
-                await asyncio.gather(
-                    _client_to_upstream(client_ws, upstream_ws),
-                    _upstream_to_client(client_ws, upstream_ws),
-                )
+                tasks = [
+                    asyncio.create_task(_client_to_upstream(client_ws, upstream_ws, message_interceptor)),
+                    asyncio.create_task(_upstream_to_client(client_ws, upstream_ws, message_interceptor)),
+                ]
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    for task in tasks:
+                        try:
+                            await cancel_and_await(task)
+                        except (WebSocketDisconnect, ConnectionClosed):
+                            pass
         except WebSocketDisconnect:
             logger.info("Client websocket disconnected")
         except ConnectionClosed:
@@ -127,22 +140,28 @@ async def proxy_websocket(
     return True
 
 
-async def _client_to_upstream(client_ws: WebSocket, upstream_ws) -> None:
+async def _client_to_upstream(client_ws: WebSocket, upstream_ws, interceptor=None) -> None:
     while True:
         message = await client_ws.receive()
 
         if message["type"] == "websocket.disconnect":
             raise WebSocketDisconnect()
 
-        if "bytes" in message and message["bytes"] is not None:
-            await upstream_ws.send(message["bytes"])
-        elif "text" in message and message["text"] is not None:
-            await upstream_ws.send(message["text"])
+        data = message.get("bytes") if message.get("bytes") is not None else message.get("text")
+        if data is not None:
+            if interceptor is not None:
+                data = await interceptor.client_message(data)
+            if data is not None:
+                await upstream_ws.send(data)
+                if interceptor is not None:
+                    await interceptor.after_send()
 
 
-async def _upstream_to_client(client_ws: WebSocket, upstream_ws) -> None:
+async def _upstream_to_client(client_ws: WebSocket, upstream_ws, interceptor=None) -> None:
     while True:
         msg = await upstream_ws.recv()
+        if interceptor is not None:
+            msg = await interceptor.server_message(msg)
         if isinstance(msg, bytes):
             await client_ws.send_bytes(msg)
         else:

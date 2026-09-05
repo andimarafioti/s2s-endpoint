@@ -219,11 +219,10 @@ to each pool. Metrics contain no credential values, prompts, or conversation IDs
 Conversation affinity and gradual cache-aware draining remain
 [#112](https://github.com/andimarafioti/s2s-endpoint/issues/112); their bindings
 must live inside the selected pool. Cache/continuation verification remains
-[#113](https://github.com/andimarafioti/s2s-endpoint/issues/113). Optional Realtime
-`session.update` model switching and conversation-identifier propagation remain
-[speech-to-speech #547](https://github.com/huggingface/speech-to-speech/issues/547).
-This gateway's per-request route resolution supplies the pool boundary for those
-changes; it does not implement mid-session switching or affinity itself.
+[#113](https://github.com/andimarafioti/s2s-endpoint/issues/113). The companion
+[speech-to-speech change](https://github.com/huggingface/speech-to-speech/pull/548)
+propagates conversation identity and supports optional session model updates.
+The gateway retains ownership of catalogs and pool accounting.
 ## Session admission and five-pipeline reserve
 
 Capacity composition is opt-in on the allocator with `PIPELINE_CAPACITY`. Its
@@ -294,7 +293,7 @@ hold healthy choices. Queue positions still describe arrival order; deadlines
 and abandonment cleanup are unchanged. Unconfigured queues retain strict FIFO.
 
 Clients may include `{"pipeline":"qwen-gemma-qwen"}` in `POST /session`; omission
-uses the configured default. Unknown choices fail with 400. The selected
+uses the configured default unless session model updates are enabled below. Unknown choices fail with 400. The selected
 model/provider/protocol identities are signed into the grant and passed by the
 compute wrapper as `X-Speech-Session-Routing` to the private upstream listener.
 Client copies of that header are not forwarded. Enable `SESSION_ROUTING_ENABLED`
@@ -317,5 +316,79 @@ advertising its workload-derived reserve.
 
 Connected sessions are not expired because their ticket, token or backend cache
 ages. Queue tickets have the separate absolute 300-second waiting deadline.
-Cache retention/affinity and full mid-session model switching remain #112,
-#113 and upstream #547 work; the initial admitted model is immutable here.
+Cache retention/affinity and cache verification remain #112 and #113 work.
+
+### Selecting and removing session stages
+
+Set `"session_updates_enabled": true` inside `PIPELINE_CAPACITY`, and configure
+the same `LB_CALLBACK_AUTH_TOKEN` on the allocator and CPU workers. CPU workers
+still use `SESSION_ROUTING_ENABLED=true`. They initialize the configured remote
+adapters without probing their bootstrap models; gateways own model readiness
+and warmup. An unavailable optional model or voice does not take down the CPU
+session service.
+
+In this mode, `POST /session` with no selection allocates an empty CPU session.
+No STT/LLM/TTS pool demand is claimed until models are selected. Named `pipeline`
+selection remains supported, and `/session` can also accept a `models` map:
+
+```json
+{"models":{"stt":{"model":"qwen-asr","provider":"hf"},"llm":"gemma-route","tts":null}}
+```
+
+After connecting with the returned grant, select or change stages on the same
+WebSocket:
+
+```json
+{
+  "type":"session.update",
+  "event_id":"choose-models",
+  "session":{
+    "type":"realtime",
+    "models":{"stt":"qwen-asr","llm":"gemma-route","tts":"qwen-tts"}
+  }
+}
+```
+
+Choices are configured logical model names or route aliases, optionally qualified
+by provider. Catalog defaults resolve ambiguous logical names; an explicit
+provider is preserved. A missing update key retains its selection; `null`
+disables that stage. `session.model` is also accepted as an LLM shorthand. If
+both spellings are present, they must agree. `session.created` and
+`session.updated` report the effective `models` map and LLM `model`.
+
+Removing TTS gives text-only responses; adding it again enables audio unless
+the update explicitly requests text. Removing STT permits text input and direct
+audio to a declared audio-input LLM on the Chat Completions adapter. A text-only
+LLM rejects audio input. Removing the LLM permits transcription but rejects
+response generation. Missing stages never fall back to bootstrap models.
+
+Updates are accepted only at a drained turn boundary. Finish/cancel a response,
+wait for provider cleanup, and resolve outstanding tools before switching.
+Retained history, session identity and compatible settings remain intact.
+The initial switch contract requires the same adapter protocol, full-context
+continuation, an equal or larger declared context window, and compatible tools,
+images, retained audio and voice. It does not implement tokenizer conversion,
+backend-local continuation migration, or cross-protocol adapter replacement.
+
+Compute reserves newly selected pools through the authenticated
+`/internal/sessions/{id}/routing` callback, then sends a private proposal to the
+upstream listener. Until the acknowledgement, accounting holds the union of old
+and new pools, counting shared stages once. Accepted updates release the old
+selection; rejected updates release the proposal and preserve all prior session
+fields. Unready capacity returns a correlated Realtime error that the client can
+retry. No inference lease is held while the user is idle. On a lost/uncertain
+handoff or callback, compute closes the connection and releases its allocation
+instead of continuing with uncertain accounting. The original admission-token
+expiry does not prevent an already connected session from releasing its claims.
+
+The private routing envelope is stripped from public messages and responses;
+clients cannot supply resolved routes, worker addresses or credentials. Callback
+credentials use `X-Reachy-Mini-Callback-Authorization`, with precedence over the
+standard-header fallback. Keep the upstream listener private.
+
+This is an optional service extension. OpenAI's hosted Realtime API does not
+permit mid-session model changes ([session.update reference](https://developers.openai.com/api/reference/resources/realtime/client-events#session.update)).
+Clients that omit the extension keep existing supported WebSocket/WebRTC flows;
+the managed selection path currently covers WebSocket only. When disabled,
+`/session` retains its existing default-route behavior and admitted models remain
+fixed.
