@@ -93,3 +93,17 @@ class SessionModelSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             sum(self.capacity.pool_counts(manager.endpoint_router._pipeline_counts_unlocked()).values()), 0
         )
+
+    async def test_connected_session_can_update_and_release_after_admission_token_expiry(self):
+        from unittest.mock import patch
+
+        self.enable_updates()
+        manager = self.manager_with_capacity()
+        with patch("app.session_tokens.time.time", return_value=1000):
+            grant = await manager.allocate("https://allocator.example", pipeline="qwen")
+            sid, token = grant["session_id"], grant["session_token"]
+            await manager.handle_event(sid, token, "connected")
+        with patch("app.session_tokens.time.time", return_value=1000000):
+            await manager.prepare_routing(sid, token, "after-expiry", {"stt": "stt-openai"})
+            await manager.handle_event(sid, token, "disconnected")
+        self.assertEqual(sum(self.capacity.pool_counts(manager.endpoint_router._pipeline_counts_unlocked()).values()), 0)
