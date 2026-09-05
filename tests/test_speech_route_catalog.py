@@ -1,8 +1,10 @@
 import asyncio
 import copy
 import json
+import time
 import unittest
 from contextlib import contextmanager
+from email.utils import formatdate
 from unittest.mock import patch
 
 import httpx
@@ -340,6 +342,43 @@ class CatalogApplicationTests(unittest.TestCase):
             self.assertEqual(len(attempts), 1)
             self.assertEqual(client.get("/health").json()["backends"][0]["active_requests"], 0)
 
+    def test_external_503_retry_after_prevents_replay_for_json_and_stt(self):
+        for service, protocol, delay in (
+            ("llm", "chat_completions", "30"),
+            ("stt", "transcriptions", formatdate(time.time() + 60, usegmt=True)),
+        ):
+            with self.subTest(service=service):
+                attempts = []
+
+                async def backend(request):
+                    if request.method == "GET":
+                        return httpx.Response(200, json={"data": [{"id": "deployed-model"}]})
+                    attempts.append(request)
+                    return httpx.Response(503, json={"error": "overloaded"}, headers={"Retry-After": delay})
+
+                env = environment(route("external", "model", kind="external", provider="api", protocols=[protocol]))
+                env["SPEECH_PROXY_SERVICE"] = service
+                with catalog_client(env, backend) as client:
+
+                    def send():
+                        if service == "stt":
+                            return client.post(
+                                "/v1/audio/transcriptions",
+                                data={"model": "model"},
+                                files={"file": ("audio.wav", wav_bytes(), "audio/wav")},
+                            )
+                        return client.post("/v1/chat/completions", json={"model": "model", "stream": True})
+
+                    first = send()
+                    self.assertEqual(first.status_code, 503)
+                    self.assertEqual(first.headers.get("retry-after"), delay)
+                    self.assertEqual(first.json(), {"error": "overloaded"})
+                    self.assertEqual(send().status_code, 429)
+                    self.assertEqual(len(attempts), 1)
+                    health = client.get("/health").json()
+                    self.assertGreater(health["pools"]["external"]["capacity"]["retry_after_s"], 0)
+                    self.assertEqual(health["backends"][0]["active_requests"], 0)
+
     def test_stt_multipart_and_tts_voice_format_use_selected_route(self):
         seen = []
 
@@ -380,6 +419,19 @@ class CatalogApplicationTests(unittest.TestCase):
 
 
 class CatalogValidationTests(unittest.TestCase):
+    def test_fractional_lifecycle_counts_are_rejected_before_startup(self):
+        for field in ("min_warm", "max_workers", "max_restart_attempts"):
+            configured = route(
+                "managed",
+                "model",
+                namespace="org",
+                control_token_env="CTRL",
+                backends=[{"name": "one"}, {"name": "two"}],
+                lifecycle={"max_workers": 2, field: 1.5},
+            )
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                SpeechProxySettings.from_env({**environment(configured), "CTRL": "control"})
+
     def test_ambiguous_selections_require_defaults_or_explicit_aliases(self):
         routes = (
             route("old", "model", aliases=["stable"]),

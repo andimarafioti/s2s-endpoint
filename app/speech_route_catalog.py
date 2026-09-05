@@ -107,7 +107,13 @@ class SpeechRoute(CatalogModel):
         if self.lifecycle is not None:
             if not self.namespace or not self.control_token_env:
                 raise ValueError("managed pools require namespace and control_token_env")
-            lifecycle = WorkerLifecycleSettings(**self.lifecycle)
+            for name in ("min_warm", "max_workers", "max_restart_attempts"):
+                if name in self.lifecycle and type(self.lifecycle[name]) is not int:
+                    raise ValueError(f"{name} must be an integer")
+            try:
+                lifecycle = WorkerLifecycleSettings(**self.lifecycle)
+            except TypeError as exc:
+                raise ValueError("invalid lifecycle settings") from exc
             if lifecycle.max_workers > len(self.backends):
                 raise ValueError("max_workers exceeds pool inventory")
         elif any(not backend.url for backend in self.backends):

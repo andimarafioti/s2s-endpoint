@@ -154,6 +154,8 @@ Every inference attempt, including a retry, consumes one request in a rolling
 60-second window. Local exhaustion returns 429 with `Retry-After`; provider 429s
 are returned to the caller and put the entire pool into a cooldown using the
 provider's `Retry-After` (seconds or HTTP date; one second if missing/invalid).
+External 503 responses carrying `Retry-After` also set this cooldown and are
+returned with the original status and retry header, without immediate replay.
 Other retryable failures use the bounded attempt count before downstream bytes
 begin. A partially streamed response is never replayed.
 

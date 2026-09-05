@@ -540,7 +540,9 @@ async def _proxy_stt(
             elapsed = time.monotonic() - started
             success = 200 <= response.status_code < 300
             retryable = _retryable_response(response.status_code, response.content)
-            if dependencies.pool.settings.external and response.status_code == 429:
+            if dependencies.pool.settings.external and (
+                response.status_code == 429 or (response.status_code == 503 and "retry-after" in response.headers)
+            ):
                 await dependencies.pool.rate_limited(response.headers.get("retry-after"))
                 retryable = False
             latency_metric = elapsed / duration_s if duration_s > 0 else elapsed
@@ -663,7 +665,10 @@ async def _proxy_streaming_json(
                 )
                 response = await dependencies.client.send(upstream_request, stream=True)
                 if not 200 <= response.status_code < 300:
-                    provider_limited = dependencies.pool.settings.external and response.status_code == 429
+                    provider_limited = dependencies.pool.settings.external and (
+                        response.status_code == 429
+                        or (response.status_code == 503 and "retry-after" in response.headers)
+                    )
                     if provider_limited:
                         await dependencies.pool.rate_limited(response.headers.get("retry-after"))
                     response_body = await response.aread()
