@@ -64,6 +64,32 @@ def catalog_client(env, handler):
 
 
 class CatalogApplicationTests(unittest.TestCase):
+    def test_capacity_control_auth_and_schema_precede_demand_mutation(self):
+        configured = route(
+            "one",
+            "model",
+            policy={"target_work": 2, "max_work": 4, "llm_warmup_enabled": False},
+            session_workload={"profile": "recorded workload", "work_per_session": 0.5},
+        )
+        env = {**environment(configured), "SPEECH_CAPACITY_API_KEY": "control-secret"}
+        body = {"session_counts": {"one": 2}, "reserve_sessions": 5}
+        with catalog_client(env, lambda request: httpx.Response(200)) as client:
+            self.assertEqual(client.post("/internal/capacity", json=body).status_code, 401)
+            headers = {"Authorization": "Bearer control-secret", "X-Speech-Capacity-Authorization": "Bearer wrong"}
+            self.assertEqual(client.post("/internal/capacity", json=body, headers=headers).status_code, 401)
+            headers = {"Authorization": "Bearer hf-ingress", "X-Speech-Capacity-Authorization": "Bearer control-secret"}
+            response = client.post("/internal/capacity", json=body, headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["pools"]["one"]["available_sessions"], 2)
+            self.assertEqual(response.json()["pools"]["one"]["admissible_sessions"], 6)
+            for invalid in ({"one": 1.5}, {"one": True}, {"one": -1}, {"one": 0, "missing": 1}):
+                self.assertEqual(
+                    client.post(
+                        "/internal/capacity", json={**body, "session_counts": invalid}, headers=headers
+                    ).status_code,
+                    400,
+                )
+
     def test_responses_tool_output_images_require_declared_capability(self):
         image = {"type": "input_image", "image_url": "data:image/png;base64,eA=="}
         for kind in ("self_hosted", "external"):

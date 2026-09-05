@@ -53,6 +53,7 @@ class RouteCapabilities(CatalogModel):
 
 class RoutePolicy(CatalogModel):
     target_work: float = Field(default=8, gt=0)
+    max_work: float | None = Field(default=None, gt=0)
     latency_target: float = Field(default=0.5, gt=0)
     latency_weight: float = Field(default=0.25, ge=0)
     ewma_alpha: float = Field(default=0.2, gt=0, le=1)
@@ -74,6 +75,17 @@ class ExternalCapacity(CatalogModel):
     requests_per_minute: int = Field(gt=0)
 
 
+class SessionWorkload(CatalogModel):
+    profile: str = Field(min_length=1, max_length=2000)
+    work_per_session: float = Field(gt=0)
+    requests_per_minute: float = Field(default=1, gt=0)
+
+
+class SessionDemandUpdate(CatalogModel):
+    session_counts: dict[PoolId, Annotated[int, Field(ge=0)]]
+    reserve_sessions: int = Field(ge=0, le=300)
+
+
 class SpeechRoute(CatalogModel):
     pool: PoolId
     model: Identifier
@@ -89,13 +101,20 @@ class SpeechRoute(CatalogModel):
     backends: tuple[RouteBackend, ...] = Field(min_length=1)
     policy: RoutePolicy = Field(default_factory=RoutePolicy)
     capacity: ExternalCapacity | None = None
+    session_workload: SessionWorkload | None = None
     lifecycle: dict[str, int | float] | None = None
     namespace: str | None = None
     control_token_env: EnvName | None = None
 
     @model_validator(mode="after")
     def validate_pool(self):
+        if self.policy.max_work is not None and self.policy.max_work < self.policy.target_work:
+            raise ValueError("max_work must be >= target_work")
+        if self.session_workload and self.kind == "self_hosted" and self.policy.max_work is None:
+            raise ValueError("self-hosted session headroom requires max_work")
         if self.kind == "external":
+            if self.policy.max_work is not None:
+                raise ValueError("external routes use capacity.max_concurrency rather than max_work")
             if self.lifecycle is not None or self.namespace or self.control_token_env:
                 raise ValueError("external routes cannot configure HF lifecycle operations")
             if self.capacity is None or len(self.backends) != 1:

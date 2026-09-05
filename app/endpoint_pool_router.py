@@ -20,6 +20,7 @@ logger = logging.getLogger("s2s-endpoint")
 class ComputeUsage:
     active_sessions: int
     max_sessions: int
+    route_sessions: dict[str, int] = field(default_factory=dict)
 
 
 ComputeUsageFetcher = Callable[[str], ComputeUsage]
@@ -127,10 +128,18 @@ def fetch_compute_usage(base_url: str, *, api_key: str | None = None) -> Compute
         raise ComputeUsageSchemaError("compute health reported max_sessions below 1")
     if active_sessions > max_sessions:
         raise ComputeUsageSchemaError("compute health reported more active sessions than max_sessions")
+    routes = router.get("route_sessions", {})
+    if not isinstance(routes, dict) or any(
+        not isinstance(k, str) or type(v) is not int or v < 0 for k, v in routes.items()
+    ):
+        raise ComputeUsageSchemaError("invalid compute route session counts")
+    if sum(routes.values()) > active_sessions:
+        raise ComputeUsageSchemaError("route counts exceed compute active sessions")
 
     return ComputeUsage(
         active_sessions=active_sessions,
         max_sessions=max_sessions,
+        route_sessions=routes,
     )
 
 
@@ -152,6 +161,7 @@ class EndpointLease:
     endpoint_name: str
     ws_url: str
     waited_for_capacity: bool = False
+    pipeline: Optional[str] = None
 
 
 @dataclass
@@ -388,6 +398,9 @@ class ManagedEndpoint:
     url: Optional[str] = None
     active_sessions: int = 0
     connected_sessions: int = 0
+    route_active: dict[str, int] = field(default_factory=dict)
+    route_connected: dict[str, int] = field(default_factory=dict)
+    observed_routes: dict[str, int] = field(default_factory=dict)
     observed_active_sessions: int = 0
     unobserved_connected_sessions: int = 0
     waking: bool = False
@@ -434,13 +447,17 @@ class ManagedEndpoint:
 
     def reset_usage_after_fresh_process(self) -> None:
         self.observed_active_sessions = 0
+        self.observed_routes.clear()
         self.invalidate_usage_sync(forget_last_success=True)
 
     def reset_usage_after_process_stop(self, *, clear_local_sessions: bool) -> None:
         if clear_local_sessions:
             self.active_sessions = 0
             self.connected_sessions = 0
+            self.route_active.clear()
+            self.route_connected.clear()
         self.observed_active_sessions = 0
+        self.observed_routes.clear()
         self.unobserved_connected_sessions = 0
         self.invalidate_usage_sync(forget_last_success=True)
 
@@ -454,6 +471,7 @@ class ManagedEndpoint:
         observed_increase = max(usage.active_sessions - self.observed_active_sessions, 0)
         self.slots = usage.max_sessions
         self.observed_active_sessions = usage.active_sessions
+        self.observed_routes = dict(usage.route_sessions)
         self.usage_synced = True
         self.last_usage_sync_at = synced_at
         self.usage_sync_drain_generation = drain_generation
@@ -563,6 +581,7 @@ class EndpointPoolRouter:
         usage_sync_stale_ttl_s: float = 60.0,
         control_fetch_timeout_s: float = 30.0,
         reconcile_stale_after_s: Optional[float] = None,
+        pipeline_capacity=None,
     ) -> None:
         names = [name.strip() for name in endpoint_names if name.strip()]
         if not names:
@@ -588,6 +607,7 @@ class EndpointPoolRouter:
 
         self.endpoint_ws_path = endpoint_ws_path
         self.min_warm_endpoints = min_warm_endpoints
+        self.pipeline_capacity = pipeline_capacity
         self.wake_threshold_slots = wake_threshold_slots
         self.idle_park_timeout_s = idle_park_timeout_s
         self.reconcile_interval_s = reconcile_interval_s
@@ -627,6 +647,7 @@ class EndpointPoolRouter:
         self._usage_sync_lock = asyncio.Lock()
         self._closed = False
         self._reconcile_task: Optional[asyncio.Task] = None
+        self._capacity_task: Optional[asyncio.Task] = None
         self._initial_warm_task: Optional[asyncio.Task] = None
         self._last_error: Optional[str] = None
         self._next_park_allowed_at = 0.0
@@ -644,6 +665,9 @@ class EndpointPoolRouter:
     async def start(self) -> None:
         await self.refresh()
         await self._retry_initial_usage_sync()
+        await self._refresh_pipeline_capacity()
+        if self.pipeline_capacity is not None:
+            self._capacity_task = asyncio.create_task(self._capacity_loop())
         self._initial_warm_task = asyncio.create_task(self.ensure_min_warm())
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
 
@@ -669,9 +693,12 @@ class EndpointPoolRouter:
 
         await cancel_and_await(self._reconcile_task)
         self._reconcile_task = None
+        await cancel_and_await(self._capacity_task)
 
         self._control_fetch_executor.shutdown(wait=False, cancel_futures=True)
         self._control_transition_executor.shutdown(wait=False, cancel_futures=True)
+        if self.pipeline_capacity is not None:
+            await self.pipeline_capacity.close()
 
     async def _run_controller_call(
         self,
@@ -696,17 +723,25 @@ class EndpointPoolRouter:
         except asyncio.TimeoutError as exc:
             raise TimeoutError(f"{operation} for endpoint {name} exceeded {self.control_fetch_timeout_s:.1f}s") from exc
 
-    def _claim_slot_unlocked(self, *, waited_for_capacity: bool) -> tuple[Optional[EndpointLease], list[str]]:
+    def _claim_slot_unlocked(
+        self, *, waited_for_capacity: bool, pipeline: Optional[str] = None
+    ) -> tuple[Optional[EndpointLease], list[str]]:
         """Single slot-claim attempt; the caller must hold ``self._condition``.
 
         On a hit: bumps the endpoint's session accounting and returns the lease
         plus any proactive wake-ups. On a miss: returns ``None`` plus force-marked
         wake-ups so capacity is on its way for whoever retries. The caller spawns
         the wake tasks once outside the claim."""
+        if self.pipeline_capacity is not None:
+            pipeline = self.pipeline_capacity.resolve(pipeline)
+            if not self.pipeline_capacity.can_admit(pipeline, self._pipeline_counts_unlocked()):
+                return None, self._mark_endpoints_to_wake_unlocked()
         endpoint = self._select_endpoint_unlocked()
         if endpoint is None or endpoint.ws_url is None:
             return None, self._mark_endpoints_to_wake_unlocked(force=True)
         endpoint.active_sessions += 1
+        if pipeline is not None:
+            endpoint.route_active[pipeline] = endpoint.route_active.get(pipeline, 0) + 1
         endpoint.last_used_at = time.monotonic()
         wake_names = self._mark_endpoints_to_wake_unlocked()
         lease = EndpointLease(
@@ -714,6 +749,7 @@ class EndpointPoolRouter:
             endpoint_name=endpoint.name,
             ws_url=endpoint.ws_url,
             waited_for_capacity=waited_for_capacity,
+            pipeline=pipeline,
         )
         return lease, wake_names
 
@@ -753,7 +789,7 @@ class EndpointPoolRouter:
         self._spawn_wake_tasks(wake_names)
         return lease
 
-    async def try_acquire(self) -> Optional[EndpointLease]:
+    async def try_acquire(self, *, pipeline: Optional[str] = None) -> Optional[EndpointLease]:
         """Single non-blocking attempt to grab a free slot.
 
         Returns a lease if one is available right now, otherwise ``None``. When
@@ -762,12 +798,14 @@ class EndpointPoolRouter:
         session queue, which owns the waiting instead of blocking here."""
         async with self._condition:
             self._raise_if_closed()
-            lease, wake_names = self._claim_slot_unlocked(waited_for_capacity=False)
+            if self.pipeline_capacity is not None:
+                pipeline = self.pipeline_capacity.resolve(pipeline)
+            lease, wake_names = self._claim_slot_unlocked(waited_for_capacity=False, pipeline=pipeline)
 
         self._spawn_wake_tasks(wake_names)
         return lease
 
-    async def mark_connected(self, slot_id: str) -> None:
+    async def mark_connected(self, slot_id: str, *, pipeline: Optional[str] = None) -> None:
         async with self._condition:
             endpoint = self._endpoints.get(slot_id)
             if endpoint is None:
@@ -776,18 +814,24 @@ class EndpointPoolRouter:
                 return
 
             endpoint.connected_sessions += 1
+            if pipeline is not None:
+                endpoint.route_connected[pipeline] = endpoint.route_connected.get(pipeline, 0) + 1
             endpoint.unobserved_connected_sessions += 1
             endpoint.last_used_at = time.monotonic()
 
             self._condition.notify_all()
 
-    async def release(self, slot_id: str, *, connected: bool = False) -> None:
+    async def release(self, slot_id: str, *, connected: bool = False, pipeline: Optional[str] = None) -> None:
         async with self._condition:
             endpoint = self._endpoints.get(slot_id)
             if endpoint is None:
                 return
 
             endpoint.active_sessions = max(endpoint.active_sessions - 1, 0)
+            if pipeline is not None:
+                endpoint.route_active[pipeline] = max(endpoint.route_active.get(pipeline, 0) - 1, 0)
+                if connected:
+                    endpoint.route_connected[pipeline] = max(endpoint.route_connected.get(pipeline, 0) - 1, 0)
             if connected:
                 endpoint.connected_sessions = max(endpoint.connected_sessions - 1, 0)
                 endpoint.unobserved_connected_sessions = max(
@@ -955,6 +999,11 @@ class EndpointPoolRouter:
             "free_slots": free_slots,
             "warming_slots": warming_slots,
             "effective_free_slots": free_slots + warming_slots,
+            **(
+                {"pipeline_capacity": self.pipeline_capacity.snapshot(self._pipeline_counts_unlocked(), free_slots)}
+                if self.pipeline_capacity
+                else {}
+            ),
             "endpoints": [
                 {
                     "name": endpoint.name,
@@ -1421,6 +1470,29 @@ class EndpointPoolRouter:
             wake_names = self._mark_endpoints_to_wake_unlocked()
         self._spawn_wake_tasks(wake_names)
 
+    def _pipeline_counts_unlocked(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for endpoint in self._endpoints.values():
+            known = 0
+            for name in endpoint.route_active.keys() | endpoint.observed_routes.keys():
+                connected = max(endpoint.route_connected.get(name, 0), endpoint.observed_routes.get(name, 0))
+                pending = max(endpoint.route_active.get(name, 0) - endpoint.route_connected.get(name, 0), 0)
+                counts[name] = counts.get(name, 0) + connected + pending
+                known += connected + pending
+            counts["__unknown__"] = counts.get("__unknown__", 0) + max(0, endpoint.busy_sessions - known)
+        return counts
+
+    async def _refresh_pipeline_capacity(self):
+        if self.pipeline_capacity is not None:
+            async with self._lock:
+                counts = self._pipeline_counts_unlocked()
+            await self.pipeline_capacity.refresh(counts)
+
+    async def _capacity_loop(self):
+        while True:
+            await asyncio.sleep(self.pipeline_capacity.config.refresh_interval_s)
+            await self._refresh_pipeline_capacity()
+
     async def _schedule_parks_if_needed(self) -> None:
         async with self._condition:
             park_names = self._mark_endpoints_to_park_unlocked()
@@ -1438,11 +1510,12 @@ class EndpointPoolRouter:
             # Keep the warm floor, but don't spin up extra endpoints while the
             # system is idle. Proactive wakes should only happen once there is
             # actual allocated session pressure.
-            if self._active_sessions_unlocked() == 0:
+            if self._active_sessions_unlocked() == 0 and self.pipeline_capacity is None:
                 return []
-            if effective_free_slots >= self.wake_threshold_slots or self._has_pending_unknown_capacity_wake_unlocked(
-                now
-            ):
+            target_slots = (
+                self.pipeline_capacity.config.reserve_sessions if self.pipeline_capacity else self.wake_threshold_slots
+            )
+            if effective_free_slots >= target_slots or self._has_pending_unknown_capacity_wake_unlocked(now):
                 return []
         elif force and target_count is None:
             if effective_free_slots > 0 or self._has_pending_wake_unlocked(now):
@@ -1513,6 +1586,11 @@ class EndpointPoolRouter:
             # that state as unhealthy.
             return False
         if self._running_count_unlocked() <= self.min_warm_endpoints:
+            return False
+        if (
+            self.pipeline_capacity
+            and self._free_slots_unlocked() - endpoint.free_slots < self.pipeline_capacity.config.reserve_sessions
+        ):
             return False
         idle_for = time.monotonic() - endpoint.last_used_at
         return idle_for >= self.idle_park_timeout_s

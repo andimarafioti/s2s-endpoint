@@ -224,3 +224,89 @@ must live inside the selected pool. Cache/continuation verification remains
 [speech-to-speech #547](https://github.com/huggingface/speech-to-speech/issues/547).
 This gateway's per-request route resolution supplies the pool boundary for those
 changes; it does not implement mid-session switching or affinity itself.
+## Session admission and five-pipeline reserve
+
+Capacity composition is opt-in on the allocator with `PIPELINE_CAPACITY`. Its
+named choices reference pool IDs on the three configured gateway URLs:
+
+```json
+{
+  "default": "qwen-gemma-qwen",
+  "routes": {
+    "qwen-gemma-qwen": {"stt": "qwen-asr", "llm": "gemma", "tts": "qwen-tts"},
+    "openai-gemma-qwen": {"stt": "openai-asr", "llm": "gemma", "tts": "qwen-tts"}
+  },
+  "reserve_sessions": 5,
+  "llm_protocol": "chat_completions"
+}
+```
+
+Set `SESSION_QUEUE_ENABLED=true`, `SPEECH_STT_PROXY_URL`, `SPEECH_LLM_PROXY_URL`,
+`SPEECH_TTS_PROXY_URL`, and a shared `SPEECH_CAPACITY_API_KEY` on this allocator
+and its gateways. For protected HF gateways, set
+`SPEECH_CAPACITY_INGRESS_API_KEY` separately: it uses `Authorization`, while
+the control key uses `X-Speech-Capacity-Authorization`. The latter takes
+precedence over the standard-header fallback. Keep one admission owner and
+one lifecycle controller per managed pool; do not run duplicate allocators
+against the same pool's capacity control endpoint.
+
+Each referenced pool needs a measured `session_workload`, for example:
+
+```json
+{
+  "session_workload": {
+    "profile": "Calibration reference, audio/context sizes, turn rate and concurrency assumptions",
+    "work_per_session": 0.5,
+    "requests_per_minute": 2
+  },
+  "policy": {"target_work": 8, "max_work": 12}
+}
+```
+
+These numbers illustrate the schema, not a calibrated production setting.
+`work_per_session` uses the pool's existing request-work units: STT equivalent
+audio work, TTS/LLM requests. For external APIs it is concurrent requests;
+the additional request-rate estimate must fit the provider's RPM budget.
+Self-hosted admission pools require `max_work >= target_work` as a separate
+hard per-worker ceiling. External pools retain their concurrency/RPM ceilings.
+
+The allocator posts pending-plus-connected demand to `/internal/capacity` and
+uses ready soft headroom to advertise available pipelines. It accounts for
+both STT alternatives independently and shared stages once in aggregate.
+Claims immediately spend shared headroom before another caller can allocate.
+Compute health exports route counts for surviving connections after allocator
+restart; unclassified connections count conservatively against all choices.
+Returning activity remains in the workload forecast; observed in-flight work
+can increase demand above it. Inference leases still last only for requests.
+
+Admission requires one complete route within hard ceilings, even if the
+five-pipeline reserve or normal target is depleted. Warming workers deduplicate
+wakes but contribute no ready reserve. Inference workers scale from demand plus
+reserve; CPU workers replenish free slots using their existing wake logic.
+Cooldowns and sustained low use gate consolidation, and stale demand cannot
+authorize an inference-worker drain. Stale gateway observations stop new
+admissions; they do not disconnect healthy existing conversations. Health
+reports `pipeline_capacity`, with per-choice stage headroom and the limiting
+stage. Alternative capacities are never added together.
+
+Clients may include `{"pipeline":"qwen-gemma-qwen"}` in `POST /session`; omission
+uses the configured default. Unknown choices fail with 400. The selected
+model/provider/protocol identities are signed into the grant and passed by the
+compute wrapper as `X-Speech-Session-Routing` to the private upstream listener.
+Client copies of that header are not forwarded. Enable `SESSION_ROUTING_ENABLED`
+on those CPU workers and use the companion speech-to-speech revision supporting
+the [initial routing handoff](https://github.com/huggingface/speech-to-speech/blob/feature/session-routing-handoff/docs/session-routing-handoff.md).
+All advertised choices must match the worker's LLM adapter and audio settings.
+
+Provider-specific request options must also be compatible across those choices.
+`RESPONSES_API_DISABLE_THINKING=false` disables the automatic vLLM chat-template
+extension. `TTS_STREAM=false` omits vLLM's `stream` flag while retaining the HTTP
+stream reader and PCM `stream_format=audio`; `TTS_LANGUAGE=` omits its language
+extension. Existing defaults stay unchanged. Do not assume an OpenAI endpoint
+accepts vLLM-only fields. Tune and measure a compatible deployment before
+advertising its workload-derived reserve.
+
+Connected sessions are not expired because their ticket, token or backend cache
+ages. Queue tickets have the separate absolute 300-second waiting deadline.
+Cache retention/affinity and full mid-session model switching remain #112,
+#113 and upstream #547 work; the initial admitted model is immutable here.

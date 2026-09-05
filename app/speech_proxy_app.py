@@ -34,7 +34,7 @@ from app.speech_proxy_router import (
     SpeechPoolCapacityExceeded,
     SpeechService,
 )
-from app.speech_route_catalog import SpeechRoute, SpeechRouteCatalog
+from app.speech_route_catalog import SessionDemandUpdate, SpeechRoute, SpeechRouteCatalog
 from app.speech_worker_lifecycle import SpeechWorkerLifecycle, WorkerLifecycleSettings
 
 logger = setup_logging()
@@ -86,6 +86,7 @@ class SpeechProxySettings:
     backends: tuple[SpeechBackendConfig, ...]
     backend_api_key: str | None = None
     target_work: float = 8.0
+    max_work: float | None = None
     latency_target: float = 0.5
     latency_weight: float = 0.25
     ewma_alpha: float = 0.2
@@ -113,6 +114,7 @@ class SpeechProxySettings:
     routes: tuple[SpeechProxySettings, ...] = ()
     route: SpeechRoute | None = None
     access_api_key: str | None = field(default=None, repr=False)
+    capacity_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         SpeechBackendPoolSettings(
@@ -178,6 +180,7 @@ class SpeechProxySettings:
                 }
             )
         settings = cls(
+            capacity_api_key=env_optional("SPEECH_CAPACITY_API_KEY", environ=environ),
             service=service,  # type: ignore[arg-type]
             backends=backends,
             lifecycle=lifecycle,
@@ -290,6 +293,13 @@ class SpeechProxySettings:
         return SpeechBackendPoolSettings(
             service=self.service,
             target_work=self.target_work,
+            max_work=self.max_work,
+            session_work=self.route.session_workload.work_per_session
+            if self.route and self.route.session_workload
+            else None,
+            session_rpm=self.route.session_workload.requests_per_minute
+            if self.route and self.route.session_workload
+            else 1,
             latency_target=self.latency_target,
             latency_weight=self.latency_weight,
             ewma_alpha=self.ewma_alpha,
@@ -909,6 +919,34 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return payload
+
+    @app.post("/internal/capacity")
+    async def session_capacity(request: Request):
+        if not settings.catalog or not settings.capacity_api_key:
+            raise HTTPException(status_code=404, detail="session capacity is not configured")
+        credential = request.headers.get("X-Speech-Capacity-Authorization", request.headers.get("Authorization", ""))
+        if not hmac.compare_digest(credential.encode(), f"Bearer {settings.capacity_api_key}".encode()):
+            raise HTTPException(status_code=401, detail="capacity controller authorization required")
+        try:
+            update = SessionDemandUpdate.model_validate_json(await request.body())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid session demand") from exc
+        selected = {s.route.pool: s for s in settings.routes}
+        if any(pool not in selected or not selected[pool].route.session_workload for pool in update.session_counts):
+            raise HTTPException(status_code=400, detail="unknown pool or missing workload profile")
+        results = {}
+        for pool, count in update.session_counts.items():
+            route = selected[pool].route
+            deps = dependencies.routes[pool]
+            await deps.pool.set_session_demand(count, reserve_sessions=update.reserve_sessions)
+            results[pool] = {
+                **route.labels(),
+                "protocols": route.protocols,
+                "voices": route.capabilities.voices,
+                "profile": route.session_workload.profile,
+                **await deps.pool.capacity_snapshot(),
+            }
+        return {"pools": results}
 
     if settings.service == "stt":
 

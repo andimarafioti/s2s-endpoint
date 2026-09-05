@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -20,7 +21,7 @@ class NoSpeechBackendAvailable(RuntimeError):
 
 class SpeechPoolCapacityExceeded(NoSpeechBackendAvailable):
     def __init__(self, retry_after: float):
-        super().__init__("provider pool capacity is temporarily exhausted")
+        super().__init__("pool capacity is temporarily exhausted")
         self.retry_after = retry_after
 
 
@@ -140,6 +141,9 @@ class SpeechBackendPoolSettings:
     external: bool = False
     max_concurrency: int | None = None
     requests_per_minute: int | None = None
+    max_work: float | None = None
+    session_work: float | None = None
+    session_rpm: float = 1.0
 
     def __post_init__(self) -> None:
         if self.service not in {"stt", "tts", "llm"}:
@@ -158,6 +162,15 @@ class SpeechBackendPoolSettings:
             raise ValueError("health intervals and timeouts must be > 0")
         if self.external and (not self.max_concurrency or not self.requests_per_minute):
             raise ValueError("external pools require concurrency and request limits")
+        if self.max_work is not None and (not math.isfinite(self.max_work) or self.max_work < self.target_work):
+            raise ValueError("max_work must be finite and >= target_work")
+        if self.session_work is not None:
+            if not math.isfinite(self.session_work) or self.session_work <= 0:
+                raise ValueError("session_work must be finite and positive")
+            if not self.external and self.max_work is None:
+                raise ValueError("session capacity requires a hard max_work")
+            if not math.isfinite(self.session_rpm) or self.session_rpm <= 0:
+                raise ValueError("session_rpm must be finite and positive")
 
 
 class SpeechBackendPool:
@@ -185,6 +198,9 @@ class SpeechBackendPool:
         self._peak_work = 0.0
         self._request_times: deque[float] = deque()
         self._cooldown_until = 0.0
+        self._session_count = 0
+        self._reserve_sessions = 0
+        self._session_demand_at: float | None = None
         self._health_task: asyncio.Task | None = None
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=True)
@@ -221,9 +237,16 @@ class SpeechBackendPool:
             candidates = [
                 state
                 for state in self._states.values()
-                if state.ready and not state.draining and state.config.name not in exclude
+                if state.ready
+                and not state.draining
+                and state.config.name not in exclude
+                and (self.settings.max_work is None or state.active_work + work <= self.settings.max_work)
             ]
             if not candidates:
+                if self.settings.max_work is not None and any(
+                    s.ready and not s.draining and s.config.name not in exclude for s in self._states.values()
+                ):
+                    raise SpeechPoolCapacityExceeded(1)
                 raise NoSpeechBackendAvailable("no ready speech backend is available")
             state = min(candidates, key=self._score)
             if self.settings.external:
@@ -297,18 +320,69 @@ class SpeechBackendPool:
         async with self._lock:
             self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
 
+    async def set_session_demand(self, sessions: int, *, reserve_sessions: int) -> None:
+        if self.settings.session_work is None:
+            raise ValueError("pool has no session workload profile")
+        if type(sessions) is not int or sessions < 0 or type(reserve_sessions) is not int or reserve_sessions < 0:
+            raise ValueError("session counts must be nonnegative integers")
+        async with self._lock:
+            self._session_count = sessions
+            self._reserve_sessions = reserve_sessions
+            self._session_demand_at = time.monotonic()
+
+    def _session_demand_unlocked(self) -> tuple[float, float, bool]:
+        cost = self.settings.session_work or 0
+        stale = cost > 0 and (self._session_demand_at is None or time.monotonic() - self._session_demand_at > 60)
+        return self._session_count * cost, self._reserve_sessions * cost, stale
+
     async def capacity_snapshot(self) -> dict:
-        if not self.settings.external:
-            return {"mode": "soft_target"}
         async with self._lock:
             now = time.monotonic()
-            return {
-                "mode": "external",
-                "max_concurrency": self.settings.max_concurrency,
-                "requests_per_minute": self.settings.requests_per_minute,
-                "requests_in_window": sum(start > now - 60 for start in self._request_times),
-                "retry_after_s": max(self._cooldown_until - now, 0),
-            }
+            result = {"mode": "external" if self.settings.external else "soft_target"}
+            if self.settings.external:
+                result.update(
+                    {
+                        "max_concurrency": self.settings.max_concurrency,
+                        "requests_per_minute": self.settings.requests_per_minute,
+                        "requests_in_window": sum(start > now - 60 for start in self._request_times),
+                        "retry_after_s": max(self._cooldown_until - now, 0),
+                    }
+                )
+            if self.settings.session_work is not None:
+                ready = sum(s.ready and not s.draining for s in self._states.values())
+                active = sum(
+                    s.active_requests if self.settings.external else s.active_work for s in self._states.values()
+                )
+                planned, reserve, stale = self._session_demand_unlocked()
+                demand = max(active, planned)
+                target = ready * (
+                    min(self.settings.target_work, self.settings.max_concurrency)
+                    if self.settings.external
+                    else self.settings.target_work
+                )
+                hard = ready * (self.settings.max_concurrency if self.settings.external else self.settings.max_work)
+                available = max(0, math.floor((target - demand) / self.settings.session_work))
+                admissible = max(0, math.floor((hard - demand) / self.settings.session_work))
+                if self.settings.external:
+                    rpm_demand = max(result["requests_in_window"], self._session_count * self.settings.session_rpm)
+                    quota = max(
+                        0, math.floor((self.settings.requests_per_minute - rpm_demand) / self.settings.session_rpm)
+                    )
+                    available, admissible = min(available, quota), min(admissible, quota)
+                    if result["retry_after_s"] > 0:
+                        available = admissible = 0
+                result.update(
+                    ready_work=target,
+                    hard_work=hard,
+                    active_work=active,
+                    session_work=planned,
+                    reserve_work=reserve,
+                    work_per_session=self.settings.session_work,
+                    available_sessions=available,
+                    admissible_sessions=admissible,
+                    demand_stale=stale,
+                )
+            return result
 
     async def take_work_peak(self) -> float:
         """Retain short STT bursts that complete between controller polls."""
@@ -336,11 +410,13 @@ class SpeechBackendPool:
         async with self._lock:
             state = self._states[backend_name]
             others = [s for s in self._states.values() if s is not state and s.ready and not s.draining]
+            planned, reserve, stale = self._session_demand_unlocked()
             if (
                 not state.ready
                 or state.draining
                 or len(others) < min_ready
-                or sum(s.active_work for s in self._states.values())
+                or stale
+                or max(sum(s.active_work for s in self._states.values()), planned) + reserve
                 > len(others) * self.settings.target_work * utilization
             ):
                 return False
