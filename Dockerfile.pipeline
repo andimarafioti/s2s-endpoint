@@ -4,7 +4,7 @@
 FROM python:3.12-slim
 
 ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
-ARG S2S_REF=e3264f2a913088ce9c604d7b05ade24c7e890ca9
+ARG S2S_REF=d38c51784671e245f9309802e5a51363de293d5e
 ARG SMART_TURN_MODEL_REPO=pipecat-ai/smart-turn-v3
 ARG SMART_TURN_MODEL_REV=f766f81d3cfdf7737ac64aad813d91bbfd56bf93
 ARG SMART_TURN_MODEL_FILENAME=smart-turn-v3.2-cpu.onnx

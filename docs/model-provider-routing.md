@@ -367,7 +367,8 @@ wait for provider cleanup, and resolve outstanding tools before switching.
 Retained history, session identity and compatible settings remain intact.
 The initial switch contract requires the same adapter protocol, full-context
 continuation, an equal or larger declared context window, and compatible tools,
-images, retained audio and voice. It does not implement tokenizer conversion,
+images, retained audio and voice. The context-window floor survives LLM removal
+and resets with the session. It does not implement tokenizer conversion,
 backend-local continuation migration, or cross-protocol adapter replacement.
 
 Compute reserves newly selected pools through the authenticated
