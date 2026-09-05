@@ -1,0 +1,71 @@
+# CPU-only speech-to-speech orchestration image. STT, LLM, and TTS inference
+# all run on remote services; this container owns VAD, turn detection, and the
+# OpenAI Realtime-compatible WebSocket server.
+FROM python:3.12-slim
+
+ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
+ARG S2S_REF=3986f453012a131632eee4731995474046846794
+ARG SMART_TURN_MODEL_REPO=pipecat-ai/smart-turn-v3
+ARG SMART_TURN_MODEL_REV=f766f81d3cfdf7737ac64aad813d91bbfd56bf93
+ARG SMART_TURN_MODEL_FILENAME=smart-turn-v3.2-cpu.onnx
+ARG SILERO_VAD_REF=867c2aa692646a1f1de3e94a15c9dd9f614c0acb
+
+LABEL org.opencontainers.image.source="https://github.com/andimarafioti/s2s-endpoint"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PORT=7860 \
+    S2S_REPO_DIR=/opt/speech-to-speech \
+    SMART_TURN_MODEL_PATH=/opt/models/smart-turn-v3.2-cpu.onnx \
+    TORCH_HOME=/opt/torch-cache
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git \
+    libgomp1 \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --filter=blob:none "${S2S_REPO_URL}" "${S2S_REPO_DIR}" && \
+    git -C "${S2S_REPO_DIR}" checkout "${S2S_REF}"
+
+# Install CPU PyTorch explicitly so PyPI does not pull CUDA runtime packages.
+# The remaining list is the subset needed by the remote STT/LLM/TTS pipeline;
+# local speech model backends are intentionally absent from this image.
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install \
+      --index-url https://download.pytorch.org/whl/cpu \
+      torch==2.11.0 \
+      torchaudio==2.11.0 && \
+    python -m pip install \
+      "fastapi>=0.115.0" \
+      "huggingface-hub>=0.34.0" \
+      "httpx>=0.28.0" \
+      "jsonschema>=4.0" \
+      "nltk==3.10.0" \
+      "numpy>=1.26.0" \
+      "onnxruntime>=1.17.0" \
+      "openai==2.28.0" \
+      "pillow>=10.0.0" \
+      "pydantic>=2.0" \
+      "requests>=2.32.0" \
+      "rich>=13.0" \
+      "scipy>=1.10.0" \
+      "transformers==5.15.1" \
+      "uvicorn>=0.30.0" \
+      "websockets>=12.0" && \
+    python -m pip install --no-deps "${S2S_REPO_DIR}"
+
+# Bake the small CPU-side models and tokenizer data into the image so endpoint
+# readiness does not depend on downloading them at container startup.
+RUN mkdir -p /opt/models "${TORCH_HOME}" && \
+    python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='${SMART_TURN_MODEL_REPO}', filename='${SMART_TURN_MODEL_FILENAME}', revision='${SMART_TURN_MODEL_REV}', local_dir='/opt/models')" && \
+    python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')" && \
+    python -c "import torch; torch.hub.load('snakers4/silero-vad:${SILERO_VAD_REF}', 'silero_vad', trust_repo=True)"
+
+COPY pipeline_entrypoint.py /app/pipeline_entrypoint.py
+
+EXPOSE 7860
+
+ENTRYPOINT ["python", "/app/pipeline_entrypoint.py"]

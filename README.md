@@ -19,6 +19,19 @@ This repo now builds two different images with two different app entrypoints:
 - load-balancer image: `Dockerfile.load_balancer`
   Starts `app.load_balancer_main:app` on a CPU instance, tracks a configured set of pre-created compute endpoints, keeps a warm pool, wakes parked endpoints when free session capacity gets tight, and allocates direct compute sessions for clients.
 
+For the split speech-service experiment it also builds two OpenAI-compatible
+GPU service images:
+
+- STT image: `Dockerfile.stt`
+  Runs Qwen3-ASR through vLLM on port 8000. The image adds the audio extras that
+  the official vLLM image intentionally omits.
+- TTS image: `Dockerfile.tts`
+  Runs Qwen3-TTS CustomVoice through vLLM-Omni on port 8091. Its bundled deploy
+  config keeps async chunking and multi-request batching enabled.
+- pipeline image: `Dockerfile.pipeline`
+  Runs only VAD, Smart Turn, and `speech-to-speech serve` on CPU. It sends STT
+  and TTS requests to the dedicated GPU endpoints and LLM requests to OpenAI.
+
 This is intended for a deployment with:
 
 - one load-balancer endpoint
@@ -87,6 +100,93 @@ When deploying that image on a Hugging Face vLLM endpoint, use container argumen
 ```text
 --max-model-len 32768 --reasoning-parser qwen3 --chat-template /app/qwen3_nonthinking.jinja
 ```
+
+Build the dedicated speech-service images:
+
+```bash
+docker buildx build --platform linux/amd64 -f Dockerfile.stt \
+  -t your-registry/s2s-stt:sha-YOUR_FULL_COMMIT_SHA --push .
+docker buildx build --platform linux/amd64 -f Dockerfile.tts \
+  -t your-registry/s2s-tts:sha-YOUR_FULL_COMMIT_SHA --push .
+```
+
+On every relevant `main` change, the `Publish speech service images` workflow
+publishes Linux AMD64 images as
+`ghcr.io/andimarafioti/s2s-{stt,tts}:sha-<full-commit-sha>`. A manual workflow
+run can additionally promote an explicit version alias such as `v0.3`; normal
+builds never overwrite a version alias. These images use the CUDA 12 vLLM
+runtime required by the current A10G endpoint hosts.
+
+Create one protected, warm A10G endpoint for each service in the production
+region. The script resolves and pins the current model revisions before it
+creates anything, and refuses to reuse an existing endpoint name:
+
+```bash
+uv run --with-requirements requirements.txt python scripts/create_speech_service_endpoints.py \
+  --namespace HuggingFaceM4 \
+  --stt-image-url ghcr.io/andimarafioti/s2s-stt:sha-YOUR_FULL_COMMIT_SHA \
+  --tts-image-url ghcr.io/andimarafioti/s2s-tts:sha-YOUR_FULL_COMMIT_SHA \
+  --dry-run
+
+uv run --with-requirements requirements.txt python scripts/create_speech_service_endpoints.py \
+  --namespace HuggingFaceM4 \
+  --stt-image-url ghcr.io/andimarafioti/s2s-stt:sha-YOUR_FULL_COMMIT_SHA \
+  --tts-image-url ghcr.io/andimarafioti/s2s-tts:sha-YOUR_FULL_COMMIT_SHA \
+  --wait
+```
+
+The resulting OpenAI-compatible base URLs are the endpoint URL plus `/v1`.
+Because the endpoints are protected, pass a Hugging Face token as the
+`--openai_stt_api_key` or `--openai_tts_api_key` value when configuring the
+speech-to-speech pipeline. This deployment does not change
+`stream_batch_sentences`; the experiment should preserve the pipeline's current
+sentence batching while comparing service placement.
+
+Build and deploy the CPU-only pipeline after both speech services are running:
+
+```bash
+docker buildx build --platform linux/amd64 -f Dockerfile.pipeline \
+  -t your-registry/s2s-pipeline:sha-YOUR_FULL_COMMIT_SHA --push .
+
+export HF_TOKEN=...
+export OPENAI_API_KEY=...
+uv run --with-requirements requirements.txt python scripts/create_pipeline_endpoint.py \
+  --namespace HuggingFaceM4 \
+  --image-url your-registry/s2s-pipeline:sha-YOUR_FULL_COMMIT_SHA \
+  --stt-base-url https://YOUR-STT-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
+  --tts-base-url https://YOUR-TTS-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
+  --dry-run
+uv run --with-requirements requirements.txt python scripts/create_pipeline_endpoint.py \
+  --namespace HuggingFaceM4 \
+  --image-url your-registry/s2s-pipeline:sha-YOUR_FULL_COMMIT_SHA \
+  --stt-base-url https://YOUR-STT-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
+  --tts-base-url https://YOUR-TTS-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1 \
+  --wait
+```
+
+The `Publish pipeline image` workflow uses the same immutable commit-tag and
+manual version-alias convention as the speech-service workflow. The deployment
+helpers require explicit image references so the endpoint configuration always
+records the exact build selected by the operator.
+
+The default endpoint is a protected, always-warm AWS `intel-spr-x4` CPU
+instance in `us-east-1`. It preserves `stream_batch_sentences=3`, disables live
+transcription for the baseline, and keeps conversation transcripts out of
+retained endpoint logs. Secrets are written only to an owner-readable ephemeral
+configuration file inside the container; they are not included in the process
+arguments.
+
+Connect the packaged microphone/speaker client directly to the resulting URL:
+
+```bash
+speech-to-speech talk \
+  --url wss://YOUR-ENDPOINT.us-east-1.aws.endpoints.huggingface.cloud/v1/realtime \
+  --api-key "$HF_TOKEN" \
+  --playback-buffer-ms 196
+```
+
+Current upstream uses the command name `talk`; older checkouts may call the
+same client `listen`.
 
 ## Direct Session Flow
 
