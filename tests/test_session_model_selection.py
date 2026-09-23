@@ -19,9 +19,7 @@ class SessionModelSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(grant["state"], "granted")
         self.assertEqual(grant["routing"]["routes"], {"stt": None, "llm": None, "tts": None})
         self.assertTrue(grant["routing"]["updates_enabled"])
-        self.assertEqual(
-            sum(self.capacity.pool_counts(manager.endpoint_router._pipeline_counts_unlocked()).values()), 0
-        )
+        self.assertEqual(sum(manager.endpoint_router._pool_counts_unlocked().values()), 0)
 
     async def test_select_and_remove_stages_preserves_unspecified_choices(self):
         self.enable_updates()
@@ -41,12 +39,18 @@ class SessionModelSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_switch_reserves_only_added_pools_and_union_survives_health_reconstruction(self):
         self.enable_updates()
         counts = {"qwen": 7}
-        self.assertTrue(self.capacity.can_switch("qwen", "openai", counts))
+        self.assertTrue(self.capacity.can_switch("qwen", "openai", self.capacity.pool_counts(counts)))
         union = self.capacity.hold_selection("qwen", "openai")
         demand = self.capacity.pool_counts({union: 1})
         self.assertEqual(demand, {("stt", "qwen"): 1, ("stt", "openai"): 1, ("llm", "shared"): 1, ("tts", "shared"): 1})
-        self.assertFalse(self.capacity.can_switch("qwen", "openai", {"openai": 7, "qwen": 1}))
-        self.assertTrue(self.capacity.can_switch("qwen", self.capacity.select_models("qwen", {"stt": None}), counts))
+        self.assertFalse(
+            self.capacity.can_switch("qwen", "openai", self.capacity.pool_counts({"openai": 7, "qwen": 1}))
+        )
+        self.assertTrue(
+            self.capacity.can_switch(
+                "qwen", self.capacity.select_models("qwen", {"stt": None}), self.capacity.pool_counts(counts)
+            )
+        )
 
     async def test_legacy_admission_still_uses_the_default_complete_route(self):
         self.assertEqual(self.capacity.resolve(None), "qwen")
@@ -74,17 +78,17 @@ class SessionModelSelectionTests(unittest.IsolatedAsyncioTestCase):
         observe({"qwen": 1})
         prepared = await manager.prepare_routing(sid, token, "switch", {"stt": "stt-openai"})
         expected = {("stt", "qwen"): 1, ("stt", "openai"): 1, ("llm", "shared"): 1, ("tts", "shared"): 1}
-        self.assertEqual(self.capacity.pool_counts(router._pipeline_counts_unlocked()), expected)
+        self.assertEqual(router._pool_counts_unlocked(), expected)
         observe({prepared["hold"]: 1})
         await manager.finish_routing(sid, token, "switch", accepted=True)
-        self.assertEqual(self.capacity.pool_counts(router._pipeline_counts_unlocked()), expected)
+        self.assertEqual(router._pool_counts_unlocked(), expected)
         await router._refresh_pipeline_capacity()
         self.assertEqual([r for r in self.requests if r[0] == "llm"][-1][1]["session_counts"], {"shared": 1})
         # A pending admission is additional work, never absorbed by an observation.
         await manager.allocate("https://allocator.example", pipeline="openai")
-        self.assertEqual(self.capacity.pool_counts(router._pipeline_counts_unlocked())[("llm", "shared")], 2)
+        self.assertEqual(router._pool_counts_unlocked()[("llm", "shared")], 2)
         observe({prepared["routing"]["pipeline"]: 1})
-        counts = self.capacity.pool_counts(router._pipeline_counts_unlocked())
+        counts = router._pool_counts_unlocked()
         self.assertEqual(counts[("stt", "qwen")], 0)
         self.assertEqual(counts[("stt", "openai")], 2)
 
@@ -95,7 +99,7 @@ class SessionModelSelectionTests(unittest.IsolatedAsyncioTestCase):
         sid, token = grant["session_id"], grant["session_token"]
         await manager.handle_event(sid, token, "connected")
         prepared = await manager.prepare_routing(sid, token, "change-1", {"stt": "stt-openai"})
-        counts = self.capacity.pool_counts(manager.endpoint_router._pipeline_counts_unlocked())
+        counts = manager.endpoint_router._pool_counts_unlocked()
         self.assertEqual(counts[("stt", "qwen")], 1)
         self.assertEqual(counts[("stt", "openai")], 1)
         self.assertEqual(counts[("llm", "shared")], 1)
@@ -104,13 +108,11 @@ class SessionModelSelectionTests(unittest.IsolatedAsyncioTestCase):
             await manager.prepare_routing(sid, token, "change-2", {"tts": None})
         await manager.finish_routing(sid, token, "change-1", accepted=True)
         await manager.finish_routing(sid, token, "change-1", accepted=True)
-        counts = self.capacity.pool_counts(manager.endpoint_router._pipeline_counts_unlocked())
+        counts = manager.endpoint_router._pool_counts_unlocked()
         self.assertEqual(counts[("stt", "qwen")], 0)
         self.assertEqual(counts[("stt", "openai")], 1)
         await manager.handle_event(sid, token, "disconnected")
-        self.assertEqual(
-            sum(self.capacity.pool_counts(manager.endpoint_router._pipeline_counts_unlocked()).values()), 0
-        )
+        self.assertEqual(sum(manager.endpoint_router._pool_counts_unlocked().values()), 0)
 
     async def test_rejected_update_restores_old_selection_and_disconnect_releases_pending_hold(self):
         self.enable_updates()
@@ -125,9 +127,7 @@ class SessionModelSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager._sessions[sid].lease.pipeline, "qwen")
         await manager.prepare_routing(sid, token, "change-2", {"stt": "stt-openai"})
         await manager.handle_event(sid, token, "disconnected")
-        self.assertEqual(
-            sum(self.capacity.pool_counts(manager.endpoint_router._pipeline_counts_unlocked()).values()), 0
-        )
+        self.assertEqual(sum(manager.endpoint_router._pool_counts_unlocked().values()), 0)
 
     async def test_connected_session_can_update_and_release_after_admission_token_expiry(self):
         from unittest.mock import patch
@@ -141,9 +141,7 @@ class SessionModelSelectionTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.session_tokens.time.time", return_value=1000000):
             await manager.prepare_routing(sid, token, "after-expiry", {"stt": "stt-openai"})
             await manager.handle_event(sid, token, "disconnected")
-        self.assertEqual(
-            sum(self.capacity.pool_counts(manager.endpoint_router._pipeline_counts_unlocked()).values()), 0
-        )
+        self.assertEqual(sum(manager.endpoint_router._pool_counts_unlocked().values()), 0)
 
     async def test_http_session_selection_and_private_callback_authentication(self):
         from dataclasses import replace

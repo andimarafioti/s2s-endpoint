@@ -734,7 +734,7 @@ class EndpointPoolRouter:
         the wake tasks once outside the claim."""
         if self.pipeline_capacity is not None:
             pipeline = self.pipeline_capacity.resolve(pipeline)
-            if not self.pipeline_capacity.can_admit(pipeline, self._pipeline_counts_unlocked()):
+            if not self.pipeline_capacity.can_admit(pipeline, self._pool_counts_unlocked()):
                 return None, self._mark_endpoints_to_wake_unlocked()
         endpoint = self._select_endpoint_unlocked()
         if endpoint is None or endpoint.ws_url is None:
@@ -805,7 +805,7 @@ class EndpointPoolRouter:
                 # Eligibility and the claim share one lock and demand snapshot.
                 # An unavailable optional route must not hold other routes, but
                 # an earlier eligible ticket retains first claim on shared CPU.
-                counts = self._pipeline_counts_unlocked()
+                counts = self._pool_counts_unlocked()
                 if any(
                     self.pipeline_capacity.can_admit(self.pipeline_capacity.resolve(earlier), counts)
                     for earlier in earlier_pipelines
@@ -841,7 +841,7 @@ class EndpointPoolRouter:
             if endpoint is None or endpoint.route_connected.get(previous, 0) < 1:
                 raise ValueError("connected pipeline selection was not found")
             if proposed is not None and not self.pipeline_capacity.can_switch(
-                previous, proposed, self._pipeline_counts_unlocked()
+                previous, proposed, self._pool_counts_unlocked()
             ):
                 raise ValueError("selected model capacity is not ready; retry the update")
             for counts in (endpoint.route_active, endpoint.route_connected):
@@ -1028,7 +1028,7 @@ class EndpointPoolRouter:
             "warming_slots": warming_slots,
             "effective_free_slots": free_slots + warming_slots,
             **(
-                {"pipeline_capacity": self.pipeline_capacity.snapshot(self._pipeline_counts_unlocked(), free_slots)}
+                {"pipeline_capacity": self.pipeline_capacity.snapshot(self._pool_counts_unlocked(), free_slots)}
                 if self.pipeline_capacity
                 else {}
             ),
@@ -1498,22 +1498,33 @@ class EndpointPoolRouter:
             wake_names = self._mark_endpoints_to_wake_unlocked()
         self._spawn_wake_tasks(wake_names)
 
-    def _pipeline_counts_unlocked(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
+    def _pool_counts_unlocked(self) -> dict[tuple[str, str], int]:
+        counts = self.pipeline_capacity.pool_counts({})
         for endpoint in self._endpoints.values():
-            known = 0
-            for name in endpoint.route_active.keys() | endpoint.observed_routes.keys():
-                connected = max(endpoint.route_connected.get(name, 0), endpoint.observed_routes.get(name, 0))
-                pending = max(endpoint.route_active.get(name, 0) - endpoint.route_connected.get(name, 0), 0)
-                counts[name] = counts.get(name, 0) + connected + pending
-                known += connected + pending
-            counts["__unknown__"] = counts.get("__unknown__", 0) + max(0, endpoint.busy_sessions - known)
+            # Local and health snapshots may name different selections for the
+            # same connected session. Project each into pools before reconciling
+            # so a stale route/hold cannot duplicate unchanged shared stages.
+            local = dict(endpoint.route_connected)
+            observed = dict(endpoint.observed_routes)
+            pending = {name: max(active - local.get(name, 0), 0) for name, active in endpoint.route_active.items()}
+            local["__unknown__"] = max(0, endpoint.connected_sessions - sum(local.values()))
+            observed["__unknown__"] = max(0, endpoint.observed_active_sessions - sum(observed.values()))
+            pending["__unknown__"] = max(0, endpoint.pending_sessions - sum(pending.values()))
+            # Preserve CPU evidence of additional, as-yet unclassified sessions.
+            pending["__unknown__"] += max(
+                0, endpoint.busy_sessions - max(sum(local.values()), sum(observed.values())) - sum(pending.values())
+            )
+            local_pools = self.pipeline_capacity.pool_counts(local)
+            observed_pools = self.pipeline_capacity.pool_counts(observed)
+            pending_pools = self.pipeline_capacity.pool_counts(pending)
+            for key in counts:
+                counts[key] += max(local_pools[key], observed_pools[key]) + pending_pools[key]
         return counts
 
     async def _refresh_pipeline_capacity(self):
         if self.pipeline_capacity is not None:
             async with self._lock:
-                counts = self._pipeline_counts_unlocked()
+                counts = self._pool_counts_unlocked()
             await self.pipeline_capacity.refresh(counts)
 
     async def _capacity_loop(self):

@@ -136,9 +136,8 @@ class PipelineCapacity:
         old, new = self._pools(current), self._pools(proposed)
         return self._key({s: tuple(set(old[s]) | set(new[s])) for s in SERVICES})
 
-    def can_switch(self, current: str, proposed: str, sessions: dict[str, int]) -> bool:
+    def can_switch(self, current: str, proposed: str, counts: dict[tuple[str, str], int]) -> bool:
         old, new = self._pools(current), self._pools(proposed)
-        counts = self.pool_counts(sessions)
         return all(
             self._remaining((s, p), counts, "admissible_sessions") >= 1
             for s in SERVICES
@@ -163,8 +162,8 @@ class PipelineCapacity:
                         counts[(service, pool)] += count
         return dict(counts)
 
-    async def refresh(self, sessions: dict[str, int]):
-        counts = self.pool_counts(sessions)
+    async def refresh(self, counts: dict[tuple[str, str], int]):
+        counts = self.pool_counts({}) | counts
 
         async def fetch(service):
             selected = {pool: count for (stage, pool), count in counts.items() if stage == service}
@@ -211,10 +210,9 @@ class PipelineCapacity:
             return 0
         # Claims since this snapshot immediately spend the shared pool's
         # estimate. Releases never create headroom from an older observation.
-        return max(0, self._views[key][field] - max(0, counts[key] - self._counts[key]))
+        return max(0, self._views[key][field] - max(0, counts.get(key, 0) - self._counts[key]))
 
-    def can_admit(self, name: str, sessions: dict[str, int]) -> bool:
-        counts = self.pool_counts(sessions)
+    def can_admit(self, name: str, counts: dict[tuple[str, str], int]) -> bool:
         return all(
             self._remaining((s, p), counts, "admissible_sessions") >= 1
             for s, pools in self._pools(name).items()
@@ -251,8 +249,7 @@ class PipelineCapacity:
             **({"updates_enabled": True} if self.config.session_updates_enabled else {}),
         }
 
-    def snapshot(self, sessions: dict[str, int], cpu_slots: int) -> dict:
-        counts = self.pool_counts(sessions)
+    def snapshot(self, counts: dict[tuple[str, str], int], cpu_slots: int) -> dict:
         routes = {}
         for name in self.config.routes:
             stages = {

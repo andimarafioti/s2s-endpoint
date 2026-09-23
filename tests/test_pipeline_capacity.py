@@ -149,10 +149,10 @@ class PipelineAdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.capacity.pool_counts(sessions),
             {("stt", "qwen"): 2, ("stt", "openai"): 3, ("llm", "shared"): 5, ("tts", "shared"): 5},
         )
-        self.assertEqual(self.capacity.snapshot(sessions, 10)["available_pipelines"], 0)
-        self.assertTrue(self.capacity.can_admit("qwen", sessions))  # reserve is a target
-        self.assertFalse(self.capacity.can_admit("openai", {"qwen": 4, "openai": 3}))
-        await self.capacity.refresh(sessions)
+        self.assertEqual(self.capacity.snapshot(self.capacity.pool_counts(sessions), 10)["available_pipelines"], 0)
+        self.assertTrue(self.capacity.can_admit("qwen", self.capacity.pool_counts(sessions)))  # reserve is a target
+        self.assertFalse(self.capacity.can_admit("openai", self.capacity.pool_counts({"qwen": 4, "openai": 3})))
+        await self.capacity.refresh(self.capacity.pool_counts(sessions))
         llm_request = [r for r in self.requests if r[0] == "llm"][-1]
         self.assertEqual(llm_request[1], {"session_counts": {"shared": 5}, "reserve_sessions": 5})
         self.assertEqual(llm_request[2]["authorization"], "Bearer ingress-secret")
@@ -160,7 +160,7 @@ class PipelineAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.capacity.snapshot({}, 10)["available_pipelines"], 0)  # releases await a new observation
 
     async def test_unknown_surviving_sessions_and_stale_or_failed_gateway_are_conservative(self):
-        self.assertFalse(self.capacity.can_admit("qwen", {"old-configuration": 7}))
+        self.assertFalse(self.capacity.can_admit("qwen", self.capacity.pool_counts({"old-configuration": 7})))
         self.now += 15
         self.assertFalse(self.capacity.can_admit("qwen", {}))
         await self.capacity.refresh({})
@@ -219,7 +219,7 @@ class PipelineAdmissionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await manager.poll(second["queue_id"], "https://allocator.example")
         self.assertEqual(list(manager._queue), [first["queue_id"], second["queue_id"]])
-        self.assertEqual(sum(manager.endpoint_router._pipeline_counts_unlocked().values()), 0)
+        self.assertEqual(sum(manager.endpoint_router._pool_counts_unlocked().values()), 0)
         self.capacity._views[("stt", "qwen")]["admissible_sessions"] = 7
         self.assertEqual((await manager.poll(second["queue_id"], "https://allocator.example"))["state"], "queued")
 
@@ -259,11 +259,11 @@ class PipelineAdmissionTests(unittest.IsolatedAsyncioTestCase):
             claims = verify_session_token(allocation["session_token"], "secret")
             self.assertEqual(claims["routing"], allocation["routing"])
             self.assertEqual(claims["routing"]["routes"]["llm"]["model"], "llm-shared")
-        self.assertEqual(sum(router._pipeline_counts_unlocked().values()), 7)
+        self.assertEqual(router._pool_counts_unlocked()[("llm", "shared")], 7)
         await manager.handle_event(granted[0]["session_id"], granted[0]["session_token"], "connected")
-        self.assertEqual(sum(router._pipeline_counts_unlocked().values()), 7)
+        self.assertEqual(router._pool_counts_unlocked()[("llm", "shared")], 7)
         await manager.cancel_pending_session(granted[1]["session_id"])
-        self.assertEqual(sum(router._pipeline_counts_unlocked().values()), 6)
+        self.assertEqual(router._pool_counts_unlocked()[("llm", "shared")], 6)
         queued = [a for a in allocations if a["state"] == "queued"][0]
         claimed = await manager.poll(queued["queue_id"], "https://allocator.example")
         self.assertEqual(claimed["state"], "granted")
@@ -272,7 +272,7 @@ class PipelineAdmissionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.capacity, "routing", side_effect=ValueError("invalid handoff")):
             with self.assertRaises(ValueError):
                 await manager.allocate("https://allocator.example")
-        self.assertEqual(sum(router._pipeline_counts_unlocked().values()), 6)
+        self.assertEqual(router._pool_counts_unlocked()[("llm", "shared")], 6)
 
     async def test_restart_counts_observed_routes_and_unclassified_connections(self):
         router = _make_test_router(
@@ -294,9 +294,41 @@ class PipelineAdmissionTests(unittest.IsolatedAsyncioTestCase):
             synced_at=100,
             drain_generation=0,
         )
-        counts = router._pipeline_counts_unlocked()
-        self.assertEqual(counts, {"qwen": 2, "__unknown__": 2})
-        self.assertEqual(self.capacity.pool_counts(counts)[("llm", "shared")], 4)
+        counts = router._pool_counts_unlocked()
+        self.assertEqual(counts, self.capacity.pool_counts({"qwen": 2, "__unknown__": 2}))
+        self.assertEqual(counts[("llm", "shared")], 4)
+
+    async def test_pool_reconciliation_preserves_endpoint_and_unknown_demand(self):
+        from app.endpoint_pool_router import ManagedEndpoint
+
+        manager = self.manager_with_capacity()
+        router = manager.endpoint_router
+        router._endpoints = {
+            "first": ManagedEndpoint(
+                name="first",
+                slots=20,
+                active_sessions=2,
+                connected_sessions=1,
+                route_active={"qwen": 2},
+                route_connected={"qwen": 1},
+            ),
+            "second": ManagedEndpoint(
+                name="second",
+                slots=20,
+                observed_active_sessions=3,
+                observed_routes={"openai": 2},
+            ),
+        }
+        # Do not take the maximum across endpoints: these are distinct users.
+        self.assertEqual(
+            router._pool_counts_unlocked(),
+            self.capacity.pool_counts({"qwen": 2, "openai": 2, "__unknown__": 1}),
+        )
+        # An unclassified survivor observed beside a locally known session must
+        # still count against every pool, even when shared local demand is higher.
+        router._endpoints["first"].observed_active_sessions = 2
+        router._endpoints["first"].observed_routes = {"qwen": 1}
+        self.assertEqual(router._pool_counts_unlocked()[("llm", "shared")], 6)
 
     async def test_cpu_idle_reserve_wakes_once_and_prevents_premature_consolidation(self):
         controller = FakeEndpointController(
