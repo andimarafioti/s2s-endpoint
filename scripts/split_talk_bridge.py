@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Bridge the packaged talk client to one protected split-fleet session.
+"""Bridge the packaged talk client to one signed split-fleet session.
 
 The packaged client rejects query parameters in --url. Split compute workers
-require a signed session_token query parameter in addition to HF ingress auth.
+require a signed session_token query parameter. Protected ingress also needs HF auth.
 This loopback bridge obtains the signed URL from the split LB and relays one
 WebSocket connection without storing credentials or media.
 """
