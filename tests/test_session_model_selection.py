@@ -53,6 +53,41 @@ class SessionModelSelectionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             self.capacity.select_models(None, {"stt": None})
 
+    async def test_stale_health_does_not_duplicate_shared_pools_during_switch(self):
+        from app.endpoint_pool_router import ComputeUsage
+
+        self.enable_updates()
+        manager = self.manager_with_capacity()
+        router = manager.endpoint_router
+        endpoint = router._endpoints["cpu"]
+        grant = await manager.allocate("https://allocator.example", pipeline="qwen")
+        sid, token = grant["session_id"], grant["session_token"]
+        await manager.handle_event(sid, token, "connected")
+
+        def observe(routes):
+            endpoint.apply_usage_sync(
+                ComputeUsage(active_sessions=1, max_sessions=20, route_sessions=routes),
+                synced_at=self.now,
+                drain_generation=0,
+            )
+
+        observe({"qwen": 1})
+        prepared = await manager.prepare_routing(sid, token, "switch", {"stt": "stt-openai"})
+        expected = {("stt", "qwen"): 1, ("stt", "openai"): 1, ("llm", "shared"): 1, ("tts", "shared"): 1}
+        self.assertEqual(self.capacity.pool_counts(router._pipeline_counts_unlocked()), expected)
+        observe({prepared["hold"]: 1})
+        await manager.finish_routing(sid, token, "switch", accepted=True)
+        self.assertEqual(self.capacity.pool_counts(router._pipeline_counts_unlocked()), expected)
+        await router._refresh_pipeline_capacity()
+        self.assertEqual([r for r in self.requests if r[0] == "llm"][-1][1]["session_counts"], {"shared": 1})
+        # A pending admission is additional work, never absorbed by an observation.
+        await manager.allocate("https://allocator.example", pipeline="openai")
+        self.assertEqual(self.capacity.pool_counts(router._pipeline_counts_unlocked())[("llm", "shared")], 2)
+        observe({prepared["routing"]["pipeline"]: 1})
+        counts = self.capacity.pool_counts(router._pipeline_counts_unlocked())
+        self.assertEqual(counts[("stt", "qwen")], 0)
+        self.assertEqual(counts[("stt", "openai")], 2)
+
     async def test_route_update_holds_old_and_new_until_ack_then_releases_on_disconnect(self):
         self.enable_updates()
         manager = self.manager_with_capacity()
