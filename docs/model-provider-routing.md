@@ -277,6 +277,11 @@ Compute health exports route counts for surviving connections after allocator
 restart; unclassified connections count conservatively against all choices.
 Returning activity remains in the workload forecast; observed in-flight work
 can increase demand above it. Inference leases still last only for requests.
+Idle connected sessions still contribute their configured workload to retained
+capacity. This is a conservative forecast, not evidence of economical always-on
+operation. Calibrate it with measured conversation profiles; distinguishing idle
+from recently active sessions is separate future work. The five-pipeline reserve
+and slow scale-down remain unchanged.
 
 Admission requires one complete route within hard ceilings, even if the
 five-pipeline reserve or normal target is depleted. Warming workers deduplicate
@@ -381,6 +386,12 @@ retry. No inference lease is held while the user is idle. On a lost/uncertain
 handoff or callback, compute closes the connection and releases its allocation
 instead of continuing with uncertain accounting. The original admission-token
 expiry does not prevent an already connected session from releasing its claims.
+This means an ordinary model change can end a conversation during an allocator
+or upstream control-plane failure. A reconnect allocates a new session; retained
+conversation state is not restored automatically. The local lifecycle tests cover
+lost prepare responses, missing upstream acknowledgements, failed/lost commit
+callbacks, and client disconnect during settlement using a fault-injecting
+WebSocket peer. They do not replace live provider and modest concurrency checks.
 
 The private routing envelope is stripped from public messages and responses;
 clients cannot supply resolved routes, worker addresses or credentials. Callback
