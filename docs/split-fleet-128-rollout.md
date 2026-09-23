@@ -129,6 +129,36 @@ because health probes can wake scale-to-zero backends. Do not roll a second live
 controller over the same inventory while the first is still draining requests.
 The original production load balancer remains available and unchanged.
 
+## Manual conversation through the split LB
+
+The packaged `speech-to-speech talk` client rejects URLs with query parameters,
+while a managed CPU worker requires the LB-issued `session_token` in its WebSocket
+URL. Its single `--api-key` header also cannot carry both the application token
+and the HF credential required by protected worker ingress. Run the local bridge
+in one terminal, using the split LB URL currently reported by the HF endpoint
+API:
+
+```bash
+uv run --default-index https://pypi.org/simple --with-requirements requirements.txt \
+  python scripts/split_talk_bridge.py --lb-url https://YOUR-SPLIT-LB-URL
+```
+
+Then use the packaged microphone/speaker client in another terminal:
+
+```bash
+speech-to-speech talk \
+  --url ws://127.0.0.1:8765/v1/realtime \
+  --api-key local \
+  --playback-buffer-ms 196
+```
+
+The bridge sends `HF_TOKEN` to the LB in `X-Reachy-Mini-Authorization` for
+verified session admission. It connects to the LB-selected protected CPU worker
+using the signed `connect_url` plus standard `Authorization: Bearer $HF_TOKEN`
+for HF ingress. `local` is used only for the loopback client connection. The
+bridge handles one conversation at a time and does not save media or tokens.
+Stop it with Ctrl-C after testing.
+
 ## Rollout checks
 
 - The new proxy image first served requests with lifecycle disabled, then each
