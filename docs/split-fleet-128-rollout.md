@@ -57,6 +57,35 @@ speech stop to first audio. This verifies one manual path, not concurrency or
 public-load capacity. The Space still needs a user-side retry to confirm its
 full UI flow.
 
+## Temporary dense LLM evaluation — 2026-09-24
+
+The split fleet is temporarily configured for a subjective comparison with
+`nvidia/Gemma-4-31B-IT-NVFP4` on the existing single RTX PRO 6000 endpoint
+`gemma4-31b-nvfp4-rtx6000-test`. The LLM proxy has only that endpoint in its
+inventory, a warm floor and maximum of one worker, and the dense model as its
+warmup target. All 11 LB-managed CPU pipelines have the matching `MODEL_NAME`.
+The previous `gemma4-26b-a4b-nvfp4-rtx6000-test` endpoint and the two A4B
+standbys are paused, not deleted.
+
+The cutover was performed with the split LB paused and no connected or pending
+sessions. After the dense backend and proxy were healthy, the LB was resumed;
+pipelines `-02` and `-03` returned as the two-worker warm floor with eight free
+slots, while `-04` through `-12` remained paused. A synthetic conversation
+through the public LB completed STT, dense LLM inference, and TTS. It measured
+1.278 seconds from speech stop to first audio, including 165 ms from speech stop
+to completed STT, 647 ms from completed STT to the first LLM output batch, and
+466 ms from that output to first audio. This is a single smoke turn, not a
+latency distribution or concurrency result.
+
+This temporary one-backend proxy configuration deliberately suspends LLM fleet
+scale-out during the comparison. To restore the A4B fleet, pause the split LB,
+restore `MODEL_NAME=nvidia/Gemma-4-26B-A4B-NVFP4` on all managed pipelines, and
+restore the proxy inventory to
+`gemma4-26b-a4b-nvfp4-rtx6000-test,reachy-s2s-llm-02,reachy-s2s-llm-03`, with
+`LLM_WARMUP_MODEL=nvidia/Gemma-4-26B-A4B-NVFP4` and
+`SPEECH_WORKER_MAX_WORKERS=3`. Resume the proxy and A4B warm worker, verify one
+ready backend, pause the dense endpoint, and only then resume the split LB.
+
 ## Capacity and placement
 
 | Stage | Hardware / region | Per-worker operating target | Warm floor | Maximum workers | Inventory |
