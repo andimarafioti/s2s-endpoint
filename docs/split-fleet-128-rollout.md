@@ -57,6 +57,26 @@ speech stop to first audio. This verifies one manual path, not concurrency or
 public-load capacity. The Space still needs a user-side retry to confirm its
 full UI flow.
 
+## CPU image refresh — 2026-09-24
+
+The 11 LB-managed CPU workers (`-02` through `-12`) were updated in place to
+`s2s-pipeline:sha-1c1e4e79d653615294c2f7fa706dea0089710cb2`, built from
+PR #116 after bringing in the latest #110 commits. Its upstream
+`huggingface/speech-to-speech` source is pinned to
+`abbd61e297c48db963021b88471b2771af16731d`. The current split LB and
+GPU proxies retain their earlier images and legacy single-route configuration;
+`PIPELINE_CAPACITY`, `SESSION_ROUTING_ENABLED`, and `SPEECH_ROUTE_CATALOG` were not
+enabled. `NUM_PIPELINES=4` and the two-worker CPU warm floor are unchanged.
+
+The nine standby CPU workers stayed paused through their image updates. The
+controller briefly woke `-04` while `-02` was updating, then parked it after
+`-02` and `-03` became ready. One browser-style spoken conversation through the
+LB completed STT, LLM, and TTS on the new image with 1274 ms from speech stop to
+first audio. Its session disconnected cleanly; another client's simultaneous
+conversation remained connected. An unsigned WebSocket to `-03` still returned
+HTTP 403. This is a one-conversation smoke check, not a model/provider routing
+or concurrency validation. No original production endpoint was changed.
+
 ## Capacity and placement
 
 | Stage | Hardware / region | Per-worker operating target | Warm floor | Maximum workers | Inventory |
@@ -87,7 +107,7 @@ a CPU capacity limit. Three-sentence TTS batching remains unchanged.
 ## Images and configuration
 
 - Proxies: `ghcr.io/andimarafioti/s2s-speech-proxy:sha-f303b920f8d6431c1f5fdf85338942074dfa923a`.
-- Managed CPU pipelines: `ghcr.io/andimarafioti/s2s-pipeline:sha-0015309562157e8a5bc031465908f82b9f98d2ad`.
+- Managed CPU pipelines: `ghcr.io/andimarafioti/s2s-pipeline:sha-1c1e4e79d653615294c2f7fa706dea0089710cb2`.
 - Split LB: `ghcr.io/andimarafioti/s2s-load-balancer:sha-246fdc4673d9d7697a71cac889b8a8f3167ae971`.
 - STT/TTS retain their validated `sha-3c6f1d904b95f1a700696b57397d8dc5a82ef244` service images.
 - New Gemma replicas pin `vllm/vllm-openai@sha256:383e409fc7695d6e40cd40d452f3ec277a3d1c462d7b1510034768d26f2cd397`, preserving model revision, 128k context, 256 sequences, NVFP4, and MTP.
