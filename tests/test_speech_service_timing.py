@@ -27,7 +27,9 @@ class SpeechServiceTimingMiddlewareTests(unittest.IsolatedAsyncioTestCase):
                     middleware = SpeechServiceTimingMiddleware(app)
                     await middleware({"type": "http", "path": path, "headers": []}, lambda: None, send)
 
-                    self.assertEqual([message["type"] for message in sent], ["http.response.start", "http.response.body"])
+                    self.assertEqual(
+                        [message["type"] for message in sent], ["http.response.start", "http.response.body"]
+                    )
                     self.assertEqual(sent[1]["body"], result)
                     self.assertFalse(sent[1]["more_body"])
                     headers = dict(sent[0]["headers"])
