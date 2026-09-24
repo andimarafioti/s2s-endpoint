@@ -6,6 +6,17 @@ LABEL org.opencontainers.image.source="https://github.com/andimarafioti/s2s-endp
 COPY app/speech_service_timing.py /opt/s2s-observability/speech_service_timing.py
 ENV PYTHONPATH=/opt/s2s-observability
 
+# The packaged config optimizes the first-byte metric with one 80 ms codec
+# frame, then jumps directly to 2 s chunks. Unbuffered realtime clients can
+# exhaust that first frame before the second chunk is ready. vLLM-Omni's
+# documented ramp keeps the early stream playable while preserving large
+# steady-state chunks.
+RUN sed -i \
+    's/^      #   codec_chunk_ramp: \[4, 4, 8, 16, 25\]$/      codec_chunk_ramp: [4, 4, 8, 16, 25]/' \
+    /app/vllm-omni/vllm_omni/deploy/qwen3_tts.yaml && \
+    grep -Fq 'codec_chunk_ramp: [4, 4, 8, 16, 25]' \
+    /app/vllm-omni/vllm_omni/deploy/qwen3_tts.yaml
+
 EXPOSE 8091
 
 # The bundled deploy config enables async chunking and keeps multi-request
