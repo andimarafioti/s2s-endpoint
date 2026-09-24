@@ -63,8 +63,8 @@ The 11 LB-managed CPU workers (`-02` through `-12`) were updated in place to
 `s2s-pipeline:sha-1c1e4e79d653615294c2f7fa706dea0089710cb2`, built from
 PR #116 after bringing in the latest #110 commits. Its upstream
 `huggingface/speech-to-speech` source is pinned to
-`abbd61e297c48db963021b88471b2771af16731d`. The current split LB and
-GPU proxies retain their earlier images and legacy single-route configuration;
+`abbd61e297c48db963021b88471b2771af16731d`. At the time of this CPU refresh, the split LB and GPU proxies retained their
+earlier images and legacy single-route configuration;
 `PIPELINE_CAPACITY`, `SESSION_ROUTING_ENABLED`, and `SPEECH_ROUTE_CATALOG` were not
 enabled. `NUM_PIPELINES=4` and the two-worker CPU warm floor are unchanged.
 
@@ -75,7 +75,10 @@ LB completed STT, LLM, and TTS on the new image with 1274 ms from speech stop to
 first audio. Its session disconnected cleanly; another client's simultaneous
 conversation remained connected. An unsigned WebSocket to `-03` still returned
 HTTP 403. This is a one-conversation smoke check, not a model/provider routing
-or concurrency validation. No original production endpoint was changed.
+or concurrency validation. No original production endpoint was changed in
+this refresh. At 12:53 UTC, a separate operation paused the split LB and CPU
+workers and began changing the LLM route to Gemma 4 31B. The smoke check above
+predates that operation; endpoint states must be rediscovered before further use.
 
 ## Capacity and placement
 
