@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from app.dashboard_history import SwarmHistoryBucket
 from app.dashboard_history_store import ReadOnlyDashboardHistoryStore
 from app.dashboard_preview import DashboardPreviewSessionManager
+from app.direct_session_manager import DirectSessionManager
 from app.endpoint_pool_router import EndpointCapacityTimeoutError, EndpointTransitionConflictError
 from app.load_balancer_app import (
     create_session,
@@ -28,6 +29,7 @@ from app.verification_admission_limiter import (
     VerificationAdmissionLimiter,
 )
 from tests.helpers import load_balancer_fixture, monotonic_sequence
+from tests.test_direct_session_manager import ToggleCapacityRouter
 
 
 class FakeClock:
@@ -1014,6 +1016,31 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(granted.body)["state"], "granted")
         self.assertEqual(fake_session_manager.poll_calls, 1)
         self.assertEqual(fake_dashboard.calls, ["request", "success"])
+
+    async def test_queue_deadline_returns_retry_outcome_and_releases_requester_permit(self):
+        module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})
+        dashboard = FakeDashboard()
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = DirectSessionManager(endpoint_router=router, session_shared_secret="test", queue_enabled=True)
+        module.dependencies.dashboard = dashboard
+        module.dependencies.session_manager = manager
+        verified = _requester_identity(verification="verified", kind="authenticated")
+        with (
+            patch.object(module.dependencies.requester_identity_resolver, "identify", return_value=verified),
+            patch("app.direct_session_manager.monotonic", return_value=100) as clock,
+        ):
+            queued = await create_session(module.runtime, FakeConnectedRequest())
+            ticket_id = json.loads(queued.body)["queue_id"]
+            clock.return_value = 400
+            result = await queue_status(module.runtime, ticket_id, FakeConnectedRequest())
+        self.assertEqual(result.status_code, 503)
+        self.assertEqual(json.loads(result.body)["state"], "timed_out")
+        self.assertGreater(int(result.headers["Retry-After"]), 0)
+        self.assertEqual(router.acquire_calls, 0)
+        self.assertIsNone(module.dependencies.queue_requester_tracker.take(ticket_id))
+        self.assertEqual(dashboard.calls, ["request", "failure"])
+        self.assertEqual(module.dependencies.requester_rate_limiter.status()["totals"]["allocation_failures"], 1)
+        self.assertEqual(module.dependencies.requester_rate_limiter.status()["active_allocations"], 0)
 
     async def test_default_verification_age_preserves_queue_ticket_past_60_seconds(self):
         module = self._import_load_balancer({"SESSION_REQUIRE_VERIFIED_HF_TOKEN": "true"})

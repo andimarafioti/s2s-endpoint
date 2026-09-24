@@ -146,7 +146,9 @@ speech-to-speech pipeline. This deployment does not change
 `stream_batch_sentences`; the experiment should preserve the pipeline's current
 sentence batching while comparing service placement.
 
-Build and deploy the request-level speech proxies after the GPU workers exist:
+Build and deploy the request-level speech proxies after the GPU workers exist.
+For multiple models/providers with independent deployment pools, see
+[model/provider routing](docs/model-provider-routing.md); the single-model setup below remains supported.
 
 ```bash
 docker buildx build --platform linux/amd64 -f Dockerfile.speech_proxy \

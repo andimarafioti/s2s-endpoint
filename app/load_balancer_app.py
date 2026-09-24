@@ -1,7 +1,7 @@
 import json
 import logging
 import secrets
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from inspect import cleandoc
 from time import monotonic
 from typing import Any, Mapping
@@ -35,11 +35,13 @@ from app.llm_proxy_usage import (
     LLM_PROXY_CLIENT_IP_MAX_LENGTH,
     LLM_PROXY_REASONS,
 )
+from app.pipeline_capacity import PipelineCapacity, PipelineCapacityConfig
 from app.requester_identity import (
     RequesterIdentity,
     RequesterIdentityResolver,
     bearer_token,
     is_validatable_hf_token,
+    normalize_hardware_id,
 )
 from app.requester_rate_limiter import (
     RateLimitDecision,
@@ -47,7 +49,7 @@ from app.requester_rate_limiter import (
     RequesterRateLimiter,
 )
 from app.session_manager import SessionManager
-from app.session_request_metadata import reported_hardware_id
+from app.session_request_metadata import reported_hardware_id, session_metadata
 from app.session_requester_tracker import SessionRequesterTracker
 from app.session_tokens import llm_token_fingerprint
 from app.speech_proxy_telemetry import SpeechProxyTelemetryClient, SpeechProxyTelemetryTarget
@@ -141,6 +143,9 @@ class LoadBalancerSettings:
     speech_llm_proxy_url: str | None = None
     speech_proxy_api_key: str | None = None
     speech_proxy_metrics_timeout_s: float = 5.0
+    pipeline_capacity: PipelineCapacityConfig | None = None
+    speech_capacity_api_key: str | None = field(default=None, repr=False)
+    speech_capacity_ingress_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.session_hf_token_verify_timeout_s <= 0:
@@ -176,6 +181,20 @@ class LoadBalancerSettings:
             object.__setattr__(self, "speech_proxy_api_key", self.hf_control_token)
         if self.speech_proxy_metrics_timeout_s <= 0:
             raise ValueError("SPEECH_PROXY_METRICS_TIMEOUT_S must be > 0")
+        if self.pipeline_capacity is not None:
+            if self.pipeline_capacity.session_updates_enabled and not self.lb_callback_auth_token:
+                raise ValueError("session model updates require LB_CALLBACK_AUTH_TOKEN")
+            if not self.session_queue_enabled:
+                raise ValueError("PIPELINE_CAPACITY requires SESSION_QUEUE_ENABLED")
+            if not all(
+                (
+                    self.speech_stt_proxy_url,
+                    self.speech_llm_proxy_url,
+                    self.speech_tts_proxy_url,
+                    self.speech_capacity_api_key,
+                )
+            ):
+                raise ValueError("PIPELINE_CAPACITY requires all gateway URLs and SPEECH_CAPACITY_API_KEY")
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "LoadBalancerSettings":
@@ -332,6 +351,11 @@ class LoadBalancerSettings:
             speech_llm_proxy_url=env_optional("SPEECH_LLM_PROXY_URL", environ=environ),
             speech_proxy_api_key=env_optional("SPEECH_PROXY_API_KEY", environ=environ),
             speech_proxy_metrics_timeout_s=float(env_text("SPEECH_PROXY_METRICS_TIMEOUT_S", "5", environ=environ)),
+            pipeline_capacity=PipelineCapacityConfig.model_validate_json(env_text("PIPELINE_CAPACITY", environ=environ))
+            if env_optional("PIPELINE_CAPACITY", environ=environ)
+            else None,
+            speech_capacity_api_key=env_optional("SPEECH_CAPACITY_API_KEY", environ=environ),
+            speech_capacity_ingress_api_key=env_optional("SPEECH_CAPACITY_INGRESS_API_KEY", environ=environ),
         )
 
 
@@ -376,6 +400,18 @@ def build_endpoint_router(settings: LoadBalancerSettings) -> EndpointPoolRouter:
         usage_sync_stale_ttl_s=settings.compute_usage_stale_ttl_s,
         control_fetch_timeout_s=settings.compute_endpoint_control_fetch_timeout_s,
         reconcile_stale_after_s=settings.compute_endpoint_reconcile_stale_after_s,
+        pipeline_capacity=PipelineCapacity(
+            settings.pipeline_capacity,
+            {
+                "stt": settings.speech_stt_proxy_url,
+                "llm": settings.speech_llm_proxy_url,
+                "tts": settings.speech_tts_proxy_url,
+            },
+            settings.speech_capacity_api_key,
+            ingress_api_key=settings.speech_capacity_ingress_api_key,
+        )
+        if settings.pipeline_capacity
+        else None,
     )
 
 
@@ -979,7 +1015,24 @@ async def create_session(runtime: LoadBalancerRuntime, request: Request):
     when the queue itself is full; 503 otherwise when the pool can't allocate."""
     settings = runtime.settings
     dependencies = runtime.dependencies
-    hardware_id = await reported_hardware_id(request)
+    metadata = await session_metadata(request, strict=settings.pipeline_capacity is not None)
+    hardware_id = normalize_hardware_id(metadata.get("hardware_id"))
+    pipeline = metadata.get("pipeline")
+    if pipeline is not None and (
+        not isinstance(pipeline, str)
+        or settings.pipeline_capacity is None
+        or pipeline not in settings.pipeline_capacity.routes
+    ):
+        raise HTTPException(status_code=400, detail="unknown pipeline route")
+    if "models" in metadata:
+        if settings.pipeline_capacity is None:
+            raise HTTPException(status_code=400, detail="session model selection is disabled")
+        try:
+            pipeline = dependencies.session_manager.endpoint_router.pipeline_capacity.select_models(
+                pipeline, metadata["models"]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid or unavailable session model selection") from exc
     requester = dependencies.requester_identity_resolver.identify(
         request,
         hardware_id=hardware_id,
@@ -1016,6 +1069,7 @@ async def create_session(runtime: LoadBalancerRuntime, request: Request):
         allocation = await dependencies.session_manager.allocate(
             public_base_url(request),
             llm_fingerprint=await _llm_proxy_fingerprint(runtime, request, requester),
+            **({"pipeline": pipeline} if pipeline is not None else {}),
         )
     except QueueAtCapacityError as exc:
         dependencies.requester_rate_limiter.record_allocation_failure(requester)
@@ -1129,6 +1183,11 @@ async def queue_status(runtime: LoadBalancerRuntime, queue_id: str, request: Req
         if requester is not None:
             dependencies.queue_requester_tracker.remember(queue_id, requester)  # refresh retention
         return JSONResponse(result)
+    if result.get("state") == "timed_out":
+        if requester is not None:
+            dependencies.requester_rate_limiter.record_allocation_failure(requester)
+        await dependencies.dashboard.record_session_allocation_failure(requester)
+        return JSONResponse(result, status_code=503, headers={"Retry-After": str(result["retry_after_s"])})
 
     # Head of line claimed a slot — same delivery path as a fast-path grant. The
     # requester was resolved at ticket creation; falling back to the poll request
@@ -1539,6 +1598,26 @@ def create_app(
     async def session_event_route(session_id: str, payload: dict[str, Any]):
         return await session_event(runtime, session_id, payload)
 
+    async def session_routing_route(session_id: str, request: Request):
+        require_callback_auth(runtime, request)
+        payload = await session_metadata(request, strict=True, max_body_bytes=LLM_PROXY_CALLBACK_BODY_MAX_BYTES)
+        token, update_id = payload.get("session_token"), payload.get("update_id")
+        if not isinstance(token, str) or not isinstance(update_id, str) or not 1 <= len(update_id) <= 64:
+            raise HTTPException(status_code=400, detail="invalid routing update")
+        manager = runtime.dependencies.session_manager
+        try:
+            if payload.get("action") == "prepare":
+                return await manager.prepare_routing(session_id, token, update_id, payload.get("models"))
+            if payload.get("action") in {"commit", "abort"}:
+                return await manager.finish_routing(
+                    session_id, token, update_id, accepted=payload["action"] == "commit"
+                )
+            raise HTTPException(status_code=400, detail="invalid routing action")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="unknown session") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="routing update unavailable or incompatible") from exc
+
     async def llm_proxy_usage_route(request: Request):
         require_callback_auth(runtime, request)
         return await llm_proxy_usage(runtime, await _llm_proxy_usage_payload(request))
@@ -1589,6 +1668,13 @@ def create_app(
         methods=["POST"],
         name="session_event",
     )
+    if settings.pipeline_capacity is not None and settings.pipeline_capacity.session_updates_enabled:
+        application.add_api_route(
+            "/internal/sessions/{session_id}/routing",
+            session_routing_route,
+            methods=["POST"],
+            name="session_routing",
+        )
     application.add_api_route(
         "/internal/llm-proxy-usage",
         llm_proxy_usage_route,

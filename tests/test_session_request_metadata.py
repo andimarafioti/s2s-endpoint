@@ -1,7 +1,9 @@
 import asyncio
 import unittest
 
-from app.session_request_metadata import reported_hardware_id
+from starlette.exceptions import HTTPException
+
+from app.session_request_metadata import reported_hardware_id, session_metadata
 
 
 class FakeStreamingRequest:
@@ -20,6 +22,16 @@ class FakeStreamingRequest:
 
 
 class SessionRequestMetadataTests(unittest.IsolatedAsyncioTestCase):
+    async def test_routed_metadata_never_silently_discards_an_explicit_choice(self):
+        for body in (b'{"pipeline":"openai",', b'{"pipeline":"openai","padding":"' + b"x" * 4096 + b'"}', b"[]"):
+            with self.assertRaises(HTTPException) as raised:
+                await session_metadata(FakeStreamingRequest([body]), strict=True)
+            self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(
+            await session_metadata(FakeStreamingRequest([b'{"pipeline":"openai"}']), strict=True),
+            {"pipeline": "openai"},
+        )
+
     async def test_reads_valid_hardware_id_from_fragmented_json(self):
         request = FakeStreamingRequest(
             [b'{"hardware_id": "ABCDEF', b'0123456789"}'],

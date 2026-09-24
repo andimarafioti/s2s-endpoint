@@ -4,7 +4,7 @@
 FROM python:3.12-slim
 
 ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
-ARG S2S_REF=3986f453012a131632eee4731995474046846794
+ARG S2S_REF=abbd61e297c48db963021b88471b2771af16731d
 ARG SMART_TURN_MODEL_REPO=pipecat-ai/smart-turn-v3
 ARG SMART_TURN_MODEL_REV=f766f81d3cfdf7737ac64aad813d91bbfd56bf93
 ARG SMART_TURN_MODEL_FILENAME=smart-turn-v3.2-cpu.onnx
@@ -59,10 +59,11 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 
 # Bake the small CPU-side models and tokenizer data into the image so endpoint
 # readiness does not depend on downloading them at container startup.
+# The pinned Silero commit need not be a current branch/tag tip.
 RUN mkdir -p /opt/models "${TORCH_HOME}" && \
     python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='${SMART_TURN_MODEL_REPO}', filename='${SMART_TURN_MODEL_FILENAME}', revision='${SMART_TURN_MODEL_REV}', local_dir='/opt/models')" && \
     python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')" && \
-    python -c "import torch; torch.hub.load('snakers4/silero-vad:${SILERO_VAD_REF}', 'silero_vad', trust_repo=True)"
+    python -c "import torch; torch.hub.load('snakers4/silero-vad:${SILERO_VAD_REF}', 'silero_vad', trust_repo=True, skip_validation=True)"
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt

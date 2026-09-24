@@ -57,6 +57,28 @@ speech stop to first audio. This verifies one manual path, not concurrency or
 public-load capacity. The Space still needs a user-side retry to confirm its
 full UI flow.
 
+## CPU image refresh — 2026-09-24
+
+The 11 LB-managed CPU workers (`-02` through `-12`) were updated in place to
+`s2s-pipeline:sha-1c1e4e79d653615294c2f7fa706dea0089710cb2`, built from
+PR #116 after bringing in #110’s then-current commits. Its upstream
+`huggingface/speech-to-speech` source is pinned to
+`abbd61e297c48db963021b88471b2771af16731d`. At the time of this CPU
+refresh, the split LB and GPU proxies retained their earlier images and legacy
+single-route configuration;
+`PIPELINE_CAPACITY`, `SESSION_ROUTING_ENABLED`, and `SPEECH_ROUTE_CATALOG` were not
+enabled. `NUM_PIPELINES=4` and the two-worker CPU warm floor are unchanged.
+
+The nine standby CPU workers stayed paused through their image updates. The
+controller briefly woke `-04` while `-02` was updating, then parked it after
+`-02` and `-03` became ready. One browser-style spoken conversation through the
+LB completed STT, LLM, and TTS on the new image with 1274 ms from speech stop to
+first audio. Its session disconnected cleanly; another client's simultaneous
+conversation remained connected. An unsigned WebSocket to `-03` still returned
+HTTP 403. This is a one-conversation smoke check, not a model/provider routing
+or concurrency validation. No original production endpoint was changed in
+this refresh. This smoke check predates the dense-model cutover below.
+
 ## Temporary dense LLM evaluation — 2026-09-24
 
 The split fleet is temporarily configured for a subjective comparison with
@@ -75,7 +97,9 @@ through the public LB completed STT, dense LLM inference, and TTS. It measured
 1.278 seconds from speech stop to first audio, including 165 ms from speech stop
 to completed STT, 647 ms from completed STT to the first LLM output batch, and
 466 ms from that output to first audio. This is a single smoke turn, not a
-latency distribution or concurrency result.
+latency distribution or concurrency result. A second browser-style smoke
+conversation on the dense route completed all three stages with 1.335 seconds
+from speech stop to first audio.
 
 This temporary one-backend proxy configuration deliberately suspends LLM fleet
 scale-out during the comparison. To restore the A4B fleet, pause the split LB,
@@ -93,7 +117,7 @@ ready backend, pause the dense endpoint, and only then resume the split LB.
 | Pipeline | Intel SPR x4 / us-east-1 | 4 connected sessions | 2 | 11 live / 32 prepared | `reachy-s2s-pipeline-02` through `-12` live; through `-33` prepared |
 | STT | A10G / us-east-1 | 96 five-second audio equivalents | 1 | 2 | `reachy-s2s-stt-01`, `-02` |
 | TTS | A10G / us-east-1 | 8 active generations | 1 | 19 | `reachy-s2s-tts-01` through `-19` |
-| LLM | RTX PRO 6000 / us-east-2 | 64 active generations | 1 | 3 | `gemma4-26b-a4b-nvfp4-rtx6000-test`, `reachy-s2s-llm-02`, `-03` |
+| LLM | RTX PRO 6000 / us-east-2 | 64 active generations | 1 | 1 temporarily (3 baseline) | `gemma4-31b-nvfp4-rtx6000-test` temporarily; A4B inventory paused |
 
 All endpoints have exactly one HF replica. The CPU LB and speech proxies run
 in us-east-1. Gemma retains its tested us-east-2 placement; this is **not** a
@@ -116,10 +140,10 @@ a CPU capacity limit. Three-sentence TTS batching remains unchanged.
 ## Images and configuration
 
 - Proxies: `ghcr.io/andimarafioti/s2s-speech-proxy:sha-f303b920f8d6431c1f5fdf85338942074dfa923a`.
-- Managed CPU pipelines: `ghcr.io/andimarafioti/s2s-pipeline:sha-0015309562157e8a5bc031465908f82b9f98d2ad`.
+- Managed CPU pipelines: `ghcr.io/andimarafioti/s2s-pipeline:sha-1c1e4e79d653615294c2f7fa706dea0089710cb2`.
 - Split LB: `ghcr.io/andimarafioti/s2s-load-balancer:sha-246fdc4673d9d7697a71cac889b8a8f3167ae971`.
 - STT/TTS retain their validated `sha-3c6f1d904b95f1a700696b57397d8dc5a82ef244` service images.
-- New Gemma replicas pin `vllm/vllm-openai@sha256:383e409fc7695d6e40cd40d452f3ec277a3d1c462d7b1510034768d26f2cd397`, preserving model revision, 128k context, 256 sequences, NVFP4, and MTP.
+- The HF API currently reports `vllm/vllm-openai:nightly` for both Gemma endpoints. The dense model revision is `4135a98a9b728a548947683219633b25682223ac`; the paused A4B revision is `a19cfe00be84568a6867111c9a68c9c44fdcffe6`. The runtime image URL is not digest-pinned.
 
 Each proxy has `SPEECH_AUTOSCALE_ENABLED=true`, the exact inventory above in
 `SPEECH_BACKENDS`, `SPEECH_WORKER_MIN_WARM=1`, and its own maximum worker count.

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from typing import Literal
 
 import httpx
@@ -14,6 +17,12 @@ SpeechService = Literal["stt", "tts", "llm"]
 
 class NoSpeechBackendAvailable(RuntimeError):
     """Raised when no ready backend can accept the requested work."""
+
+
+class SpeechPoolCapacityExceeded(NoSpeechBackendAvailable):
+    def __init__(self, retry_after: float):
+        super().__init__("pool capacity is temporarily exhausted")
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -124,9 +133,17 @@ class SpeechBackendPoolSettings:
     tts_warmup_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     tts_warmup_voice: str = "aiden"
     tts_warmup_language: str = "English"
+    tts_warmup_format: str = "pcm"
     llm_warmup_enabled: bool = True
     llm_warmup_timeout_s: float = 120.0
     llm_warmup_model: str = "nvidia/Gemma-4-26B-A4B-NVFP4"
+    llm_warmup_api: Literal["chat_completions", "responses"] = "chat_completions"
+    external: bool = False
+    max_concurrency: int | None = None
+    requests_per_minute: int | None = None
+    max_work: float | None = None
+    session_work: float | None = None
+    session_rpm: float = 1.0
 
     def __post_init__(self) -> None:
         if self.service not in {"stt", "tts", "llm"}:
@@ -143,6 +160,17 @@ class SpeechBackendPoolSettings:
             raise ValueError("failure_threshold must be >= 1")
         if self.health_interval_s <= 0 or self.health_timeout_s <= 0:
             raise ValueError("health intervals and timeouts must be > 0")
+        if self.external and (not self.max_concurrency or not self.requests_per_minute):
+            raise ValueError("external pools require concurrency and request limits")
+        if self.max_work is not None and (not math.isfinite(self.max_work) or self.max_work < self.target_work):
+            raise ValueError("max_work must be finite and >= target_work")
+        if self.session_work is not None:
+            if not math.isfinite(self.session_work) or self.session_work <= 0:
+                raise ValueError("session_work must be finite and positive")
+            if not self.external and self.max_work is None:
+                raise ValueError("session capacity requires a hard max_work")
+            if not math.isfinite(self.session_rpm) or self.session_rpm <= 0:
+                raise ValueError("session_rpm must be finite and positive")
 
 
 class SpeechBackendPool:
@@ -168,6 +196,11 @@ class SpeechBackendPool:
         self._lock = asyncio.Lock()
         self._selection_counter = 0
         self._peak_work = 0.0
+        self._request_times: deque[float] = deque()
+        self._cooldown_until = 0.0
+        self._session_count = 0
+        self._reserve_sessions = 0
+        self._session_demand_at: float | None = None
         self._health_task: asyncio.Task | None = None
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=True)
@@ -191,14 +224,33 @@ class SpeechBackendPool:
         if work <= 0:
             raise ValueError("work must be > 0")
         async with self._lock:
+            if self.settings.external:
+                now = time.monotonic()
+                while self._request_times and self._request_times[0] <= now - 60:
+                    self._request_times.popleft()
+                if now < self._cooldown_until:
+                    raise SpeechPoolCapacityExceeded(self._cooldown_until - now)
+                if len(self._request_times) >= self.settings.requests_per_minute:
+                    raise SpeechPoolCapacityExceeded(self._request_times[0] + 60 - now)
+                if sum(s.active_requests for s in self._states.values()) >= self.settings.max_concurrency:
+                    raise SpeechPoolCapacityExceeded(1)
             candidates = [
                 state
                 for state in self._states.values()
-                if state.ready and not state.draining and state.config.name not in exclude
+                if state.ready
+                and not state.draining
+                and state.config.name not in exclude
+                and (self.settings.max_work is None or state.active_work + work <= self.settings.max_work)
             ]
             if not candidates:
+                if self.settings.max_work is not None and any(
+                    s.ready and not s.draining and s.config.name not in exclude for s in self._states.values()
+                ):
+                    raise SpeechPoolCapacityExceeded(1)
                 raise NoSpeechBackendAvailable("no ready speech backend is available")
             state = min(candidates, key=self._score)
+            if self.settings.external:
+                self._request_times.append(time.monotonic())
             self._selection_counter += 1
             state.last_selected = self._selection_counter
             state.active_requests += 1
@@ -252,6 +304,86 @@ class SpeechBackendPool:
         async with self._lock:
             self._states[backend_name].draining = draining
 
+    async def rate_limited(self, retry_after: str | None) -> None:
+        """Honor provider backpressure for the entire pool, including aliases and retries."""
+        delay = 1.0
+        if retry_after:
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                try:
+                    delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        if not 0 < delay < float("inf"):
+            delay = 1.0
+        async with self._lock:
+            self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
+
+    async def set_session_demand(self, sessions: int, *, reserve_sessions: int) -> None:
+        if self.settings.session_work is None:
+            raise ValueError("pool has no session workload profile")
+        if type(sessions) is not int or sessions < 0 or type(reserve_sessions) is not int or reserve_sessions < 0:
+            raise ValueError("session counts must be nonnegative integers")
+        async with self._lock:
+            self._session_count = sessions
+            self._reserve_sessions = reserve_sessions
+            self._session_demand_at = time.monotonic()
+
+    def _session_demand_unlocked(self) -> tuple[float, float, bool]:
+        cost = self.settings.session_work or 0
+        stale = cost > 0 and (self._session_demand_at is None or time.monotonic() - self._session_demand_at > 60)
+        return self._session_count * cost, self._reserve_sessions * cost, stale
+
+    async def capacity_snapshot(self) -> dict:
+        async with self._lock:
+            now = time.monotonic()
+            result = {"mode": "external" if self.settings.external else "soft_target"}
+            if self.settings.external:
+                result.update(
+                    {
+                        "max_concurrency": self.settings.max_concurrency,
+                        "requests_per_minute": self.settings.requests_per_minute,
+                        "requests_in_window": sum(start > now - 60 for start in self._request_times),
+                        "retry_after_s": max(self._cooldown_until - now, 0),
+                    }
+                )
+            if self.settings.session_work is not None:
+                ready = sum(s.ready and not s.draining for s in self._states.values())
+                active = sum(
+                    s.active_requests if self.settings.external else s.active_work for s in self._states.values()
+                )
+                planned, reserve, stale = self._session_demand_unlocked()
+                demand = max(active, planned)
+                target = ready * (
+                    min(self.settings.target_work, self.settings.max_concurrency)
+                    if self.settings.external
+                    else self.settings.target_work
+                )
+                hard = ready * (self.settings.max_concurrency if self.settings.external else self.settings.max_work)
+                available = max(0, math.floor((target - demand) / self.settings.session_work))
+                admissible = max(0, math.floor((hard - demand) / self.settings.session_work))
+                if self.settings.external:
+                    rpm_demand = max(result["requests_in_window"], self._session_count * self.settings.session_rpm)
+                    quota = max(
+                        0, math.floor((self.settings.requests_per_minute - rpm_demand) / self.settings.session_rpm)
+                    )
+                    available, admissible = min(available, quota), min(admissible, quota)
+                    if result["retry_after_s"] > 0:
+                        available = admissible = 0
+                result.update(
+                    ready_work=target,
+                    hard_work=hard,
+                    active_work=active,
+                    session_work=planned,
+                    reserve_work=reserve,
+                    work_per_session=self.settings.session_work,
+                    available_sessions=available,
+                    admissible_sessions=admissible,
+                    demand_stale=stale,
+                )
+            return result
+
     async def take_work_peak(self) -> float:
         """Retain short STT bursts that complete between controller polls."""
         async with self._lock:
@@ -278,11 +410,13 @@ class SpeechBackendPool:
         async with self._lock:
             state = self._states[backend_name]
             others = [s for s in self._states.values() if s is not state and s.ready and not s.draining]
+            planned, reserve, stale = self._session_demand_unlocked()
             if (
                 not state.ready
                 or state.draining
                 or len(others) < min_ready
-                or sum(s.active_work for s in self._states.values())
+                or stale
+                or max(sum(s.active_work for s in self._states.values()), planned) + reserve
                 > len(others) * self.settings.target_work * utilization
             ):
                 return False
@@ -367,6 +501,10 @@ class SpeechBackendPool:
                 timeout=self.settings.health_timeout_s,
             )
             response.raise_for_status()
+            if self.settings.external and self.settings.service == "llm":
+                models = response.json().get("data", [])
+                if not any(model.get("id") == self.settings.llm_warmup_model for model in models):
+                    raise ValueError("configured model is unavailable from provider")
             if not was_ready:
                 if self.settings.service == "tts" and self.settings.tts_warmup_enabled:
                     await self._warm_tts(url, headers)
@@ -394,7 +532,7 @@ class SpeechBackendPool:
                 "voice": self.settings.tts_warmup_voice,
                 "language": self.settings.tts_warmup_language,
                 "input": "Ready.",
-                "response_format": "pcm",
+                "response_format": self.settings.tts_warmup_format,
                 "stream": True,
             },
             timeout=self.settings.tts_warmup_timeout_s,
@@ -404,16 +542,16 @@ class SpeechBackendPool:
             raise RuntimeError("TTS warmup returned an empty response")
 
     async def _warm_llm(self, url: str, headers: dict[str, str]) -> None:
+        responses = self.settings.llm_warmup_api == "responses"
+        payload = {"model": self.settings.llm_warmup_model, "stream": False}
+        if responses:
+            payload.update(input="Reply OK.", max_output_tokens=2)
+        else:
+            payload.update(messages=[{"role": "user", "content": "Reply OK."}], max_tokens=2, temperature=0)
         response = await self._client.post(
-            f"{url.rstrip('/')}/v1/chat/completions",
+            f"{url.rstrip('/')}/v1/{'responses' if responses else 'chat/completions'}",
             headers=headers,
-            json={
-                "model": self.settings.llm_warmup_model,
-                "messages": [{"role": "user", "content": "Reply OK."}],
-                "max_tokens": 2,
-                "temperature": 0,
-                "stream": False,
-            },
+            json=payload,
             timeout=self.settings.llm_warmup_timeout_s,
         )
         response.raise_for_status()

@@ -74,6 +74,33 @@ class PipelineEntrypointTests(unittest.TestCase):
         self.assertEqual(config["openai_tts_api_key"], "hf-secret")
         self.assertFalse(config["enable_live_transcription"])
         self.assertEqual(config["stream_batch_sentences"], 3)
+        self.assertNotIn("session_routing_enabled", config)
+
+    def test_session_routing_requires_explicit_enablement(self):
+        config = build_config(
+            {
+                "HF_TOKEN": "hf-test",
+                "OPENAI_API_KEY": "openai-test",
+                "STT_BASE_URL": "http://stt/v1",
+                "TTS_BASE_URL": "http://tts/v1",
+                "SESSION_ROUTING_ENABLED": "true",
+            }
+        )
+        self.assertTrue(config["session_routing_enabled"])
+        common = build_config(
+            {
+                "HF_TOKEN": "hf-test",
+                "OPENAI_API_KEY": "openai-test",
+                "STT_BASE_URL": "http://stt/v1",
+                "TTS_BASE_URL": "http://tts/v1",
+                "TTS_STREAM": "false",
+                "TTS_LANGUAGE": "",
+                "RESPONSES_API_DISABLE_THINKING": "false",
+            }
+        )
+        self.assertFalse(common["openai_tts_stream"])
+        self.assertFalse(common["responses_api_disable_thinking"])
+        self.assertEqual(common["openai_tts_language"], "")
 
     def test_build_config_routes_llm_to_protected_chat_completions_proxy(self):
         config = build_config(

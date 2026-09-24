@@ -6,7 +6,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Optional
 
@@ -19,6 +19,7 @@ from app.app_utils import build_lifespan, env_bool, env_text, setup_logging
 from app.llm_proxy_usage import LLM_PROXY_CALLBACK_AUTH_HEADER
 from app.requester_identity import bearer_token, client_address, is_validatable_hf_token
 from app.session_router import SessionRouter
+from app.session_routing_proxy import SessionRoutingProxy
 from app.session_tokens import llm_token_fingerprint, verify_session_token, websocket_host_matches
 from app.ws_proxy import proxy_websocket
 
@@ -263,6 +264,8 @@ async def health(settings: ComputeSettings, dependencies: "ComputeDependencies")
     healthy, detail, snapshot = await dependencies.session_router.healthcheck()
     if not healthy:
         raise HTTPException(status_code=503, detail=detail or "compute router is not ready")
+    if dependencies.route_sessions:
+        snapshot = {**snapshot, "route_sessions": dict(dependencies.route_sessions)}
 
     return JSONResponse(
         {
@@ -593,6 +596,9 @@ async def websocket_proxy(
         if isinstance(claim, str) and claim:
             llm_fingerprint = claim
     llm_fingerprint_registered = False
+    routing = session_payload.get("routing") if session_payload else None
+    route_registered = False
+    routing_proxy = None
 
     async def _notify_connected() -> None:
         # Runs only after a pipeline slot is actually secured. Notifying the
@@ -612,8 +618,17 @@ async def websocket_proxy(
         if llm_fingerprint is not None:
             dependencies.connected_llm_fingerprints.add(llm_fingerprint)
             llm_fingerprint_registered = True
+        nonlocal route_registered
+        if routing is not None:
+            pipeline = routing["pipeline"]
+            dependencies.route_sessions[pipeline] = dependencies.route_sessions.get(pipeline, 0) + 1
+            route_registered = True
 
     try:
+        if routing is not None and routing.get("updates_enabled"):
+            routing_proxy = SessionRoutingProxy(
+                client_ws, session_payload, settings.lb_callback_auth_token, dependencies.route_sessions
+            )
         await dependencies.proxy_websocket(
             client_ws,
             acquire_lease=lambda _: dependencies.session_router.acquire(),
@@ -622,6 +637,19 @@ async def websocket_proxy(
             no_capacity_reason="No pipeline capacity available",
             no_capacity_log="Failed to allocate speech-to-speech slot",
             on_lease_acquired=_notify_connected,
+            **({"message_interceptor": routing_proxy} if routing_proxy is not None else {}),
+            **(
+                {
+                    "additional_headers": [
+                        (
+                            "X-Speech-Session-Routing",
+                            json.dumps({"id": session_payload["sid"], **routing}, separators=(",", ":")),
+                        )
+                    ]
+                }
+                if routing is not None
+                else {}
+            ),
         )
     except Exception as exc:
         logger.warning("Rejected websocket session: %s", exc)
@@ -630,6 +658,11 @@ async def websocket_proxy(
         except Exception:
             pass
     finally:
+        if route_registered:
+            pipeline = routing_proxy.pipeline if routing_proxy is not None else routing["pipeline"]
+            dependencies.route_sessions[pipeline] -= 1
+            if not dependencies.route_sessions[pipeline]:
+                dependencies.route_sessions.pop(pipeline)
         if llm_fingerprint_registered and llm_fingerprint is not None:
             dependencies.connected_llm_fingerprints.remove(llm_fingerprint)
         if session_payload is not None:
@@ -647,6 +680,8 @@ async def websocket_proxy(
                 )
             except Exception:
                 logger.exception("Failed to notify LB that session ended")
+        if routing_proxy is not None:
+            await routing_proxy.close()
 
 
 def _get_session_payload(
@@ -784,6 +819,7 @@ class ComputeDependencies:
     http_get_json: Callable[[str], dict[str, object]]
     notify_lb_session_event: Callable[..., Awaitable[None]]
     proxy_websocket: Callable[..., Awaitable[None]]
+    route_sessions: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

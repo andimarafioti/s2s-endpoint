@@ -3,11 +3,16 @@ import argparse
 import concurrent.futures
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 from _endpoint_helpers import DEFAULT_FRAMEWORK, DEFAULT_REPOSITORY, build_custom_image
 from huggingface_hub import HfApi
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app.speech_route_catalog import SpeechRouteCatalog  # noqa: E402
 
 DEFAULT_NAMESPACE = "HuggingFaceM4"
 DEFAULT_VENDOR = "aws"
@@ -64,6 +69,17 @@ def resolve_backend_targets(
 
 def build_specs(args: argparse.Namespace, api: HfApi) -> list[SpeechProxySpec]:
     requested_services = set(args.services)
+    if getattr(args, "catalog", None):
+        service = args.services[0]
+        return [
+            SpeechProxySpec(
+                service,
+                getattr(args, f"{service}_proxy_name"),
+                (),
+                getattr(args, f"{service}_target_work"),
+                getattr(args, f"{service}_latency_target"),
+            )
+        ]
     specs: list[SpeechProxySpec] = []
     if "stt" in requested_services:
         specs.append(
@@ -119,7 +135,14 @@ def ensure_names_available(api: HfApi, namespace: str, specs: list[SpeechProxySp
         raise ValueError(f"Inference Endpoint name already exists: {', '.join(collisions)}")
 
 
-def resolve_secrets(environ: dict[str, str], *, autoscale: bool = False) -> dict[str, str]:
+def resolve_secrets(
+    environ: dict[str, str], *, autoscale: bool = False, catalog: SpeechRouteCatalog | None = None
+) -> dict[str, str]:
+    if catalog:
+        missing = [name for name in catalog.secret_names() if not environ.get(name, "").strip()]
+        if missing:
+            raise ValueError(f"Missing required route secrets: {', '.join(missing)}")
+        return {name: environ[name].strip() for name in catalog.secret_names()}
     token = environ.get("HF_TOKEN", "").strip()
     if not token:
         raise ValueError("Missing required deployment secret: HF_TOKEN")
@@ -147,6 +170,10 @@ def deployment_env(args: argparse.Namespace, spec: SpeechProxySpec) -> dict[str,
         "SPEECH_HEALTH_TIMEOUT_S": str(args.health_timeout),
         "SPEECH_REQUEST_TIMEOUT_S": str(args.request_timeout),
     }
+    if getattr(args, "catalog", None):
+        env.pop("SPEECH_BACKENDS")
+        env["SPEECH_ROUTE_CATALOG"] = args.catalog.model_dump_json(exclude_unset=True)
+        return env
     if spec.service == "stt":
         env["STT_AUDIO_EQUIVALENT_S"] = str(args.stt_audio_equivalent)
     elif spec.service == "tts":
@@ -217,6 +244,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--services", nargs="+", choices=("stt", "tts", "llm"), default=["stt", "tts"])
+    parser.add_argument("--route-catalog", type=Path, help="JSON model/provider catalog for one --services value")
     parser.add_argument("--image-url", required=True)
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY)
     parser.add_argument("--revision")
@@ -253,6 +281,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-timeout", type=float, default=1800)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    args.catalog = None
+    if args.route_catalog:
+        if len(args.services) != 1 or args.autoscale:
+            parser.error("--route-catalog requires exactly one service and per-pool lifecycle settings")
+        try:
+            args.catalog = SpeechRouteCatalog.model_validate_json(args.route_catalog.read_text())
+            args.catalog.validate_service(args.services[0])
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        if args.type == "public" and any(route.access_key_env is None for route in args.catalog.pools):
+            parser.error("public catalog gateways require access_key_env on every route")
 
     for name in (
         "stt_target_work",
@@ -298,8 +337,9 @@ def main() -> None:
                     "type": args.type,
                     "min_replica": 1,
                     "max_replica": 1,
-                    "required_secret_names": ["SPEECH_BACKEND_API_KEY"]
-                    + (["HF_CONTROL_TOKEN"] if args.autoscale else []),
+                    "required_secret_names": args.catalog.secret_names()
+                    if args.catalog
+                    else ["SPEECH_BACKEND_API_KEY"] + (["HF_CONTROL_TOKEN"] if args.autoscale else []),
                     "endpoints": [{**asdict(spec), "env": deployment_env(args, spec)} for spec in specs],
                 },
                 indent=2,
@@ -307,7 +347,7 @@ def main() -> None:
         )
         return
 
-    secrets = resolve_secrets(dict(os.environ), autoscale=args.autoscale)
+    secrets = resolve_secrets(dict(os.environ), autoscale=args.autoscale, catalog=args.catalog)
     endpoints = [(spec, create_endpoint(api, args, spec, secrets)) for spec in specs]
     if args.wait:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoints) or 1) as executor:

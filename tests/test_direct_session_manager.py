@@ -135,6 +135,69 @@ class SessionQueueTests(unittest.IsolatedAsyncioTestCase):
         )
         return self.manager
 
+    async def test_polling_does_not_extend_300_second_wait_or_claim_after_deadline(self):
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = self._make(router)
+        with patch("app.direct_session_manager.monotonic", return_value=100) as clock:
+            ticket = await manager.allocate("https://lb.example")
+            for elapsed in range(2, 300, 2):
+                clock.return_value = 100 + elapsed
+                self.assertEqual((await manager.poll(ticket["queue_id"], "https://lb.example"))["state"], "queued")
+                await manager._reap_stale_tickets()
+            router.has_capacity = True
+            clock.return_value = 400
+            result = await manager.poll(ticket["queue_id"], "https://lb.example")
+        self.assertEqual(result["state"], "timed_out")
+        self.assertGreater(result["retry_after_s"], 0)
+        self.assertEqual(router.acquire_calls, 0)
+        self.assertEqual((await manager.snapshot())["queued_sessions"], 0)
+
+    async def test_wait_deadline_applies_to_non_head_ticket_and_preserves_fifo(self):
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = self._make(router)
+        with patch("app.direct_session_manager.monotonic", return_value=100) as clock:
+            head = await manager.allocate("https://lb.example")
+            expired = await manager.allocate("https://lb.example")
+            clock.return_value = 399
+            later = await manager.allocate("https://lb.example")
+            clock.return_value = 400
+            self.assertEqual((await manager.poll(expired["queue_id"], "https://lb.example"))["state"], "timed_out")
+            self.assertEqual((await manager.poll(head["queue_id"], "https://lb.example"))["state"], "timed_out")
+            router.has_capacity = True
+            self.assertEqual((await manager.poll(later["queue_id"], "https://lb.example"))["state"], "granted")
+
+    async def test_failed_claim_keeps_original_wait_deadline(self):
+        router = ToggleCapacityRouter(has_capacity=False)
+        manager = self._make(router)
+        with patch("app.direct_session_manager.monotonic", return_value=100) as clock:
+            ticket = await manager.allocate("https://lb.example")
+            clock.return_value = 399
+            router.has_capacity = True
+            with patch.object(manager, "_grant_from_lease", side_effect=RuntimeError("failed grant")):
+                with self.assertRaises(RuntimeError):
+                    await manager.poll(ticket["queue_id"], "https://lb.example")
+            before = router.acquire_calls
+            clock.return_value = 400
+            self.assertEqual((await manager.poll(ticket["queue_id"], "https://lb.example"))["state"], "timed_out")
+            self.assertEqual(router.acquire_calls, before)
+
+    async def test_claim_crossing_deadline_releases_capacity(self):
+        router = GatedCapacityRouter()
+        router._first = False
+        manager = self._make(router)
+        with patch("app.direct_session_manager.monotonic", return_value=100) as clock:
+            ticket = await manager.allocate("https://lb.example")
+            clock.return_value = 399
+            router._first = True
+            router.free = 1
+            polling = asyncio.create_task(manager.poll(ticket["queue_id"], "https://lb.example"))
+            await router.first_entered.wait()
+            clock.return_value = 400
+            router.gate.set()
+            self.assertEqual((await polling)["state"], "timed_out")
+        self.assertEqual(router.release_calls, ["endpoint-1"])
+        self.assertEqual((await manager.snapshot())["pending_sessions"], 0)
+
     async def test_busy_pool_queues_and_head_claims_when_capacity_returns(self):
         router = ToggleCapacityRouter(has_capacity=False)
         manager = self._make(router, queue_max_depth=5)

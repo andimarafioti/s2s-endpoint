@@ -261,6 +261,43 @@ class ComputeLlmProxyTestCase(unittest.TestCase):
 
 
 class AuthorizedPassthroughTests(ComputeLlmProxyTestCase):
+    def test_only_signed_session_routing_is_forwarded_to_the_pipeline(self):
+        client = self.gated_client()
+        routing = {
+            "pipeline": "selected",
+            "routes": {"llm": {"model": "admitted", "provider": "hf", "protocol": "chat_completions"}},
+        }
+        token = create_session_token(
+            SECRET,
+            session_id="allocated-id",
+            websocket_url="ws://testserver/v1/realtime",
+            callback_url="http://lb.internal/event",
+            ttl_s=60,
+            routing=routing,
+        )
+        seen = []
+
+        def connect(*args, **kwargs):
+            seen.append(kwargs.get("additional_headers"))
+            return _FakeUpstreamConnect()
+
+        with patch("app.ws_proxy.websockets.connect", connect):
+            with client.websocket_connect(
+                f"/v1/realtime?session_token={token}", headers={"X-Speech-Session-Routing": '{"pipeline":"spoofed"}'}
+            ) as ws:
+                ws.send_json({"type": "ping"})
+                # The first pipeline write proves the upstream connect completed.
+                self.post_chat(client)
+            self.assertEqual(json.loads(dict(seen[0])["X-Speech-Session-Routing"]), {"id": "allocated-id", **routing})
+            seen.clear()
+            with client.websocket_connect(
+                f"/v1/realtime?session_token={_mint_session_token()}",
+                headers={"X-Speech-Session-Routing": '{"pipeline":"spoofed"}'},
+            ) as ws:
+                ws.send_json({"type": "ping"})
+                self.post_chat(client)
+            self.assertFalse(seen[0])
+
     def test_chat_completions_reaches_internal_pipeline_verbatim(self) -> None:
         self.stub.responder = lambda path: (
             200,
