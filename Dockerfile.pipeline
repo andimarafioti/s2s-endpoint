@@ -8,7 +8,7 @@ ARG S2S_REF=cd1a5657f8a54d7faf059ff602072f5c495a246d
 ARG SMART_TURN_MODEL_REPO=pipecat-ai/smart-turn-v3
 ARG SMART_TURN_MODEL_REV=f766f81d3cfdf7737ac64aad813d91bbfd56bf93
 ARG SMART_TURN_MODEL_FILENAME=smart-turn-v3.2-cpu.onnx
-ARG SILERO_VAD_REF=867c2aa692646a1f1de3e94a15c9dd9f614c0acb
+ARG SILERO_VAD_REF=5cd7945676eb32225748052e2e6a0580e4686a08
 
 LABEL org.opencontainers.image.source="https://github.com/andimarafioti/s2s-endpoint"
 
