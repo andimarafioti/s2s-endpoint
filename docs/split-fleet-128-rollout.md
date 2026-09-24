@@ -41,6 +41,22 @@ This is a separate live fleet behind `reachy-s2s-split-lb`. The existing
 `reachy-s2s-pipeline-01` are not migrated. The three existing speech proxies
 are updated, so the direct-testing pipeline also benefits from GPU autoscaling.
 
+## Browser ingress cutover — 2026-09-23
+
+The `smolagents/hf-realtime-voice` Space successfully allocated sessions from the
+split LB but browser WebSockets could not carry HF `Authorization` to the
+protected CPU endpoints. All 11 CPU workers registered with `reachy-s2s-split-lb`
+were changed in place to `type=public`; none were deleted or recreated. The warm
+floor stayed on `-02` and `-03`, while `-04` through `-12` stayed paused. No GPU
+proxy or backend and no original production endpoint changed visibility.
+
+Both running CPU workers rejected unsigned WebSocket handshakes with HTTP 403.
+One short browser-style conversation, using an LB-issued signed `connect_url`
+without an HF WebSocket header, completed STT, LLM, and TTS with 936 ms from
+speech stop to first audio. This verifies one manual path, not concurrency or
+public-load capacity. The Space still needs a user-side retry to confirm its
+full UI flow.
+
 ## Capacity and placement
 
 | Stage | Hardware / region | Per-worker operating target | Warm floor | Maximum workers | Inventory |
@@ -90,15 +106,20 @@ on each managed worker and learned through authenticated health polling.
 
 The LB is public so compute session callbacks can reach it, but session admission
 requires a verified HF token (`SESSION_REQUIRE_VERIFIED_HF_TOKEN=true`). Clients
-send that token in `X-Reachy-Mini-Authorization`; protected pipeline ingress uses
-standard `Authorization`, while the signed session token is in the returned
-connection URL. Existing per-requester rate limits are retained: 128 total users
-does not imply 128 parallel sessions permitted for one identity.
-Pipeline endpoints retain protected HF ingress for this testing rollout, so
-clients also need namespace-authorized HF credentials. Admission with an arbitrary
-valid HF identity alone does not confer access to protected worker ingress.
-Before a general-public client cutover, decide whether to use public HF worker
-ingress with the already-required signed application session tokens.
+send that token in `X-Reachy-Mini-Authorization`. The 11 LB-managed CPU workers
+(`reachy-s2s-pipeline-02` through `-12`) now have public HF ingress so a browser
+can open the returned `connect_url` without setting an HF `Authorization` header.
+Each worker still requires the LB-issued, HMAC-signed `session_token` in that URL
+before it admits a realtime conversation. Existing per-requester rate limits are
+retained: 128 total users does not imply 128 parallel sessions permitted for one
+identity. The GPU proxies and backends, unregistered CPU workers, and direct
+pipeline `-01` retain protected HF ingress.
+
+Public ingress also exposes the CPU workers' health and pool routes. A signed
+connection URL is a bearer credential: the current `SESSION_TOKEN_TTL_S=86400`
+means someone who obtains that URL could reuse it for up to 24 hours, even after
+the original session ends. Token lifetime and replay protection are separate
+hardening follow-ups; a session ID alone is not an access credential.
 
 New LB/worker application secrets are shared only within the split fleet. HF
 credentials are endpoint secrets, not plain environment configuration. The
@@ -128,6 +149,36 @@ of already-running backend URLs. Do not register paused URLs in unmanaged mode,
 because health probes can wake scale-to-zero backends. Do not roll a second live
 controller over the same inventory while the first is still draining requests.
 The original production load balancer remains available and unchanged.
+
+## Manual conversation through the split LB
+
+The packaged `speech-to-speech talk` client rejects URLs with query parameters,
+while a managed CPU worker requires the LB-issued `session_token` in its WebSocket
+URL. The local bridge supplies that signed URL and also supports protected-worker
+HF ingress. Run it in one terminal, using the split LB URL currently reported by
+the HF endpoint API:
+
+```bash
+uv run --default-index https://pypi.org/simple --with-requirements requirements.txt \
+  python scripts/split_talk_bridge.py --lb-url https://YOUR-SPLIT-LB-URL
+```
+
+Then use the packaged microphone/speaker client in another terminal:
+
+```bash
+speech-to-speech talk \
+  --url ws://127.0.0.1:8765/v1/realtime \
+  --api-key local \
+  --playback-buffer-ms 196
+```
+
+The bridge sends `HF_TOKEN` to the LB in `X-Reachy-Mini-Authorization` for
+verified session admission. It connects using the signed `connect_url` and also
+sends standard `Authorization: Bearer $HF_TOKEN` for compatibility with protected
+worker deployments; the current public CPU workers do not need that ingress
+header. `local` is used only for the loopback client connection. The bridge
+handles one conversation at a time and does not save media or tokens. Stop it
+with Ctrl-C after testing.
 
 ## Rollout checks
 
