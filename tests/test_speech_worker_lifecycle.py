@@ -1,13 +1,15 @@
 import asyncio
+import itertools
 import unittest
 from unittest.mock import patch
 
 import httpx
 
 from app.endpoint_pool_router import EndpointSnapshot
-from app.speech_proxy_app import SpeechProxySettings
+from app.speech_proxy_app import SpeechProxyDependencies, SpeechProxySettings, create_app
 from app.speech_proxy_router import NoSpeechBackendAvailable, SpeechBackendPool, SpeechBackendPoolSettings
 from app.speech_worker_lifecycle import SpeechWorkerLifecycle, WorkerLifecycleSettings
+from tests.test_speech_proxy_app import wav_bytes
 from tests.test_speech_proxy_router import _backends
 
 
@@ -46,7 +48,7 @@ class Controller:
 
 
 class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def make_fleet(self, statuses=("running", "paused", "paused"), **overrides):
+    async def make_fleet(self, statuses=("running", "paused", "paused"), *, service="tts", **overrides):
         self.now = 1000.0
         self.probes = []
 
@@ -58,7 +60,7 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.client.aclose)
         self.pool = SpeechBackendPool(
             _backends(len(statuses)),
-            SpeechBackendPoolSettings(service="tts", target_work=8, latency_target=0.5, tts_warmup_enabled=False),
+            SpeechBackendPoolSettings(service=service, target_work=8, latency_target=0.5, tts_warmup_enabled=False),
             client=self.client,
         )
         self.controller = Controller(statuses)
@@ -111,6 +113,36 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.tick()
         self.assertEqual(self.controller.calls, [("wake", "backend-2")])
 
+    async def test_stt_autoscaling_uses_only_duration_normalized_latency(self):
+        await self.make_fleet(service="stt")
+        settings = SpeechProxySettings(service="stt", backends=_backends(3))
+        app = create_app(settings, SpeechProxyDependencies(pool=self.pool, client=self.client))
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://proxy") as client:
+            # Mock upstream success for an upload whose duration cannot be read.
+            # One second per request exceeds the 0.5 RTF target only if raw
+            # seconds are incorrectly substituted for a normalized sample.
+            for filename, content in (("audio.mp3", b"ID3"), ("audio.wav", wav_bytes(1))):
+                with patch("app.speech_proxy_app.time") as clock:
+                    clock.monotonic.side_effect = itertools.count(step=1)
+                    for _ in range(8):
+                        response = await client.post(
+                            "/v1/audio/transcriptions",
+                            files={"file": (filename, content)},
+                        )
+                        self.assertEqual(response.status_code, 200)
+                        await self.tick()
+                        self.now += 5
+                backend = (await self.pool.snapshots())[0]
+                self.assertEqual(backend.active_requests, 0)
+                self.assertEqual(backend.active_work, 0)
+                if filename.endswith("mp3"):
+                    self.assertIsNone(backend.ewma_latency)
+                    self.assertIsNone(backend.latency_age_s)
+                    self.assertEqual(self.controller.calls, [])
+                else:
+                    self.assertEqual(backend.ewma_latency, 1)
+                    self.assertEqual(self.controller.calls, [("wake", "backend-2")])
+
     async def test_maximum_worker_count_bounds_wakes(self):
         await self.make_fleet(max_workers=2)
         await self.load(50)
@@ -145,6 +177,11 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.now += 100
         await self.tick()
         self.assertEqual(self.controller.calls, [])
+        telemetry = await self.lifecycle.snapshot()
+        self.assertEqual(telemetry["latency_target"], 0.5)
+        self.assertEqual(telemetry["workers"][0]["ewma_latency"], 2)
+        self.assertGreaterEqual(telemetry["workers"][0]["latency_age_s"], 100)
+        self.assertIsNone(telemetry["workers"][1]["latency_age_s"])
 
     async def test_idle_scale_down_preserves_warm_floor(self):
         await self.make_fleet(("running", "running", "running"))

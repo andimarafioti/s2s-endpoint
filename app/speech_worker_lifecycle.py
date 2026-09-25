@@ -142,6 +142,7 @@ class SpeechWorkerLifecycle:
         return {
             "enabled": True,
             "settings": asdict(self.settings),
+            "latency_target": self.pool.settings.latency_target,
             "last_reconcile_age_s": (
                 self._time() - self._last_reconcile_at if self._last_reconcile_at is not None else None
             ),
@@ -159,6 +160,7 @@ class SpeechWorkerLifecycle:
                     "active_work": backends[w.name].active_work,
                     "target_work": backends[w.name].target_work,
                     "ewma_latency": backends[w.name].ewma_latency,
+                    "latency_age_s": backends[w.name].latency_age_s,
                 }
                 for w in self._workers.values()
             ],

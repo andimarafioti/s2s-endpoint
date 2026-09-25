@@ -438,7 +438,7 @@ async def _proxy_stt(
             elapsed = time.monotonic() - started
             success = 200 <= response.status_code < 300
             retryable = _retryable_response(response.status_code, response.content)
-            latency_metric = elapsed / duration_s if duration_s > 0 else elapsed
+            latency_metric = elapsed / duration_s if duration_s > 0 else None
             await lease.release(
                 success=success,
                 latency=latency_metric,

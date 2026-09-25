@@ -261,7 +261,13 @@ uv run --default-index https://pypi.org/simple --with-requirements requirements.
 ```
 
 Worker phases, actions, active work, target work, and lifecycle errors appear in
-both proxy health/metrics and the load-balancer dashboard. Set
+both proxy health/metrics and the load-balancer dashboard. Worker rows also show
+recent weighted latency (EWMA), its configured target, and whether the sample is
+too old for scaling. STT uses real-time factor (transcription seconds per second
+of input audio); TTS and LLM use time to first audio/token in milliseconds. This
+per-worker average is independent of the dashboard's selected percentile window.
+STT requests with unknown audio duration still release their work reservations,
+but do not update the latency average or its freshness. Set
 `SPEECH_WORKER_MIN_WARM=2` when immediate single-worker failover is worth the
 second always-on GPU; a warm floor of one optimizes cost but accepts model-load
 time after failure or scale-up.

@@ -1447,9 +1447,19 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
         const phase = phaseLabels[entry.phase] || entry.phase || 'unknown';
         const coveragePercent = `${(Number(coverage.ratio || 0) * 100).toFixed(0)}%`;
         const fleet = entry.lifecycle;
-        const workers = fleet && fleet.enabled ? (fleet.workers || []).map(worker =>
-          `<div class="footer-note"><strong>${htmlEscape(worker.name)}</strong> · ${htmlEscape(worker.phase)} · ${htmlEscape(worker.active_requests)} active · work ${htmlEscape(worker.active_work)}/${htmlEscape(worker.target_work)}${worker.reason ? ` · ${htmlEscape(worker.reason)}` : ''}${worker.last_error ? ` · ${htmlEscape(worker.last_error)}` : ''}</div>`
-        ).join('') : '';
+        const formatEwma = value => {
+          if (value == null || !Number.isFinite(Number(value))) return '—';
+          return service === 'stt' ? `${Number(value).toFixed(3)} RTF` : formatLatencyMs(Number(value) * 1000);
+        };
+        const ewmaExplanation = service === 'stt'
+          ? 'Recent weighted average of transcription time divided by input audio duration. Lower is faster. Unknown-duration requests are excluded.'
+          : `Recent weighted average of time to ${service === 'tts' ? 'first audio' : 'first token'}. Lower is faster.`;
+        const workers = fleet && fleet.enabled ? (fleet.workers || []).map(worker => {
+          const stale = worker.latency_age_s != null && worker.latency_age_s > (fleet.settings || {}).latency_max_age_s;
+          return `<div class="footer-note"><strong>${htmlEscape(worker.name)}</strong> · ${htmlEscape(worker.phase)} · ${htmlEscape(worker.active_requests)} active · work ${htmlEscape(worker.active_work)}/${htmlEscape(worker.target_work)}${worker.reason ? ` · ${htmlEscape(worker.reason)}` : ''}${worker.last_error ? ` · ${htmlEscape(worker.last_error)}` : ''}
+            <div title="${htmlEscape(ewmaExplanation)}">${service === 'stt' ? 'Transcription' : (service === 'tts' ? 'First audio' : 'First token')} EWMA: <span class="mono">${htmlEscape(formatEwma(worker.ewma_latency))}</span> · target <span class="mono">${htmlEscape(formatEwma(fleet.latency_target))}</span>${stale ? ' · stale (excluded from scaling)' : ''}</div>
+          </div>`;
+        }).join('') : '';
         return `<div class="speech-latency-service">
           <div class="speech-latency-title">
             <strong>${service.toUpperCase()} · ${htmlEscape(phase)}</strong>
@@ -1460,6 +1470,7 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
             <tbody>${rows}</tbody>
           </table>
           <div class="footer-note">GPU timing coverage ${htmlEscape(coveragePercent)} · pre-result errors ${htmlEscape(prettyNumber(requests.errors || 0))} · cancellations ${htmlEscape(prettyNumber(requests.cancellations || 0))}</div>
+          ${fleet && fleet.enabled ? `<div class="footer-note">EWMA is a recent weighted average per worker, independent of this table's time window.${service === 'stt' ? ' RTF (real-time factor) is transcription seconds per second of input audio.' : ''}</div>` : ''}
           ${workers}
         </div>`;
       }).join('')}</div>`;
