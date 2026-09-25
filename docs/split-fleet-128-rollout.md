@@ -71,6 +71,32 @@ After the capacity update, `reachy-s2s-split-lb` reported two warm workers, 32
 free slots, zero connected or pending sessions, and no router errors. The other
 registered workers remained available for autoscaling.
 
+## Raw pipeline turn latency rollout — 2026-09-25
+
+The isolated split fleet now reports the structured terminal-response latency
+metadata added by `huggingface/speech-to-speech` merge
+`21a51e58dc7720d5dfeb70fecccad8e67c4dd4f4`. All 11 managed CPU workers use
+`ghcr.io/andimarafioti/s2s-pipeline:sha-f42e04364a9517e063dfd8fb298234e627f90c4d`,
+and `reachy-s2s-split-lb` uses the matching
+`ghcr.io/andimarafioti/s2s-load-balancer:sha-f42e04364a9517e063dfd8fb298234e627f90c4d`.
+The load balancer was paused with zero connected and pending sessions during the
+rollout; parked workers stayed parked, the two warm workers returned to running,
+and the 32-slot warm floor was restored. Production `reachy-s2s-01` through
+`-32` were not changed.
+
+The dashboard now has a separate **Conversation Turn Latency** panel. It reports
+raw server-side final STT, full LLM generation, TTS time to first provider audio,
+speech-end to first server audio, and MLX lock wait. These values intentionally
+remain separate from the proxy metrics because their measurement boundaries are
+different.
+
+One synthetic turn through the public split load balancer completed successfully
+and populated the new panel. The server reported 212 ms STT, 575 ms full LLM,
+183 ms TTS first audio, 985 ms speech-end to first audio, and 0 ms MLX lock wait.
+The independent client event trace measured 220 ms, 590 ms, 170 ms, and 981 ms
+for the corresponding observable intervals. This close agreement validates the
+telemetry path and boundaries for one turn; it is not a latency distribution.
+
 ## Browser ingress cutover — 2026-09-23
 
 The `smolagents/hf-realtime-voice` Space successfully allocated sessions from the
@@ -147,8 +173,8 @@ validated 16 users per worker. Three-sentence TTS batching remains unchanged.
 ## Images and configuration
 
 - Proxies: `ghcr.io/andimarafioti/s2s-speech-proxy:sha-f303b920f8d6431c1f5fdf85338942074dfa923a`.
-- Managed CPU pipelines: `ghcr.io/andimarafioti/s2s-pipeline:sha-4d134f458b8137e615e89a6967a2a8a0036dd2a0`.
-- Split LB: `ghcr.io/andimarafioti/s2s-load-balancer:sha-246fdc4673d9d7697a71cac889b8a8f3167ae971`.
+- Managed CPU pipelines: `ghcr.io/andimarafioti/s2s-pipeline:sha-f42e04364a9517e063dfd8fb298234e627f90c4d`.
+- Split LB: `ghcr.io/andimarafioti/s2s-load-balancer:sha-f42e04364a9517e063dfd8fb298234e627f90c4d`.
 - STT/TTS retain their validated `sha-3c6f1d904b95f1a700696b57397d8dc5a82ef244` service images.
 - New Gemma replicas pin `vllm/vllm-openai@sha256:383e409fc7695d6e40cd40d452f3ec277a3d1c462d7b1510034768d26f2cd397`, preserving model revision, 128k context, 256 sequences, NVFP4, and MTP.
 
