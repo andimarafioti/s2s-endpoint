@@ -300,6 +300,15 @@ If the GPU images have not yet been redeployed with the timing middleware, the
 proxy and backend-round-trip metrics still work, while GPU-service timing is
 shown as unavailable with zero reporting coverage.
 
+Managed pipeline workers also inspect terminal Realtime `response.done` events
+after forwarding them to the client. When speech-to-speech supplies the reserved
+`speech_to_speech.turn_latency` metadata, the worker reports its raw server-side
+STT, full LLM generation, TTS first-audio, end-to-end first-audio, and MLX lock
+wait measurements to the load balancer. The dashboard presents these separately
+from proxy timings because their boundaries differ. Reports are authenticated
+with the existing session token, deduplicated by session and response key, kept
+in a bounded process-local window, and reset when the load balancer restarts.
+
 Build and deploy the CPU-only pipeline after both speech services are running:
 
 ```bash
@@ -491,6 +500,8 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - `POST /session` request counts, authentication rejections, allocation
   successes/failures, and connect/disconnect events
 - conversation starts/completions plus average and max completed conversation duration
+- pipeline turn latency for STT, full LLM generation, TTS first audio, and
+  speech-end-to-first-server-audio, with terminal response outcomes
 - distinct verified Hugging Face users, token fingerprints, anonymous network
   fingerprints, and client-reported robot fingerprints
 - a per-requester leaderboard with allocation and connection outcomes, traffic

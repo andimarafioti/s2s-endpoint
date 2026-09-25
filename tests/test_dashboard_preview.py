@@ -567,6 +567,41 @@ class LoadBalancerPreviewModeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403)
 
+    def test_turn_latency_callback_requires_compute_authentication(self):
+        module = self._import_load_balancer({"LB_CALLBACK_AUTH_TOKEN": "callback-secret"})
+        client = TestClient(module.app)
+        payload = {
+            "session_token": "session-token",
+            "event": "turn_latency",
+            "latency": {
+                "version": 1,
+                "turn_id": "turn_1",
+                "turn_revision": 0,
+                "response_key": "response_1",
+                "status": "completed",
+                "stt_s": 0.18,
+                "llm_s": 1.24,
+                "tts_ttfa_s": 0.12,
+                "e2e_s": 1.61,
+                "mlx_lock_wait_s": 0.0,
+            },
+        }
+        url = "/internal/sessions/session-123/event"
+
+        self.assertEqual(client.post(url, json=payload).status_code, 401)
+        self.assertEqual(
+            client.post(url, headers={"Authorization": "Bearer hf_user_token"}, json=payload).status_code,
+            403,
+        )
+        self.assertEqual(
+            client.post(
+                url,
+                headers={"X-Reachy-Mini-Callback-Authorization": "Bearer callback-secret"},
+                json=payload,
+            ).status_code,
+            404,
+        )
+
     def _import_load_balancer(self, env):
         return load_balancer_fixture({"LB_ADMIN_AUTH_TOKEN": "", **env})
 
@@ -1199,6 +1234,61 @@ class LoadBalancerSessionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_dashboard.session_events, ["connected", "connected"])
         self.assertEqual(fake_dashboard.connected_requesters, [fake_dashboard.requesters[0]])
 
+    async def test_turn_latency_callback_records_structured_pipeline_measurement(self):
+        module = self._import_load_balancer()
+        fake_dashboard = FakeDashboard()
+        module.dependencies.dashboard = fake_dashboard
+        module.dependencies.session_manager = FakeSessionManager(allocation_wait_ms=40)
+        await session_event(
+            module.runtime,
+            "session-123",
+            {"session_token": "session-token", "event": "connected"},
+        )
+        latency = {
+            "version": 1,
+            "turn_id": "turn_1",
+            "turn_revision": 0,
+            "response_key": "response_1",
+            "status": "completed",
+            "stt_s": 0.18,
+            "llm_s": 1.24,
+            "tts_ttfa_s": 0.12,
+            "e2e_s": 1.61,
+            "mlx_lock_wait_s": 0.0,
+        }
+
+        response = await session_event(
+            module.runtime,
+            "session-123",
+            {"session_token": "session-token", "event": "turn_latency", "latency": latency},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(json.loads(response.body)["recorded"])
+        self.assertEqual(len(fake_dashboard.pipeline_turn_latencies), 1)
+        session_id, recorded = fake_dashboard.pipeline_turn_latencies[0]
+        self.assertEqual(session_id, "session-123")
+        self.assertEqual(recorded.to_payload(), latency)
+        self.assertEqual(fake_dashboard.session_events, ["connected"])
+
+    async def test_turn_latency_callback_rejects_invalid_measurement(self):
+        module = self._import_load_balancer()
+        module.dependencies.dashboard = FakeDashboard()
+        module.dependencies.session_manager = FakeSessionManager(allocation_wait_ms=40)
+
+        with self.assertRaises(HTTPException) as raised:
+            await session_event(
+                module.runtime,
+                "session-123",
+                {
+                    "session_token": "session-token",
+                    "event": "turn_latency",
+                    "latency": {"version": 1},
+                },
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+
     async def test_proxy_usage_attributes_token_first_then_falls_back_to_ip(self):
         module = self._import_load_balancer({"LB_CALLBACK_AUTH_TOKEN": "callback-secret"})
         fake_dashboard = FakeDashboard()
@@ -1390,6 +1480,7 @@ class FakeDashboard:
         self.disconnected_requesters = []
         self.identity_updates = []
         self.llm_proxy_requests = []
+        self.pipeline_turn_latencies = []
 
     async def record_session_request(self, requester=None):
         self.calls.append("request")
@@ -1431,6 +1522,10 @@ class FakeDashboard:
     async def record_llm_proxy_request(self, *, reason, actor_id, metadata):
         self.llm_proxy_requests.append((reason, actor_id, metadata))
 
+    async def record_pipeline_turn_latency(self, session_id, latency):
+        self.pipeline_turn_latencies.append((session_id, latency))
+        return True
+
 
 class FakeSessionManager:
     def __init__(self, *, allocation_wait_ms: int = 1200, waited_for_capacity: bool = True):
@@ -1469,7 +1564,8 @@ class FakeSessionManager:
         return {
             "status": "ok",
             "session_id": session_id,
-            "state": "connected" if event == "connected" else "released",
+            "state": "released" if event == "disconnected" else "connected",
+            "event": event,
             "release_reason": "client_disconnected" if event == "disconnected" else None,
             "conversation_counted": event == "disconnected" and was_connected,
             "conversation_duration_s": (6.0 if event == "disconnected" and was_connected else None),

@@ -35,6 +35,7 @@ from app.llm_proxy_usage import (
     LLM_PROXY_CLIENT_IP_MAX_LENGTH,
     LLM_PROXY_REASONS,
 )
+from app.pipeline_turn_latency import TURN_LATENCY_EVENT, PipelineTurnLatency
 from app.requester_identity import (
     RequesterIdentity,
     RequesterIdentityResolver,
@@ -1262,6 +1263,13 @@ async def session_event(
     if not event:
         raise HTTPException(status_code=400, detail="event is required")
 
+    turn_latency = None
+    if event == TURN_LATENCY_EVENT:
+        try:
+            turn_latency = PipelineTurnLatency.from_payload(payload.get("latency"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
         result = await dependencies.session_manager.handle_event(session_id, session_token, event)
     except KeyError:
@@ -1272,6 +1280,10 @@ async def session_event(
         raise HTTPException(status_code=404, detail="Unknown session id") from None
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    if turn_latency is not None:
+        recorded = await dependencies.dashboard.record_pipeline_turn_latency(session_id, turn_latency)
+        return JSONResponse({**result, "recorded": recorded})
 
     await dependencies.dashboard.record_session_event(
         event,
@@ -1536,7 +1548,9 @@ def create_app(
     async def queue_leave_route(queue_id: str):
         return await queue_leave(runtime, queue_id)
 
-    async def session_event_route(session_id: str, payload: dict[str, Any]):
+    async def session_event_route(session_id: str, payload: dict[str, Any], request: Request):
+        if payload.get("event") == TURN_LATENCY_EVENT:
+            require_callback_auth(runtime, request)
         return await session_event(runtime, session_id, payload)
 
     async def llm_proxy_usage_route(request: Request):

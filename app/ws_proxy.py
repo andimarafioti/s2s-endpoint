@@ -18,6 +18,7 @@ class LeaseLike(Protocol):
 AcquireLease = Callable[[float], Awaitable[LeaseLike]]
 ReleaseLease = Callable[[object], Awaitable[None]]
 DescribeLease = Callable[[LeaseLike], str]
+ObserveUpstreamText = Callable[[str], None]
 
 
 def _select_client_subprotocol(client_ws: WebSocket) -> Optional[str]:
@@ -36,6 +37,7 @@ async def proxy_websocket(
     no_capacity_log: str,
     additional_headers: Optional[list[tuple[str, str]]] = None,
     on_lease_acquired: Optional[Callable[[], Awaitable[None]]] = None,
+    on_upstream_text: Optional[ObserveUpstreamText] = None,
 ) -> bool:
     """Proxy a client websocket to an upstream pipeline slot.
 
@@ -105,7 +107,7 @@ async def proxy_websocket(
             ) as upstream_ws:
                 await asyncio.gather(
                     _client_to_upstream(client_ws, upstream_ws),
-                    _upstream_to_client(client_ws, upstream_ws),
+                    _upstream_to_client(client_ws, upstream_ws, on_upstream_text=on_upstream_text),
                 )
         except WebSocketDisconnect:
             logger.info("Client websocket disconnected")
@@ -140,10 +142,22 @@ async def _client_to_upstream(client_ws: WebSocket, upstream_ws) -> None:
             await upstream_ws.send(message["text"])
 
 
-async def _upstream_to_client(client_ws: WebSocket, upstream_ws) -> None:
+async def _upstream_to_client(
+    client_ws: WebSocket,
+    upstream_ws,
+    *,
+    on_upstream_text: Optional[ObserveUpstreamText] = None,
+) -> None:
     while True:
         msg = await upstream_ws.recv()
         if isinstance(msg, bytes):
             await client_ws.send_bytes(msg)
         else:
             await client_ws.send_text(msg)
+            if on_upstream_text is not None:
+                try:
+                    on_upstream_text(msg)
+                except Exception:
+                    # Observability must never interrupt or delay the realtime
+                    # stream after the event has already reached the client.
+                    logger.exception("Upstream websocket observer failed")

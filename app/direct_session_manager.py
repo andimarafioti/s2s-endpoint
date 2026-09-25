@@ -8,6 +8,7 @@ from typing import Optional
 
 from app.app_utils import cancel_and_await, elapsed_ms, http_base_url_from_ws_url
 from app.endpoint_pool_router import EndpointLease, EndpointPoolRouter
+from app.pipeline_turn_latency import TURN_LATENCY_EVENT
 from app.session_manager import SessionReleaseHandler, TicketExpiredHandler
 from app.session_tokens import attach_session_token, create_session_token, verify_session_token
 
@@ -336,8 +337,8 @@ class DirectSessionManager:
         if payload.get("sid") != session_id:
             raise ValueError("session token does not match session id")
 
-        if event not in {"connected", "disconnected"}:
-            raise ValueError("event must be 'connected' or 'disconnected'")
+        if event not in {"connected", "disconnected", TURN_LATENCY_EVENT}:
+            raise ValueError("event must be 'connected', 'disconnected', or 'turn_latency'")
 
         session_to_release: Optional[DirectSession] = None
         connected_session: Optional[DirectSession] = None
@@ -349,6 +350,15 @@ class DirectSessionManager:
             if session.lease.ws_url != payload.get("ws_url"):
                 raise ValueError("session token does not match reserved endpoint")
 
+            if event == TURN_LATENCY_EVENT:
+                if not session.connected:
+                    raise ValueError("turn latency requires a connected session")
+                return {
+                    "status": "ok",
+                    "session_id": session_id,
+                    "state": "connected",
+                    "event": TURN_LATENCY_EVENT,
+                }
             if event == "connected":
                 was_connected = session.connected
                 session.connected = True

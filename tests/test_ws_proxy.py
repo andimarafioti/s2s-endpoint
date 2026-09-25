@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -5,7 +6,8 @@ from unittest.mock import AsyncMock, patch
 from websockets.exceptions import ConnectionClosed
 
 from app import compute_app as compute_main
-from app.ws_proxy import proxy_websocket
+from app.pipeline_turn_latency import TURN_LATENCY_METADATA_KEY
+from app.ws_proxy import _upstream_to_client, proxy_websocket
 
 
 class FakeClientWS:
@@ -183,6 +185,27 @@ class ProxyWebsocketLeaseHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(released, [7])
         self.assertEqual(client.close_calls[-1][0], 1011)
 
+    async def test_forwards_upstream_text_before_observing_it(self):
+        events = []
+
+        class Upstream:
+            async def recv(self):
+                if not events:
+                    return '{"type":"response.done"}'
+                raise ConnectionClosed(None, None)
+
+        class Client(FakeClientWS):
+            async def send_text(self, text):
+                events.append(("forwarded", text))
+
+        def observe(text):
+            events.append(("observed", text))
+
+        with self.assertRaises(ConnectionClosed):
+            await _upstream_to_client(Client(), Upstream(), on_upstream_text=observe)
+
+        self.assertEqual([event[0] for event in events], ["forwarded", "observed"])
+
 
 class ProxyWebsocketSubprotocolTests(unittest.IsolatedAsyncioTestCase):
     async def _proxy(self, client, *, capacity_available=True):
@@ -291,6 +314,50 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
         events = [call.args[2] for call in notify.await_args_list]
         self.assertEqual(events, ["connected", "disconnected"])
 
+    async def test_reports_terminal_turn_latency_between_session_events(self):
+        client = FakeClientWS()
+        notify = AsyncMock()
+        latency = {
+            "version": 1,
+            "turn_id": "turn_1",
+            "turn_revision": 0,
+            "response_key": "response_1",
+            "status": "completed",
+            "stt_s": 0.18,
+            "llm_s": 1.24,
+            "tts_ttfa_s": 0.12,
+            "e2e_s": 1.61,
+            "mlx_lock_wait_s": 0.0,
+        }
+
+        async def proxy(client_ws, **kwargs):
+            await kwargs["on_lease_acquired"]()
+            event = {
+                "type": "response.done",
+                "response": {"metadata": {TURN_LATENCY_METADATA_KEY: json.dumps(latency)}},
+            }
+            await client_ws.send_text(json.dumps(event))
+            kwargs["on_upstream_text"](json.dumps(event))
+            return True
+
+        dependencies = _dependencies(SimpleNamespace(release=AsyncMock()), notify)
+        dependencies = compute_main.ComputeDependencies(
+            session_router=dependencies.session_router,
+            connected_llm_fingerprints=dependencies.connected_llm_fingerprints,
+            llm_rate_limiter=dependencies.llm_rate_limiter,
+            http_get_json=dependencies.http_get_json,
+            notify_lb_session_event=notify,
+            proxy_websocket=proxy,
+        )
+        with patch.object(compute_main, "_get_session_payload", return_value=self._payload()):
+            await compute_main.websocket_proxy(client, self._settings(), dependencies)
+
+        self.assertEqual(
+            [call.args[2] for call in notify.await_args_list], ["connected", "turn_latency", "disconnected"]
+        )
+        self.assertEqual(notify.await_args_list[1].kwargs["details"], {"latency": latency})
+        self.assertTrue(any('"type": "response.done"' in item for item in client.sent))
+
     async def test_connected_notify_failure_still_attempts_release_notification(self):
         # If the connected callback failed, the LB may or may not have
         # registered the session; a best-effort disconnected keeps a possibly
@@ -345,6 +412,32 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NotifyLbRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_includes_callback_details_without_allowing_identity_override(self):
+        posted = []
+
+        await compute_main._notify_lb_session_event(
+            "https://lb.example/internal/sessions/abc/event",
+            "token-abc",
+            "turn_latency",
+            post_json=lambda url, payload: posted.append(payload),
+            default_backoff_s=0,
+            details={"latency": {"version": 1}},
+        )
+
+        self.assertEqual(
+            posted,
+            [{"session_token": "token-abc", "event": "turn_latency", "latency": {"version": 1}}],
+        )
+        with self.assertRaisesRegex(ValueError, "cannot replace"):
+            await compute_main._notify_lb_session_event(
+                "https://lb.example/internal/sessions/abc/event",
+                "token-abc",
+                "turn_latency",
+                post_json=lambda url, payload: None,
+                default_backoff_s=0,
+                details={"event": "disconnected"},
+            )
+
     async def test_retries_until_success(self):
         calls = []
 
