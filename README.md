@@ -171,13 +171,15 @@ The same proxy image is configured as STT, TTS, or LLM by environment. STT
 accounts for work in five-second audio equivalents; TTS and LLM account for
 concurrent calls. The initial operating targets are 96 STT work units, 8 TTS
 calls, and 64 LLM generations per worker. The LLM latency target is 500 ms to
-first token, based on the Gemma 4 26B-A4B NVFP4 RTX PRO 6000 curve. These are
+the first non-empty upstream response chunk, based on the Gemma 4 26B-A4B NVFP4
+RTX PRO 6000 curve. This proxy measurement is not a model-token boundary; the
+pipeline reports its first non-whitespace text delta separately. These are
 soft routing targets and do not reject excess work. When every healthy worker
 is above target, new calls still go to the best available worker. Routing
 combines current work with an EWMA latency penalty. TTS and LLM readiness each
 include a real short inference. Retries move to another worker only before the
-first audio/token reaches the caller, and cancellation closes the upstream
-response and releases its reservation.
+first audio or upstream response chunk reaches the caller, and cancellation
+closes the upstream response and releases its reservation.
 
 Create the LLM proxy explicitly after the Gemma workers exist. The tested RTX
 PRO 6000 endpoint is in AWS `us-east-2`, but Hugging Face currently offers no
@@ -264,8 +266,9 @@ Worker phases, actions, active work, target work, and lifecycle errors appear in
 both proxy health/metrics and the load-balancer dashboard. Worker rows also show
 recent weighted latency (EWMA), its configured target, and whether the sample is
 too old for scaling. STT uses real-time factor (transcription seconds per second
-of input audio); TTS and LLM use time to first audio/token in milliseconds. This
-per-worker average is independent of the dashboard's selected percentile window.
+of input audio); TTS uses time to first audio and LLM uses time to the first
+non-empty upstream response chunk, both in milliseconds. This per-worker average
+is independent of the dashboard's selected percentile window.
 STT requests with unknown audio duration still release their work reservations,
 but do not update the latency average or its freshness. Set
 `SPEECH_WORKER_MIN_WARM=2` when immediate single-worker failover is worth the
@@ -506,8 +509,9 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - `POST /session` request counts, authentication rejections, allocation
   successes/failures, and connect/disconnect events
 - conversation starts/completions plus average and max completed conversation duration
-- pipeline turn latency for STT, full LLM generation, TTS first audio, and
-  speech-end-to-first-server-audio, with terminal response outcomes
+- pipeline turn latency for STT, the first non-whitespace LLM text delta, full
+  LLM generation, TTS first audio, and speech-end-to-first-server-audio, with
+  terminal response outcomes
 - distinct verified Hugging Face users, token fingerprints, anonymous network
   fingerprints, and client-reported robot fingerprints
 - a per-requester leaderboard with allocation and connection outcomes, traffic

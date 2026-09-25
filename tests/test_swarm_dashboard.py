@@ -327,6 +327,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
                 "response_key": "response_1",
                 "status": "completed",
                 "stt_s": 0.2,
+                "llm_ttft_s": 0.12,
                 "llm_s": 1.0,
                 "tts_ttfa_s": 0.3,
                 "e2e_s": 1.5,
@@ -340,6 +341,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         telemetry = payload["pipeline_turn_latency"]
         self.assertEqual(telemetry["responses"]["window"], 1)
         self.assertEqual(telemetry["latency_ms"]["stt"]["p50"], 200.0)
+        self.assertEqual(telemetry["latency_ms"]["llm_ttft"]["p50"], 120.0)
         self.assertEqual(telemetry["latency_ms"]["e2e"]["p95"], 1500.0)
 
     async def test_empty_minute_point_uses_history_bucket_shape(self):
@@ -570,7 +572,8 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("renderSpeechLatency", html)
         self.assertIn("transcription: 'transcription'", html)
         self.assertIn("first_audio: 'first audio'", html)
-        self.assertIn("first_token: 'first token'", html)
+        self.assertIn("first_token: 'first upstream chunk'", html)
+        self.assertIn("llm_ttft: 'LLM first text'", html)
         self.assertIn("phaseLabels[entry.phase]", html)
         self.assertIn("renderRollingChartCards();", html)
 

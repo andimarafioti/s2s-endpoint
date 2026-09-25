@@ -13,7 +13,7 @@ TURN_LATENCY_METADATA_KEY = "speech_to_speech.turn_latency"
 TURN_LATENCY_EVENT = "turn_latency"
 TurnLatencyStatus = Literal["completed", "cancelled", "failed", "incomplete"]
 _STATUSES = {"completed", "cancelled", "failed", "incomplete"}
-_LATENCY_FIELDS = ("stt_s", "llm_s", "tts_ttfa_s", "e2e_s", "mlx_lock_wait_s")
+_LATENCY_FIELDS = ("stt_s", "llm_ttft_s", "llm_s", "tts_ttfa_s", "e2e_s", "mlx_lock_wait_s")
 
 
 def _required_text(payload: dict[str, object], key: str) -> str:
@@ -43,6 +43,7 @@ class PipelineTurnLatency:
     response_key: str
     status: TurnLatencyStatus
     stt_s: float | None
+    llm_ttft_s: float | None
     llm_s: float | None
     tts_ttfa_s: float | None
     e2e_s: float | None

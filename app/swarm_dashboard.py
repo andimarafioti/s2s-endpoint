@@ -1115,7 +1115,8 @@ __REQUESTER_DASHBOARD_MARKUP__
         <h2>Conversation Turn Latency</h2>
         <div id="pipeline-turn-latency"></div>
         <div class="footer-note">
-          STT is final transcription time, LLM is full generation time, TTS first audio is measured at the
+          STT is final transcription time, LLM first text ends at the first non-empty provider text delta,
+          LLM full generation ends when the provider stream completes, TTS first audio is measured at the
           provider's first audio chunk, and end to end runs from speech stop to the first playable server audio block.
           These terminal response measurements are reported by the pipeline and do not include browser playback buffering.
         </div>
@@ -1375,6 +1376,7 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
       const latency = telemetry.latency_ms || {};
       const labels = {
         stt: 'STT final transcription',
+        llm_ttft: 'LLM first text',
         llm: 'LLM full generation',
         tts_ttfa: 'TTS provider first audio',
         e2e: 'Speech end → first server audio',
@@ -1421,7 +1423,7 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
       const phaseLabels = {
         transcription: 'transcription',
         first_audio: 'first audio',
-        first_token: 'first token',
+        first_token: 'first upstream chunk',
       };
       target.innerHTML = `<div class="speech-latency-grid">${['stt', 'tts', 'llm'].map((service) => {
         const entry = (telemetry.services || {})[service];
@@ -1453,11 +1455,11 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
         };
         const ewmaExplanation = service === 'stt'
           ? 'Recent weighted average of transcription time divided by input audio duration. Lower is faster. Unknown-duration requests are excluded.'
-          : `Recent weighted average of time to ${service === 'tts' ? 'first audio' : 'first token'}. Lower is faster.`;
+          : `Recent weighted average of time to ${service === 'tts' ? 'first audio' : 'the first upstream response chunk'}. Lower is faster.`;
         const workers = fleet && fleet.enabled ? (fleet.workers || []).map(worker => {
           const stale = worker.latency_age_s != null && worker.latency_age_s > (fleet.settings || {}).latency_max_age_s;
           return `<div class="footer-note"><strong>${htmlEscape(worker.name)}</strong> · ${htmlEscape(worker.phase)} · ${htmlEscape(worker.active_requests)} active · work ${htmlEscape(worker.active_work)}/${htmlEscape(worker.target_work)}${worker.reason ? ` · ${htmlEscape(worker.reason)}` : ''}${worker.last_error ? ` · ${htmlEscape(worker.last_error)}` : ''}
-            <div title="${htmlEscape(ewmaExplanation)}">${service === 'stt' ? 'Transcription' : (service === 'tts' ? 'First audio' : 'First token')} EWMA: <span class="mono">${htmlEscape(formatEwma(worker.ewma_latency))}</span> · target <span class="mono">${htmlEscape(formatEwma(fleet.latency_target))}</span>${stale ? ' · stale (excluded from scaling)' : ''}</div>
+            <div title="${htmlEscape(ewmaExplanation)}">${service === 'stt' ? 'Transcription' : (service === 'tts' ? 'First audio' : 'First upstream chunk')} EWMA: <span class="mono">${htmlEscape(formatEwma(worker.ewma_latency))}</span> · target <span class="mono">${htmlEscape(formatEwma(fleet.latency_target))}</span>${stale ? ' · stale (excluded from scaling)' : ''}</div>
           </div>`;
         }).join('') : '';
         return `<div class="speech-latency-service">

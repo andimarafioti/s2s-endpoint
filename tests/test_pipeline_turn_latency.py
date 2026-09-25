@@ -17,6 +17,7 @@ def _payload(**overrides):
         "response_key": "response_4",
         "status": "completed",
         "stt_s": 0.181284,
+        "llm_ttft_s": 0.214567,
         "llm_s": 1.241907,
         "tts_ttfa_s": 0.121775,
         "e2e_s": 1.613482,
@@ -44,6 +45,14 @@ class PipelineTurnLatencyParsingTests(unittest.TestCase):
         self.assertIsNone(extract_pipeline_turn_latency('{"type":"response.created"}'))
         self.assertIsNone(extract_pipeline_turn_latency('{"type":"response.done","response":{"metadata":null}}'))
         self.assertIsNone(extract_pipeline_turn_latency("not json"))
+
+    def test_accepts_v1_metadata_without_additive_llm_ttft(self):
+        payload = _payload()
+        payload.pop("llm_ttft_s")
+
+        latency = PipelineTurnLatency.from_payload(payload)
+
+        self.assertIsNone(latency.llm_ttft_s)
 
     def test_rejects_invalid_server_measurement(self):
         with self.assertRaisesRegex(ValueError, "finite non-negative"):
@@ -82,6 +91,7 @@ class PipelineTurnLatencyMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["responses"]["failed"], 1)
         self.assertEqual(snapshot["responses"]["duplicates_ignored_lifetime"], 1)
         self.assertEqual(snapshot["latency_ms"]["stt"]["p50"], 240.642)
+        self.assertEqual(snapshot["latency_ms"]["llm_ttft"]["p50"], 214.567)
         self.assertEqual(snapshot["latency_ms"]["e2e"]["n"], 1)
         self.assertEqual(snapshot["latency_ms"]["e2e"]["p95"], 1613.482)
 

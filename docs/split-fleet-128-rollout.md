@@ -85,10 +85,12 @@ and the 32-slot warm floor was restored. Production `reachy-s2s-01` through
 `-32` were not changed.
 
 The dashboard now has a separate **Conversation Turn Latency** panel. It reports
-raw server-side final STT, full LLM generation, TTS time to first provider audio,
-speech-end to first server audio, and MLX lock wait. These values intentionally
-remain separate from the proxy metrics because their measurement boundaries are
-different.
+raw server-side final STT, first non-whitespace LLM text delta, full LLM
+generation, TTS time to first provider audio, speech-end to first server audio,
+and MLX lock wait. These values intentionally remain separate from the proxy
+metrics because their measurement boundaries are different. The LLM proxy's
+"first upstream chunk" can be protocol-only and must not be interpreted as first
+model text.
 
 One synthetic turn through the public split load balancer completed successfully
 and populated the new panel. The server reported 212 ms STT, 575 ms full LLM,

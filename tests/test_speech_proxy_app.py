@@ -561,7 +561,7 @@ class ProxyCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["active_work"], 0)
         self.assertEqual(snapshot["cancellations"], 1)
 
-    async def test_llm_cancellation_before_first_token_releases_capacity(self):
+    async def test_llm_cancellation_before_first_upstream_chunk_releases_capacity(self):
         snapshot = await self._cancel_inflight_request("llm")
 
         self.assertEqual(snapshot["active_work"], 0)

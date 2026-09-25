@@ -324,6 +324,7 @@ class ComputeSessionEventOrderingTests(unittest.IsolatedAsyncioTestCase):
             "response_key": "response_1",
             "status": "completed",
             "stt_s": 0.18,
+            "llm_ttft_s": 0.21,
             "llm_s": 1.24,
             "tts_ttfa_s": 0.12,
             "e2e_s": 1.61,
