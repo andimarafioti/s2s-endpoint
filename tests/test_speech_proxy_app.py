@@ -5,6 +5,7 @@ import json
 import unittest
 import wave
 
+import anyio
 import httpx
 from fastapi.testclient import TestClient
 
@@ -470,6 +471,22 @@ class _FakeLease:
 
 
 class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_failure_still_releases_capacity(self):
+        class BrokenClose:
+            async def aclose(self):
+                raise httpx.CloseError("close failed")
+
+        async def rest():
+            yield b"second"
+
+        lease = _FakeLease()
+        stream = _proxy_stream(b"first", rest(), BrokenClose(), lease, 0.2)
+        await anext(stream)
+        with self.assertRaises(httpx.CloseError):
+            await stream.aclose()
+        self.assertEqual(len(lease.releases), 1)
+        self.assertTrue(lease.releases[0]["cancelled"])
+
     async def test_closing_downstream_stream_releases_backend_as_cancelled(self):
         async def rest():
             yield b"second"
@@ -506,6 +523,80 @@ class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProxyCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disconnect_during_downstream_send_closes_upstream_and_releases_capacity(self):
+        for service, path in (
+            ("tts", "/v1/audio/speech"),
+            ("llm", "/v1/chat/completions"),
+            ("llm", "/v1/responses"),
+        ):
+            for blocked_message in ("http.response.start", "http.response.body"):
+                with self.subTest(service=service, path=path, blocked_message=blocked_message):
+                    disconnected = asyncio.Event()
+                    body_delivered = False
+                    attempts = []
+
+                    class Body(httpx.AsyncByteStream):
+                        closed = False
+
+                        async def __aiter__(self):
+                            yield b"first"
+                            await asyncio.Event().wait()
+
+                        async def aclose(self):
+                            # Real transports may yield while closing. Cleanup
+                            # must survive the response's cancelled task group.
+                            await anyio.sleep(0)
+                            self.closed = True
+
+                    body = Body()
+
+                    async def handler(request):
+                        if request.url.path == "/health":
+                            return httpx.Response(200)
+                        attempts.append(request.url.host)
+                        return httpx.Response(200, stream=body)
+
+                    proxy_settings = settings(service, count=2)
+                    deps = dependencies(proxy_settings, handler)
+                    self.addAsyncCleanup(deps.stop)
+                    await deps.pool.refresh_health()
+                    app = create_app(proxy_settings, deps)
+
+                    async def receive():
+                        nonlocal body_delivered
+                        if not body_delivered:
+                            body_delivered = True
+                            return {"type": "http.request", "body": b"{}", "more_body": False}
+                        await disconnected.wait()
+                        return {"type": "http.disconnect"}
+
+                    async def send(message):
+                        if message["type"] == blocked_message:
+                            disconnected.set()
+                            await asyncio.Event().wait()
+
+                    scope = {
+                        "type": "http",
+                        "asgi": {"version": "3.0", "spec_version": "2.3"},
+                        "http_version": "1.1",
+                        "method": "POST",
+                        "scheme": "http",
+                        "path": path,
+                        "query_string": b"",
+                        "headers": [(b"content-type", b"application/json")],
+                    }
+                    await asyncio.wait_for(app(scope, receive, send), 1)
+                    # No garbage collection or extra event-loop turns: the
+                    # response itself must finish cleanup before returning.
+                    self.assertTrue(body.closed)
+                    snapshot = (await deps.pool.snapshots())[0]
+                    self.assertEqual(snapshot.active_requests, 0)
+                    self.assertEqual(snapshot.active_work, 0)
+                    self.assertEqual(snapshot.cancellations, 1)
+                    self.assertEqual(snapshot.successes, 0)
+                    self.assertEqual(snapshot.errors, 0)
+                    self.assertEqual(attempts, ["backend-1.example"])
+
     async def test_http_disconnect_cancels_upstream_waits_without_retry(self):
         for service, path in (
             ("stt", "/v1/audio/transcriptions"),
