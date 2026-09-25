@@ -498,11 +498,6 @@ async def _proxy_stream(
             await lease.release(success=False, cancelled=True, latency=routing_latency)
 
 
-# Retain the original test/helper name while sharing the lifecycle implementation
-# with streamed LLM responses.
-_tts_stream = _proxy_stream
-
-
 async def _proxy_streaming_json(
     request: Request,
     path: str,

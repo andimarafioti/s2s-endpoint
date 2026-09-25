@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from app.speech_proxy_app import (
     SpeechProxyDependencies,
     SpeechProxySettings,
-    _tts_stream,
+    _proxy_stream,
     create_app,
 )
 from app.speech_proxy_router import SpeechBackendConfig, SpeechBackendPool
@@ -477,7 +477,7 @@ class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         response = _FakeResponse()
         lease = _FakeLease()
-        stream = _tts_stream(b"first", rest(), response, lease, 0.2)
+        stream = _proxy_stream(b"first", rest(), response, lease, 0.2)
 
         self.assertEqual(await anext(stream), b"first")
         await stream.aclose()
@@ -493,7 +493,7 @@ class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         response = _FakeResponse()
         lease = _FakeLease()
-        stream = _tts_stream(b"first", rest(), response, lease, 0.2)
+        stream = _proxy_stream(b"first", rest(), response, lease, 0.2)
 
         self.assertEqual(await anext(stream), b"first")
         with self.assertRaises(httpx.ReadError):
