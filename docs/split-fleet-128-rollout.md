@@ -74,7 +74,7 @@ registered workers remained available for autoscaling.
 ## Multilingual TTS language routing
 
 The managed CPU pipeline now defaults `TTS_LANGUAGE` to `Auto`. In the pinned
-speech-to-speech runtime, final STT language metadata already travels through the
+speech-to-speech runtime, final STT language metadata can travel through the
 LLM output into each TTS input, but the OpenAI-compatible TTS handler previously
 ignored it. The pipeline image applies a small patch at build time: with
 `TTS_LANGUAGE=Auto`, supported Qwen3-TTS language codes and names are sent as the
@@ -82,6 +82,11 @@ per-turn language (`de` → `German`, `fr` → `French`, etc.). Missing or unsup
 metadata stays `Auto`, allowing Qwen to inspect the response text. An explicitly
 named `TTS_LANGUAGE` remains a fixed override. The TTS proxy's warmup language is
 separate and does not set conversation language.
+
+The deployed Qwen3-ASR service currently returns text without a language field in
+its `json` response, and rejects `verbose_json` for this model. The live split
+path therefore uses Qwen3-TTS `Auto` for these turns. If the STT service later
+reports a language, the same image will pass recognized values explicitly.
 
 This fixes the English language hint previously sent with non-English replies.
 The default `aiden` voice is still an English-native Qwen preset, so language
