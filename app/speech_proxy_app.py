@@ -585,7 +585,11 @@ async def _proxy_streaming_json(
                 first_result_latency = time.monotonic() - started
                 await trace.record("success")
                 downstream_response = _ProxyStreamingResponse(
-                    first_chunk, iterator, response, lease, first_result_latency,
+                    first_chunk,
+                    iterator,
+                    response,
+                    lease,
+                    first_result_latency,
                     headers=_traced_response_headers(response, trace),
                 )
                 stream_owns_response = True
