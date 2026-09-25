@@ -177,6 +177,11 @@ class WorkerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.now += 100
         await self.tick()
         self.assertEqual(self.controller.calls, [])
+        telemetry = await self.lifecycle.snapshot()
+        self.assertEqual(telemetry["latency_target"], 0.5)
+        self.assertEqual(telemetry["workers"][0]["ewma_latency"], 2)
+        self.assertGreaterEqual(telemetry["workers"][0]["latency_age_s"], 100)
+        self.assertIsNone(telemetry["workers"][1]["latency_age_s"])
 
     async def test_idle_scale_down_preserves_warm_floor(self):
         await self.make_fleet(("running", "running", "running"))
