@@ -87,7 +87,7 @@ def build_config(environ: Mapping[str, str]) -> dict[str, object]:
             "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         ),
         "openai_tts_voice": environ.get("TTS_VOICE", "aiden"),
-        "openai_tts_language": environ.get("TTS_LANGUAGE", "English"),
+        "openai_tts_language": environ.get("TTS_LANGUAGE", "Auto"),
         "openai_tts_response_format": "pcm",
         "openai_tts_sample_rate": 24000,
         "openai_tts_stream": True,

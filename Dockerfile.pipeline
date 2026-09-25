@@ -30,6 +30,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --filter=blob:none "${S2S_REPO_URL}" "${S2S_REPO_DIR}" && \
     git -C "${S2S_REPO_DIR}" checkout "${S2S_REF}"
 
+# Forward the detected turn language to Qwen TTS while the upstream handler
+# still treats its language setting as a fixed value.
+COPY patches/openai-tts-turn-language.patch /tmp/openai-tts-turn-language.patch
+RUN git -C "${S2S_REPO_DIR}" apply /tmp/openai-tts-turn-language.patch
+
 # Install CPU PyTorch explicitly so PyPI does not pull CUDA runtime packages.
 # The remaining list is the subset needed by the remote STT/LLM/TTS pipeline;
 # local speech model backends are intentionally absent from this image.

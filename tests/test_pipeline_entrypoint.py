@@ -72,8 +72,21 @@ class PipelineEntrypointTests(unittest.TestCase):
         self.assertEqual(config["tts"], "openai")
         self.assertEqual(config["openai_tts_base_url"], "https://tts.example/v1")
         self.assertEqual(config["openai_tts_api_key"], "hf-secret")
+        self.assertEqual(config["openai_tts_language"], "Auto")
         self.assertFalse(config["enable_live_transcription"])
         self.assertEqual(config["stream_batch_sentences"], 3)
+
+    def test_build_config_allows_fixed_tts_language_override(self):
+        config = build_config(
+            {
+                "HF_TOKEN": "hf-secret",
+                "OPENAI_API_KEY": "openai-secret",
+                "STT_BASE_URL": "https://stt.example/v1",
+                "TTS_BASE_URL": "https://tts.example/v1",
+                "TTS_LANGUAGE": "German",
+            }
+        )
+        self.assertEqual(config["openai_tts_language"], "German")
 
     def test_build_config_routes_llm_to_protected_chat_completions_proxy(self):
         config = build_config(

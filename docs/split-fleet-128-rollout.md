@@ -71,6 +71,23 @@ After the capacity update, `reachy-s2s-split-lb` reported two warm workers, 32
 free slots, zero connected or pending sessions, and no router errors. The other
 registered workers remained available for autoscaling.
 
+## Multilingual TTS language routing
+
+The managed CPU pipeline now defaults `TTS_LANGUAGE` to `Auto`. In the pinned
+speech-to-speech runtime, final STT language metadata already travels through the
+LLM output into each TTS input, but the OpenAI-compatible TTS handler previously
+ignored it. The pipeline image applies a small patch at build time: with
+`TTS_LANGUAGE=Auto`, supported Qwen3-TTS language codes and names are sent as the
+per-turn language (`de` → `German`, `fr` → `French`, etc.). Missing or unsupported
+metadata stays `Auto`, allowing Qwen to inspect the response text. An explicitly
+named `TTS_LANGUAGE` remains a fixed override. The TTS proxy's warmup language is
+separate and does not set conversation language.
+
+This fixes the English language hint previously sent with non-English replies.
+The default `aiden` voice is still an English-native Qwen preset, so language
+routing alone may not remove every accent; voice quality should be checked in a
+same-text, same-voice comparison after deployment.
+
 ## Raw pipeline turn latency rollout — 2026-09-25
 
 The isolated split fleet now reports the structured terminal-response latency
