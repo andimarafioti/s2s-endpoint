@@ -6,9 +6,11 @@ import time
 import uuid
 import wave
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from typing import Any
 
+import anyio
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -395,6 +397,30 @@ def _unavailable_response(service: SpeechService) -> JSONResponse:
     )
 
 
+@asynccontextmanager
+async def _cancel_on_disconnect(request: Request):
+    """Cancel upstream waits after the request body has been consumed.
+
+    Stop reading disconnect events before handing off to StreamingResponse,
+    which owns disconnect detection once downstream streaming starts.
+    """
+    owner = asyncio.current_task()
+
+    async def watch_disconnect():
+        while True:
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
+                owner.cancel()
+                return
+
+    watcher = asyncio.create_task(watch_disconnect())
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+
+
 async def _proxy_stt(
     request: Request,
     settings: SpeechProxySettings,
@@ -415,15 +441,16 @@ async def _proxy_stt(
             started = time.monotonic()
             trace.start_upstream(lease.backend_name)
             try:
-                response = await dependencies.client.post(
-                    f"{lease.backend_url}/v1/audio/transcriptions",
-                    headers={
-                        **_backend_headers(settings),
-                        "X-Speech-Request-Id": trace.request_id,
-                    },
-                    files=multipart,
-                    timeout=settings.request_timeout_s,
-                )
+                async with _cancel_on_disconnect(request):
+                    response = await dependencies.client.post(
+                        f"{lease.backend_url}/v1/audio/transcriptions",
+                        headers={
+                            **_backend_headers(settings),
+                            "X-Speech-Request-Id": trace.request_id,
+                        },
+                        files=multipart,
+                        timeout=settings.request_timeout_s,
+                    )
             except asyncio.CancelledError:
                 trace.finish_upstream()
                 await lease.release(success=False, cancelled=True)
@@ -485,35 +512,53 @@ async def _proxy_stream(
     lease: SpeechBackendLease,
     routing_latency: float,
 ):
-    completed = False
+    outcome = {"success": False, "cancelled": True}
     try:
         yield first_chunk
         async for chunk in iterator:
             if chunk:
                 yield chunk
-        completed = True
-    except asyncio.CancelledError:
-        await lease.release(success=False, cancelled=True, latency=routing_latency)
-        raise
+        outcome = {"success": True}
     except Exception as exc:
-        await lease.release(
-            success=False,
-            latency=routing_latency,
-            retryable_failure=True,
-            error=f"{type(exc).__name__}: {exc}",
-        )
+        outcome = {
+            "success": False,
+            "retryable_failure": True,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
         raise
     finally:
-        await response.aclose()
-        if completed:
-            await lease.release(success=True, latency=routing_latency)
-        else:
-            await lease.release(success=False, cancelled=True, latency=routing_latency)
+        with anyio.CancelScope(shield=True):
+            try:
+                await response.aclose()
+            finally:
+                await lease.release(latency=routing_latency, **outcome)
 
 
-# Retain the original test/helper name while sharing the lifecycle implementation
-# with streamed LLM responses.
-_tts_stream = _proxy_stream
+class _ProxyStreamingResponse(StreamingResponse):
+    def __init__(self, first_chunk, iterator, response, lease, routing_latency, *, headers):
+        super().__init__(
+            _proxy_stream(first_chunk, iterator, response, lease, routing_latency),
+            status_code=response.status_code,
+            headers=headers,
+        )
+        self.upstream_response = response
+        self.lease = lease
+        self.routing_latency = routing_latency
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Cancellation during send() leaves the generator suspended at yield.
+            # Explicitly close it, including when no body iteration has started.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                finally:
+                    try:
+                        await self.upstream_response.aclose()
+                    finally:
+                        await self.lease.release(success=False, cancelled=True, latency=self.routing_latency)
 
 
 async def _proxy_streaming_json(
@@ -551,9 +596,13 @@ async def _proxy_streaming_json(
                     content=body,
                     timeout=settings.request_timeout_s,
                 )
-                response = await dependencies.client.send(upstream_request, stream=True)
+                async with _cancel_on_disconnect(request):
+                    response = await dependencies.client.send(upstream_request, stream=True)
+                    if 200 <= response.status_code < 300:
+                        first_chunk, iterator = await _read_first_chunk(response)
+                    else:
+                        response_body = await response.aread()
                 if not 200 <= response.status_code < 300:
-                    response_body = await response.aread()
                     trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
                     retryable = _retryable_response(response.status_code, response_body)
                     await lease.release(
@@ -571,13 +620,15 @@ async def _proxy_streaming_json(
                         response_body,
                         _traced_response_headers(response, trace),
                     )
-                first_chunk, iterator = await _read_first_chunk(response)
                 trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
                 first_result_latency = time.monotonic() - started
                 await trace.record("success")
-                downstream_response = StreamingResponse(
-                    _proxy_stream(first_chunk, iterator, response, lease, first_result_latency),
-                    status_code=response.status_code,
+                downstream_response = _ProxyStreamingResponse(
+                    first_chunk,
+                    iterator,
+                    response,
+                    lease,
+                    first_result_latency,
                     headers=_traced_response_headers(response, trace),
                 )
                 stream_owns_response = True

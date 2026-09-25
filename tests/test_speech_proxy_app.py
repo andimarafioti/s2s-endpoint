@@ -5,13 +5,14 @@ import json
 import unittest
 import wave
 
+import anyio
 import httpx
 from fastapi.testclient import TestClient
 
 from app.speech_proxy_app import (
     SpeechProxyDependencies,
     SpeechProxySettings,
-    _tts_stream,
+    _proxy_stream,
     create_app,
 )
 from app.speech_proxy_router import SpeechBackendConfig, SpeechBackendPool
@@ -344,7 +345,7 @@ class SpeechProxyApplicationTests(unittest.TestCase):
         self.assertEqual(seen[0][0:3], ("POST", "/v1/chat/completions", "Bearer backend-secret"))
         self.assertEqual(json.loads(seen[0][3]), request_body)
         self.assertEqual(metrics["service"], "llm")
-        self.assertEqual(metrics["phase"], "first_token")
+        self.assertEqual(metrics["phase"], "first_response_chunk")
         self.assertEqual(metrics["requests"]["successes"], 1)
         self.assertEqual(health["backends"][0]["active_work"], 0)
         self.assertEqual(health["backends"][0]["successes"], 1)
@@ -395,6 +396,63 @@ class SpeechProxyApplicationTests(unittest.TestCase):
         self.assertNotIn("/v1/audio/speech", llm_app.openapi()["paths"])
 
 
+class LLMStreamTimingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_response_chunk_metrics_include_metadata_before_tokens(self):
+        for path, metadata, token in (
+            (
+                "/v1/chat/completions",
+                b'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n',
+                b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+            ),
+            (
+                "/v1/responses",
+                b'event: response.created\ndata: {"type":"response.created"}\n\n',
+                b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}\n\n',
+            ),
+        ):
+            with self.subTest(path=path):
+                metadata_sent = asyncio.Event()
+                allow_token = asyncio.Event()
+
+                class Body(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        yield metadata
+                        metadata_sent.set()
+                        await allow_token.wait()
+                        yield token
+
+                async def handler(request):
+                    if request.url.path == "/health":
+                        return httpx.Response(200)
+                    return httpx.Response(200, stream=Body(), headers={"content-type": "text/event-stream"})
+
+                proxy_settings = settings("llm")
+                deps = dependencies(proxy_settings, handler)
+                self.addAsyncCleanup(deps.stop)
+                await deps.pool.refresh_health()
+                app = create_app(proxy_settings, deps)
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+                ) as client:
+                    task = asyncio.create_task(client.post(path, json={"model": "test", "stream": True}))
+                    try:
+                        await asyncio.wait_for(metadata_sent.wait(), 1)
+                        metrics = await deps.metrics.snapshot(60)
+                        self.assertEqual(metrics["phase"], "first_response_chunk")
+                        self.assertEqual(metrics["requests"]["successes"], 1)
+                        self.assertFalse(task.done(), "The token is still pending")
+                        self.assertEqual((await deps.pool.snapshots())[0].active_work, 1)
+                        allow_token.set()
+                        response = await asyncio.wait_for(task, 1)
+                        self.assertEqual(response.content, metadata + token)
+                        self.assertEqual((await deps.pool.snapshots())[0].active_work, 0)
+                        completed_metrics = await deps.metrics.snapshot(60)
+                        self.assertEqual(completed_metrics["latency_ms"], metrics["latency_ms"])
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
+
 class _FakeResponse:
     def __init__(self):
         self.closed = False
@@ -413,6 +471,22 @@ class _FakeLease:
 
 
 class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_failure_still_releases_capacity(self):
+        class BrokenClose:
+            async def aclose(self):
+                raise httpx.CloseError("close failed")
+
+        async def rest():
+            yield b"second"
+
+        lease = _FakeLease()
+        stream = _proxy_stream(b"first", rest(), BrokenClose(), lease, 0.2)
+        await anext(stream)
+        with self.assertRaises(httpx.CloseError):
+            await stream.aclose()
+        self.assertEqual(len(lease.releases), 1)
+        self.assertTrue(lease.releases[0]["cancelled"])
+
     async def test_closing_downstream_stream_releases_backend_as_cancelled(self):
         async def rest():
             yield b"second"
@@ -420,7 +494,7 @@ class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         response = _FakeResponse()
         lease = _FakeLease()
-        stream = _tts_stream(b"first", rest(), response, lease, 0.2)
+        stream = _proxy_stream(b"first", rest(), response, lease, 0.2)
 
         self.assertEqual(await anext(stream), b"first")
         await stream.aclose()
@@ -436,7 +510,7 @@ class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         response = _FakeResponse()
         lease = _FakeLease()
-        stream = _tts_stream(b"first", rest(), response, lease, 0.2)
+        stream = _proxy_stream(b"first", rest(), response, lease, 0.2)
 
         self.assertEqual(await anext(stream), b"first")
         with self.assertRaises(httpx.ReadError):
@@ -449,6 +523,185 @@ class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProxyCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disconnect_during_downstream_send_closes_upstream_and_releases_capacity(self):
+        for service, path in (
+            ("tts", "/v1/audio/speech"),
+            ("llm", "/v1/chat/completions"),
+            ("llm", "/v1/responses"),
+        ):
+            for blocked_message in ("http.response.start", "http.response.body"):
+                with self.subTest(service=service, path=path, blocked_message=blocked_message):
+                    disconnected = asyncio.Event()
+                    body_delivered = False
+                    attempts = []
+
+                    class Body(httpx.AsyncByteStream):
+                        closed = False
+
+                        async def __aiter__(self):
+                            yield b"first"
+                            await asyncio.Event().wait()
+
+                        async def aclose(self):
+                            # Real transports may yield while closing. Cleanup
+                            # must survive the response's cancelled task group.
+                            await anyio.sleep(0)
+                            self.closed = True
+
+                    body = Body()
+
+                    async def handler(request):
+                        if request.url.path == "/health":
+                            return httpx.Response(200)
+                        attempts.append(request.url.host)
+                        return httpx.Response(200, stream=body)
+
+                    proxy_settings = settings(service, count=2)
+                    deps = dependencies(proxy_settings, handler)
+                    self.addAsyncCleanup(deps.stop)
+                    await deps.pool.refresh_health()
+                    app = create_app(proxy_settings, deps)
+
+                    async def receive():
+                        nonlocal body_delivered
+                        if not body_delivered:
+                            body_delivered = True
+                            return {"type": "http.request", "body": b"{}", "more_body": False}
+                        await disconnected.wait()
+                        return {"type": "http.disconnect"}
+
+                    async def send(message):
+                        if message["type"] == blocked_message:
+                            disconnected.set()
+                            await asyncio.Event().wait()
+
+                    scope = {
+                        "type": "http",
+                        "asgi": {"version": "3.0", "spec_version": "2.3"},
+                        "http_version": "1.1",
+                        "method": "POST",
+                        "scheme": "http",
+                        "path": path,
+                        "query_string": b"",
+                        "headers": [(b"content-type", b"application/json")],
+                    }
+                    await asyncio.wait_for(app(scope, receive, send), 1)
+                    # No garbage collection or extra event-loop turns: the
+                    # response itself must finish cleanup before returning.
+                    self.assertTrue(body.closed)
+                    snapshot = (await deps.pool.snapshots())[0]
+                    self.assertEqual(snapshot.active_requests, 0)
+                    self.assertEqual(snapshot.active_work, 0)
+                    self.assertEqual(snapshot.cancellations, 1)
+                    self.assertEqual(snapshot.successes, 0)
+                    self.assertEqual(snapshot.errors, 0)
+                    self.assertEqual(attempts, ["backend-1.example"])
+
+    async def test_http_disconnect_cancels_upstream_waits_without_retry(self):
+        for service, path in (
+            ("stt", "/v1/audio/transcriptions"),
+            ("tts", "/v1/audio/speech"),
+            ("llm", "/v1/chat/completions"),
+            ("llm", "/v1/responses"),
+        ):
+            for phase in ("headers", "first_body", "error_body"):
+                with self.subTest(service=service, phase=phase, path=path):
+                    started = asyncio.Event()
+                    disconnected = asyncio.Event()
+                    upstream_cancelled = asyncio.Event()
+                    attempts = []
+
+                    async def stall():
+                        started.set()
+                        try:
+                            await asyncio.Event().wait()
+                        except asyncio.CancelledError:
+                            upstream_cancelled.set()
+                            raise
+
+                    class StalledBody(httpx.AsyncByteStream):
+                        closed = False
+
+                        async def __aiter__(self):
+                            await stall()
+                            yield b"unreachable"
+
+                        async def aclose(self):
+                            self.closed = True
+
+                    body = StalledBody()
+
+                    async def handler(request):
+                        if request.url.path == "/health":
+                            return httpx.Response(200)
+                        attempts.append(request.url.host)
+                        if phase == "headers":
+                            await stall()
+                        return httpx.Response(503 if phase == "error_body" else 200, stream=body)
+
+                    proxy_settings = settings(service, count=2)
+                    deps = dependencies(proxy_settings, handler)
+                    self.addAsyncCleanup(deps.stop)
+                    await deps.pool.refresh_health()
+                    app = create_app(proxy_settings, deps)
+                    request = httpx.Request(
+                        "POST",
+                        f"http://proxy.test{path}",
+                        **(
+                            {"files": {"file": ("audio.wav", wav_bytes(20), "audio/wav")}}
+                            if service == "stt"
+                            else {"json": {"model": "test", "stream": True}}
+                        ),
+                    )
+                    request_body = request.read()
+                    body_delivered = False
+
+                    async def receive():
+                        nonlocal body_delivered
+                        if not body_delivered:
+                            body_delivered = True
+                            return {"type": "http.request", "body": request_body, "more_body": False}
+                        await disconnected.wait()
+                        return {"type": "http.disconnect"}
+
+                    async def send(message):
+                        self.fail(f"Unexpected downstream output before disconnect: {message['type']}")
+
+                    scope = {
+                        "type": "http",
+                        "asgi": {"version": "3.0", "spec_version": "2.3"},
+                        "http_version": "1.1",
+                        "method": "POST",
+                        "scheme": "http",
+                        "path": path,
+                        "query_string": b"",
+                        "headers": [(name.lower(), value) for name, value in request.headers.raw],
+                    }
+                    task = asyncio.create_task(app(scope, receive, send))
+                    try:
+                        await asyncio.wait_for(started.wait(), 1)
+                        snapshot = (await deps.pool.snapshots())[0]
+                        self.assertEqual(snapshot.active_work, 4 if service == "stt" else 1)
+                        disconnected.set()
+                        done, _ = await asyncio.wait({task}, timeout=1)
+                        self.assertIn(task, done, "HTTP disconnect must stop the handler without task.cancel()")
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                        self.assertTrue(upstream_cancelled.is_set())
+                        if phase != "headers":
+                            self.assertTrue(body.closed)
+                        snapshot = (await deps.pool.snapshots())[0]
+                        self.assertEqual(snapshot.active_requests, 0)
+                        self.assertEqual(snapshot.active_work, 0)
+                        self.assertEqual(snapshot.cancellations, 1)
+                        self.assertEqual(snapshot.errors, 0)
+                        self.assertEqual(attempts, ["backend-1.example"])
+                        metrics = await deps.metrics.snapshot(60)
+                        self.assertEqual(metrics["requests"]["cancellations"], 1)
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
     async def test_cancellation_while_reading_error_body_releases_capacity(self):
         for service, path in (
             ("tts", "/v1/audio/speech"),
@@ -561,7 +814,7 @@ class ProxyCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["active_work"], 0)
         self.assertEqual(snapshot["cancellations"], 1)
 
-    async def test_llm_cancellation_before_first_upstream_chunk_releases_capacity(self):
+    async def test_llm_cancellation_before_first_response_chunk_releases_capacity(self):
         snapshot = await self._cancel_inflight_request("llm")
 
         self.assertEqual(snapshot["active_work"], 0)

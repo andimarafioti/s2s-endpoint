@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from collections import Counter, deque
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from statistics import mean
 from typing import Literal
 
@@ -102,7 +102,7 @@ class SpeechProxyMetrics:
             "phase": {
                 "stt": "transcription",
                 "tts": "first_audio",
-                "llm": "first_token",
+                "llm": "first_response_chunk",
             }[self.service],
             "generated_at_s": now,
             "window_s": window_s,
@@ -256,7 +256,3 @@ def sample_headers(sample: SpeechLatencySample) -> dict[str, str]:
             headers["X-Speech-Overhead-Latency-Ms"] = f"{sample.proxy_path_overhead_ms:.3f}"
     headers["Server-Timing"] = ", ".join(timings)
     return headers
-
-
-def sample_as_dict(sample: SpeechLatencySample) -> dict[str, object]:
-    return asdict(sample)
