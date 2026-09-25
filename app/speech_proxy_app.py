@@ -6,6 +6,7 @@ import time
 import uuid
 import wave
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -356,6 +357,30 @@ def _unavailable_response(service: SpeechService) -> JSONResponse:
     )
 
 
+@asynccontextmanager
+async def _cancel_on_disconnect(request: Request):
+    """Cancel upstream waits after the request body has been consumed.
+
+    Stop reading disconnect events before handing off to StreamingResponse,
+    which owns disconnect detection once downstream streaming starts.
+    """
+    owner = asyncio.current_task()
+
+    async def watch_disconnect():
+        while True:
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
+                owner.cancel()
+                return
+
+    watcher = asyncio.create_task(watch_disconnect())
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+
+
 async def _proxy_stt(
     request: Request,
     settings: SpeechProxySettings,
@@ -376,15 +401,16 @@ async def _proxy_stt(
             started = time.monotonic()
             trace.start_upstream(lease.backend_name)
             try:
-                response = await dependencies.client.post(
-                    f"{lease.backend_url}/v1/audio/transcriptions",
-                    headers={
-                        **_backend_headers(settings),
-                        "X-Speech-Request-Id": trace.request_id,
-                    },
-                    files=multipart,
-                    timeout=settings.request_timeout_s,
-                )
+                async with _cancel_on_disconnect(request):
+                    response = await dependencies.client.post(
+                        f"{lease.backend_url}/v1/audio/transcriptions",
+                        headers={
+                            **_backend_headers(settings),
+                            "X-Speech-Request-Id": trace.request_id,
+                        },
+                        files=multipart,
+                        timeout=settings.request_timeout_s,
+                    )
             except asyncio.CancelledError:
                 trace.finish_upstream()
                 await lease.release(success=False, cancelled=True)
@@ -512,9 +538,13 @@ async def _proxy_streaming_json(
                     content=body,
                     timeout=settings.request_timeout_s,
                 )
-                response = await dependencies.client.send(upstream_request, stream=True)
+                async with _cancel_on_disconnect(request):
+                    response = await dependencies.client.send(upstream_request, stream=True)
+                    if 200 <= response.status_code < 300:
+                        first_chunk, iterator = await _read_first_chunk(response)
+                    else:
+                        response_body = await response.aread()
                 if not 200 <= response.status_code < 300:
-                    response_body = await response.aread()
                     trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
                     retryable = _retryable_response(response.status_code, response_body)
                     await lease.release(
@@ -532,7 +562,6 @@ async def _proxy_streaming_json(
                         response_body,
                         _traced_response_headers(response, trace),
                     )
-                first_chunk, iterator = await _read_first_chunk(response)
                 trace.finish_upstream(response.headers.get(SERVICE_LATENCY_HEADER))
                 first_result_latency = time.monotonic() - started
                 await trace.record("success")

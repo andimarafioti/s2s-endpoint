@@ -449,6 +449,111 @@ class TTSStreamLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProxyCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_disconnect_cancels_upstream_waits_without_retry(self):
+        for service, path in (
+            ("stt", "/v1/audio/transcriptions"),
+            ("tts", "/v1/audio/speech"),
+            ("llm", "/v1/chat/completions"),
+            ("llm", "/v1/responses"),
+        ):
+            for phase in ("headers", "first_body", "error_body"):
+                with self.subTest(service=service, phase=phase, path=path):
+                    started = asyncio.Event()
+                    disconnected = asyncio.Event()
+                    upstream_cancelled = asyncio.Event()
+                    attempts = []
+
+                    async def stall():
+                        started.set()
+                        try:
+                            await asyncio.Event().wait()
+                        except asyncio.CancelledError:
+                            upstream_cancelled.set()
+                            raise
+
+                    class StalledBody(httpx.AsyncByteStream):
+                        closed = False
+
+                        async def __aiter__(self):
+                            await stall()
+                            yield b"unreachable"
+
+                        async def aclose(self):
+                            self.closed = True
+
+                    body = StalledBody()
+
+                    async def handler(request):
+                        if request.url.path == "/health":
+                            return httpx.Response(200)
+                        attempts.append(request.url.host)
+                        if phase == "headers":
+                            await stall()
+                        return httpx.Response(503 if phase == "error_body" else 200, stream=body)
+
+                    proxy_settings = settings(service, count=2)
+                    deps = dependencies(proxy_settings, handler)
+                    self.addAsyncCleanup(deps.stop)
+                    await deps.pool.refresh_health()
+                    app = create_app(proxy_settings, deps)
+                    request = httpx.Request(
+                        "POST",
+                        f"http://proxy.test{path}",
+                        **(
+                            {"files": {"file": ("audio.wav", wav_bytes(20), "audio/wav")}}
+                            if service == "stt"
+                            else {"json": {"model": "test", "stream": True}}
+                        ),
+                    )
+                    request_body = request.read()
+                    body_delivered = False
+
+                    async def receive():
+                        nonlocal body_delivered
+                        if not body_delivered:
+                            body_delivered = True
+                            return {"type": "http.request", "body": request_body, "more_body": False}
+                        await disconnected.wait()
+                        return {"type": "http.disconnect"}
+
+                    async def send(message):
+                        self.fail(f"Unexpected downstream output before disconnect: {message['type']}")
+
+                    scope = {
+                        "type": "http",
+                        "asgi": {"version": "3.0", "spec_version": "2.3"},
+                        "http_version": "1.1",
+                        "method": "POST",
+                        "scheme": "http",
+                        "path": path,
+                        "query_string": b"",
+                        "headers": [(name.lower(), value) for name, value in request.headers.raw],
+                    }
+                    task = asyncio.create_task(app(scope, receive, send))
+                    try:
+                        await asyncio.wait_for(started.wait(), 1)
+                        snapshot = (await deps.pool.snapshots())[0]
+                        self.assertEqual(snapshot.active_work, 4 if service == "stt" else 1)
+                        disconnected.set()
+                        done, _ = await asyncio.wait({task}, timeout=1)
+                        self.assertIn(task, done, "HTTP disconnect must stop the handler without task.cancel()")
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                        self.assertTrue(upstream_cancelled.is_set())
+                        if phase != "headers":
+                            self.assertTrue(body.closed)
+                        snapshot = (await deps.pool.snapshots())[0]
+                        self.assertEqual(snapshot.active_requests, 0)
+                        self.assertEqual(snapshot.active_work, 0)
+                        self.assertEqual(snapshot.cancellations, 1)
+                        self.assertEqual(snapshot.errors, 0)
+                        self.assertEqual(attempts, ["backend-1.example"])
+                        metrics = await deps.metrics.snapshot(60)
+                        self.assertEqual(metrics["requests"]["cancellations"], 1)
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
     async def test_cancellation_while_reading_error_body_releases_capacity(self):
         for service, path in (
             ("tts", "/v1/audio/speech"),
