@@ -72,6 +72,23 @@ class SpeechBackendPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.backend_name, "backend-2")
         await second.release(success=True, latency=0.1)
 
+    async def test_unknown_stt_duration_preserves_latency_and_sample_age(self):
+        pool = SpeechBackendPool(_backends(1), self.settings(service="stt"), client=self.client)
+        await pool.refresh_health()
+        known = await pool.reserve(4)
+        await known.release(success=True, latency=0.01)
+        sampled_at = pool._states["backend-1"].last_latency_at
+
+        unknown = await pool.reserve(1)
+        await unknown.release(success=True, latency=None)
+        snapshot = (await pool.snapshots())[0]
+
+        self.assertEqual(snapshot.ewma_latency, 0.01)
+        self.assertEqual(pool._states["backend-1"].last_latency_at, sampled_at)
+        self.assertEqual(snapshot.successes, 2)
+        self.assertEqual(snapshot.active_requests, 0)
+        self.assertEqual(snapshot.active_work, 0)
+
     async def test_draining_backend_finishes_existing_work_but_gets_no_new_work(self):
         pool = SpeechBackendPool(_backends(), self.settings(), client=self.client)
         await pool.refresh_health()

@@ -94,7 +94,9 @@ class SpeechBackendLease:
             if self._released:
                 return
             self._released = True
-            if latency is None:
+            # STT latency is a real-time factor, not elapsed seconds. Without
+            # a known input duration, release capacity without sampling latency.
+            if latency is None and self._pool.settings.service != "stt":
                 latency = time.monotonic() - self.started_at
             await self._pool.release(
                 self.backend_name,
@@ -220,7 +222,7 @@ class SpeechBackendPool:
         work: float,
         success: bool,
         cancelled: bool,
-        latency: float,
+        latency: float | None,
         retryable_failure: bool,
         error: str | None,
     ) -> None:
@@ -237,8 +239,9 @@ class SpeechBackendPool:
                 state.successes += 1
                 state.consecutive_failures = 0
                 state.last_health_error = None
-                state.ewma_latency = self._ewma(state.ewma_latency, latency)
-                state.last_latency_at = time.monotonic()
+                if latency is not None:
+                    state.ewma_latency = self._ewma(state.ewma_latency, latency)
+                    state.last_latency_at = time.monotonic()
                 return
             state.errors += 1
             if error:
