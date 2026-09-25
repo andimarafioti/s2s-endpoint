@@ -29,32 +29,36 @@ def ensure_name_available(api: HfApi, namespace: str, name: str) -> None:
     raise ValueError(f"Inference Endpoint name already exists: {name}")
 
 
-def resolve_secrets(environ: dict[str, str]) -> dict[str, str]:
+def resolve_secrets(environ: dict[str, str], *, use_hf_llm: bool = False) -> dict[str, str]:
     hf_token = environ.get("HF_TOKEN", "").strip()
     openai_key = environ.get("RESPONSES_API_API_KEY", "").strip() or environ.get("OPENAI_API_KEY", "").strip()
     missing = []
     if not hf_token:
         missing.append("HF_TOKEN")
-    if not openai_key:
+    if not use_hf_llm and not openai_key:
         missing.append("RESPONSES_API_API_KEY or OPENAI_API_KEY")
     if missing:
         raise ValueError(f"Missing required deployment secret(s): {', '.join(missing)}")
     return {
         "HF_TOKEN": hf_token,
-        "RESPONSES_API_API_KEY": openai_key,
+        "RESPONSES_API_API_KEY": hf_token if use_hf_llm else openai_key,
     }
 
 
 def deployment_env(args: argparse.Namespace) -> dict[str, str]:
-    return {
+    env = {
         "STT_BASE_URL": args.stt_base_url,
         "TTS_BASE_URL": args.tts_base_url,
         "MODEL_NAME": args.model_name,
+        "LLM_BACKEND": args.llm_backend,
         "NUM_PIPELINES": str(args.num_pipelines),
         "ENABLE_LIVE_TRANSCRIPTION": str(args.enable_live_transcription).lower(),
         "STREAM_BATCH_SENTENCES": str(args.stream_batch_sentences),
         "LOG_TRANSCRIPTS": "false",
     }
+    if args.llm_base_url:
+        env["LLM_BASE_URL"] = args.llm_base_url.rstrip("/")
+    return env
 
 
 def summary(endpoint) -> dict[str, Any]:
@@ -85,6 +89,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stt-base-url", required=True)
     parser.add_argument("--tts-base-url", required=True)
     parser.add_argument("--model-name", default="gpt-5.6-terra")
+    parser.add_argument("--llm-base-url", help="OpenAI-compatible LLM proxy base URL ending in /v1")
+    parser.add_argument(
+        "--llm-backend",
+        choices=("responses-api", "chat-completions"),
+        default="responses-api",
+    )
     parser.add_argument("--num-pipelines", type=int, default=1)
     parser.add_argument("--stream-batch-sentences", type=int, default=3)
     parser.add_argument("--enable-live-transcription", action="store_true")
@@ -128,14 +138,16 @@ def main() -> None:
                     "min_replica": args.min_replica,
                     "max_replica": args.max_replica,
                     "env": endpoint_env,
-                    "required_secret_names": ["HF_TOKEN", "RESPONSES_API_API_KEY"],
+                    "required_secret_names": (
+                        ["HF_TOKEN"] if args.llm_base_url else ["HF_TOKEN", "RESPONSES_API_API_KEY"]
+                    ),
                 },
                 indent=2,
             )
         )
         return
 
-    secrets = resolve_secrets(dict(os.environ))
+    secrets = resolve_secrets(dict(os.environ), use_hf_llm=bool(args.llm_base_url))
     endpoint = api.create_inference_endpoint(
         args.name,
         namespace=args.namespace,

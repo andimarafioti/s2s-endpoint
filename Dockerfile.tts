@@ -3,9 +3,12 @@ FROM vllm/vllm-omni:v${VLLM_OMNI_VERSION}
 
 LABEL org.opencontainers.image.source="https://github.com/andimarafioti/s2s-endpoint"
 
+COPY app/speech_service_timing.py /opt/s2s-observability/speech_service_timing.py
+ENV PYTHONPATH=/opt/s2s-observability
+
 EXPOSE 8091
 
 # The bundled deploy config enables async chunking and keeps multi-request
 # batching. The model itself is mounted by Inference Endpoints at /repository.
 ENTRYPOINT []
-CMD ["vllm", "serve", "/repository", "--served-model-name", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "--stage-configs-path", "/workspace/vllm-omni/vllm_omni/model_executor/stage_configs/qwen3_tts.yaml", "--omni", "--host", "0.0.0.0", "--port", "8091", "--trust-remote-code"]
+CMD ["vllm", "serve", "/repository", "--served-model-name", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "--stage-configs-path", "/workspace/vllm-omni/vllm_omni/model_executor/stage_configs/qwen3_tts.yaml", "--omni", "--host", "0.0.0.0", "--port", "8091", "--trust-remote-code", "--middleware", "speech_service_timing.SpeechServiceTimingMiddleware", "--enable-request-id-headers"]
