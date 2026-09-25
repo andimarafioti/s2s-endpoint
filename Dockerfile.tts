@@ -1,0 +1,11 @@
+ARG VLLM_OMNI_VERSION=0.18.0
+FROM vllm/vllm-omni:v${VLLM_OMNI_VERSION}
+
+LABEL org.opencontainers.image.source="https://github.com/andimarafioti/s2s-endpoint"
+
+EXPOSE 8091
+
+# The bundled deploy config enables async chunking and keeps multi-request
+# batching. The model itself is mounted by Inference Endpoints at /repository.
+ENTRYPOINT []
+CMD ["vllm", "serve", "/repository", "--served-model-name", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "--stage-configs-path", "/workspace/vllm-omni/vllm_omni/model_executor/stage_configs/qwen3_tts.yaml", "--omni", "--host", "0.0.0.0", "--port", "8091", "--trust-remote-code"]
