@@ -88,6 +88,23 @@ its `json` response, and rejects `verbose_json` for this model. The live split
 path therefore uses Qwen3-TTS `Auto` for these turns. If the STT service later
 reports a language, the same image will pass recognized values explicitly.
 
+On 2026-09-25, image
+`ghcr.io/andimarafioti/s2s-pipeline:sha-6dabb0563736c0bf7ba85a06efec6129f5e79467`
+was published from the consecutive PR #110 commit and applied to all 11
+LB-managed CPU workers (`-02` through `-12`). The nine parked workers remained
+paused; warm workers `-03` and `-05` were updated one at a time and returned to
+running. The original production fleet was not changed.
+
+A single synthetic German spoken turn completed through the public split LB:
+STT returned the expected German transcript, the LLM response completed, and
+first audio arrived 151 ms after the client observed speech stop. The Qwen3-ASR
+`json` response omitted language metadata, so the new TTS fallback used `Auto`.
+This verifies the end-to-end path and audio production, not subjective accent
+quality; a human listening check is still needed. After the smoke, the split LB
+reported zero connected and pending sessions, two ready CPU workers, and 32 free
+slots. The STT, TTS, and LLM proxies each reported one ready backend and no
+lifecycle error.
+
 This fixes the English language hint previously sent with non-English replies.
 The default `aiden` voice is still an English-native Qwen preset, so language
 routing alone may not remove every accent; voice quality should be checked in a
