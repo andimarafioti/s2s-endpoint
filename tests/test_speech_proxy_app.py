@@ -344,7 +344,7 @@ class SpeechProxyApplicationTests(unittest.TestCase):
         self.assertEqual(seen[0][0:3], ("POST", "/v1/chat/completions", "Bearer backend-secret"))
         self.assertEqual(json.loads(seen[0][3]), request_body)
         self.assertEqual(metrics["service"], "llm")
-        self.assertEqual(metrics["phase"], "first_token")
+        self.assertEqual(metrics["phase"], "first_response_chunk")
         self.assertEqual(metrics["requests"]["successes"], 1)
         self.assertEqual(health["backends"][0]["active_work"], 0)
         self.assertEqual(health["backends"][0]["successes"], 1)
@@ -393,6 +393,63 @@ class SpeechProxyApplicationTests(unittest.TestCase):
         self.assertIn("/v1/chat/completions", llm_app.openapi()["paths"])
         self.assertIn("/v1/responses", llm_app.openapi()["paths"])
         self.assertNotIn("/v1/audio/speech", llm_app.openapi()["paths"])
+
+
+class LLMStreamTimingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_response_chunk_metrics_include_metadata_before_tokens(self):
+        for path, metadata, token in (
+            (
+                "/v1/chat/completions",
+                b'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n',
+                b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+            ),
+            (
+                "/v1/responses",
+                b'event: response.created\ndata: {"type":"response.created"}\n\n',
+                b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}\n\n',
+            ),
+        ):
+            with self.subTest(path=path):
+                metadata_sent = asyncio.Event()
+                allow_token = asyncio.Event()
+
+                class Body(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        yield metadata
+                        metadata_sent.set()
+                        await allow_token.wait()
+                        yield token
+
+                async def handler(request):
+                    if request.url.path == "/health":
+                        return httpx.Response(200)
+                    return httpx.Response(200, stream=Body(), headers={"content-type": "text/event-stream"})
+
+                proxy_settings = settings("llm")
+                deps = dependencies(proxy_settings, handler)
+                self.addAsyncCleanup(deps.stop)
+                await deps.pool.refresh_health()
+                app = create_app(proxy_settings, deps)
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://proxy.test"
+                ) as client:
+                    task = asyncio.create_task(client.post(path, json={"model": "test", "stream": True}))
+                    try:
+                        await asyncio.wait_for(metadata_sent.wait(), 1)
+                        metrics = await deps.metrics.snapshot(60)
+                        self.assertEqual(metrics["phase"], "first_response_chunk")
+                        self.assertEqual(metrics["requests"]["successes"], 1)
+                        self.assertFalse(task.done(), "The token is still pending")
+                        self.assertEqual((await deps.pool.snapshots())[0].active_work, 1)
+                        allow_token.set()
+                        response = await asyncio.wait_for(task, 1)
+                        self.assertEqual(response.content, metadata + token)
+                        self.assertEqual((await deps.pool.snapshots())[0].active_work, 0)
+                        completed_metrics = await deps.metrics.snapshot(60)
+                        self.assertEqual(completed_metrics["latency_ms"], metrics["latency_ms"])
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
 
 
 class _FakeResponse:
@@ -666,7 +723,7 @@ class ProxyCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["active_work"], 0)
         self.assertEqual(snapshot["cancellations"], 1)
 
-    async def test_llm_cancellation_before_first_token_releases_capacity(self):
+    async def test_llm_cancellation_before_first_response_chunk_releases_capacity(self):
         snapshot = await self._cancel_inflight_request("llm")
 
         self.assertEqual(snapshot["active_work"], 0)

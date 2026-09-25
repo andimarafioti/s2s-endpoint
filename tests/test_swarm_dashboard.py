@@ -531,7 +531,7 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("renderSpeechLatency", html)
         self.assertIn("transcription: 'transcription'", html)
         self.assertIn("first_audio: 'first audio'", html)
-        self.assertIn("first_token: 'first token'", html)
+        self.assertIn("first_response_chunk: 'first response chunk'", html)
         self.assertIn("phaseLabels[entry.phase]", html)
         self.assertIn("renderRollingChartCards();", html)
 

@@ -511,7 +511,7 @@ async def _proxy_streaming_json(
     trace: SpeechRequestTrace,
 ) -> Response:
     service = settings.service
-    first_result = "audio" if service == "tts" else "token"
+    first_result = "audio" if service == "tts" else "response chunk"
     try:
         body = await request.body()
         excluded: set[str] = set()

@@ -102,7 +102,7 @@ class SpeechProxyMetrics:
             "phase": {
                 "stt": "transcription",
                 "tts": "first_audio",
-                "llm": "first_token",
+                "llm": "first_response_chunk",
             }[self.service],
             "generated_at_s": now,
             "window_s": window_s,

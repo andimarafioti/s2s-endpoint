@@ -1367,7 +1367,7 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
       const phaseLabels = {
         transcription: 'transcription',
         first_audio: 'first audio',
-        first_token: 'first token',
+        first_response_chunk: 'first response chunk',
       };
       target.innerHTML = `<div class="speech-latency-grid">${['stt', 'tts', 'llm'].map((service) => {
         const entry = (telemetry.services || {})[service];

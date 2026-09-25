@@ -170,13 +170,15 @@ uv run --with-requirements requirements.txt python scripts/create_speech_proxy_e
 The same proxy image is configured as STT, TTS, or LLM by environment. STT
 accounts for work in five-second audio equivalents; TTS and LLM account for
 concurrent calls. The initial operating targets are 96 STT work units, 8 TTS
-calls, and 64 LLM generations per worker. The LLM latency target is 500 ms to
-first token, based on the Gemma 4 26B-A4B NVFP4 RTX PRO 6000 curve. These are
+calls, and 64 LLM generations per worker. The initial LLM latency target is 500 ms to
+the first non-empty response chunk. That chunk can contain metadata rather
+than generated text, so this is not a time-to-first-token measurement or a
+validated first-token target. These are
 soft routing targets and do not reject excess work. When every healthy worker
 is above target, new calls still go to the best available worker. Routing
 combines current work with an EWMA latency penalty. TTS and LLM readiness each
 include a real short inference. Retries move to another worker only before the
-first audio/token reaches the caller, and cancellation closes the upstream
+first non-empty response bytes reach the caller, and cancellation closes the upstream
 response and releases its reservation.
 
 Create the LLM proxy explicitly after the Gemma workers exist. The tested RTX
