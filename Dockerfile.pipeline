@@ -3,8 +3,8 @@
 # OpenAI Realtime-compatible WebSocket server.
 FROM python:3.12-slim
 
-ARG S2S_REPO_URL=https://github.com/andimarafioti/speech-to-speech.git
-ARG S2S_REF=10dcce52a2dc300f9b098ca9c9015e8812a9b00f
+ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
+ARG S2S_REF=60d2cb23533579fc7c6990b3545d23bce4a139b9
 ARG SMART_TURN_MODEL_REPO=pipecat-ai/smart-turn-v3
 ARG SMART_TURN_MODEL_REV=f766f81d3cfdf7737ac64aad813d91bbfd56bf93
 ARG SMART_TURN_MODEL_FILENAME=smart-turn-v3.2-cpu.onnx
@@ -39,6 +39,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
       torch==2.11.0 \
       torchaudio==2.11.0 && \
     python -m pip install \
+      "anyio>=4.0,<5" \
       "fastapi>=0.115.0" \
       "huggingface-hub>=0.34.0" \
       "httpx>=0.28.0" \
@@ -52,6 +53,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
       "requests>=2.32.0" \
       "rich>=13.0" \
       "scipy>=1.10.0" \
+      "soxr>=0.3.2" \
       "transformers==5.15.1" \
       "uvicorn>=0.30.0" \
       "websockets>=12.0" && \
