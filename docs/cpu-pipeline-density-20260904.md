@@ -1,5 +1,24 @@
 # CPU pipeline density retest — 2026-09-04
 
+## Current-image follow-up — 2026-09-25
+
+The isolated split-pipeline test fleet was changed to **16 users per 4-vCPU
+worker** after repeating the single-worker validation with the upstream-main
+pipeline image `sha-4d134f458b8137e615e89a6967a2a8a0036dd2a0` and the current
+Gemma 4 31B NVFP4 backend.
+
+| Workload on one worker | Completed turns | Speech stop → first audio p50 / p95 | Peak CPU | Peak RAM |
+| --- | ---: | ---: | ---: | ---: |
+| Short, staggered; 16 users × 3 turns | 48 / 48 | 0.947 / 1.005 s | 26% | 1.40 GB |
+| Short, synchronized; 16 users × 1 turn | 16 / 16 | 1.139 / 1.314 s | 37% | 1.45 GB |
+| 19.42-second input, staggered; 16 users × 3 turns | 48 / 48 | 1.435 / 1.596 s | 29% | 1.54 GB |
+
+The dedicated benchmark load balancer and `reachy-s2s-pipeline-33` were paused
+afterward. The test fleet retained two warm 16-slot workers, providing 32
+immediately available slots. Production `reachy-s2s-01` through `-32` were not
+changed. Raw local results use prefixes `20260925T112639Z` and
+`20260925T112935Z` under `logs/cpu-density-20260904/`.
+
 Four users per CPU worker was a conservative deployment setting, not a measured
 limit. Each pipeline still serves one user; `NUM_PIPELINES` determines how many
 pipelines share the worker. The retest supports starting with **16 users per
@@ -160,8 +179,8 @@ observed 60-vCPU quota. A quota increase is therefore not intrinsically needed
 for 128 users. GPU-stage burst capacity, warmup time, longer conversations, tools,
 and full-fleet latency still need their own validation.
 
-The live split LB and its four-slot worker configurations were not changed by
-this retest. The test LB and worker are parked between runs; worker configuration
+At the time, the split LB and its four-slot worker configurations were not changed
+by this retest. The test LB and worker are parked between runs; worker configuration
 is restored after testing. Benchmark JSON, hardware samples, and downloaded logs
 are retained locally under `logs/cpu-density-20260904/`, including the failed run.
 The initial matrix has prefix `20260904T153957Z`; the 32-user repeat has prefix
