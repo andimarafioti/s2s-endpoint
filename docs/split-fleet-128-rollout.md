@@ -99,6 +99,26 @@ The independent client event trace measured 220 ms, 590 ms, 170 ms, and 981 ms
 for the corresponding observable intervals. This close agreement validates the
 telemetry path and boundaries for one turn; it is not a latency distribution.
 
+### LLM first-text follow-up
+
+After `huggingface/speech-to-speech` merge
+`260c7879d9ce5012fe25c9aa921a35efb514484e`, all 11 isolated pipeline workers
+were moved to
+`ghcr.io/andimarafioti/s2s-pipeline:sha-6e4d4d1df8f9839b9957eb60cb354a5f94d452da`.
+The nine parked workers were updated while parked. The idle warm worker was
+updated while the other worker carried the only connected conversation; that
+conversation was allowed to end before the remaining warm worker and load
+balancer were updated. The split load balancer now uses
+`ghcr.io/andimarafioti/s2s-load-balancer:sha-6e4d4d1df8f9839b9957eb60cb354a5f94d452da`.
+
+One synthetic spoken turn completed through the public load balancer and
+populated every dashboard stage: 178 ms final STT, 115 ms LLM first text, 612 ms
+full LLM generation, 156 ms TTS first audio, 958 ms speech-end to first server
+audio, and 0 ms MLX lock wait. This validates the first-text metadata path; it is
+one sample, not a latency distribution. The fleet was returned to two warm
+workers with zero connected and pending sessions. Production `reachy-s2s-01`
+through `-32` were not changed.
+
 ## Browser ingress cutover — 2026-09-23
 
 The `smolagents/hf-realtime-voice` Space successfully allocated sessions from the
