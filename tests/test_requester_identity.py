@@ -182,6 +182,15 @@ class RequesterIdentityResolverTests(unittest.IsolatedAsyncioTestCase):
 
         await resolver.stop()
 
+    async def test_realtime_space_user_agent_is_classified(self):
+        resolver = RequesterIdentityResolver(hash_secret="stable-secret")
+
+        identity = resolver.identify(FakeRequest(headers={"user-agent": "hf-realtime-voice-space"}))
+
+        self.assertEqual(identity.client_kind, "realtime-space")
+
+        await resolver.stop()
+
     async def test_invalid_token_is_classified_but_request_remains_identifiable(self):
         updated = asyncio.Event()
         updates = []

@@ -15,6 +15,7 @@ from app.dashboard_history import (
     _isoformat,
 )
 from app.llm_proxy_usage import llm_proxy_counts
+from app.pipeline_turn_latency import PipelineTurnLatency, PipelineTurnLatencyMetrics
 from app.requester_dashboard_ui import inject_requester_dashboard
 from app.requester_identity import RequesterIdentity
 from app.requester_usage import RequesterUsageService, RequesterUsageThresholds
@@ -199,6 +200,7 @@ class SwarmDashboard:
         *,
         snapshot_provider: SnapshotProvider,
         speech_telemetry_provider: SpeechTelemetryProvider | None = None,
+        turn_latency_metrics: PipelineTurnLatencyMetrics | None = None,
         sample_interval_s: float = 15.0,
         retention_minutes: int = 28 * 24 * 60,
         history_store: Optional[DashboardHistoryStore] = None,
@@ -219,6 +221,7 @@ class SwarmDashboard:
 
         self.snapshot_provider = snapshot_provider
         self.speech_telemetry_provider = speech_telemetry_provider
+        self.turn_latency_metrics = turn_latency_metrics or PipelineTurnLatencyMetrics(time_fn=time_fn)
         self.sample_interval_s = sample_interval_s
         self.retention_minutes = retention_minutes
         self.history_store = history_store
@@ -337,6 +340,9 @@ class SwarmDashboard:
             if conversation_counted:
                 await self.history.record_completed_conversation(max(float(conversation_duration_s or 0.0), 0.0))
 
+    async def record_pipeline_turn_latency(self, session_id: str, latency: PipelineTurnLatency) -> bool:
+        return await self.turn_latency_metrics.record(session_id, latency)
+
     async def live_sample(self) -> SwarmStateSample:
         return await self.capture_sample()
 
@@ -357,6 +363,7 @@ class SwarmDashboard:
             if self.speech_telemetry_provider is not None
             else {"configured": False, "window_s": window_minutes * 60.0, "services": {}}
         )
+        pipeline_turn_latency = await self.turn_latency_metrics.snapshot(window_minutes * 60.0)
 
         return {
             "generated_at": _isoformat(self._time_fn()),
@@ -369,6 +376,7 @@ class SwarmDashboard:
             "summary": summary,
             "requesters": requesters,
             "speech_proxies": speech_proxies,
+            "pipeline_turn_latency": pipeline_turn_latency,
             "series": series,
             "rolling_windows": [{"label": label, "minutes": minutes} for label, minutes in ROLLING_VIEW_WINDOWS],
             "rolling_series": rolling_series,
@@ -1103,6 +1111,18 @@ __REQUESTER_DASHBOARD_STYLES__
 __REQUESTER_DASHBOARD_MARKUP__
 
       <div class="panel card span-12">
+        <div class="label">Pipeline / Selected Window</div>
+        <h2>Conversation Turn Latency</h2>
+        <div id="pipeline-turn-latency"></div>
+        <div class="footer-note">
+          STT is final transcription time, LLM first text ends at the first non-empty provider text delta,
+          LLM full generation ends when the provider stream completes, TTS first audio is measured at the
+          provider's first audio chunk, and end to end runs from speech stop to the first playable server audio block.
+          These terminal response measurements are reported by the pipeline and do not include browser playback buffering.
+        </div>
+      </div>
+
+      <div class="panel card span-12">
         <div class="label">Speech / Selected Window</div>
         <h2>Proxy And GPU Latency</h2>
         <div id="speech-latency"></div>
@@ -1350,6 +1370,42 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
       return `${numeric.toFixed(numeric >= 100 ? 0 : 1)} ms`;
     }
 
+    function renderPipelineTurnLatency(telemetry, windowLabel) {
+      const target = document.getElementById('pipeline-turn-latency');
+      const responses = telemetry.responses || {};
+      const latency = telemetry.latency_ms || {};
+      const labels = {
+        stt: 'STT final transcription',
+        llm_ttft: 'LLM first text',
+        llm: 'LLM full generation',
+        tts_ttfa: 'TTS provider first audio',
+        e2e: 'Speech end → first server audio',
+        mlx_lock_wait: 'MLX lock wait',
+      };
+      const rows = Object.entries(labels).map(([key, label]) => {
+        const stats = latency[key] || { n: 0 };
+        return `<tr>
+          <td>${htmlEscape(label)}</td>
+          <td class="mono">${htmlEscape(formatLatencyMs(stats.p50))}</td>
+          <td class="mono">${htmlEscape(formatLatencyMs(stats.p95))}</td>
+          <td class="mono">${htmlEscape(prettyNumber(stats.n || 0))}</td>
+        </tr>`;
+      }).join('');
+      target.innerHTML = `<div class="speech-latency-grid">
+        <div class="speech-latency-service">
+          <div class="speech-latency-title">
+            <strong>Terminal responses</strong>
+            <span class="status-pill good">${htmlEscape(prettyNumber(responses.window || 0))} responses / ${htmlEscape(windowLabel)}</span>
+          </div>
+          <table>
+            <thead><tr><th>Stage</th><th>p50</th><th>p95</th><th>n</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+          <div class="footer-note">Completed ${htmlEscape(prettyNumber(responses.completed || 0))} · failed ${htmlEscape(prettyNumber(responses.failed || 0))} · cancelled ${htmlEscape(prettyNumber(responses.cancelled || 0))} · incomplete ${htmlEscape(prettyNumber(responses.incomplete || 0))}</div>
+        </div>
+      </div>`;
+    }
+
     function renderSpeechLatency(telemetry, windowLabel) {
       const target = document.getElementById('speech-latency');
       if (!telemetry.configured) {
@@ -1367,7 +1423,7 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
       const phaseLabels = {
         transcription: 'transcription',
         first_audio: 'first audio',
-        first_response_chunk: 'first response chunk',
+        first_response_chunk: 'first upstream chunk',
       };
       target.innerHTML = `<div class="speech-latency-grid">${['stt', 'tts', 'llm'].map((service) => {
         const entry = (telemetry.services || {})[service];
@@ -1392,6 +1448,20 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
         }).join('');
         const phase = phaseLabels[entry.phase] || entry.phase || 'unknown';
         const coveragePercent = `${(Number(coverage.ratio || 0) * 100).toFixed(0)}%`;
+        const fleet = entry.lifecycle;
+        const formatEwma = value => {
+          if (value == null || !Number.isFinite(Number(value))) return '—';
+          return service === 'stt' ? `${Number(value).toFixed(3)} RTF` : formatLatencyMs(Number(value) * 1000);
+        };
+        const ewmaExplanation = service === 'stt'
+          ? 'Recent weighted average of transcription time divided by input audio duration. Lower is faster. Unknown-duration requests are excluded.'
+          : `Recent weighted average of time to ${service === 'tts' ? 'first audio' : 'the first upstream response chunk'}. Lower is faster.`;
+        const workers = fleet && fleet.enabled ? (fleet.workers || []).map(worker => {
+          const stale = worker.latency_age_s != null && worker.latency_age_s > (fleet.settings || {}).latency_max_age_s;
+          return `<div class="footer-note"><strong>${htmlEscape(worker.name)}</strong> · ${htmlEscape(worker.phase)} · ${htmlEscape(worker.active_requests)} active · work ${htmlEscape(worker.active_work)}/${htmlEscape(worker.target_work)}${worker.reason ? ` · ${htmlEscape(worker.reason)}` : ''}${worker.last_error ? ` · ${htmlEscape(worker.last_error)}` : ''}
+            <div title="${htmlEscape(ewmaExplanation)}">${service === 'stt' ? 'Transcription' : (service === 'tts' ? 'First audio' : 'First upstream chunk')} EWMA: <span class="mono">${htmlEscape(formatEwma(worker.ewma_latency))}</span> · target <span class="mono">${htmlEscape(formatEwma(fleet.latency_target))}</span>${stale ? ' · stale (excluded from scaling)' : ''}</div>
+          </div>`;
+        }).join('') : '';
         return `<div class="speech-latency-service">
           <div class="speech-latency-title">
             <strong>${service.toUpperCase()} · ${htmlEscape(phase)}</strong>
@@ -1402,6 +1472,8 @@ __REQUESTER_DASHBOARD_KPI_CARDS__
             <tbody>${rows}</tbody>
           </table>
           <div class="footer-note">GPU timing coverage ${htmlEscape(coveragePercent)} · pre-result errors ${htmlEscape(prettyNumber(requests.errors || 0))} · cancellations ${htmlEscape(prettyNumber(requests.cancellations || 0))}</div>
+          ${fleet && fleet.enabled ? `<div class="footer-note">EWMA is a recent weighted average per worker, independent of this table's time window.${service === 'stt' ? ' RTF (real-time factor) is transcription seconds per second of input audio.' : ''}</div>` : ''}
+          ${workers}
         </div>`;
       }).join('')}</div>`;
     }
@@ -1745,6 +1817,7 @@ __REQUESTER_DASHBOARD_SCRIPT__
 
       renderHeroStats(current, summary);
       renderKpis(current, summary);
+      renderPipelineTurnLatency(payload.pipeline_turn_latency || {}, summary.window_label || payload.window.requested);
       renderSpeechLatency(payload.speech_proxies || {}, summary.window_label || payload.window.requested);
       renderRequesterUsage(payload.requesters || {}, summary);
       renderHealth(current);

@@ -1,11 +1,13 @@
 import asyncio
 import json
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Optional
 
 import httpx
@@ -15,6 +17,7 @@ from starlette.background import BackgroundTask
 
 from app.app_utils import build_lifespan, env_bool, env_text, setup_logging
 from app.llm_proxy_usage import LLM_PROXY_CALLBACK_AUTH_HEADER
+from app.pipeline_turn_latency import TURN_LATENCY_EVENT, extract_pipeline_turn_latency
 from app.requester_identity import bearer_token, client_address, is_validatable_hf_token
 from app.session_router import SessionRouter
 from app.session_tokens import llm_token_fingerprint, verify_session_token, websocket_host_matches
@@ -29,6 +32,8 @@ INTERNAL_USAGE_PATH = "/v1/usage"
 INTERNAL_POOL_PATH = "/v1/pool"
 LLM_PROXY_CONNECT_TIMEOUT_S = 10.0
 LLM_PROXY_ACCOUNTING_TIMEOUT_S = 1.0
+TURN_LATENCY_CALLBACK_DRAIN_TIMEOUT_S = 1.0
+TURN_LATENCY_CALLBACK_MAX_PENDING = 64
 
 
 @dataclass(frozen=True)
@@ -37,6 +42,7 @@ class ComputeSettings:
     internal_ws_base_port: int = 9000
     s2s_repo_dir: str = "/opt/speech-to-speech"
     num_pipelines: str = "1"
+    remote_pipeline: bool = False
     language: str = "en"
     chat_size: str = "30"
     stt: str = "parakeet-tdt"
@@ -72,6 +78,7 @@ class ComputeSettings:
             internal_ws_base_port=int(env_text("INTERNAL_WS_PORT", "9000", environ=environ, strip=False)),
             s2s_repo_dir=env_text("S2S_REPO_DIR", "/opt/speech-to-speech", environ=environ, strip=False),
             num_pipelines=env_text("NUM_PIPELINES", "1", environ=environ),
+            remote_pipeline=env_bool("PIPELINE_MANAGED", False, environ=environ),
             language=env_text("LANGUAGE", "en", environ=environ),
             chat_size=env_text("CHAT_SIZE", "30", environ=environ),
             stt=env_text("STT", "parakeet-tdt", environ=environ),
@@ -143,6 +150,16 @@ def build_s2s_command(
     port: int,
     settings: ComputeSettings,
 ) -> list[str]:
+    if settings.remote_pipeline:
+        return [
+            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "pipeline_entrypoint.py"),
+            "--internal",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
     cmd = [
         "uv",
         "run",
@@ -579,6 +596,44 @@ async def websocket_proxy(
         if isinstance(claim, str) and claim:
             llm_fingerprint = claim
     llm_fingerprint_registered = False
+    turn_latency_tasks: set[asyncio.Task] = set()
+
+    def _observe_upstream_text(message: str) -> None:
+        if session_payload is None:
+            return
+        try:
+            latency = extract_pipeline_turn_latency(message)
+        except ValueError as exc:
+            logger.warning("Ignoring invalid pipeline turn latency metadata: %s", exc)
+            return
+        if latency is None:
+            return
+        if len(turn_latency_tasks) >= TURN_LATENCY_CALLBACK_MAX_PENDING:
+            logger.warning(
+                "Dropping pipeline turn latency callback because %d reports are pending", len(turn_latency_tasks)
+            )
+            return
+
+        task = asyncio.create_task(
+            dependencies.notify_lb_session_event(
+                session_payload["callback_url"],
+                session_payload["session_token"],
+                TURN_LATENCY_EVENT,
+                details={"latency": latency.to_payload()},
+            )
+        )
+        turn_latency_tasks.add(task)
+
+        def _finished(completed: asyncio.Task) -> None:
+            turn_latency_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except Exception as exc:
+                logger.warning("Pipeline turn latency callback failed: %s", exc)
+
+        task.add_done_callback(_finished)
 
     async def _notify_connected() -> None:
         # Runs only after a pipeline slot is actually secured. Notifying the
@@ -608,6 +663,7 @@ async def websocket_proxy(
             no_capacity_reason="No pipeline capacity available",
             no_capacity_log="Failed to allocate speech-to-speech slot",
             on_lease_acquired=_notify_connected,
+            on_upstream_text=_observe_upstream_text,
         )
     except Exception as exc:
         logger.warning("Rejected websocket session: %s", exc)
@@ -616,6 +672,15 @@ async def websocket_proxy(
         except Exception:
             pass
     finally:
+        if turn_latency_tasks:
+            _, pending = await asyncio.wait(
+                turn_latency_tasks,
+                timeout=TURN_LATENCY_CALLBACK_DRAIN_TIMEOUT_S,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                logger.warning("Abandoned %d pipeline turn latency callback(s) during session teardown", len(pending))
         if llm_fingerprint_registered and llm_fingerprint is not None:
             dependencies.connected_llm_fingerprints.remove(llm_fingerprint)
         if session_payload is not None:
@@ -678,10 +743,11 @@ async def _notify_lb_session_event(
     session_token: str,
     event: str,
     *,
-    post_json: Callable[[str, dict[str, str]], None],
+    post_json: Callable[[str, dict[str, object]], None],
     default_backoff_s: float,
     attempts: int = 1,
     backoff_s: Optional[float] = None,
+    details: Optional[dict[str, object]] = None,
 ) -> None:
     """Post a session lifecycle event to the LB callback URL.
 
@@ -690,9 +756,12 @@ async def _notify_lb_session_event(
     released session returns 200 already_released, so repeating a request
     whose response was lost is safe.
     """
-    payload = {
+    if details and details.keys() & {"session_token", "event"}:
+        raise ValueError("callback details cannot replace session_token or event")
+    payload: dict[str, object] = {
         "session_token": session_token,
         "event": event,
+        **(details or {}),
     }
     if backoff_s is None:
         backoff_s = default_backoff_s
@@ -807,6 +876,7 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
         *,
         attempts: int = 1,
         backoff_s: Optional[float] = None,
+        details: Optional[dict[str, object]] = None,
     ) -> None:
         await _notify_lb_session_event(
             callback_url,
@@ -816,6 +886,7 @@ def build_compute_dependencies(settings: ComputeSettings) -> ComputeDependencies
             default_backoff_s=settings.lb_callback_retry_backoff_s,
             attempts=attempts,
             backoff_s=backoff_s,
+            details=details,
         )
 
     router = SessionRouter(

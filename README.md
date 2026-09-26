@@ -170,16 +170,17 @@ uv run --with-requirements requirements.txt python scripts/create_speech_proxy_e
 The same proxy image is configured as STT, TTS, or LLM by environment. STT
 accounts for work in five-second audio equivalents; TTS and LLM account for
 concurrent calls. The initial operating targets are 96 STT work units, 8 TTS
-calls, and 64 LLM generations per worker. The initial LLM latency target is 500 ms to
-the first non-empty response chunk. That chunk can contain metadata rather
-than generated text, so this is not a time-to-first-token measurement or a
-validated first-token target. These are
+calls, and 64 LLM generations per worker. The initial LLM latency target is
+500 ms to the first non-empty upstream response chunk, based on the Gemma 4
+26B-A4B NVFP4 RTX PRO 6000 curve. That chunk can contain metadata rather than
+model text, so this is not a validated time-to-first-token target. The pipeline
+reports its first non-whitespace text delta separately. These are
 soft routing targets and do not reject excess work. When every healthy worker
 is above target, new calls still go to the best available worker. Routing
 combines current work with an EWMA latency penalty. TTS and LLM readiness each
 include a real short inference. Retries move to another worker only before the
-first non-empty response bytes reach the caller, and cancellation closes the upstream
-response and releases its reservation.
+first audio or non-empty upstream response chunk reaches the caller, and
+cancellation closes the upstream response and releases its reservation.
 
 Create the LLM proxy explicitly after the Gemma workers exist. The tested RTX
 PRO 6000 endpoint is in AWS `us-east-2`, but Hugging Face currently offers no
@@ -218,12 +219,62 @@ because that is the API used for the tool-call and vision validation.
 In this mode the deployment reuses `HF_TOKEN` for the protected LLM proxy and
 does not require an OpenAI API key.
 
-This first deployment intentionally uses one CPU proxy replica per service.
-Its reservations and latency history are process-local, so horizontally scaling
-the proxy would make its capacity view inconsistent. Worker membership is also
-an explicit endpoint-name list at deployment time. The autoscaling controller
-can later add, drain, wake, or remove workers behind these same stable proxy
-URLs without changing any pipeline assignment.
+Each service keeps one stable CPU proxy replica because reservations and
+latency history are process-local. Its bounded worker inventory may contain
+running or paused endpoints. With autoscaling enabled, the proxy discovers URLs
+through the endpoint control API, keeps the configured warm floor, records
+short load peaks between control polls, and starts one additional worker when
+per-worker work or fresh fleet-wide latency crosses its target. The targets are
+soft: requests continue using available workers while capacity warms.
+
+Scale-down requires sustained surplus capacity, atomically marks one worker as
+draining, sends it no new requests, waits for every active request/stream to
+release, and only then pauses it. A burst can cancel a drain before the pause
+begins. Pending starts count as capacity, control failures block scale-down,
+and ambiguous pause failures remain quarantined. Unhealthy workers are restarted
+with bounded attempts and backoff. Parked workers are never HTTP health-probed,
+because an inference request can wake a scaled-to-zero service.
+
+Create the complete endpoint inventory first, leaving the standbys paused:
+
+```bash
+export HF_TOKEN=...
+uv run --default-index https://pypi.org/simple --with-requirements requirements.txt \
+  python scripts/create_worker_standbys.py \
+  --source reachy-s2s-tts-01 --names reachy-s2s-tts-02 \
+  --apply --wait-ready
+```
+
+Then configure the service proxy with every worker name and a dedicated HF
+control credential. Initial scale-up utilization is 85%: 81.6 five-second STT
+equivalents, 6.8 TTS generations, or 54.4 LLM generations per ready worker.
+Latency only votes after every ready worker is above its service target for 30
+seconds; an isolated slow worker cannot wake capacity.
+
+```bash
+export HF_TOKEN=...
+export HF_CONTROL_TOKEN=...
+uv run --default-index https://pypi.org/simple --with-requirements requirements.txt \
+  python scripts/create_speech_proxy_endpoints.py \
+  --services stt tts llm --autoscale --min-warm-workers 1 --max-workers 2 \
+  --stt-backends reachy-s2s-stt-01 reachy-s2s-stt-02 \
+  --tts-backends reachy-s2s-tts-01 reachy-s2s-tts-02 \
+  --llm-backends gemma4-26b-a4b-nvfp4-rtx6000-test reachy-s2s-llm-02 \
+  --image-url ghcr.io/andimarafioti/s2s-speech-proxy:sha-YOUR_FULL_COMMIT_SHA
+```
+
+Worker phases, actions, active work, target work, and lifecycle errors appear in
+both proxy health/metrics and the load-balancer dashboard. Worker rows also show
+recent weighted latency (EWMA), its configured target, and whether the sample is
+too old for scaling. STT uses real-time factor (transcription seconds per second
+of input audio); TTS uses time to first audio and LLM uses time to the first
+non-empty upstream response chunk, both in milliseconds. This per-worker average
+is independent of the dashboard's selected percentile window.
+STT requests with unknown audio duration still release their work reservations,
+but do not update the latency average or its freshness. Set
+`SPEECH_WORKER_MIN_WARM=2` when immediate single-worker failover is worth the
+second always-on GPU; a warm floor of one optimizes cost but accepts model-load
+time after failure or scale-up.
 
 The `Publish speech service images` workflow can selectively publish immutable
 `ghcr.io/andimarafioti/s2s-speech-proxy:sha-<full-commit-sha>` images. A manual
@@ -258,6 +309,15 @@ The dashboard displays STT, TTS, and LLM together for the selected dashboard win
 If the GPU images have not yet been redeployed with the timing middleware, the
 proxy and backend-round-trip metrics still work, while GPU-service timing is
 shown as unavailable with zero reporting coverage.
+
+Managed pipeline workers also inspect terminal Realtime `response.done` events
+after forwarding them to the client. When speech-to-speech supplies the reserved
+`speech_to_speech.turn_latency` metadata, the worker reports its raw server-side
+STT, full LLM generation, TTS first-audio, end-to-end first-audio, and MLX lock
+wait measurements to the load balancer. The dashboard presents these separately
+from proxy timings because their boundaries differ. Reports are authenticated
+with the existing session token, deduplicated by session and response key, kept
+in a bounded process-local window, and reset when the load balancer restarts.
 
 Build and deploy the CPU-only pipeline after both speech services are running:
 
@@ -304,6 +364,68 @@ speech-to-speech talk \
 
 Current upstream uses the command name `talk`; older checkouts may call the
 same client `listen`.
+
+### Managed CPU pipeline workers
+
+For pipeline autoscaling, deploy with `create_pipeline_endpoint.py --managed`
+and supply `SESSION_SHARED_SECRET` in the environment, matching the LB's session
+signing secret. This selects `PIPELINE_MANAGED=true` and `/health` readiness.
+The same CPU image then runs the existing compute wrapper on port 7860 and the
+remote-only S2S process on loopback port 9000. Health reports real session slots;
+session-token validation, connected/disconnected callbacks, and drain recovery
+use the existing LB protocol. The original direct-testing mode stays unchanged
+when `PIPELINE_MANAGED` is false.
+
+Add the managed pipeline names to the LB's `COMPUTE_ENDPOINT_NAMES` and use its
+existing `COMPUTE_ENDPOINT_MIN_WARM`, `COMPUTE_ENDPOINT_WAKE_THRESHOLD_SLOTS`,
+idle parking, and recovery settings. Do not add raw/direct S2S endpoints to this
+inventory: their health and session-allocation contracts are different. The LB
+now supplies its HF ingress credential when reading protected worker health.
+End-user clients must also have HF ingress access to protected pipeline endpoints;
+public pipeline endpoints instead rely on signed session tokens.
+
+### Worker scaling controls and rollout boundary
+
+Autoscaling is opt-in (`SPEECH_AUTOSCALE_ENABLED=true`) and requires separate
+`HF_CONTROL_TOKEN` and `HF_ENDPOINT_NAMESPACE` configuration. `SPEECH_BACKENDS`
+accepts `name=url` entries or, in managed mode, endpoint names alone. All listed
+endpoints belong exclusively to that proxy; do not run a second controller over
+the same inventory, enable HF replica autoscaling, or send inference directly
+to those GPUs. Bypassing the proxy makes active-work/drain accounting incomplete.
+
+Every `WorkerLifecycleSettings` field is configurable as
+`SPEECH_WORKER_<UPPERCASE_FIELD>`. Important defaults:
+
+| Setting suffix | Default | Meaning |
+| --- | ---: | --- |
+| `MIN_WARM` / `MAX_WORKERS` | 1 / inventory size | Warm floor and bounded activation budget |
+| `SCALE_UP_UTILIZATION` / `SCALE_DOWN_UTILIZATION` | 0.85 / 0.5 | Growth and consolidation thresholds |
+| `RECONCILE_INTERVAL_S` | 5 | Control-plane poll interval |
+| `LATENCY_BREACH_S` / `LATENCY_MAX_AGE_S` | 30 / 60 | Sustained breach and freshness windows |
+| `SCALE_UP_COOLDOWN_S` / `SCALE_DOWN_COOLDOWN_S` | 30 / 180 | Change-rate limits |
+| `IDLE_TIMEOUT_S` / `MIN_UPTIME_S` | 600 / 300 | Sustained surplus window and minimum worker uptime |
+| `STARTUP_TIMEOUT_S` / `UNHEALTHY_RESTART_S` | 900 / 120 | Pending-capacity expiry and unhealthy recovery delay |
+| `MAX_RESTART_ATTEMPTS` / `RETRY_BACKOFF_S` | 3 / 30 | Bounded restarts with capped exponential backoff |
+
+STT latency is normalized by uploaded duration, not compared as raw seconds.
+The fleet can consolidate under light continuous traffic, not only complete
+silence. A timed-out remote operation stays out of routing; initialization that
+exceeds its timeout stops counting as pending capacity but is not blindly
+restarted while HF still reports an ongoing transition.
+
+Provisioning never creates capacity in response to unbounded demand: the helper
+pre-creates a fixed inventory, and runtime control only starts/stops those names.
+It preserves source runtime arguments, model revision, hardware, and region;
+all source secret names must be supplied from environment variables (use
+`--secret-from-env ENDPOINT_SECRET=ENV_VAR_NAME` for aliases). Its default is a
+read-only plan; `--apply` creates and pauses, and `--wait-ready` boots once first.
+Prefer immutable image digests for managed engines with mutable upstream tags.
+
+Roll out a new proxy image with autoscaling disabled first. Verify its inventory,
+then enable one service at a time. To disable lifecycle control, set
+`SPEECH_AUTOSCALE_ENABLED=false` and use an explicit list of already-warm backend
+URLs. This does not pause or delete workers. Metrics and controller state remain
+process-local, and durable telemetry/multi-proxy coordination are separate work.
 
 ## Direct Session Flow
 
@@ -388,6 +510,9 @@ The dashboard keeps an in-memory rolling history on the LB itself and shows:
 - `POST /session` request counts, authentication rejections, allocation
   successes/failures, and connect/disconnect events
 - conversation starts/completions plus average and max completed conversation duration
+- pipeline turn latency for STT, the first non-whitespace LLM text delta, full
+  LLM generation, TTS first audio, and speech-end-to-first-server-audio, with
+  terminal response outcomes
 - distinct verified Hugging Face users, token fingerprints, anonymous network
   fingerprints, and client-reported robot fingerprints
 - a per-requester leaderboard with allocation and connection outcomes, traffic
@@ -544,7 +669,10 @@ load-balancer variable is ignored and can be removed from existing deployments.
 - `COMPUTE_ENDPOINT_PARK_STRATEGY`: `pause` or `scale_to_zero`
 - `HF_CONTROL_TOKEN`: token used to call the Inference Endpoints API
 - `LB_ADMIN_AUTH_TOKEN`: dedicated bearer token required by the internal endpoint
-  status and drain routes; do not reuse `HF_CONTROL_TOKEN`
+  status and drain routes. Send it in
+  `X-Reachy-Mini-Admin-Authorization` because HF Inference Endpoints consumes
+  the standard `Authorization` header; the LB retains the standard header as a
+  fallback for non-HF deployments. Do not reuse `HF_CONTROL_TOKEN`.
 - `LB_CALLBACK_AUTH_TOKEN`: dedicated bearer credential required from compute
   endpoints at `/internal/llm-proxy-usage`. Use the same value on the LB and
   every compute endpoint; do not reuse a requester's HF token. Compute sends
@@ -1022,7 +1150,7 @@ endpoint is safe to reopen:
 
 ```bash
 curl --fail-with-body -X POST \
-  -H "Authorization: Bearer $LB_ADMIN_AUTH_TOKEN" \
+  -H "X-Reachy-Mini-Admin-Authorization: Bearer $LB_ADMIN_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   --data '{"draining": false, "force": true}' \
   "$LOAD_BALANCER_URL/internal/endpoints/reachy-s2s-01/drain"

@@ -35,6 +35,7 @@ from app.llm_proxy_usage import (
     LLM_PROXY_CLIENT_IP_MAX_LENGTH,
     LLM_PROXY_REASONS,
 )
+from app.pipeline_turn_latency import TURN_LATENCY_EVENT, PipelineTurnLatency
 from app.requester_identity import (
     RequesterIdentity,
     RequesterIdentityResolver,
@@ -60,6 +61,7 @@ from app.verification_admission_limiter import (
 logger = setup_logging()
 APP_ROLE = "load_balancer"
 DASHBOARD_PREVIEW_SENTINELS = {"test", "preview", "dashboard_preview"}
+LB_ADMIN_AUTH_HEADER = "X-Reachy-Mini-Admin-Authorization"
 
 
 @dataclass(frozen=True)
@@ -366,7 +368,7 @@ def build_endpoint_router(settings: LoadBalancerSettings) -> EndpointPoolRouter:
         drain_lease_ttl_s=settings.compute_endpoint_drain_lease_ttl_s,
         drain_warning_after_s=settings.compute_endpoint_drain_warning_after_s,
         drain_warning_interval_s=settings.compute_endpoint_drain_warning_interval_s,
-        compute_usage_fetcher=fetch_compute_usage,
+        compute_usage_fetcher=lambda url: fetch_compute_usage(url, api_key=settings.hf_control_token),
         # How long a previously observed usage count stays trusted when
         # health polls fail transiently. Must be comfortably above the
         # reconcile interval (10s): the default 60s means roughly six
@@ -1261,6 +1263,13 @@ async def session_event(
     if not event:
         raise HTTPException(status_code=400, detail="event is required")
 
+    turn_latency = None
+    if event == TURN_LATENCY_EVENT:
+        try:
+            turn_latency = PipelineTurnLatency.from_payload(payload.get("latency"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
         result = await dependencies.session_manager.handle_event(session_id, session_token, event)
     except KeyError:
@@ -1271,6 +1280,10 @@ async def session_event(
         raise HTTPException(status_code=404, detail="Unknown session id") from None
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    if turn_latency is not None:
+        recorded = await dependencies.dashboard.record_pipeline_turn_latency(session_id, turn_latency)
+        return JSONResponse({**result, "recorded": recorded})
 
     await dependencies.dashboard.record_session_event(
         event,
@@ -1458,7 +1471,10 @@ def require_callback_auth(runtime: LoadBalancerRuntime, request: Request) -> Non
 
 
 def require_admin_auth(runtime: LoadBalancerRuntime, request: Request) -> None:
-    _require_bearer_auth(request.headers.get("authorization"), runtime.settings.lb_admin_auth_token, "admin")
+    authorization = request.headers.get(LB_ADMIN_AUTH_HEADER)
+    if authorization is None:
+        authorization = request.headers.get("authorization")
+    _require_bearer_auth(authorization, runtime.settings.lb_admin_auth_token, "admin")
 
 
 def _require_bearer_auth(authorization: str | None, expected_token: str | None, label: str) -> None:
@@ -1532,7 +1548,9 @@ def create_app(
     async def queue_leave_route(queue_id: str):
         return await queue_leave(runtime, queue_id)
 
-    async def session_event_route(session_id: str, payload: dict[str, Any]):
+    async def session_event_route(session_id: str, payload: dict[str, Any], request: Request):
+        if payload.get("event") == TURN_LATENCY_EVENT:
+            require_callback_auth(runtime, request)
         return await session_event(runtime, session_id, payload)
 
     async def llm_proxy_usage_route(request: Request):

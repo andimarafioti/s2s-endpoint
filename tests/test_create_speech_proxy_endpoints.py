@@ -60,6 +60,24 @@ def make_args(**overrides):
 
 
 class SpeechProxyDeploymentTests(unittest.TestCase):
+    def test_autoscale_inventory_can_include_parked_workers_without_urls(self):
+        args = make_args(autoscale=True, min_warm_workers=1, max_workers=None)
+        api = MagicMock()
+        api.get_inference_endpoint.return_value = MagicMock(url=None)
+        specs = build_specs(args, api)
+        self.assertEqual(specs[0].backends[0].url, "")
+        env = deployment_env(args, specs[0])
+        self.assertEqual(env["SPEECH_AUTOSCALE_ENABLED"], "true")
+        self.assertEqual(env["SPEECH_WORKER_MAX_WORKERS"], "1")
+
+    def test_autoscale_requires_explicit_control_secret(self):
+        with self.assertRaisesRegex(ValueError, "HF_CONTROL_TOKEN"):
+            resolve_secrets({"HF_TOKEN": "ingress"}, autoscale=True)
+        self.assertEqual(
+            resolve_secrets({"HF_TOKEN": "ingress", "HF_CONTROL_TOKEN": "control"}, autoscale=True),
+            {"SPEECH_BACKEND_API_KEY": "ingress", "HF_CONTROL_TOKEN": "control"},
+        )
+
     def test_build_specs_resolves_worker_names_to_urls(self):
         api = MagicMock()
         api.get_inference_endpoint.side_effect = [

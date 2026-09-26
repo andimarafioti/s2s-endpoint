@@ -29,7 +29,7 @@ def ensure_name_available(api: HfApi, namespace: str, name: str) -> None:
     raise ValueError(f"Inference Endpoint name already exists: {name}")
 
 
-def resolve_secrets(environ: dict[str, str], *, use_hf_llm: bool = False) -> dict[str, str]:
+def resolve_secrets(environ: dict[str, str], *, use_hf_llm: bool = False, managed: bool = False) -> dict[str, str]:
     hf_token = environ.get("HF_TOKEN", "").strip()
     openai_key = environ.get("RESPONSES_API_API_KEY", "").strip() or environ.get("OPENAI_API_KEY", "").strip()
     missing = []
@@ -39,10 +39,18 @@ def resolve_secrets(environ: dict[str, str], *, use_hf_llm: bool = False) -> dic
         missing.append("RESPONSES_API_API_KEY or OPENAI_API_KEY")
     if missing:
         raise ValueError(f"Missing required deployment secret(s): {', '.join(missing)}")
-    return {
+    secrets = {
         "HF_TOKEN": hf_token,
         "RESPONSES_API_API_KEY": hf_token if use_hf_llm else openai_key,
     }
+    if managed:
+        shared_secret = environ.get("SESSION_SHARED_SECRET", "").strip()
+        if not shared_secret:
+            raise ValueError("managed pipelines require SESSION_SHARED_SECRET matching the load balancer")
+        secrets["SESSION_SHARED_SECRET"] = shared_secret
+        if environ.get("LB_CALLBACK_AUTH_TOKEN"):
+            secrets["LB_CALLBACK_AUTH_TOKEN"] = environ["LB_CALLBACK_AUTH_TOKEN"]
+    return secrets
 
 
 def deployment_env(args: argparse.Namespace) -> dict[str, str]:
@@ -58,6 +66,8 @@ def deployment_env(args: argparse.Namespace) -> dict[str, str]:
     }
     if args.llm_base_url:
         env["LLM_BASE_URL"] = args.llm_base_url.rstrip("/")
+    if getattr(args, "managed", False):
+        env.update(PIPELINE_MANAGED="true", STT="openai", TTS="openai", LLM=args.llm_backend)
     return env
 
 
@@ -98,6 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-pipelines", type=int, default=1)
     parser.add_argument("--stream-batch-sentences", type=int, default=3)
     parser.add_argument("--enable-live-transcription", action="store_true")
+    parser.add_argument("--managed", action="store_true", help="Use the LB session/capacity/drain wrapper")
     parser.add_argument("--wait", action="store_true")
     parser.add_argument("--wait-timeout", type=float, default=1800)
     parser.add_argument("--dry-run", action="store_true")
@@ -139,7 +150,8 @@ def main() -> None:
                     "max_replica": args.max_replica,
                     "env": endpoint_env,
                     "required_secret_names": (
-                        ["HF_TOKEN"] if args.llm_base_url else ["HF_TOKEN", "RESPONSES_API_API_KEY"]
+                        (["HF_TOKEN"] if args.llm_base_url else ["HF_TOKEN", "RESPONSES_API_API_KEY"])
+                        + (["SESSION_SHARED_SECRET"] if args.managed else [])
                     ),
                 },
                 indent=2,
@@ -147,7 +159,7 @@ def main() -> None:
         )
         return
 
-    secrets = resolve_secrets(dict(os.environ), use_hf_llm=bool(args.llm_base_url))
+    secrets = resolve_secrets(dict(os.environ), use_hf_llm=bool(args.llm_base_url), managed=args.managed)
     endpoint = api.create_inference_endpoint(
         args.name,
         namespace=args.namespace,
@@ -162,7 +174,9 @@ def main() -> None:
         region=args.region,
         min_replica=args.min_replica,
         max_replica=args.max_replica,
-        custom_image=build_custom_image(args.image_url, DEFAULT_HEALTH_ROUTE, DEFAULT_PORT),
+        custom_image=build_custom_image(
+            args.image_url, "/health" if args.managed else DEFAULT_HEALTH_ROUTE, DEFAULT_PORT
+        ),
         env=endpoint_env,
         secrets=secrets,
         type=args.type,

@@ -21,6 +21,14 @@ class FakeNotFound(Exception):
 
 
 class CreatePipelineEndpointTests(unittest.TestCase):
+    def test_managed_mode_requires_and_preserves_session_secret(self):
+        with self.assertRaisesRegex(ValueError, "SESSION_SHARED_SECRET"):
+            resolve_secrets({"HF_TOKEN": "hf-secret"}, use_hf_llm=True, managed=True)
+        secrets = resolve_secrets(
+            {"HF_TOKEN": "hf-secret", "SESSION_SHARED_SECRET": "shared"}, use_hf_llm=True, managed=True
+        )
+        self.assertEqual(secrets["SESSION_SHARED_SECRET"], "shared")
+
     def test_parse_args_requires_explicit_image(self):
         with (
             patch(

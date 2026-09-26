@@ -71,10 +71,13 @@ class ComputeUnhealthyError(RuntimeError):
     """The compute endpoint explicitly reported that it is not ready."""
 
 
-def fetch_compute_usage(base_url: str) -> ComputeUsage:
+def fetch_compute_usage(base_url: str, *, api_key: str | None = None) -> ComputeUsage:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(
         _to_health_url(base_url),
-        headers={"Accept": "application/json"},
+        headers=headers,
         method="GET",
     )
     try:
@@ -171,6 +174,8 @@ class EndpointController(Protocol):
 
     def wake(self, name: str) -> EndpointSnapshot: ...
 
+    def begin_wake(self, name: str) -> EndpointSnapshot: ...
+
     def park(self, name: str) -> EndpointSnapshot: ...
 
     def restart(self, name: str) -> EndpointSnapshot: ...
@@ -227,7 +232,8 @@ class HuggingFaceEndpointController:
         endpoint = self._get(name)
         return self._snapshot(name, endpoint)
 
-    def wake(self, name: str) -> EndpointSnapshot:
+    def begin_wake(self, name: str) -> EndpointSnapshot:
+        """Request capacity without blocking until the model finishes loading."""
         endpoint = self._get(name)
         status = _normalize_status(getattr(endpoint, "status", ""))
 
@@ -235,10 +241,11 @@ class HuggingFaceEndpointController:
             endpoint = self._resume(name, running_ok=True)
         elif _is_parked_status(status):
             endpoint = self._update(name)
-        elif not _is_running_status(status):
-            return self._snapshot(name, self._wait(name, endpoint))
+        return self._snapshot(name, endpoint)
 
-        return self._snapshot(name, self._wait(name, endpoint))
+    def wake(self, name: str) -> EndpointSnapshot:
+        self.begin_wake(name)
+        return self._snapshot(name, self._wait(name, self._get(name)))
 
     def park(self, name: str) -> EndpointSnapshot:
         endpoint = self._get(name)

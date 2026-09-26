@@ -4,11 +4,11 @@
 FROM python:3.12-slim
 
 ARG S2S_REPO_URL=https://github.com/huggingface/speech-to-speech.git
-ARG S2S_REF=3986f453012a131632eee4731995474046846794
+ARG S2S_REF=c60efc4eb9a0f173d13dbfe201c46ec279c1be0d
 ARG SMART_TURN_MODEL_REPO=pipecat-ai/smart-turn-v3
 ARG SMART_TURN_MODEL_REV=f766f81d3cfdf7737ac64aad813d91bbfd56bf93
 ARG SMART_TURN_MODEL_FILENAME=smart-turn-v3.2-cpu.onnx
-ARG SILERO_VAD_REF=867c2aa692646a1f1de3e94a15c9dd9f614c0acb
+ARG SILERO_VAD_REF=5cd7945676eb32225748052e2e6a0580e4686a08
 
 LABEL org.opencontainers.image.source="https://github.com/andimarafioti/s2s-endpoint"
 
@@ -30,6 +30,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --filter=blob:none "${S2S_REPO_URL}" "${S2S_REPO_DIR}" && \
     git -C "${S2S_REPO_DIR}" checkout "${S2S_REF}"
 
+# Forward the detected turn language to Qwen TTS while the upstream handler
+# still treats its language setting as a fixed value.
+COPY patches/openai-tts-turn-language.patch /tmp/openai-tts-turn-language.patch
+RUN git -C "${S2S_REPO_DIR}" apply /tmp/openai-tts-turn-language.patch
+
 # Install CPU PyTorch explicitly so PyPI does not pull CUDA runtime packages.
 # The remaining list is the subset needed by the remote STT/LLM/TTS pipeline;
 # local speech model backends are intentionally absent from this image.
@@ -39,6 +44,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
       torch==2.11.0 \
       torchaudio==2.11.0 && \
     python -m pip install \
+      "anyio>=4.0,<5" \
       "fastapi>=0.115.0" \
       "huggingface-hub>=0.34.0" \
       "httpx>=0.28.0" \
@@ -52,6 +58,7 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
       "requests>=2.32.0" \
       "rich>=13.0" \
       "scipy>=1.10.0" \
+      "soxr>=0.3.2" \
       "transformers==5.15.1" \
       "uvicorn>=0.30.0" \
       "websockets>=12.0" && \
@@ -64,6 +71,10 @@ RUN mkdir -p /opt/models "${TORCH_HOME}" && \
     python -c "import nltk; nltk.download('punkt_tab'); nltk.download('averaged_perceptron_tagger_eng')" && \
     python -c "import torch; torch.hub.load('snakers4/silero-vad:${SILERO_VAD_REF}', 'silero_vad', trust_repo=True, skip_validation=True)"
 
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN python -m pip install -r /app/requirements.txt
+COPY app /app/app
 COPY pipeline_entrypoint.py /app/pipeline_entrypoint.py
 
 EXPOSE 7860

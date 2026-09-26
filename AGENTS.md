@@ -5,6 +5,15 @@
 - Never merge pull requests automatically. Leave every pull request open for user review, and merge only when the user explicitly asks to merge that specific pull request.
 - For existing/open pull requests, do not amend, squash, rebase-rewrite, or force-push follow-up changes. Make new commits and push normally unless explicitly asked to rewrite history.
 
+## HF Inference Endpoint Authentication
+
+- Hugging Face Inference Endpoints may consume the standard `Authorization`
+  header at ingress instead of forwarding it to the application container.
+- Send application-level credentials through a dedicated custom header. Routes
+  may retain standard `Authorization` as a fallback for local or non-HF
+  deployments, but the custom header must take precedence when both are present.
+- Reserve standard `Authorization` for credentials intended for HF ingress.
+
 # Operational Log Analysis Notes
 
 These notes capture the current working understanding of the Reachy S2S endpoint logs and dashboard semantics.

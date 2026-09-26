@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app.dashboard_history import DashboardHistory, SwarmHistoryBucket, SwarmStateSample
 from app.dashboard_history_store import HuggingFaceBucketHistoryStore, ReadOnlyDashboardHistoryStore
+from app.pipeline_turn_latency import PipelineTurnLatency
 from app.requester_identity import RequesterIdentity
 from app.swarm_dashboard import SwarmDashboard
 
@@ -305,6 +306,44 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["speech_proxies"]["configured"])
         self.assertEqual(set(payload["speech_proxies"]["services"]), {"stt", "tts"})
 
+    async def test_data_summarizes_pipeline_turn_latency_for_selected_window(self):
+        dashboard = SwarmDashboard(
+            snapshot_provider=FakeSnapshotProvider(
+                _health_snapshot(
+                    connected=1,
+                    pending=0,
+                    running=1,
+                    waking=0,
+                    free_slots=15,
+                    effective_free_slots=15,
+                )
+            ),
+        )
+        latency = PipelineTurnLatency.from_payload(
+            {
+                "version": 1,
+                "turn_id": "turn_1",
+                "turn_revision": 0,
+                "response_key": "response_1",
+                "status": "completed",
+                "stt_s": 0.2,
+                "llm_ttft_s": 0.12,
+                "llm_s": 1.0,
+                "tts_ttfa_s": 0.3,
+                "e2e_s": 1.5,
+                "mlx_lock_wait_s": 0.0,
+            }
+        )
+        await dashboard.record_pipeline_turn_latency("session_1", latency)
+
+        payload = await dashboard.data(window="60m", resolution="minute")
+
+        telemetry = payload["pipeline_turn_latency"]
+        self.assertEqual(telemetry["responses"]["window"], 1)
+        self.assertEqual(telemetry["latency_ms"]["stt"]["p50"], 200.0)
+        self.assertEqual(telemetry["latency_ms"]["llm_ttft"]["p50"], 120.0)
+        self.assertEqual(telemetry["latency_ms"]["e2e"]["p95"], 1500.0)
+
     async def test_empty_minute_point_uses_history_bucket_shape(self):
         clock = FakeClock(2 * 3600)
         dashboard = SwarmDashboard(
@@ -527,11 +566,14 @@ class SwarmDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("const rollingCharts = [", html)
         self.assertIn("Maximum Connected Users", html)
         self.assertIn("Median Duration", html)
+        self.assertIn("Conversation Turn Latency", html)
+        self.assertIn("renderPipelineTurnLatency", html)
         self.assertIn("Proxy And GPU Latency", html)
         self.assertIn("renderSpeechLatency", html)
         self.assertIn("transcription: 'transcription'", html)
         self.assertIn("first_audio: 'first audio'", html)
-        self.assertIn("first_response_chunk: 'first response chunk'", html)
+        self.assertIn("first_response_chunk: 'first upstream chunk'", html)
+        self.assertIn("llm_ttft: 'LLM first text'", html)
         self.assertIn("phaseLabels[entry.phase]", html)
         self.assertIn("renderRollingChartCards();", html)
 

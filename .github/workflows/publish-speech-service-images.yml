@@ -12,7 +12,9 @@ on:
           - all
           - stt
           - tts
+          - tts-ggml
           - proxy
+          - load-balancer
       release_tag:
         description: Optional version alias to publish, such as v0.3
         required: false
@@ -24,14 +26,19 @@ on:
       - .github/workflows/publish-speech-service-images.yml
       - Dockerfile.stt
       - Dockerfile.tts
+      - Dockerfile.tts-ggml
       - Dockerfile.speech_proxy
+      - Dockerfile.load_balancer
       - requirements.txt
       - app/app_utils.py
       - app/speech_proxy_app.py
       - app/speech_proxy_main.py
       - app/speech_proxy_metrics.py
       - app/speech_proxy_router.py
+      - app/speech_worker_lifecycle.py
+      - app/endpoint_pool_router.py
       - app/speech_service_timing.py
+      - app/**
 
 permissions:
   contents: read
@@ -52,10 +59,18 @@ jobs:
             image: s2s-tts
             dockerfile: Dockerfile.tts
             cache_scope: speech-tts
+          - service: tts-ggml
+            image: s2s-tts-ggml
+            dockerfile: Dockerfile.tts-ggml
+            cache_scope: speech-tts-ggml
           - service: proxy
             image: s2s-speech-proxy
             dockerfile: Dockerfile.speech_proxy
             cache_scope: speech-proxy
+          - service: load-balancer
+            image: s2s-load-balancer
+            dockerfile: Dockerfile.load_balancer
+            cache_scope: speech-load-balancer
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
       SHOULD_PUBLISH: ${{ inputs.service == '' || inputs.service == 'all' || inputs.service == matrix.service }}

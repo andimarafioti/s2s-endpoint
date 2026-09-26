@@ -429,6 +429,15 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot["connected_sessions"], 1)
             self.assertAlmostEqual(snapshot["sessions"][0]["connected_duration_s"], 5.0, places=3)
 
+            telemetry = await self.manager.handle_event(
+                allocation["session_id"],
+                allocation["session_token"],
+                "turn_latency",
+            )
+            self.assertEqual(telemetry["state"], "connected")
+            self.assertEqual(telemetry["event"], "turn_latency")
+            self.assertEqual(router.release_calls, [])
+
             released = await self.manager.handle_event(
                 allocation["session_id"],
                 allocation["session_token"],
@@ -441,6 +450,22 @@ class DirectSessionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(router.mark_connected_calls, ["endpoint-1"])
         self.assertEqual(router.release_calls, ["endpoint-1"])
         self.assertEqual(router.release_connected_calls, [True])
+
+    async def test_turn_latency_rejected_before_session_connects(self):
+        router = FakeLeaseRouter()
+        self.manager = DirectSessionManager(
+            endpoint_router=router,
+            session_shared_secret="shared-secret",
+            queue_enabled=True,
+            pending_timeout_s=60,
+            session_token_ttl_s=3600,
+            reap_interval_s=60,
+        )
+        await self.manager.start()
+        allocation = await self.manager.allocate("https://lb.example")
+
+        with self.assertRaisesRegex(ValueError, "requires a connected session"):
+            await self.manager.handle_event(allocation["session_id"], allocation["session_token"], "turn_latency")
 
     async def test_disconnect_without_connected_releases_without_counting(self):
         # Capacity-rejected sessions now post 'disconnected' with no prior
