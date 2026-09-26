@@ -12,6 +12,7 @@ on:
           - all
           - stt
           - tts
+          - tts-ggml
           - proxy
           - load-balancer
       release_tag:
@@ -25,6 +26,7 @@ on:
       - .github/workflows/publish-speech-service-images.yml
       - Dockerfile.stt
       - Dockerfile.tts
+      - Dockerfile.tts-ggml
       - Dockerfile.speech_proxy
       - Dockerfile.load_balancer
       - requirements.txt
@@ -57,6 +59,10 @@ jobs:
             image: s2s-tts
             dockerfile: Dockerfile.tts
             cache_scope: speech-tts
+          - service: tts-ggml
+            image: s2s-tts-ggml
+            dockerfile: Dockerfile.tts-ggml
+            cache_scope: speech-tts-ggml
           - service: proxy
             image: s2s-speech-proxy
             dockerfile: Dockerfile.speech_proxy
