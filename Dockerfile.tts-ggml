@@ -19,9 +19,10 @@ RUN python3 -m pip install --no-cache-dir \
     python3 -m pip install --no-cache-dir \
     'https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/resolve/main/whl/cu124/qwentts_cpp_python-0.4.1%2Bcu124-py3-none-manylinux_2_35_x86_64.whl'
 
-# Bake the exact GGUF weights used for the local quality comparison into this
-# canary image. The HF endpoint model mount remains independent of inference.
-RUN mkdir -p /opt/models && python3 -c 'from huggingface_hub import hf_hub_download; import shutil; from pathlib import Path; repo="Serveurperso/Qwen3-TTS-GGUF"; rev="b7ee2e8c7459c3bea99da23e3d178125a7d1713c"; target=Path("/opt/models"); files=("qwen-talker-1.7b-customvoice-Q4_K_M.gguf", "qwen-tokenizer-12hz-Q8_0.gguf"); [shutil.copyfile(hf_hub_download(repo_id=repo, filename=name, revision=rev), target/name) for name in files]' && \
+# CUDA 12.4 GGML cannot run the q6_K tensors mixed into Q4_K_M. Use the Q8
+# talker from the same pinned model revision, with the same Q8 codec. The HF
+# endpoint model mount remains independent of inference.
+RUN mkdir -p /opt/models && python3 -c 'from huggingface_hub import hf_hub_download; import shutil; from pathlib import Path; repo="Serveurperso/Qwen3-TTS-GGUF"; rev="b7ee2e8c7459c3bea99da23e3d178125a7d1713c"; target=Path("/opt/models"); files=("qwen-talker-1.7b-customvoice-Q8_0.gguf", "qwen-tokenizer-12hz-Q8_0.gguf"); [shutil.copyfile(hf_hub_download(repo_id=repo, filename=name, revision=rev), target/name) for name in files]' && \
     rm -rf /root/.cache/huggingface
 
 WORKDIR /opt/service

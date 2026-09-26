@@ -50,7 +50,7 @@ def _load_model():
     from qwentts_cpp import QwenTTS
 
     return QwenTTS(
-        talker_path=os.environ.get("GGML_TALKER_PATH", "/opt/models/qwen-talker-1.7b-customvoice-Q4_K_M.gguf"),
+        talker_path=os.environ.get("GGML_TALKER_PATH", "/opt/models/qwen-talker-1.7b-customvoice-Q8_0.gguf"),
         codec_path=os.environ.get("GGML_CODEC_PATH", "/opt/models/qwen-tokenizer-12hz-Q8_0.gguf"),
     )
 
