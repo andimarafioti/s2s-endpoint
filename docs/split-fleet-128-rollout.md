@@ -158,6 +158,24 @@ one sample, not a latency distribution. The fleet was returned to two warm
 workers with zero connected and pending sessions. Production `reachy-s2s-01`
 through `-32` were not changed.
 
+### Stateful microphone input resampling follow-up
+
+After `huggingface/speech-to-speech` PR #598 merged as
+`c60efc4eb9a0f173d13dbfe201c46ec279c1be0d`, all 11 isolated pipeline workers
+were rebuilt and moved to
+`ghcr.io/andimarafioti/s2s-pipeline:sha-a7a95ec70c15b5713593eb96cf23b90602abfe06`.
+The rollout preserved each worker's running or parked state and started with zero
+connected or pending sessions. The split load balancer and production
+`reachy-s2s-01` through `-32` were not changed.
+
+One synthetic 24 kHz PCM turn was streamed in real time through the public split
+load balancer in 40 ms chunks, specifically exercising the new stateful input
+resampler across chunk boundaries. STT returned the expected sentence and the
+assistant replied `okay`. The server reported 181 ms final STT, 192 ms LLM first
+text, 607 ms full LLM generation, 161 ms TTS first audio, 963 ms speech-end to
+first server audio, and 0 ms MLX lock wait. This is a functional canary and one
+latency sample, not a distribution.
+
 ## Browser ingress cutover — 2026-09-23
 
 The `smolagents/hf-realtime-voice` Space successfully allocated sessions from the
@@ -234,7 +252,7 @@ validated 16 users per worker. Three-sentence TTS batching remains unchanged.
 ## Images and configuration
 
 - Proxies: `ghcr.io/andimarafioti/s2s-speech-proxy:sha-f303b920f8d6431c1f5fdf85338942074dfa923a`.
-- Managed CPU pipelines: `ghcr.io/andimarafioti/s2s-pipeline:sha-f42e04364a9517e063dfd8fb298234e627f90c4d`.
+- Managed CPU pipelines: `ghcr.io/andimarafioti/s2s-pipeline:sha-a7a95ec70c15b5713593eb96cf23b90602abfe06`.
 - Split LB: `ghcr.io/andimarafioti/s2s-load-balancer:sha-f42e04364a9517e063dfd8fb298234e627f90c4d`.
 - STT/TTS retain their validated `sha-3c6f1d904b95f1a700696b57397d8dc5a82ef244` service images.
 - New Gemma replicas pin `vllm/vllm-openai@sha256:383e409fc7695d6e40cd40d452f3ec277a3d1c462d7b1510034768d26f2cd397`, preserving model revision, 128k context, 256 sequences, NVFP4, and MTP.
